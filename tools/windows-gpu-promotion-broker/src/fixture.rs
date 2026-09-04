@@ -17,7 +17,10 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{PromotionRequest, validate_sha256, validate_store_component};
+use super::{
+    ClientInvocation, PROMOTION_POLICY_NAMESPACE, PromotionIntent, validate_sha256,
+    validate_store_component,
+};
 
 const HANDOFF_NAME: &str = "windows-gpu-pack-handoff.json";
 const MANIFEST_NAME: &str = "pack-manifest.json";
@@ -35,9 +38,8 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RELEASE_SET_DOMAIN: &[u8] = b"scribe-windows-gpu-release-set-v1\0";
 const PACK_DIGEST_DOMAIN: &[u8] = b"scribe-gpu-worker-pack-digest-v1\0";
-const RECEIPT_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-receipt-v1\0";
-const REQUEST_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-request-v1\0";
-const LEDGER_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-ledger-record-v1\0";
+const RECEIPT_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-receipt-v2\0";
+const LEDGER_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-ledger-record-v2\0";
 const FIXTURE_KEY_ID: &str = "fixture-ed25519-v1";
 const FIXTURE_SEED: [u8; 32] = [7; 32];
 
@@ -167,20 +169,8 @@ struct PackReceipt {
 struct ReceiptStatement {
     schema_version: u16,
     authority: String,
-    request_sha256: String,
-    source_repository: String,
-    source_ref: String,
-    source_revision: String,
-    workflow_ref: String,
-    workflow_source_sha: String,
-    run_id: String,
-    run_attempt: String,
-    artifact_id: String,
-    artifact_digest: String,
-    handoff_sha256: String,
-    release_set_digest: String,
-    toolchain_manifest_sha256: String,
-    pack_version: String,
+    promotion_intent_sha256: String,
+    promotion_intent: PromotionIntent,
     packs: Vec<PackReceipt>,
 }
 
@@ -226,9 +216,7 @@ struct LedgerRecord {
     previous_record_sha256: String,
     kind: LedgerKind,
     release_set_digest: Option<String>,
-    request_sha256: Option<String>,
-    stage_name: Option<String>,
-    output_name: Option<String>,
+    promotion_intent_sha256: Option<String>,
     epochs: Vec<EpochBinding>,
     record_sha256: String,
 }
@@ -236,9 +224,7 @@ struct LedgerRecord {
 struct LedgerTransition {
     kind: LedgerKind,
     release_set_digest: Option<String>,
-    request_sha256: Option<String>,
-    stage_name: Option<String>,
-    output_name: Option<String>,
+    promotion_intent_sha256: Option<String>,
     epochs: Vec<EpochBinding>,
 }
 
@@ -247,9 +233,7 @@ impl LedgerTransition {
         Self {
             kind: LedgerKind::Genesis,
             release_set_digest: None,
-            request_sha256: None,
-            stage_name: None,
-            output_name: None,
+            promotion_intent_sha256: None,
             epochs: Vec::new(),
         }
     }
@@ -257,17 +241,13 @@ impl LedgerTransition {
     fn bound(
         kind: LedgerKind,
         release_set_digest: &str,
-        request_sha256: &str,
-        stage_name: &str,
-        output_name: &str,
+        promotion_intent_sha256: &str,
         epochs: Vec<EpochBinding>,
     ) -> Self {
         Self {
             kind,
             release_set_digest: Some(release_set_digest.to_owned()),
-            request_sha256: Some(request_sha256.to_owned()),
-            stage_name: Some(stage_name.to_owned()),
-            output_name: Some(output_name.to_owned()),
+            promotion_intent_sha256: Some(promotion_intent_sha256.to_owned()),
             epochs,
         }
     }
@@ -280,18 +260,14 @@ struct LedgerMaterial<'a> {
     previous_record_sha256: &'a str,
     kind: &'a LedgerKind,
     release_set_digest: &'a Option<String>,
-    request_sha256: &'a Option<String>,
-    stage_name: &'a Option<String>,
-    output_name: &'a Option<String>,
+    promotion_intent_sha256: &'a Option<String>,
     epochs: &'a [EpochBinding],
 }
 
 #[derive(Clone, Debug)]
 struct ReleaseState {
     kind: LedgerKind,
-    request_sha256: String,
-    stage_name: String,
-    output_name: String,
+    promotion_intent_sha256: String,
 }
 
 struct LedgerSnapshot {
@@ -384,25 +360,30 @@ impl FixtureBroker {
         self.state_root.join(LEDGER_NAME)
     }
 
-    fn promote(&self, request: &PromotionRequest, fault: FaultPoint) -> Result<()> {
+    fn promote(&self, invocation: &ClientInvocation, fault: FaultPoint) -> Result<()> {
         let _guard = self
             .process_lock
             .lock()
             .map_err(|_| anyhow!("fixture broker lock poisoned"))?;
-        request.validate()?;
-        let (handoff_root, output_root, output_name) = self.resolve_roots(request)?;
+        invocation.validate()?;
+        let intent = &invocation.intent;
+        authorize_intent(intent)?;
+        let promotion_intent_sha256 = intent.sha256()?;
+        let (handoff_root, output_root) = self.resolve_roots(invocation)?;
         let mut ledger = open_existing_ledger(&self.ledger_path())?;
         let snapshot = load_ledger(&mut ledger)?;
-        if snapshot.used.contains(&request.release_set_digest) {
-            bail!("release set was already consumed");
+        if let Some(existing) = snapshot.releases.get(&intent.release_set_digest) {
+            if existing.promotion_intent_sha256 == promotion_intent_sha256 {
+                bail!("release set and promotion intent were already consumed");
+            }
+            bail!("release set conflicts with a different promotion intent");
         }
         if output_root.exists() {
             bail!("publication output already exists");
         }
-        let request_sha256 = hash_domain(REQUEST_DOMAIN, &request.canonical_json()?);
-        let (handoff, mut packs) = inspect_handoff(&handoff_root, request)?;
-        validate_epoch_policy(&snapshot, &handoff.packs, request.minimum_security_epoch)?;
-        let stage_name = format!(".staging-{}", request.release_set_digest);
+        let (handoff, mut packs) = inspect_handoff(&handoff_root, intent)?;
+        validate_epoch_policy(&snapshot, &handoff.packs, intent.minimum_security_epoch)?;
+        let stage_name = format!(".staging-{}", intent.release_set_digest);
         let stage_root = self.publication_parent.join(&stage_name);
         if stage_root.exists() {
             bail!("fixture signer staging root was not fresh");
@@ -421,10 +402,8 @@ impl FixtureBroker {
             &snapshot,
             LedgerTransition::bound(
                 LedgerKind::Reserved,
-                &request.release_set_digest,
-                &request_sha256,
-                &stage_name,
-                &output_name,
+                &intent.release_set_digest,
+                &promotion_intent_sha256,
                 epochs,
             ),
         )?;
@@ -436,7 +415,7 @@ impl FixtureBroker {
         let mut copied_packs = Vec::with_capacity(2);
         for (index, pack) in packs.iter_mut().enumerate() {
             let destination = stage_root.join(pack.manifest.backend.as_str());
-            let copied = copy_prepared_pack(pack, &destination, request)?;
+            let copied = copy_prepared_pack(pack, &destination, intent)?;
             if copied.manifest.pack_digest != pack.manifest.pack_digest {
                 bail!("copied prepared pack changed before authority use");
             }
@@ -457,12 +436,12 @@ impl FixtureBroker {
             )?);
         }
         drop(copied_packs);
-        let receipt = create_receipt(request, &signed_packs, &request_sha256, &key_pair)?;
+        let receipt = create_receipt(intent, &signed_packs, &key_pair)?;
         write_new_synced(
             &stage_root.join(RECEIPT_NAME),
             &serde_json::to_vec(&receipt)?,
         )?;
-        verify_published_set(&stage_root, request, key_pair.public_key().as_ref())?;
+        verify_published_set(&stage_root, intent, key_pair.public_key().as_ref())?;
 
         let snapshot = load_ledger(&mut ledger)?;
         append_transition(
@@ -470,10 +449,8 @@ impl FixtureBroker {
             &snapshot,
             LedgerTransition::bound(
                 LedgerKind::Ready,
-                &request.release_set_digest,
-                &request_sha256,
-                &stage_name,
-                &output_name,
+                &intent.release_set_digest,
+                &promotion_intent_sha256,
                 Vec::new(),
             ),
         )?;
@@ -490,10 +467,8 @@ impl FixtureBroker {
             &snapshot,
             LedgerTransition::bound(
                 LedgerKind::Published,
-                &request.release_set_digest,
-                &request_sha256,
-                &stage_name,
-                &output_name,
+                &intent.release_set_digest,
+                &promotion_intent_sha256,
                 Vec::new(),
             ),
         )?;
@@ -508,8 +483,9 @@ impl FixtureBroker {
         let mut ledger = open_existing_ledger(&self.ledger_path())?;
         let snapshot = load_ledger(&mut ledger)?;
         for (digest, state) in snapshot.releases.clone() {
-            let stage = self.publication_parent.join(&state.stage_name);
-            let output = self.publication_parent.join(&state.output_name);
+            validate_sha256(&digest)?;
+            let stage = self.publication_parent.join(format!(".staging-{digest}"));
+            let output = self.publication_parent.join(&digest);
             match state.kind {
                 LedgerKind::Reserved => {
                     if output.exists() {
@@ -522,10 +498,10 @@ impl FixtureBroker {
                         bail!("ready release has an ambiguous publication state");
                     }
                     if stage.exists() {
-                        verify_fixture_output(&stage, &digest, &state.request_sha256)?;
+                        verify_fixture_output(&stage, &digest, &state.promotion_intent_sha256)?;
                         atomic_publish(&stage, &output)?;
                     } else {
-                        verify_fixture_output(&output, &digest, &state.request_sha256)?;
+                        verify_fixture_output(&output, &digest, &state.promotion_intent_sha256)?;
                     }
                     let current = load_ledger(&mut ledger)?;
                     append_transition(
@@ -534,9 +510,7 @@ impl FixtureBroker {
                         LedgerTransition::bound(
                             LedgerKind::Published,
                             &digest,
-                            &state.request_sha256,
-                            &state.stage_name,
-                            &state.output_name,
+                            &state.promotion_intent_sha256,
                             Vec::new(),
                         ),
                     )?;
@@ -545,7 +519,7 @@ impl FixtureBroker {
                     if stage.exists() || !output.exists() {
                         bail!("published release state does not match signer-owned output");
                     }
-                    verify_fixture_output(&output, &digest, &state.request_sha256)?;
+                    verify_fixture_output(&output, &digest, &state.promotion_intent_sha256)?;
                 }
                 LedgerKind::Genesis => bail!("invalid per-release genesis state"),
             }
@@ -553,36 +527,40 @@ impl FixtureBroker {
         Ok(())
     }
 
-    fn resolve_roots(&self, request: &PromotionRequest) -> Result<(PathBuf, PathBuf, String)> {
-        let handoff_root = PathBuf::from(&request.handoff_root);
-        let requested_output_root = PathBuf::from(&request.output_root);
+    fn resolve_roots(&self, invocation: &ClientInvocation) -> Result<(PathBuf, PathBuf)> {
+        let handoff_root = &invocation.handoff_root;
+        let requested_publication_parent = &invocation.output_root;
         let handoff_parent = fs::canonicalize(&self.handoff_parent)?;
-        let actual_handoff = fs::canonicalize(&handoff_root)?;
+        let actual_handoff = fs::canonicalize(handoff_root)?;
         if actual_handoff.parent() != Some(handoff_parent.as_path()) {
             bail!("handoff is outside the fixture broker intake root");
         }
-        let output_name = requested_output_root
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| anyhow!("output name is not canonical UTF-8"))?
-            .to_owned();
-        validate_store_component(&output_name)?;
-        let requested_output_parent = requested_output_root
-            .parent()
-            .ok_or_else(|| anyhow!("output has no existing publication parent"))?;
+        validate_sha256(&invocation.intent.release_set_digest)?;
         let approved_publication_parent = fs::canonicalize(&self.publication_parent)
             .context("fixture broker publication root is unavailable")?;
-        let actual_output_parent = fs::canonicalize(requested_output_parent)
+        let actual_output_parent = fs::canonicalize(requested_publication_parent)
             .context("requested publication parent is unavailable")?;
         if actual_output_parent != approved_publication_parent {
             bail!("output is outside the fixture broker publication root");
         }
-        let output_root = approved_publication_parent.join(&output_name);
-        Ok((actual_handoff, output_root, output_name))
+        let output_root = approved_publication_parent.join(&invocation.intent.release_set_digest);
+        Ok((actual_handoff, output_root))
     }
 }
 
-fn inspect_handoff(root: &Path, request: &PromotionRequest) -> Result<(Handoff, Vec<PinnedPack>)> {
+fn authorize_intent(intent: &PromotionIntent) -> Result<()> {
+    if intent.policy_namespace != PROMOTION_POLICY_NAMESPACE
+        || intent.source_repository != "tyhuang9/scribe"
+        || intent.source_ref != "refs/heads/main"
+        || intent.workflow_ref
+            != "tyhuang9/scribe/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main"
+    {
+        bail!("promotion intent is not authorized by the fixture broker policy");
+    }
+    Ok(())
+}
+
+fn inspect_handoff(root: &Path, intent: &PromotionIntent) -> Result<(Handoff, Vec<PinnedPack>)> {
     let root_handle = open_directory_no_follow(root)?;
     let root_entries = bounded_directory_names(root, 3)?;
     let expected = [
@@ -595,11 +573,11 @@ fn inspect_handoff(root: &Path, request: &PromotionRequest) -> Result<(Handoff, 
     }
     let handoff_file = open_regular_no_follow(&root.join(HANDOFF_NAME))?;
     let handoff_bytes = read_exact_bounded(&handoff_file, MAX_HANDOFF_BYTES)?;
-    if encode_hex(&Sha256::digest(&handoff_bytes)) != request.handoff_sha256 {
+    if encode_hex(&Sha256::digest(&handoff_bytes)) != intent.handoff_sha256 {
         bail!("handoff digest does not match request");
     }
     let handoff: Handoff = parse_canonical(&handoff_bytes, "handoff")?;
-    validate_handoff(&handoff, request)?;
+    validate_handoff(&handoff, intent)?;
     let release_material = ReleaseMaterial {
         schema_version: handoff.schema_version,
         source_repository: &handoff.source_repository,
@@ -613,32 +591,32 @@ fn inspect_handoff(root: &Path, request: &PromotionRequest) -> Result<(Handoff, 
         packs: &handoff.packs,
     };
     let release_digest = hash_domain(RELEASE_SET_DOMAIN, &serde_json::to_vec(&release_material)?);
-    if release_digest != request.release_set_digest {
+    if release_digest != intent.release_set_digest {
         bail!("release-set digest is not canonical");
     }
     let mut packs = Vec::with_capacity(2);
     for handoff_pack in &handoff.packs {
-        let pack = inspect_pack(&root.join(handoff_pack.backend.as_str()), request)?;
-        validate_pack_binding(&pack, handoff_pack, request)?;
+        let pack = inspect_pack(&root.join(handoff_pack.backend.as_str()), intent)?;
+        validate_pack_binding(&pack, handoff_pack, intent)?;
         packs.push(pack);
     }
     drop(root_handle);
     Ok((handoff, packs))
 }
 
-fn validate_handoff(handoff: &Handoff, request: &PromotionRequest) -> Result<()> {
+fn validate_handoff(handoff: &Handoff, intent: &PromotionIntent) -> Result<()> {
     if handoff.schema_version != 1
-        || handoff.source_repository != request.source_repository
-        || handoff.source_ref != request.source_ref
-        || handoff.source_revision != request.source_revision
-        || handoff.workflow_ref != request.workflow_ref
-        || handoff.run_id != request.run_id
-        || handoff.run_attempt != request.run_attempt
-        || handoff.pack_version != request.pack_version
-        || handoff.toolchain_manifest_sha256 != request.toolchain_manifest_sha256
-        || handoff.release_set_digest != request.release_set_digest
+        || handoff.source_repository != intent.source_repository
+        || handoff.source_ref != intent.source_ref
+        || handoff.source_revision != intent.source_revision
+        || handoff.workflow_ref != intent.workflow_ref
+        || handoff.run_id != intent.run_id
+        || handoff.run_attempt != intent.run_attempt
+        || handoff.pack_version != intent.pack_version
+        || handoff.toolchain_manifest_sha256 != intent.toolchain_manifest_sha256
+        || handoff.release_set_digest != intent.release_set_digest
     {
-        bail!("handoff provenance does not match the promotion request");
+        bail!("handoff provenance does not match the promotion intent");
     }
     if handoff.packs.len() != 2
         || handoff.packs[0].backend != Backend::Cuda
@@ -655,14 +633,14 @@ fn validate_handoff(handoff: &Handoff, request: &PromotionRequest) -> Result<()>
 fn validate_pack_binding(
     pack: &PinnedPack,
     handoff: &HandoffPack,
-    request: &PromotionRequest,
+    intent: &PromotionIntent,
 ) -> Result<()> {
     let manifest_sha256 = encode_hex(&Sha256::digest(&pack.manifest_bytes));
     let manifest = &pack.manifest;
     if manifest.backend != handoff.backend
         || manifest.pack_id != handoff.pack_id
         || manifest.pack_version != handoff.pack_version
-        || manifest.pack_version != request.pack_version
+        || manifest.pack_version != intent.pack_version
         || manifest.pack_digest != handoff.pack_digest
         || manifest.security_epoch != handoff.security_epoch
         || manifest.provider != handoff.provider
@@ -673,14 +651,14 @@ fn validate_pack_binding(
     Ok(())
 }
 
-fn inspect_pack(root: &Path, request: &PromotionRequest) -> Result<PinnedPack> {
+fn inspect_pack(root: &Path, intent: &PromotionIntent) -> Result<PinnedPack> {
     let root_handle = open_directory_no_follow(root)?;
     let manifest_file = open_regular_no_follow(&root.join(MANIFEST_NAME))?;
     reject_hardlink(&manifest_file)?;
     reject_named_streams(&root.join(MANIFEST_NAME))?;
     let manifest_bytes = read_exact_bounded(&manifest_file, MAX_MANIFEST_BYTES)?;
     let manifest: PackManifest = parse_canonical(&manifest_bytes, "manifest")?;
-    validate_manifest(&manifest, request)?;
+    validate_manifest(&manifest, intent)?;
 
     let expected_files = manifest
         .payload
@@ -794,15 +772,15 @@ fn inspect_pack(root: &Path, request: &PromotionRequest) -> Result<PinnedPack> {
     })
 }
 
-fn validate_manifest(manifest: &PackManifest, request: &PromotionRequest) -> Result<()> {
+fn validate_manifest(manifest: &PackManifest, intent: &PromotionIntent) -> Result<()> {
     if manifest.schema_version != 1
         || manifest.app_protocol_version != 5
         || manifest.worker_protocol_version != 5
         || manifest.runtime_abi_version != 1
         || manifest.target_os != "windows"
         || manifest.target_arch != "x86_64"
-        || manifest.pack_version != request.pack_version
-        || manifest.security_epoch < request.minimum_security_epoch
+        || manifest.pack_version != intent.pack_version
+        || manifest.security_epoch < intent.minimum_security_epoch
         || manifest.worker_path != "bin/scribe-inference-worker.exe"
         || manifest.payload.is_empty()
         || manifest.payload.len() > MAX_FILES
@@ -822,9 +800,9 @@ fn validate_manifest(manifest: &PackManifest, request: &PromotionRequest) -> Res
     };
     if manifest.pack_id != expected_pack_id
         || manifest.provider != expected_provider
-        || manifest.app_build != format!("local-transcriber@0.1.0#{}", request.source_revision)
+        || manifest.app_build != format!("local-transcriber@0.1.0#{}", intent.source_revision)
         || manifest.worker_build
-            != format!("scribe-inference-worker@0.1.0#{}", request.source_revision)
+            != format!("scribe-inference-worker@0.1.0#{}", intent.source_revision)
     {
         bail!("prepared manifest provider or build identity is not exact");
     }
@@ -884,7 +862,7 @@ fn compute_pack_digest(manifest: &PackManifest) -> Result<String> {
 fn copy_prepared_pack(
     pack: &mut PinnedPack,
     destination: &Path,
-    request: &PromotionRequest,
+    intent: &PromotionIntent,
 ) -> Result<PinnedPack> {
     fs::create_dir(destination)?;
     for entry in &pack.files {
@@ -908,7 +886,7 @@ fn copy_prepared_pack(
             &destination.join(Path::new(&entry.relative)),
         )?;
     }
-    inspect_pack(destination, request)
+    inspect_pack(destination, intent)
 }
 
 fn sign_copied_pack(
@@ -1086,18 +1064,17 @@ fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) 
 }
 
 fn create_receipt(
-    request: &PromotionRequest,
+    intent: &PromotionIntent,
     signed_packs: &[SignedPackObservation],
-    request_sha256: &str,
     key_pair: &Ed25519KeyPair,
 ) -> Result<SignedReceipt> {
-    let statement = expected_receipt_statement(request, signed_packs, request_sha256)?;
+    let statement = expected_receipt_statement(intent, signed_packs)?;
     let statement_bytes = serde_json::to_vec(&statement)?;
     let mut signed = Vec::with_capacity(RECEIPT_DOMAIN.len() + statement_bytes.len());
     signed.extend_from_slice(RECEIPT_DOMAIN);
     signed.extend_from_slice(&statement_bytes);
     Ok(SignedReceipt {
-        schema_version: 1,
+        schema_version: 2,
         statement,
         key_id: FIXTURE_KEY_ID.to_owned(),
         signature_hex: encode_hex(key_pair.sign(&signed).as_ref()),
@@ -1105,9 +1082,8 @@ fn create_receipt(
 }
 
 fn expected_receipt_statement(
-    request: &PromotionRequest,
+    intent: &PromotionIntent,
     signed_packs: &[SignedPackObservation],
-    request_sha256: &str,
 ) -> Result<ReceiptStatement> {
     if signed_packs.len() != 2
         || signed_packs[0].manifest.backend != Backend::Cuda
@@ -1115,26 +1091,16 @@ fn expected_receipt_statement(
     {
         bail!("signed pack observations are not exactly CUDA then Vulkan");
     }
+    intent.validate()?;
+    authorize_intent(intent)?;
     for pack in signed_packs {
-        validate_manifest(&pack.manifest, request)?;
+        validate_manifest(&pack.manifest, intent)?;
     }
     Ok(ReceiptStatement {
-        schema_version: 1,
+        schema_version: 2,
         authority: "fixture-only".to_owned(),
-        request_sha256: request_sha256.to_owned(),
-        source_repository: request.source_repository.clone(),
-        source_ref: request.source_ref.clone(),
-        source_revision: request.source_revision.clone(),
-        workflow_ref: request.workflow_ref.clone(),
-        workflow_source_sha: request.workflow_source_sha.clone(),
-        run_id: request.run_id.clone(),
-        run_attempt: request.run_attempt.clone(),
-        artifact_id: request.artifact_id.clone(),
-        artifact_digest: request.artifact_digest.clone(),
-        handoff_sha256: request.handoff_sha256.clone(),
-        release_set_digest: request.release_set_digest.clone(),
-        toolchain_manifest_sha256: request.toolchain_manifest_sha256.clone(),
-        pack_version: request.pack_version.clone(),
+        promotion_intent_sha256: intent.sha256()?,
+        promotion_intent: intent.clone(),
         packs: signed_packs
             .iter()
             .map(|pack| PackReceipt {
@@ -1153,8 +1119,16 @@ fn expected_receipt_statement(
 }
 
 fn verify_receipt_signature(receipt: &SignedReceipt, public_key: &[u8]) -> Result<()> {
-    if receipt.schema_version != 1 || receipt.key_id != FIXTURE_KEY_ID {
+    if receipt.schema_version != 2
+        || receipt.statement.schema_version != 2
+        || receipt.key_id != FIXTURE_KEY_ID
+    {
         bail!("receipt envelope is incompatible");
+    }
+    receipt.statement.promotion_intent.validate()?;
+    authorize_intent(&receipt.statement.promotion_intent)?;
+    if receipt.statement.promotion_intent.sha256()? != receipt.statement.promotion_intent_sha256 {
+        bail!("receipt promotion intent digest is invalid");
     }
     let statement = serde_json::to_vec(&receipt.statement)?;
     let mut signed = Vec::with_capacity(RECEIPT_DOMAIN.len() + statement.len());
@@ -1166,7 +1140,7 @@ fn verify_receipt_signature(receipt: &SignedReceipt, public_key: &[u8]) -> Resul
     Ok(())
 }
 
-fn verify_published_set(root: &Path, request: &PromotionRequest, public_key: &[u8]) -> Result<()> {
+fn verify_published_set(root: &Path, intent: &PromotionIntent, public_key: &[u8]) -> Result<()> {
     validate_exact_public_inventory(root)?;
     let cuda = inspect_signed_pack(&root.join("cuda"), public_key)?;
     let vulkan = inspect_signed_pack(&root.join("vulkan"), public_key)?;
@@ -1181,10 +1155,9 @@ fn verify_published_set(root: &Path, request: &PromotionRequest, public_key: &[u
         "promotion receipt",
     )?;
     verify_receipt_signature(&receipt, public_key)?;
-    let request_sha256 = hash_domain(REQUEST_DOMAIN, &request.canonical_json()?);
-    let expected = expected_receipt_statement(request, &[cuda, vulkan], &request_sha256)?;
+    let expected = expected_receipt_statement(intent, &[cuda, vulkan])?;
     if receipt.statement != expected {
-        bail!("receipt statement does not exactly bind request and signed pack observations");
+        bail!("receipt statement does not exactly bind intent and signed pack observations");
     }
     Ok(())
 }
@@ -1245,26 +1218,22 @@ fn new_ledger_record(
     transition: LedgerTransition,
 ) -> Result<LedgerRecord> {
     let material = LedgerMaterial {
-        schema_version: 1,
+        schema_version: 2,
         sequence,
         previous_record_sha256: previous,
         kind: &transition.kind,
         release_set_digest: &transition.release_set_digest,
-        request_sha256: &transition.request_sha256,
-        stage_name: &transition.stage_name,
-        output_name: &transition.output_name,
+        promotion_intent_sha256: &transition.promotion_intent_sha256,
         epochs: &transition.epochs,
     };
     let record_sha256 = hash_domain(LEDGER_DOMAIN, &serde_json::to_vec(&material)?);
     Ok(LedgerRecord {
-        schema_version: 1,
+        schema_version: 2,
         sequence,
         previous_record_sha256: previous.to_owned(),
         kind: transition.kind,
         release_set_digest: transition.release_set_digest,
-        request_sha256: transition.request_sha256,
-        stage_name: transition.stage_name,
-        output_name: transition.output_name,
+        promotion_intent_sha256: transition.promotion_intent_sha256,
         epochs: transition.epochs,
         record_sha256,
     })
@@ -1326,13 +1295,11 @@ fn load_ledger(ledger: &mut File) -> Result<LedgerSnapshot> {
             previous_record_sha256: &record.previous_record_sha256,
             kind: &record.kind,
             release_set_digest: &record.release_set_digest,
-            request_sha256: &record.request_sha256,
-            stage_name: &record.stage_name,
-            output_name: &record.output_name,
+            promotion_intent_sha256: &record.promotion_intent_sha256,
             epochs: &record.epochs,
         };
         let expected_hash = hash_domain(LEDGER_DOMAIN, &serde_json::to_vec(&material)?);
-        if record.schema_version != 1
+        if record.schema_version != 2
             || record.sequence != index as u64
             || record.previous_record_sha256 != snapshot.last_hash
             || record.record_sha256 != expected_hash
@@ -1343,6 +1310,7 @@ fn load_ledger(ledger: &mut File) -> Result<LedgerSnapshot> {
             if record.kind != LedgerKind::Genesis
                 || record.previous_record_sha256 != "0".repeat(64)
                 || record.release_set_digest.is_some()
+                || record.promotion_intent_sha256.is_some()
                 || !record.epochs.is_empty()
             {
                 bail!("fixture ledger genesis is invalid");
@@ -1369,24 +1337,12 @@ fn apply_ledger_transition(
         .release_set_digest
         .as_ref()
         .ok_or_else(|| anyhow!("ledger transition has no release digest"))?;
-    let request = record
-        .request_sha256
+    let promotion_intent = record
+        .promotion_intent_sha256
         .as_ref()
-        .ok_or_else(|| anyhow!("ledger transition has no request digest"))?;
-    let stage = record
-        .stage_name
-        .as_ref()
-        .ok_or_else(|| anyhow!("ledger transition has no stage name"))?;
-    let output = record
-        .output_name
-        .as_ref()
-        .ok_or_else(|| anyhow!("ledger transition has no output name"))?;
+        .ok_or_else(|| anyhow!("ledger transition has no promotion intent digest"))?;
     validate_sha256(release)?;
-    validate_sha256(request)?;
-    validate_store_component(output)?;
-    if stage != &format!(".staging-{release}") {
-        bail!("ledger stage name is not canonical");
-    }
+    validate_sha256(promotion_intent)?;
     match record.kind {
         LedgerKind::Reserved => {
             if !snapshot.used.insert(release.clone())
@@ -1412,9 +1368,7 @@ fn apply_ledger_transition(
                 release.clone(),
                 ReleaseState {
                     kind: LedgerKind::Reserved,
-                    request_sha256: request.clone(),
-                    stage_name: stage.clone(),
-                    output_name: output.clone(),
+                    promotion_intent_sha256: promotion_intent.clone(),
                 },
             );
         }
@@ -1430,11 +1384,7 @@ fn apply_ledger_transition(
                 LedgerKind::Published => LedgerKind::Ready,
                 _ => unreachable!(),
             };
-            if current.kind != expected
-                || current.request_sha256 != *request
-                || current.stage_name != *stage
-                || current.output_name != *output
-            {
+            if current.kind != expected || current.promotion_intent_sha256 != *promotion_intent {
                 bail!("ledger state transition is invalid");
             }
             current.kind = record.kind.clone();
@@ -1447,7 +1397,7 @@ fn apply_ledger_transition(
 fn verify_fixture_output(
     root: &Path,
     expected_release_set_digest: &str,
-    expected_request_sha256: &str,
+    expected_promotion_intent_sha256: &str,
 ) -> Result<()> {
     validate_exact_public_inventory(root)?;
     let public_key = fixture_key_pair()?.public_key().as_ref().to_vec();
@@ -1478,10 +1428,11 @@ fn verify_fixture_output(
             signature_envelope_sha256: pack.signature_envelope_sha256.clone(),
         })
         .collect::<Vec<_>>();
-    if receipt.statement.schema_version != 1
+    if receipt.statement.schema_version != 2
         || receipt.statement.authority != "fixture-only"
-        || receipt.statement.release_set_digest != expected_release_set_digest
-        || receipt.statement.request_sha256 != expected_request_sha256
+        || receipt.statement.promotion_intent.release_set_digest != expected_release_set_digest
+        || receipt.statement.promotion_intent_sha256 != expected_promotion_intent_sha256
+        || receipt.statement.promotion_intent.sha256()? != expected_promotion_intent_sha256
         || receipt.statement.packs != actual_packs
     {
         bail!("fixture output receipt does not bind ledger and exact signed packs");
@@ -1864,7 +1815,7 @@ mod tests {
     struct Fixture {
         _temp: TempDir,
         broker: FixtureBroker,
-        request: PromotionRequest,
+        request: ClientInvocation,
         handoff_parent: PathBuf,
         publication_parent: PathBuf,
     }
@@ -1873,7 +1824,7 @@ mod tests {
         fn new(epoch: u64) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let handoff_parent = temp.path().join("intake");
-            let publication_parent = temp.path().join("published");
+            let publication_parent = temp.path().join("local-publication-sentinel");
             let state_root = temp.path().join("state");
             let broker = FixtureBroker::initialize(
                 handoff_parent.clone(),
@@ -1898,20 +1849,21 @@ mod tests {
         }
 
         fn output(&self) -> PathBuf {
-            PathBuf::from(&self.request.output_root)
+            self.publication_parent
+                .join(&self.request.intent.release_set_digest)
         }
     }
 
     fn create_request(
         handoff_parent: &Path,
         publication_parent: &Path,
-        output_name: &str,
+        handoff_suffix: &str,
         epoch: u64,
         payload_marker: &str,
-    ) -> PromotionRequest {
+    ) -> ClientInvocation {
         fs::create_dir_all(handoff_parent).unwrap();
         fs::create_dir_all(publication_parent).unwrap();
-        let handoff_root = handoff_parent.join(format!("handoff-{output_name}"));
+        let handoff_root = handoff_parent.join(format!("handoff-{handoff_suffix}"));
         fs::create_dir(&handoff_root).unwrap();
         let revision = "a".repeat(40);
         let cuda = create_prepared_pack(
@@ -1930,11 +1882,11 @@ mod tests {
         );
         let mut handoff = Handoff {
             schema_version: 1,
-            source_repository: "owner/repo".to_owned(),
+            source_repository: "tyhuang9/scribe".to_owned(),
             source_ref: "refs/heads/main".to_owned(),
             source_revision: revision.clone(),
             workflow_ref:
-                "owner/repo/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main"
+                "tyhuang9/scribe/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main"
                     .to_owned(),
             run_id: "123".to_owned(),
             run_attempt: "1".to_owned(),
@@ -1961,29 +1913,30 @@ mod tests {
         );
         let handoff_bytes = serde_json::to_vec(&handoff).unwrap();
         write_new_synced(&handoff_root.join(HANDOFF_NAME), &handoff_bytes).unwrap();
-        PromotionRequest {
-            schema_version: 1,
-            handoff_root: handoff_root.to_string_lossy().into_owned(),
-            output_root: publication_parent
-                .join(output_name)
-                .to_string_lossy()
-                .into_owned(),
-            source_repository: handoff.source_repository,
-            source_ref: handoff.source_ref,
-            source_revision: revision.clone(),
-            workflow_ref: handoff.workflow_ref,
-            workflow_source_sha: revision,
-            run_id: handoff.run_id,
-            run_attempt: handoff.run_attempt,
-            artifact_id: "456".to_owned(),
-            artifact_digest: "b".repeat(64),
-            handoff_sha256: encode_hex(&Sha256::digest(&handoff_bytes)),
-            release_set_digest: handoff.release_set_digest,
-            toolchain_manifest_sha256: handoff.toolchain_manifest_sha256,
-            pack_version: handoff.pack_version,
-            minimum_security_epoch: 1,
-            require_unused_release_set: true,
-        }
+        ClientInvocation::new(
+            handoff_root,
+            publication_parent,
+            PromotionIntent {
+                schema_version: 1,
+                policy_namespace: PROMOTION_POLICY_NAMESPACE.to_owned(),
+                source_repository: handoff.source_repository,
+                source_ref: handoff.source_ref,
+                source_revision: revision.clone(),
+                workflow_ref: handoff.workflow_ref,
+                workflow_source_sha: revision,
+                run_id: handoff.run_id,
+                run_attempt: handoff.run_attempt,
+                artifact_id: "456".to_owned(),
+                artifact_digest: "b".repeat(64),
+                handoff_sha256: encode_hex(&Sha256::digest(&handoff_bytes)),
+                release_set_digest: handoff.release_set_digest,
+                toolchain_manifest_sha256: handoff.toolchain_manifest_sha256,
+                pack_version: handoff.pack_version,
+                minimum_security_epoch: 1,
+                require_unused_release_set: true,
+            },
+        )
+        .unwrap()
     }
 
     fn create_prepared_pack(
@@ -2053,6 +2006,40 @@ mod tests {
         }
     }
 
+    fn rewrite_handoff_authority(
+        invocation: &mut ClientInvocation,
+        source_repository: &str,
+        workflow_ref: &str,
+    ) {
+        let handoff_path = invocation.handoff_root.join(HANDOFF_NAME);
+        let mut handoff: Handoff =
+            serde_json::from_slice(&fs::read(&handoff_path).unwrap()).unwrap();
+        handoff.source_repository = source_repository.to_owned();
+        handoff.workflow_ref = workflow_ref.to_owned();
+        handoff.release_set_digest = hash_domain(
+            RELEASE_SET_DOMAIN,
+            &serde_json::to_vec(&ReleaseMaterial {
+                schema_version: handoff.schema_version,
+                source_repository: &handoff.source_repository,
+                source_ref: &handoff.source_ref,
+                source_revision: &handoff.source_revision,
+                workflow_ref: &handoff.workflow_ref,
+                run_id: &handoff.run_id,
+                run_attempt: &handoff.run_attempt,
+                pack_version: &handoff.pack_version,
+                toolchain_manifest_sha256: &handoff.toolchain_manifest_sha256,
+                packs: &handoff.packs,
+            })
+            .unwrap(),
+        );
+        let bytes = serde_json::to_vec(&handoff).unwrap();
+        fs::write(handoff_path, &bytes).unwrap();
+        invocation.intent.source_repository = handoff.source_repository;
+        invocation.intent.workflow_ref = handoff.workflow_ref;
+        invocation.intent.release_set_digest = handoff.release_set_digest;
+        invocation.intent.handoff_sha256 = encode_hex(&Sha256::digest(&bytes));
+    }
+
     #[test]
     fn promotes_exact_pair_with_domain_separated_receipt_and_chained_ledger() {
         let fixture = Fixture::new(1);
@@ -2062,16 +2049,20 @@ mod tests {
             .unwrap();
         verify_fixture_output(
             &fixture.output(),
-            &fixture.request.release_set_digest,
-            &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+            &fixture.request.intent.release_set_digest,
+            &fixture.request.intent.sha256().unwrap(),
         )
         .unwrap();
         let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
         let snapshot = load_ledger(&mut ledger).unwrap();
-        assert!(snapshot.used.contains(&fixture.request.release_set_digest));
+        assert!(
+            snapshot
+                .used
+                .contains(&fixture.request.intent.release_set_digest)
+        );
         assert_eq!(snapshot.next_sequence, 4);
         assert_eq!(
-            snapshot.releases[&fixture.request.release_set_digest].kind,
+            snapshot.releases[&fixture.request.intent.release_set_digest].kind,
             LedgerKind::Published
         );
         let receipt_bytes = fs::read(fixture.output().join(RECEIPT_NAME)).unwrap();
@@ -2097,12 +2088,119 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("already consumed"));
         let mut changed_authorization = fixture.request.clone();
-        changed_authorization.artifact_id = "999".to_owned();
+        changed_authorization.intent.artifact_id = "999".to_owned();
         let error = fixture
             .broker
             .promote(&changed_authorization, FaultPoint::None)
             .unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn replay_identity_is_independent_of_local_paths() {
+        let fixture = Fixture::new(1);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        let alternate_handoff = fixture.handoff_parent.join("same-bytes-different-path");
+        copy_tree_for_substitution_test(&fixture.request.handoff_root, &alternate_handoff);
+        let mut replay = fixture.request.clone();
+        replay.handoff_root = alternate_handoff;
+        replay.output_root = fs::canonicalize(&fixture.publication_parent).unwrap();
+        assert_eq!(replay.intent, fixture.request.intent);
+        let error = fixture
+            .broker
+            .promote(&replay, FaultPoint::None)
+            .unwrap_err();
         assert!(error.to_string().contains("already consumed"));
+    }
+
+    #[test]
+    fn mismatched_handoff_and_intent_fail_before_reservation() {
+        let fixture = Fixture::new(1);
+        let other = create_request(
+            &fixture.handoff_parent,
+            &fixture.publication_parent,
+            "release-b",
+            1,
+            "different-payload",
+        );
+        let mut mismatch = fixture.request.clone();
+        mismatch.handoff_root = other.handoff_root.clone();
+        assert!(fixture.broker.promote(&mismatch, FaultPoint::None).is_err());
+
+        mismatch.intent.handoff_sha256 = other.intent.handoff_sha256.clone();
+        assert!(fixture.broker.promote(&mismatch, FaultPoint::None).is_err());
+
+        let mut duplicated_field_mismatch = other;
+        duplicated_field_mismatch.intent.run_id = "999".to_owned();
+        assert!(
+            fixture
+                .broker
+                .promote(&duplicated_field_mismatch, FaultPoint::None)
+                .is_err()
+        );
+        let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
+        assert_eq!(load_ledger(&mut ledger).unwrap().next_sequence, 1);
+    }
+
+    #[test]
+    fn self_consistent_but_unauthorized_intent_fails_before_reservation() {
+        let fixture = Fixture::new(1);
+        let mut unauthorized = fixture.request.clone();
+        rewrite_handoff_authority(
+            &mut unauthorized,
+            "attacker/scribe",
+            "attacker/scribe/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main",
+        );
+        unauthorized.validate().unwrap();
+        let error = fixture
+            .broker
+            .promote(&unauthorized, FaultPoint::None)
+            .unwrap_err();
+        assert!(error.to_string().contains("not authorized"));
+        let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
+        assert_eq!(load_ledger(&mut ledger).unwrap().next_sequence, 1);
+    }
+
+    #[test]
+    fn receipt_ledger_and_publication_names_are_path_free_and_intent_bound() {
+        let fixture = Fixture::new(2);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        assert_eq!(
+            fixture.output().file_name().unwrap().to_string_lossy(),
+            fixture.request.intent.release_set_digest
+        );
+        let receipt_bytes = fs::read(fixture.output().join(RECEIPT_NAME)).unwrap();
+        let ledger_bytes = fs::read(fixture.broker.ledger_path()).unwrap();
+        for bytes in [&receipt_bytes, &ledger_bytes] {
+            let text = String::from_utf8_lossy(bytes);
+            for forbidden in [
+                "handoff_root",
+                "output_root",
+                "stage_name",
+                "output_name",
+                "handoff-release-a",
+                "local-publication-sentinel",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "durable state contains {forbidden}"
+                );
+            }
+        }
+        let receipt: SignedReceipt = parse_canonical(&receipt_bytes, "receipt").unwrap();
+        assert_eq!(receipt.schema_version, 2);
+        assert_eq!(receipt.statement.schema_version, 2);
+        assert_eq!(receipt.statement.promotion_intent, fixture.request.intent);
+        assert_eq!(
+            receipt.statement.promotion_intent_sha256,
+            fixture.request.intent.sha256().unwrap()
+        );
     }
 
     #[test]
@@ -2124,7 +2222,33 @@ mod tests {
         assert!(
             verify_published_set(
                 &fixture.output(),
-                &fixture.request,
+                &fixture.request.intent,
+                fixture_key_pair().unwrap().public_key().as_ref(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_rejects_a_valid_signature_over_an_incorrect_intent_digest() {
+        let fixture = Fixture::new(1);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        let receipt_path = fixture.output().join(RECEIPT_NAME);
+        let mut receipt: SignedReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        receipt.statement.promotion_intent_sha256 = "0".repeat(64);
+        let statement = serde_json::to_vec(&receipt.statement).unwrap();
+        let mut material = RECEIPT_DOMAIN.to_vec();
+        material.extend_from_slice(&statement);
+        receipt.signature_hex = encode_hex(fixture_key_pair().unwrap().sign(&material).as_ref());
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(
+            verify_published_set(
+                &fixture.output(),
+                &fixture.request.intent,
                 fixture_key_pair().unwrap().public_key().as_ref(),
             )
             .is_err()
@@ -2142,14 +2266,7 @@ mod tests {
         let mut cuda = inspect_signed_pack(&fixture.output().join("cuda"), &public_key).unwrap();
         let vulkan = inspect_signed_pack(&fixture.output().join("vulkan"), &public_key).unwrap();
         cuda.manifest.pack_version = "0.1.0-cross-release".to_owned();
-        assert!(
-            expected_receipt_statement(
-                &fixture.request,
-                &[cuda, vulkan],
-                &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
-            )
-            .is_err()
-        );
+        assert!(expected_receipt_statement(&fixture.request.intent, &[cuda, vulkan]).is_err());
     }
 
     #[test]
@@ -2194,7 +2311,12 @@ mod tests {
             .promote(&rollback, FaultPoint::None)
             .unwrap_err();
         assert!(error.to_string().contains("high-water"));
-        assert!(!Path::new(&rollback.output_root).exists());
+        assert!(
+            !fixture
+                .publication_parent
+                .join(&rollback.intent.release_set_digest)
+                .exists()
+        );
     }
 
     #[test]
@@ -2212,7 +2334,10 @@ mod tests {
         assert!(
             !fixture
                 .publication_parent
-                .join(format!(".staging-{}", fixture.request.release_set_digest))
+                .join(format!(
+                    ".staging-{}",
+                    fixture.request.intent.release_set_digest
+                ))
                 .exists()
         );
         assert!(
@@ -2231,14 +2356,14 @@ mod tests {
             fixture.broker.recover().unwrap();
             verify_fixture_output(
                 &fixture.output(),
-                &fixture.request.release_set_digest,
-                &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+                &fixture.request.intent.release_set_digest,
+                &fixture.request.intent.sha256().unwrap(),
             )
             .unwrap();
             let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
             let snapshot = load_ledger(&mut ledger).unwrap();
             assert_eq!(
-                snapshot.releases[&fixture.request.release_set_digest].kind,
+                snapshot.releases[&fixture.request.intent.release_set_digest].kind,
                 LedgerKind::Published
             );
         }
@@ -2266,12 +2391,17 @@ mod tests {
         );
         let second_stage = fixture
             .publication_parent
-            .join(format!(".staging-{}", second.release_set_digest));
+            .join(format!(".staging-{}", second.intent.release_set_digest));
         fs::remove_dir_all(&second_stage).unwrap();
         copy_tree_for_substitution_test(&fixture.output(), &second_stage);
         let error = fixture.broker.recover().unwrap_err();
         assert!(error.to_string().contains("does not bind ledger"));
-        assert!(!Path::new(&second.output_root).exists());
+        assert!(
+            !fixture
+                .publication_parent
+                .join(&second.intent.release_set_digest)
+                .exists()
+        );
     }
 
     #[test]
@@ -2294,6 +2424,116 @@ mod tests {
     }
 
     #[test]
+    fn v1_or_mixed_domain_receipts_and_ledgers_are_rejected() {
+        const OLD_RECEIPT_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-receipt-v1\0";
+        const OLD_LEDGER_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-ledger-record-v1\0";
+
+        for old_schema in [true, false] {
+            let fixture = Fixture::new(1);
+            fixture
+                .broker
+                .promote(&fixture.request, FaultPoint::None)
+                .unwrap();
+            let receipt_path = fixture.output().join(RECEIPT_NAME);
+            let mut receipt: SignedReceipt =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            if old_schema {
+                receipt.schema_version = 1;
+            }
+            let statement = serde_json::to_vec(&receipt.statement).unwrap();
+            let mut signed = if old_schema {
+                RECEIPT_DOMAIN.to_vec()
+            } else {
+                OLD_RECEIPT_DOMAIN.to_vec()
+            };
+            signed.extend_from_slice(&statement);
+            receipt.signature_hex = encode_hex(fixture_key_pair().unwrap().sign(&signed).as_ref());
+            fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            assert!(
+                verify_published_set(
+                    &fixture.output(),
+                    &fixture.request.intent,
+                    fixture_key_pair().unwrap().public_key().as_ref(),
+                )
+                .is_err()
+            );
+        }
+
+        for old_schema in [true, false] {
+            let fixture = Fixture::new(1);
+            let mut record =
+                new_ledger_record(0, &"0".repeat(64), LedgerTransition::genesis()).unwrap();
+            if old_schema {
+                record.schema_version = 1;
+            }
+            let material = LedgerMaterial {
+                schema_version: record.schema_version,
+                sequence: record.sequence,
+                previous_record_sha256: &record.previous_record_sha256,
+                kind: &record.kind,
+                release_set_digest: &record.release_set_digest,
+                promotion_intent_sha256: &record.promotion_intent_sha256,
+                epochs: &record.epochs,
+            };
+            record.record_sha256 = hash_domain(
+                if old_schema {
+                    LEDGER_DOMAIN
+                } else {
+                    OLD_LEDGER_DOMAIN
+                },
+                &serde_json::to_vec(&material).unwrap(),
+            );
+            let mut ledger = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(fixture.broker.ledger_path())
+                .unwrap();
+            write_ledger_record(&mut ledger, &record).unwrap();
+            drop(ledger);
+            let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
+            assert!(load_ledger(&mut ledger).is_err());
+        }
+    }
+
+    #[test]
+    fn post_reservation_failure_burns_replay_and_advances_epoch_high_water() {
+        let fixture = Fixture::new(2);
+        assert!(
+            fixture
+                .broker
+                .promote(&fixture.request, FaultPoint::AfterReserve)
+                .is_err()
+        );
+        fixture.broker.recover().unwrap();
+        let replay = fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap_err();
+        assert!(replay.to_string().contains("already consumed"));
+
+        let lower_epoch = create_request(
+            &fixture.handoff_parent,
+            &fixture.publication_parent,
+            "lower-epoch",
+            1,
+            "lower",
+        );
+        let downgrade = fixture
+            .broker
+            .promote(&lower_epoch, FaultPoint::None)
+            .unwrap_err();
+        assert!(downgrade.to_string().contains("high-water"));
+        let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
+        let snapshot = load_ledger(&mut ledger).unwrap();
+        assert_eq!(
+            snapshot
+                .epochs
+                .get(&("cuda".to_owned(), "scribe-cuda-windows-x64".to_owned())),
+            Some(&2)
+        );
+    }
+
+    #[test]
     fn concurrent_duplicate_requests_have_one_winner() {
         let fixture = Fixture::new(1);
         let left_broker = fixture.broker.clone();
@@ -2306,8 +2546,8 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
         verify_fixture_output(
             &fixture.output(),
-            &fixture.request.release_set_digest,
-            &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+            &fixture.request.intent.release_set_digest,
+            &fixture.request.intent.sha256().unwrap(),
         )
         .unwrap();
     }
@@ -2316,7 +2556,7 @@ mod tests {
     fn handoff_unknown_fields_and_noncanonical_json_are_rejected_before_reservation() {
         for mode in ["unknown", "whitespace"] {
             let fixture = Fixture::new(1);
-            let handoff_path = Path::new(&fixture.request.handoff_root).join(HANDOFF_NAME);
+            let handoff_path = fixture.request.handoff_root.join(HANDOFF_NAME);
             let bytes = fs::read(&handoff_path).unwrap();
             let rewritten = if mode == "unknown" {
                 let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2332,7 +2572,7 @@ mod tests {
             };
             fs::write(&handoff_path, &rewritten).unwrap();
             let mut request = fixture.request.clone();
-            request.handoff_sha256 = encode_hex(&Sha256::digest(&rewritten));
+            request.intent.handoff_sha256 = encode_hex(&Sha256::digest(&rewritten));
             assert!(fixture.broker.promote(&request, FaultPoint::None).is_err());
             assert!(!fixture.output().exists());
             let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
@@ -2343,8 +2583,10 @@ mod tests {
     #[test]
     fn malformed_or_tampered_pack_is_never_signed_or_published() {
         let fixture = Fixture::new(1);
-        let worker =
-            Path::new(&fixture.request.handoff_root).join("cuda/bin/scribe-inference-worker.exe");
+        let worker = fixture
+            .request
+            .handoff_root
+            .join("cuda/bin/scribe-inference-worker.exe");
         fs::write(worker, b"tampered").unwrap();
         assert!(
             fixture
@@ -2360,8 +2602,10 @@ mod tests {
     #[test]
     fn hardlinked_payload_is_rejected_before_signing() {
         let fixture = Fixture::new(1);
-        let worker =
-            Path::new(&fixture.request.handoff_root).join("cuda/bin/scribe-inference-worker.exe");
+        let worker = fixture
+            .request
+            .handoff_root
+            .join("cuda/bin/scribe-inference-worker.exe");
         let external = fixture.handoff_parent.join("external-worker.exe");
         fs::rename(&worker, &external).unwrap();
         fs::hard_link(&external, &worker).unwrap();
@@ -2378,8 +2622,10 @@ mod tests {
     #[test]
     fn alternate_data_stream_is_rejected_before_signing() {
         let fixture = Fixture::new(1);
-        let worker =
-            Path::new(&fixture.request.handoff_root).join("cuda/bin/scribe-inference-worker.exe");
+        let worker = fixture
+            .request
+            .handoff_root
+            .join("cuda/bin/scribe-inference-worker.exe");
         fs::write(format!("{}:hostile", worker.display()), b"hidden").unwrap();
         assert!(
             fixture
@@ -2394,8 +2640,10 @@ mod tests {
     #[test]
     fn retained_read_handle_denies_source_replacement_during_copy() {
         let fixture = Fixture::new(1);
-        let worker =
-            Path::new(&fixture.request.handoff_root).join("cuda/bin/scribe-inference-worker.exe");
+        let worker = fixture
+            .request
+            .handoff_root
+            .join("cuda/bin/scribe-inference-worker.exe");
         let retained = open_regular_no_follow(&worker).unwrap();
         let rewrite = OpenOptions::new().write(true).truncate(true).open(&worker);
         assert!(rewrite.is_err());
@@ -2409,7 +2657,7 @@ mod tests {
     fn unexpected_inventory_and_case_colliding_manifest_are_rejected() {
         let fixture = Fixture::new(1);
         fs::write(
-            Path::new(&fixture.request.handoff_root).join("cuda/unexpected.dll"),
+            fixture.request.handoff_root.join("cuda/unexpected.dll"),
             b"unexpected",
         )
         .unwrap();
@@ -2421,7 +2669,7 @@ mod tests {
         );
 
         let second = Fixture::new(1);
-        let manifest_path = Path::new(&second.request.handoff_root).join("cuda/pack-manifest.json");
+        let manifest_path = second.request.handoff_root.join("cuda/pack-manifest.json");
         let mut manifest: PackManifest =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest.payload.push(PayloadEntry {
@@ -2430,9 +2678,9 @@ mod tests {
             sha256: manifest.payload[0].sha256.clone(),
         });
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let bytes = fs::read(Path::new(&second.request.handoff_root).join(HANDOFF_NAME)).unwrap();
+        let bytes = fs::read(second.request.handoff_root.join(HANDOFF_NAME)).unwrap();
         let mut request = second.request.clone();
-        request.handoff_sha256 = encode_hex(&Sha256::digest(bytes));
+        request.intent.handoff_sha256 = encode_hex(&Sha256::digest(bytes));
         assert!(second.broker.promote(&request, FaultPoint::None).is_err());
     }
 
@@ -2441,12 +2689,15 @@ mod tests {
         let fixture = Fixture::new(1);
         for index in 0..64 {
             fs::write(
-                Path::new(&fixture.request.handoff_root).join(format!("unexpected-{index:02}")),
+                fixture
+                    .request
+                    .handoff_root
+                    .join(format!("unexpected-{index:02}")),
                 b"unexpected",
             )
             .unwrap();
         }
-        assert!(bounded_directory_names(Path::new(&fixture.request.handoff_root), 3).is_err());
+        assert!(bounded_directory_names(&fixture.request.handoff_root, 3).is_err());
         assert!(
             fixture
                 .broker
@@ -2477,11 +2728,8 @@ mod tests {
         assert!(
             verify_fixture_output(
                 &pack_flood.output(),
-                &pack_flood.request.release_set_digest,
-                &hash_domain(
-                    REQUEST_DOMAIN,
-                    &pack_flood.request.canonical_json().unwrap(),
-                ),
+                &pack_flood.request.intent.release_set_digest,
+                &pack_flood.request.intent.sha256().unwrap(),
             )
             .is_err()
         );
@@ -2506,13 +2754,12 @@ mod tests {
     #[test]
     fn traversal_and_oversized_inventory_are_rejected_by_manifest_policy() {
         let fixture = Fixture::new(1);
-        let manifest_path =
-            Path::new(&fixture.request.handoff_root).join("cuda/pack-manifest.json");
+        let manifest_path = fixture.request.handoff_root.join("cuda/pack-manifest.json");
         let manifest: PackManifest =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         let mut traversal = manifest.clone();
         traversal.payload[0].path = "../escape.exe".to_owned();
-        assert!(validate_manifest(&traversal, &fixture.request).is_err());
+        assert!(validate_manifest(&traversal, &fixture.request.intent).is_err());
 
         let mut oversized = manifest;
         oversized.payload = (0..=MAX_FILES)
@@ -2522,7 +2769,7 @@ mod tests {
                 sha256: "f".repeat(64),
             })
             .collect();
-        assert!(validate_manifest(&oversized, &fixture.request).is_err());
+        assert!(validate_manifest(&oversized, &fixture.request.intent).is_err());
     }
 
     #[cfg(windows)]
@@ -2531,8 +2778,10 @@ mod tests {
         use std::os::windows::fs::symlink_file;
 
         let fixture = Fixture::new(1);
-        let worker =
-            Path::new(&fixture.request.handoff_root).join("cuda/bin/scribe-inference-worker.exe");
+        let worker = fixture
+            .request
+            .handoff_root
+            .join("cuda/bin/scribe-inference-worker.exe");
         let external = fixture.handoff_parent.join("external-symlink-target.exe");
         fs::write(&external, fs::read(&worker).unwrap()).unwrap();
         fs::remove_file(&worker).unwrap();
@@ -2578,19 +2827,13 @@ mod tests {
         let mut fixture = Fixture::new(1);
         let canonical_parent = fs::canonicalize(&fixture.publication_parent).unwrap();
         assert_ne!(canonical_parent, fixture.publication_parent);
-        let output_name = Path::new(&fixture.request.output_root)
-            .file_name()
-            .unwrap()
-            .to_owned();
-        fixture.request.output_root = canonical_parent
-            .join(&output_name)
-            .to_string_lossy()
-            .into_owned();
+        fixture.request.output_root = canonical_parent.clone();
 
-        let (_, resolved_output, resolved_name) =
-            fixture.broker.resolve_roots(&fixture.request).unwrap();
-        assert_eq!(resolved_output, canonical_parent.join(&output_name));
-        assert_eq!(resolved_name, output_name.to_string_lossy());
+        let (_, resolved_output) = fixture.broker.resolve_roots(&fixture.request).unwrap();
+        assert_eq!(
+            resolved_output,
+            canonical_parent.join(&fixture.request.intent.release_set_digest)
+        );
         fixture
             .broker
             .promote(&fixture.request, FaultPoint::None)
@@ -2628,20 +2871,25 @@ mod tests {
             "PowerShell producer failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        let request_bytes = fs::read(intake.join("promotion-request.json")).unwrap();
-        let request: PromotionRequest = serde_json::from_slice(&request_bytes).unwrap();
-        assert_eq!(request.canonical_json().unwrap(), request_bytes);
+        let intent_bytes = fs::read(intake.join("promotion-intent.json")).unwrap();
+        let intent_text = std::str::from_utf8(&intent_bytes).unwrap();
+        assert!(!intent_text.contains("handoff_root"));
+        assert!(!intent_text.contains("output_root"));
+        let intent: PromotionIntent = serde_json::from_slice(&intent_bytes).unwrap();
+        assert_eq!(intent.canonical_json().unwrap(), intent_bytes);
+        let invocation =
+            ClientInvocation::new(intake.join("handoff"), &publication, intent).unwrap();
         let broker = FixtureBroker::initialize(
             intake.clone(),
             publication.clone(),
             temp.path().join("interop-state"),
         )
         .unwrap();
-        broker.promote(&request, FaultPoint::None).unwrap();
+        broker.promote(&invocation, FaultPoint::None).unwrap();
         verify_fixture_output(
-            Path::new(&request.output_root),
-            &request.release_set_digest,
-            &hash_domain(REQUEST_DOMAIN, &request.canonical_json().unwrap()),
+            &publication.join(&invocation.intent.release_set_digest),
+            &invocation.intent.release_set_digest,
+            &invocation.intent.sha256().unwrap(),
         )
         .unwrap();
     }

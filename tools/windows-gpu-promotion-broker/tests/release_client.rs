@@ -44,6 +44,7 @@ fn release_client_fails_before_touching_untrusted_paths_or_authority() {
         .output()
         .unwrap();
     assert_eq!(result.status.code(), Some(78));
+    assert!(result.stdout.is_empty());
     let diagnostic = String::from_utf8(result.stderr).unwrap();
     assert!(!diagnostic.contains(handoff.to_string_lossy().as_ref()));
     assert!(!diagnostic.contains(output.to_string_lossy().as_ref()));
@@ -60,6 +61,7 @@ fn release_client_has_no_key_ledger_endpoint_or_fixture_flags() {
         "--ledger-root",
         "--broker-endpoint",
         "--fixture-signing",
+        "--policy-namespace",
     ] {
         let mut arguments =
             valid_arguments(&temp.path().join("missing"), &temp.path().join("output"));
@@ -79,6 +81,10 @@ fn release_client_artifact_contains_no_fixture_authority_identity() {
         b"fixture-ed25519-v1".as_slice(),
         b"fixture-promotion-ledger.jsonl".as_slice(),
         b"fixture signing authority".as_slice(),
+        b"handoff_root".as_slice(),
+        b"output_root".as_slice(),
+        b"stage_name".as_slice(),
+        b"output_name".as_slice(),
     ] {
         assert!(
             !binary

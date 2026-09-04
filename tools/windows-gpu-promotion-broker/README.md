@@ -1,16 +1,31 @@
 # Windows GPU promotion broker contract
 
-This independently locked workspace defines the unprivileged request accepted
+This independently locked workspace defines the unprivileged intent accepted
 by a future separately privileged Windows service or remote HSM broker. The
-normal `scribe-windows-gpu-promotion-client` binary validates that request in
-memory and exits with code 78. It performs no filesystem or IPC operation and
+canonical `PromotionIntent` contains the fixed
+`scribe-windows-gpu-production-v1` policy namespace and all provenance,
+artifact, digest, version, security-epoch, and replay-policy fields. It contains
+no intake path, publication path, endpoint, key, or state location. Its identity
+is SHA-256 over the exact canonical JSON prefixed by
+`scribe-windows-gpu-promotion-intent-v1\0`.
+
+The non-serializable `ClientInvocation` keeps the existing CLI compatible by
+pairing that intent with process-local `PathBuf` values. Those paths do not
+change the intent bytes or digest, do not enter receipts or the ledger, and
+cannot choose protected publication names. The test broker derives the staging
+and final names as `.staging-<release-set-digest>` and
+`<release-set-digest>` respectively. Its `--output-root` value is only the
+test-local publication parent and is not authority input.
+
+The normal `scribe-windows-gpu-promotion-client` binary validates the invocation
+in memory and exits with code 78. It performs no filesystem or IPC operation and
 has no signing key, ledger/state path, configurable broker endpoint, or fixture
 mode.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
-ledger, signed receipt, recovery state machine, and atomic publisher are under
-`cfg(test)` only. They prove the intended broker contract but are not deployable
-production authority. In particular, the tests do not establish:
+ledger, signed receipt, recovery state machine, authorizer, and atomic publisher
+are under `cfg(test)` only. They prove the intended broker contract but are not
+deployable production authority. In particular, the tests do not establish:
 
 - a fixed authenticated service/HSM transport;
 - service installation identity and ACLs;
@@ -20,6 +35,13 @@ production authority. In particular, the tests do not establish:
 - NT handle-relative traversal for every input component;
 - non-resettable replay or security-epoch storage;
 - a production key, trust root, CUDA inventory, or release catalog.
+
+The fixture receipt and ledger use incompatible v2 schemas and domains so an
+old or mixed record is rejected. Each receipt embeds the complete path-free
+intent and its recomputed digest. The v2 fixture ledger intentionally starts
+fresh because it is test-only. A production migration must preserve every v1
+used-release reservation and security-epoch high-water mark before accepting v2
+traffic; that migration is deferred with the production broker itself.
 
 Production promotion must stay disabled until those controls are implemented
 and independently reviewed. Run the current proof on Windows with:

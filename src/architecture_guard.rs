@@ -1517,7 +1517,12 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "#[serde(deny_unknown_fields)]",
         "promote-windows-pack-set",
         "--require-unused-release-set",
-        "request.validate()?",
+        "pub struct PromotionIntent",
+        "#[derive(Clone, Eq, PartialEq)]",
+        "pub struct ClientInvocation",
+        "PROMOTION_POLICY_NAMESPACE",
+        "scribe-windows-gpu-promotion-intent-v1",
+        "self.intent.validate()?",
         "self.workflow_source_sha != self.source_revision",
         "validate_positive_decimal(&minimum_security_epoch_text, 20)",
         "minimum_security_epoch_requires_canonical_positive_u64_decimal",
@@ -1530,6 +1535,9 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     for required in [
         "RECEIPT_DOMAIN",
         "LEDGER_DOMAIN",
+        "scribe-windows-gpu-promotion-receipt-v2",
+        "scribe-windows-gpu-promotion-ledger-record-v2",
+        "promotion_intent_sha256",
         "LedgerKind::Reserved",
         "LedgerKind::Ready",
         "LedgerKind::Published",
@@ -1546,6 +1554,11 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "concurrent_duplicate_requests_have_one_winner",
         "fault_after_first_pack_never_publishes_a_partial_pair_and_burns_replay",
         "recovery_rejects_a_valid_but_cross_release_output_substitution",
+        "mismatched_handoff_and_intent_fail_before_reservation",
+        "self_consistent_but_unauthorized_intent_fails_before_reservation",
+        "post_reservation_failure_burns_replay_and_advances_epoch_high_water",
+        "receipt_ledger_and_publication_names_are_path_free_and_intent_bound",
+        "receipt_rejects_a_valid_signature_over_an_incorrect_intent_digest",
         "consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author",
     ] {
         assert!(
@@ -1555,7 +1568,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     }
     for required in [
         "InteropFixtureDirectory",
-        "promotion-request.json",
+        "promotion-intent.json",
+        "policy_namespace = 'scribe-windows-gpu-production-v1'",
         "workflow_source_sha = $revision",
     ] {
         assert!(
