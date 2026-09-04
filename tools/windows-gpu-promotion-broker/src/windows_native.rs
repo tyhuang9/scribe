@@ -82,8 +82,15 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACL_REVISION: u8 = 2;
 const GROUP_ENABLED: u32 = 4;
 const GROUP_USE_FOR_DENY_ONLY: u32 = 16;
-const CLIENT_PIPE_ACCESS: u32 =
-    FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+const CLIENT_PIPE_ACCESS: u32 = 0x00100183;
+const _: () = assert!(
+    CLIENT_PIPE_ACCESS
+        == FILE_READ_DATA
+            | FILE_WRITE_DATA
+            | FILE_READ_ATTRIBUTES
+            | FILE_WRITE_ATTRIBUTES
+            | SYNCHRONIZE
+);
 
 static SERVICE_STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SERVICE_STATUS_HANDLE_VALUE: AtomicIsize = AtomicIsize::new(0);
