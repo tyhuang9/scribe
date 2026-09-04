@@ -1496,7 +1496,11 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     }
     assert!(broker_manifest.contains("[workspace]"));
     assert!(broker_manifest.contains("rust-version = \"1.96\""));
-    assert!(broker_contract.contains("#[cfg(test)]\nmod fixture;"));
+    assert!(
+        broker_contract
+            .replace("\r\n", "\n")
+            .contains("#[cfg(test)]\nmod fixture;")
+    );
     for forbidden in [
         "fixture-ed25519-v1",
         "FIXTURE_SEED",
