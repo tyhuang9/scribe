@@ -1205,6 +1205,21 @@ impl<'a> Canvas<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_vertically_centered_in_rect(
+        &mut self,
+        text: &str,
+        x: f32,
+        width: f32,
+        rect: super::layout::PhysicalRect,
+        font_size: f32,
+        style: TextStyle,
+        color: Argb,
+    ) -> Result<f32, RasterError> {
+        let y = rect.center_y() - self.rasterizer.baseline_ink_center_y(font_size, style)?;
+        self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
+    }
+
     /// The cancel control has independent hit-target geometry and intentionally
     /// retains its established glyph placement. Overlay content uses the
     /// centerline-aware variant above.
@@ -1365,7 +1380,7 @@ impl<'a> Canvas<'a> {
             if cursor >= right {
                 break;
             }
-            let measured = self.draw_text_centered_in_rect(
+            let measured = self.draw_text_vertically_centered_in_rect(
                 &section.text,
                 cursor,
                 right - cursor,
