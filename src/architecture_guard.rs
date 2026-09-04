@@ -1634,6 +1634,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "Refusing to modify the pre-existing fixed-name service",
         "sidtype",
         "restricted",
+        "$sidTypeMatches.Count -eq 1",
+        "Groups['value'].Value -ceq 'RESTRICTED'",
         "NT AUTHORITY\\LocalService",
         "SetAccessRuleProtection",
         "S-1-5-32-544",

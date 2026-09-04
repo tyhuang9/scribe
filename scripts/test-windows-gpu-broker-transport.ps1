@@ -66,6 +66,15 @@ function Get-BrokerService {
     return Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 }
 
+function Test-RestrictedServiceSidType([string]$ScOutput) {
+    $sidTypeMatches = [regex]::Matches(
+        $ScOutput,
+        '(?m)^\s*SERVICE_SID_TYPE\s*:\s*(?<value>\S+)\s*$',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    return $sidTypeMatches.Count -eq 1 -and $sidTypeMatches[0].Groups['value'].Value -ceq 'RESTRICTED'
+}
+
 function Assert-OwnedBrokerService([string]$ExpectedPath) {
     $config = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'"
     Assert-True ($null -ne $config) 'Temporary service configuration is unavailable.'
@@ -73,7 +82,7 @@ function Assert-OwnedBrokerService([string]$ExpectedPath) {
     Assert-True ($config.ServiceType -ceq 'Own Process') 'Service is not configured as an own-process service.'
     Assert-True ([IO.Path]::GetFullPath($config.PathName.Trim('"')) -ceq [IO.Path]::GetFullPath($ExpectedPath)) 'SCM service path no longer matches the protected freshly built binary; refusing destructive cleanup.'
     $queriedSidType = Invoke-Sc -Arguments @('qsidtype', $serviceName)
-    Assert-True ($queriedSidType.Stdout.Contains('SERVICE_SID_TYPE: RESTRICTED', [StringComparison]::Ordinal)) 'SCM no longer reports the restricted service SID type; refusing destructive cleanup.'
+    Assert-True (Test-RestrictedServiceSidType -ScOutput $queriedSidType.Stdout) 'SCM no longer reports the restricted service SID type; refusing destructive cleanup.'
     return $config
 }
 
@@ -118,6 +127,9 @@ try {
     $goldenResponseMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-response-v1`0$goldenResponse")
     $goldenResponseDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($goldenResponseMaterial))).Replace('-', '').ToLowerInvariant()
     Assert-True ($goldenResponseDigest -ceq '7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143') 'PowerShell and Rust disagree on the canonical broker response digest.'
+    Assert-True (Test-RestrictedServiceSidType -ScOutput "[SC] QueryServiceConfig2 SUCCESS`r`n`r`nSERVICE_NAME: $serviceName`r`n        SERVICE_SID_TYPE :  RESTRICTED`r`n") 'The SCM SID parser rejected representative aligned qsidtype output.'
+    Assert-True (-not (Test-RestrictedServiceSidType -ScOutput 'SERVICE_SID_TYPE: UNRESTRICTED')) 'The SCM SID parser accepted a non-restricted service.'
+    Assert-True (-not (Test-RestrictedServiceSidType -ScOutput "SERVICE_SID_TYPE: RESTRICTED`nSERVICE_SID_TYPE: RESTRICTED")) 'The SCM SID parser accepted ambiguous duplicate fields.'
 
     if (Get-BrokerService) {
         throw "Refusing to modify the pre-existing fixed-name service $serviceName."
