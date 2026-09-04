@@ -268,23 +268,41 @@ repository, ref, source SHA, workflow ref, run ID and attempt, pack version,
 toolchain-manifest SHA-256, ordered CUDA/Vulkan manifest and pack digests, and a
 domain-separated release-set digest. `actions/upload-artifact` exposes the
 artifact ID and digest; the digest-pinned `download-artifact` action validates
-that artifact in the protected job, and both values are also passed to the
-independent signer as approval inputs.
+that artifact in the protected job, and both values are also passed through the
+unprivileged client as approval inputs for the future privileged broker.
 
 The protected job has no source checkout, compiler, repository script, or raw
 private-key secret. It requires the `windows-gpu-pack-signing` environment and
 an ephemeral `scribe-gpu-pack-signer-ephemeral` runner containing a separately
-installed signer whose executable digest comes from protected environment
-configuration. The runner must use Actions Runner 2.327.1 or later because the
-pinned artifact download action runs on Node 24 and treats a digest mismatch as
-a fatal error. That signer must treat the handoff only as hostile data, copy it
-through no-follow handles into fresh signer-owned storage, revalidate the exact
-ASCII-only inventory and all caller-approved digests, enforce its own
-non-resettable security-epoch floor and one-use release-set ledger, sign both
-packs, and publish the pair atomically with a protected receipt. Production
-trust remains unprovisioned, so the job fails before invoking that signer and
-before consuming replay/epoch authority. The repository fixture promoter tests
-the interface and atomic two-pack behavior only; it refuses production mode.
+installed unprivileged broker client whose executable digest comes from
+protected environment configuration. The runner must use Actions Runner
+2.327.1 or later because the pinned artifact download action runs on Node 24 and
+treats a digest mismatch as fatal. The workflow retains a read-only handle that
+denies write/delete from client hashing through child exit, closing the local
+hash-to-exec replacement window. The client accepts only the canonical
+promotion request; it has no key, ledger/state path, configurable authority
+endpoint, or fixture flag.
+
+A separately privileged Windows service or remote HSM broker—not the ephemeral
+runner identity—must own the production key and independently durable replay
+and security-epoch authority. The independently locked
+`tools/windows-gpu-promotion-broker` workspace now proves the broker state
+machine with test-only authority: deny-unknown-fields canonical schemas, exact
+CUDA-then-Vulkan and provenance bindings, retained no-write/delete input
+handles, bounded inventory and ADS/hardlink/reparse/case/path rejection,
+create-new retained-handle copies, post-copy verification, authority loading
+only after both copies validate, a domain-separated signed receipt, a chained
+reserve/ready/published ledger, fault recovery, replay rejection, and
+write-through atomic publication. The fixture seed and ledger implementation
+are behind `cfg(test)` and do not compile into the normal client.
+
+This test proof still uses path-based enumeration before retained final opens;
+it does not prove full NT handle-relative traversal, service ACL enforcement,
+non-resettable state, or HSM integration. Production therefore remains
+unprovisioned and the protected job fails before invoking the client or touching
+filesystem, ledger, or signing authority. `ProductionTrustRoot`, production
+catalogs, and Auto eligibility remain empty. The earlier repository fixture
+promoter continues to test its interface only and refuses production mode.
 
 ## Windows Vulkan hardware evidence
 
@@ -546,7 +564,16 @@ installer allowlist, portable/installer parity, and hostile filesystem cases.
 `scripts/test-windows-gpu-pack-promotion.ps1` additionally exercises canonical
 unsigned handoff parsing, explicit manifest/pack digest approval, tamper and
 provenance rejection, paired atomic fixture publication, and the production
-authority isolation of the protected workflow.
+authority isolation of the protected workflow. The independently locked broker
+workspace adds adversarial hardlink/ADS/inventory tests, retained-handle
+replacement denial, canonical signed-receipt verification, missing/corrupt/torn
+ledger rejection, security-epoch rollback, unconditional replay, injected
+reserve/copy/ready/publish faults, and concurrent duplicate requests. Run it
+with:
+
+```powershell
+cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
+```
 
 ## Stage 7 Linux GPU contract
 

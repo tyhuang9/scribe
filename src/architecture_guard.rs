@@ -1410,6 +1410,10 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     let promote = include_str!("../scripts/promote-windows-gpu-worker-packs.ps1");
     let contract_test = include_str!("../scripts/test-windows-gpu-pack-promotion.ps1");
     let workflow = include_str!("../.github/workflows/windows-gpu-pack-promotion.yml");
+    let broker_manifest = include_str!("../tools/windows-gpu-promotion-broker/Cargo.toml");
+    let broker_client = include_str!("../tools/windows-gpu-promotion-broker/src/main.rs");
+    let broker_contract = include_str!("../tools/windows-gpu-promotion-broker/src/lib.rs");
+    let broker_fixture = include_str!("../tools/windows-gpu-promotion-broker/src/fixture.rs");
     let protected = workflow
         .split("  protected-promote:")
         .nth(1)
@@ -1459,13 +1463,17 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         "digest-mismatch: error",
         "cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml",
+        "cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
+        "cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
-        "SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256",
-        "SCRIBE_WINDOWS_GPU_PRODUCTION_TRUST_PROVISIONED",
+        "SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256",
+        "SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED",
         "--require-unused-release-set",
         "--workflow-source-sha",
-        "Production trust root and protected signer are not provisioned; no signing authority was consumed.",
+        "no filesystem, ledger, or signing authority was accessed",
+        "[IO.FileShare]::Read",
+        "$processInfo.ArgumentList.Add",
     ] {
         assert!(
             workflow.contains(required),
@@ -1478,10 +1486,58 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "promote-windows-gpu-worker-packs.ps1",
         "secrets.",
         "private-key",
+        "--ledger-root",
+        "--broker-endpoint",
     ] {
         assert!(
             !protected.contains(forbidden),
             "protected job regained candidate code or raw signing authority {forbidden:?}"
+        );
+    }
+    assert!(broker_manifest.contains("[workspace]"));
+    assert!(broker_manifest.contains("rust-version = \"1.96\""));
+    assert!(broker_contract.contains("#[cfg(test)]\nmod fixture;"));
+    for forbidden in [
+        "fixture-ed25519-v1",
+        "FIXTURE_SEED",
+        "private-key",
+        "ledger-root",
+        "broker-endpoint",
+    ] {
+        assert!(
+            !broker_client.contains(forbidden),
+            "release broker client contains fixture or authority material {forbidden:?}"
+        );
+    }
+    for required in [
+        "#[serde(deny_unknown_fields)]",
+        "promote-windows-pack-set",
+        "--require-unused-release-set",
+        "request.validate()?",
+    ] {
+        assert!(
+            broker_contract.contains(required),
+            "broker request contract lost {required:?}"
+        );
+    }
+    for required in [
+        "RECEIPT_DOMAIN",
+        "LEDGER_DOMAIN",
+        "LedgerKind::Reserved",
+        "LedgerKind::Ready",
+        "LedgerKind::Published",
+        "MoveFileExW",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        "FILE_SHARE_READ",
+        "reject_named_streams",
+        "reject_hardlink",
+        "copy_retained_file",
+        "concurrent_duplicate_requests_have_one_winner",
+        "fault_after_first_pack_never_publishes_a_partial_pair_and_burns_replay",
+    ] {
+        assert!(
+            broker_fixture.contains(required),
+            "test-only privileged broker proof lost {required:?}"
         );
     }
     assert!(contract_test.contains("Windows GPU pack promotion contract tests passed."));
