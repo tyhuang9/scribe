@@ -1418,6 +1418,9 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         .split_once("#[cfg(test)]")
         .expect("broker protocol must keep tests behind a production boundary");
     let broker_native = include_str!("../tools/windows-gpu-promotion-broker/src/windows_native.rs");
+    let (broker_native_production, _) = broker_native
+        .split_once("#[cfg(test)]")
+        .expect("broker native transport must keep tests behind a production boundary");
     let broker_service = include_str!(
         "../tools/windows-gpu-promotion-broker/src/bin/scribe-windows-gpu-promotion-service.rs"
     );
@@ -1607,7 +1610,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "SERVICE_WIN32_OWN_PROCESS",
     ] {
         assert!(
-            broker_native.contains(required),
+            broker_native_production.contains(required),
             "authenticated Windows broker transport lost {required:?}"
         );
     }
@@ -1621,7 +1624,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "--install",
     ] {
         assert!(
-            !broker_native.contains(forbidden),
+            !broker_native_production.contains(forbidden),
             "Windows broker transport gained forbidden authority or ACL input {forbidden:?}"
         );
     }
