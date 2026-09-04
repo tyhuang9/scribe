@@ -278,10 +278,12 @@ installed unprivileged broker client whose executable digest comes from
 protected environment configuration. The runner must use Actions Runner
 2.327.1 or later because the pinned artifact download action runs on Node 24 and
 treats a digest mismatch as fatal. The workflow retains a read-only handle that
-denies write/delete from client hashing through child exit, closing the local
-hash-to-exec replacement window. The client accepts only the canonical
-promotion request; it has no key, ledger/state path, configurable authority
-endpoint, or fixture flag.
+denies direct leaf write/delete from client hashing through child exit. This
+narrows one replacement window; it does not provide a no-follow leaf open, pin
+ancestor handles, prove the installation DACL, or constrain future loader
+dependencies, so it does not close the complete hash-to-exec path. The client
+accepts only the canonical promotion request; it has no key, ledger/state path,
+configurable authority endpoint, or fixture flag.
 
 A separately privileged Windows service or remote HSM broker—not the ephemeral
 runner identity—must own the production key and independently durable replay
@@ -298,7 +300,8 @@ are behind `cfg(test)` and do not compile into the normal client.
 
 This test proof still uses path-based enumeration before retained final opens;
 it does not prove full NT handle-relative traversal, service ACL enforcement,
-non-resettable state, or HSM integration. Production therefore remains
+non-resettable state, HSM integration, broker-client authentication, or the
+client installation/ancestor/loader policy. Production therefore remains
 unprovisioned and the protected job fails before invoking the client or touching
 filesystem, ledger, or signing authority. `ProductionTrustRoot`, production
 catalogs, and Auto eligibility remain empty. The earlier repository fixture
@@ -574,6 +577,12 @@ with:
 ```powershell
 cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
 ```
+
+That suite also asks the existing PowerShell promotion harness to build fresh
+prepared CUDA/Vulkan manifests through `scribe-worker-pack-tool`, serialize the
+canonical handoff and request, and then feeds those exact bytes into the Rust
+broker proof. This is the producer/consumer drift check; the Rust-only fixtures
+do not substitute for it.
 
 ## Stage 7 Linux GPU contract
 

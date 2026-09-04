@@ -173,6 +173,9 @@ jobs:
           if ($client.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase) -or $client.StartsWith("$runnerTemp\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Trusted broker client must not come from the checkout, handoff, or runner temporary directory.' }
           $item = Get-Item -LiteralPath $client -Force
           if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Trusted broker client is not a regular non-reparse file.' }
+          # This retained leaf handle denies direct writes/deletion after hashing. It does not
+          # provide no-follow open semantics or pin path ancestors; the broker gate stays closed
+          # until installation DACL, ancestor, loader, and service/HSM controls are reviewed.
           $clientLock = [IO.FileStream]::new($client, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
           try {
             $sha256 = [Security.Cryptography.SHA256]::Create()

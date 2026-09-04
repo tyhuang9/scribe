@@ -1514,6 +1514,9 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "promote-windows-pack-set",
         "--require-unused-release-set",
         "request.validate()?",
+        "self.workflow_source_sha != self.source_revision",
+        "validate_positive_decimal(&minimum_security_epoch_text, 20)",
+        "minimum_security_epoch_requires_canonical_positive_u64_decimal",
     ] {
         assert!(
             broker_contract.contains(required),
@@ -1532,14 +1535,31 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "reject_named_streams",
         "reject_hardlink",
         "copy_retained_file",
+        "signature_envelope_sha256",
+        "pack_version: pack.manifest.pack_version.clone()",
+        "expected_receipt_statement",
+        "bounded_directory_names",
         "concurrent_duplicate_requests_have_one_winner",
         "fault_after_first_pack_never_publishes_a_partial_pair_and_burns_replay",
+        "recovery_rejects_a_valid_but_cross_release_output_substitution",
+        "consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author",
     ] {
         assert!(
             broker_fixture.contains(required),
             "test-only privileged broker proof lost {required:?}"
         );
     }
+    for required in [
+        "InteropFixtureDirectory",
+        "promotion-request.json",
+        "workflow_source_sha = $revision",
+    ] {
+        assert!(
+            contract_test.contains(required),
+            "PowerShell interoperability producer lost {required:?}"
+        );
+    }
+    assert!(workflow.contains("provide no-follow open semantics or pin path ancestors"));
     assert!(contract_test.contains("Windows GPU pack promotion contract tests passed."));
 }
 

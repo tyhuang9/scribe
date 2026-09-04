@@ -29,6 +29,8 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FILES: usize = 256;
 const MAX_DEPTH: usize = 12;
+const MAX_DIRECTORIES: usize = MAX_FILES * MAX_DEPTH;
+const MAX_TREE_ENTRIES: usize = MAX_FILES + MAX_DIRECTORIES + 2;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const RELEASE_SET_DOMAIN: &[u8] = b"scribe-windows-gpu-release-set-v1\0";
@@ -149,11 +151,15 @@ struct ReleaseMaterial<'a> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackReceipt {
+    schema_version: u16,
     backend: Backend,
     pack_id: String,
+    pack_version: String,
     pack_digest: String,
     security_epoch: u64,
     manifest_sha256: String,
+    signature_key_id: String,
+    signature_envelope_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,6 +187,7 @@ struct ReceiptStatement {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignedReceipt {
+    schema_version: u16,
     statement: ReceiptStatement,
     key_id: String,
     signature_hex: String,
@@ -322,6 +329,14 @@ struct PinnedPack {
     _directories: Vec<File>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedPackObservation {
+    manifest: PackManifest,
+    manifest_sha256: String,
+    signature_key_id: String,
+    signature_envelope_sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultPoint {
     None,
@@ -433,15 +448,16 @@ impl FixtureBroker {
         // The fixture authority is intentionally instantiated only after both
         // complete prepared packs have been retained, copied, and revalidated.
         let key_pair = fixture_key_pair()?;
+        let mut signed_packs = Vec::with_capacity(2);
         for copied in &copied_packs {
-            sign_copied_pack(
+            signed_packs.push(sign_copied_pack(
                 copied,
                 &stage_root.join(copied.manifest.backend.as_str()),
                 &key_pair,
-            )?;
+            )?);
         }
         drop(copied_packs);
-        let receipt = create_receipt(request, &handoff, &request_sha256, &key_pair)?;
+        let receipt = create_receipt(request, &signed_packs, &request_sha256, &key_pair)?;
         write_new_synced(
             &stage_root.join(RECEIPT_NAME),
             &serde_json::to_vec(&receipt)?,
@@ -506,9 +522,11 @@ impl FixtureBroker {
                         bail!("ready release has an ambiguous publication state");
                     }
                     if stage.exists() {
+                        verify_fixture_output(&stage, &digest, &state.request_sha256)?;
                         atomic_publish(&stage, &output)?;
+                    } else {
+                        verify_fixture_output(&output, &digest, &state.request_sha256)?;
                     }
-                    verify_fixture_output(&output)?;
                     let current = load_ledger(&mut ledger)?;
                     append_transition(
                         &mut ledger,
@@ -527,7 +545,7 @@ impl FixtureBroker {
                     if stage.exists() || !output.exists() {
                         bail!("published release state does not match signer-owned output");
                     }
-                    verify_fixture_output(&output)?;
+                    verify_fixture_output(&output, &digest, &state.request_sha256)?;
                 }
                 LedgerKind::Genesis => bail!("invalid per-release genesis state"),
             }
@@ -558,10 +576,7 @@ impl FixtureBroker {
 
 fn inspect_handoff(root: &Path, request: &PromotionRequest) -> Result<(Handoff, Vec<PinnedPack>)> {
     let root_handle = open_directory_no_follow(root)?;
-    let mut root_entries = fs::read_dir(root)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<io::Result<Vec<_>>>()?;
-    root_entries.sort();
+    let root_entries = bounded_directory_names(root, 3)?;
     let expected = [
         OsString::from("cuda"),
         OsString::from("vulkan"),
@@ -678,6 +693,7 @@ fn inspect_pack(root: &Path, request: &PromotionRequest) -> Result<PinnedPack> {
     }
     let mut observed_files = BTreeSet::new();
     let mut observed_casefolded = BTreeSet::new();
+    let mut observed_entries = 0_usize;
     let mut directories = vec![root_handle];
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     while let Some((directory, depth)) = pending.pop() {
@@ -686,6 +702,12 @@ fn inspect_pack(root: &Path, request: &PromotionRequest) -> Result<PinnedPack> {
         }
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
+            observed_entries = observed_entries
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("pack tree entry count overflowed"))?;
+            if observed_entries > MAX_TREE_ENTRIES {
+                bail!("pack tree entry count exceeds bound");
+            }
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
             if is_link_or_reparse(&metadata) {
@@ -714,6 +736,9 @@ fn inspect_pack(root: &Path, request: &PromotionRequest) -> Result<PinnedPack> {
                 directories.push(open_directory_no_follow(&path)?);
                 pending.push((path, depth + 1));
             } else if metadata.is_file() {
+                if !expected_files.contains(&relative) {
+                    bail!("pack contains an unexpected file");
+                }
                 observed_files.insert(relative);
             } else {
                 bail!("pack contains a nonregular entry");
@@ -882,7 +907,7 @@ fn sign_copied_pack(
     copied: &PinnedPack,
     destination: &Path,
     key_pair: &Ed25519KeyPair,
-) -> Result<()> {
+) -> Result<SignedPackObservation> {
     let signature = DetachedSignature {
         schema_version: 1,
         key_id: FIXTURE_KEY_ID.to_owned(),
@@ -893,10 +918,10 @@ fn sign_copied_pack(
         &serde_json::to_vec(&signature)?,
     )?;
     let verified = inspect_signed_pack(destination, key_pair.public_key().as_ref())?;
-    if verified.pack_digest != copied.manifest.pack_digest {
+    if verified.manifest.pack_digest != copied.manifest.pack_digest {
         bail!("signed pack changed before fixture publication");
     }
-    Ok(())
+    Ok(verified)
 }
 
 fn copy_retained_file(
@@ -934,7 +959,7 @@ fn copy_retained_file(
     Ok(())
 }
 
-fn inspect_signed_pack(root: &Path, public_key: &[u8]) -> Result<PackManifest> {
+fn inspect_signed_pack(root: &Path, public_key: &[u8]) -> Result<SignedPackObservation> {
     let manifest_file = open_regular_no_follow(&root.join(MANIFEST_NAME))?;
     reject_hardlink(&manifest_file)?;
     reject_named_streams(&root.join(MANIFEST_NAME))?;
@@ -943,19 +968,22 @@ fn inspect_signed_pack(root: &Path, public_key: &[u8]) -> Result<PackManifest> {
     let signature_file = open_regular_no_follow(&root.join(SIGNATURE_NAME))?;
     reject_hardlink(&signature_file)?;
     reject_named_streams(&root.join(SIGNATURE_NAME))?;
-    let signature: DetachedSignature = parse_canonical(
-        &read_exact_bounded(&signature_file, 4 * 1024)?,
-        "pack signature",
-    )?;
+    let signature_bytes = read_exact_bounded(&signature_file, 4 * 1024)?;
+    let signature: DetachedSignature = parse_canonical(&signature_bytes, "pack signature")?;
     if signature.schema_version != 1 || signature.key_id != FIXTURE_KEY_ID {
         bail!("signed pack authority is not the fixture authority");
     }
-    let signature_bytes = decode_hex_exact(&signature.signature_hex, 64)?;
+    let detached_signature = decode_hex_exact(&signature.signature_hex, 64)?;
     UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(&bytes, &signature_bytes)
+        .verify(&bytes, &detached_signature)
         .map_err(|_| anyhow!("signed pack signature is invalid"))?;
     verify_signed_tree(root, &manifest, public_key)?;
-    Ok(manifest)
+    Ok(SignedPackObservation {
+        manifest,
+        manifest_sha256: encode_hex(&Sha256::digest(&bytes)),
+        signature_key_id: signature.key_id,
+        signature_envelope_sha256: encode_hex(&Sha256::digest(&signature_bytes)),
+    })
 }
 
 fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) -> Result<()> {
@@ -979,6 +1007,7 @@ fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) 
     }
     let mut files = BTreeSet::new();
     let mut casefolded = BTreeSet::new();
+    let mut observed_entries = 0_usize;
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     while let Some((directory, depth)) = pending.pop() {
         let _directory = open_directory_no_follow(&directory)?;
@@ -987,6 +1016,12 @@ fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) 
         }
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
+            observed_entries = observed_entries
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("signed pack tree entry count overflowed"))?;
+            if observed_entries > MAX_TREE_ENTRIES {
+                bail!("signed pack tree entry count exceeds bound");
+            }
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
             if is_link_or_reparse(&metadata) {
@@ -1012,6 +1047,9 @@ fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) 
                 reject_named_streams(&path)?;
                 pending.push((path, depth + 1));
             } else if metadata.is_file() {
+                if !expected.contains(&relative) {
+                    bail!("signed pack contains unexpected file");
+                }
                 files.insert(relative);
             } else {
                 bail!("signed pack contains nonregular entry");
@@ -1021,11 +1059,16 @@ fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) 
     if files != expected {
         bail!("signed pack inventory is not exact");
     }
+    let mut aggregate = 0_u64;
     for payload in &manifest.payload {
         let file = open_regular_no_follow(&root.join(Path::new(&payload.path)))?;
         reject_hardlink(&file)?;
         reject_named_streams(&root.join(Path::new(&payload.path)))?;
-        if file.metadata()?.len() != payload.size_bytes
+        aggregate = aggregate
+            .checked_add(payload.size_bytes)
+            .ok_or_else(|| anyhow!("signed payload aggregate overflowed"))?;
+        if aggregate > MAX_AGGREGATE_BYTES
+            || file.metadata()?.len() != payload.size_bytes
             || hash_file(&file, payload.size_bytes)? != payload.sha256
         {
             bail!("signed payload does not match manifest");
@@ -1036,11 +1079,38 @@ fn verify_signed_tree(root: &Path, manifest: &PackManifest, _public_key: &[u8]) 
 
 fn create_receipt(
     request: &PromotionRequest,
-    handoff: &Handoff,
+    signed_packs: &[SignedPackObservation],
     request_sha256: &str,
     key_pair: &Ed25519KeyPair,
 ) -> Result<SignedReceipt> {
-    let statement = ReceiptStatement {
+    let statement = expected_receipt_statement(request, signed_packs, request_sha256)?;
+    let statement_bytes = serde_json::to_vec(&statement)?;
+    let mut signed = Vec::with_capacity(RECEIPT_DOMAIN.len() + statement_bytes.len());
+    signed.extend_from_slice(RECEIPT_DOMAIN);
+    signed.extend_from_slice(&statement_bytes);
+    Ok(SignedReceipt {
+        schema_version: 1,
+        statement,
+        key_id: FIXTURE_KEY_ID.to_owned(),
+        signature_hex: encode_hex(key_pair.sign(&signed).as_ref()),
+    })
+}
+
+fn expected_receipt_statement(
+    request: &PromotionRequest,
+    signed_packs: &[SignedPackObservation],
+    request_sha256: &str,
+) -> Result<ReceiptStatement> {
+    if signed_packs.len() != 2
+        || signed_packs[0].manifest.backend != Backend::Cuda
+        || signed_packs[1].manifest.backend != Backend::Vulkan
+    {
+        bail!("signed pack observations are not exactly CUDA then Vulkan");
+    }
+    for pack in signed_packs {
+        validate_manifest(&pack.manifest, request)?;
+    }
+    Ok(ReceiptStatement {
         schema_version: 1,
         authority: "fixture-only".to_owned(),
         request_sha256: request_sha256.to_owned(),
@@ -1057,44 +1127,26 @@ fn create_receipt(
         release_set_digest: request.release_set_digest.clone(),
         toolchain_manifest_sha256: request.toolchain_manifest_sha256.clone(),
         pack_version: request.pack_version.clone(),
-        packs: handoff
-            .packs
+        packs: signed_packs
             .iter()
             .map(|pack| PackReceipt {
-                backend: pack.backend.clone(),
-                pack_id: pack.pack_id.clone(),
-                pack_digest: pack.pack_digest.clone(),
-                security_epoch: pack.security_epoch,
+                schema_version: pack.manifest.schema_version,
+                backend: pack.manifest.backend.clone(),
+                pack_id: pack.manifest.pack_id.clone(),
+                pack_version: pack.manifest.pack_version.clone(),
+                pack_digest: pack.manifest.pack_digest.clone(),
+                security_epoch: pack.manifest.security_epoch,
                 manifest_sha256: pack.manifest_sha256.clone(),
+                signature_key_id: pack.signature_key_id.clone(),
+                signature_envelope_sha256: pack.signature_envelope_sha256.clone(),
             })
             .collect(),
-    };
-    let statement_bytes = serde_json::to_vec(&statement)?;
-    let mut signed = Vec::with_capacity(RECEIPT_DOMAIN.len() + statement_bytes.len());
-    signed.extend_from_slice(RECEIPT_DOMAIN);
-    signed.extend_from_slice(&statement_bytes);
-    Ok(SignedReceipt {
-        statement,
-        key_id: FIXTURE_KEY_ID.to_owned(),
-        signature_hex: encode_hex(key_pair.sign(&signed).as_ref()),
     })
 }
 
-fn verify_receipt(
-    receipt: &SignedReceipt,
-    request: &PromotionRequest,
-    public_key: &[u8],
-) -> Result<()> {
-    if receipt.key_id != FIXTURE_KEY_ID
-        || receipt.statement.authority != "fixture-only"
-        || receipt.statement.release_set_digest != request.release_set_digest
-        || receipt.statement.request_sha256
-            != hash_domain(REQUEST_DOMAIN, &request.canonical_json()?)
-        || receipt.statement.packs.len() != 2
-        || receipt.statement.packs[0].backend != Backend::Cuda
-        || receipt.statement.packs[1].backend != Backend::Vulkan
-    {
-        bail!("receipt is not exactly bound to the request");
+fn verify_receipt_signature(receipt: &SignedReceipt, public_key: &[u8]) -> Result<()> {
+    if receipt.schema_version != 1 || receipt.key_id != FIXTURE_KEY_ID {
+        bail!("receipt envelope is incompatible");
     }
     let statement = serde_json::to_vec(&receipt.statement)?;
     let mut signed = Vec::with_capacity(RECEIPT_DOMAIN.len() + statement.len());
@@ -1110,7 +1162,7 @@ fn verify_published_set(root: &Path, request: &PromotionRequest, public_key: &[u
     validate_exact_public_inventory(root)?;
     let cuda = inspect_signed_pack(&root.join("cuda"), public_key)?;
     let vulkan = inspect_signed_pack(&root.join("vulkan"), public_key)?;
-    if cuda.backend != Backend::Cuda || vulkan.backend != Backend::Vulkan {
+    if cuda.manifest.backend != Backend::Cuda || vulkan.manifest.backend != Backend::Vulkan {
         bail!("published pack order or backend is invalid");
     }
     let receipt_file = open_regular_no_follow(&root.join(RECEIPT_NAME))?;
@@ -1120,21 +1172,18 @@ fn verify_published_set(root: &Path, request: &PromotionRequest, public_key: &[u
         &read_exact_bounded(&receipt_file, MAX_HANDOFF_BYTES)?,
         "promotion receipt",
     )?;
-    verify_receipt(&receipt, request, public_key)?;
-    if receipt.statement.packs[0].pack_digest != cuda.pack_digest
-        || receipt.statement.packs[1].pack_digest != vulkan.pack_digest
-    {
-        bail!("receipt pack digests do not match published packs");
+    verify_receipt_signature(&receipt, public_key)?;
+    let request_sha256 = hash_domain(REQUEST_DOMAIN, &request.canonical_json()?);
+    let expected = expected_receipt_statement(request, &[cuda, vulkan], &request_sha256)?;
+    if receipt.statement != expected {
+        bail!("receipt statement does not exactly bind request and signed pack observations");
     }
     Ok(())
 }
 
 fn validate_exact_public_inventory(root: &Path) -> Result<()> {
     let _root = open_directory_no_follow(root)?;
-    let mut names = fs::read_dir(root)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<io::Result<Vec<_>>>()?;
-    names.sort();
+    let names = bounded_directory_names(root, 3)?;
     let expected = [
         OsString::from("cuda"),
         OsString::from(RECEIPT_NAME),
@@ -1150,6 +1199,18 @@ fn validate_exact_public_inventory(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bounded_directory_names(root: &Path, maximum: usize) -> Result<Vec<OsString>> {
+    let mut names = Vec::with_capacity(maximum);
+    for entry in fs::read_dir(root)? {
+        if names.len() == maximum {
+            bail!("directory entry count exceeds the accepted bound");
+        }
+        names.push(entry?.file_name());
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn validate_epoch_policy(
@@ -1375,12 +1436,16 @@ fn apply_ledger_transition(
     Ok(())
 }
 
-fn verify_fixture_output(root: &Path) -> Result<()> {
+fn verify_fixture_output(
+    root: &Path,
+    expected_release_set_digest: &str,
+    expected_request_sha256: &str,
+) -> Result<()> {
     validate_exact_public_inventory(root)?;
     let public_key = fixture_key_pair()?.public_key().as_ref().to_vec();
     let cuda = inspect_signed_pack(&root.join("cuda"), &public_key)?;
     let vulkan = inspect_signed_pack(&root.join("vulkan"), &public_key)?;
-    if cuda.backend != Backend::Cuda || vulkan.backend != Backend::Vulkan {
+    if cuda.manifest.backend != Backend::Cuda || vulkan.manifest.backend != Backend::Vulkan {
         bail!("fixture output does not contain the exact backend pair");
     }
     let receipt_file = open_regular_no_follow(&root.join(RECEIPT_NAME))?;
@@ -1390,23 +1455,29 @@ fn verify_fixture_output(root: &Path) -> Result<()> {
         &read_exact_bounded(&receipt_file, MAX_HANDOFF_BYTES)?,
         "promotion receipt",
     )?;
-    let statement = serde_json::to_vec(&receipt.statement)?;
-    let mut signed = Vec::with_capacity(RECEIPT_DOMAIN.len() + statement.len());
-    signed.extend_from_slice(RECEIPT_DOMAIN);
-    signed.extend_from_slice(&statement);
-    if receipt.key_id != FIXTURE_KEY_ID
+    verify_receipt_signature(&receipt, &public_key)?;
+    let actual_packs = [cuda, vulkan]
+        .iter()
+        .map(|pack| PackReceipt {
+            schema_version: pack.manifest.schema_version,
+            backend: pack.manifest.backend.clone(),
+            pack_id: pack.manifest.pack_id.clone(),
+            pack_version: pack.manifest.pack_version.clone(),
+            pack_digest: pack.manifest.pack_digest.clone(),
+            security_epoch: pack.manifest.security_epoch,
+            manifest_sha256: pack.manifest_sha256.clone(),
+            signature_key_id: pack.signature_key_id.clone(),
+            signature_envelope_sha256: pack.signature_envelope_sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    if receipt.statement.schema_version != 1
         || receipt.statement.authority != "fixture-only"
-        || receipt.statement.packs.len() != 2
-        || receipt.statement.packs[0].backend != Backend::Cuda
-        || receipt.statement.packs[1].backend != Backend::Vulkan
-        || receipt.statement.packs[0].pack_digest != cuda.pack_digest
-        || receipt.statement.packs[1].pack_digest != vulkan.pack_digest
+        || receipt.statement.release_set_digest != expected_release_set_digest
+        || receipt.statement.request_sha256 != expected_request_sha256
+        || receipt.statement.packs != actual_packs
     {
-        bail!("fixture output receipt does not bind the exact backend pair");
+        bail!("fixture output receipt does not bind ledger and exact signed packs");
     }
-    UnparsedPublicKey::new(&ED25519, &public_key)
-        .verify(&signed, &decode_hex_exact(&receipt.signature_hex, 64)?)
-        .map_err(|_| anyhow!("fixture output receipt signature is invalid"))?;
     Ok(())
 }
 
@@ -1778,6 +1849,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::thread;
     use tempfile::TempDir;
 
@@ -1960,6 +2032,19 @@ mod tests {
         }
     }
 
+    fn copy_tree_for_substitution_test(source: &Path, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree_for_substitution_test(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn promotes_exact_pair_with_domain_separated_receipt_and_chained_ledger() {
         let fixture = Fixture::new(1);
@@ -1967,7 +2052,12 @@ mod tests {
             .broker
             .promote(&fixture.request, FaultPoint::None)
             .unwrap();
-        verify_fixture_output(&fixture.output()).unwrap();
+        verify_fixture_output(
+            &fixture.output(),
+            &fixture.request.release_set_digest,
+            &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+        )
+        .unwrap();
         let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
         let snapshot = load_ledger(&mut ledger).unwrap();
         assert!(snapshot.used.contains(&fixture.request.release_set_digest));
@@ -2005,6 +2095,53 @@ mod tests {
             .promote(&changed_authorization, FaultPoint::None)
             .unwrap_err();
         assert!(error.to_string().contains("already consumed"));
+    }
+
+    #[test]
+    fn receipt_rejects_a_valid_signature_over_inaccurate_post_sign_metadata() {
+        let fixture = Fixture::new(1);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        let receipt_path = fixture.output().join(RECEIPT_NAME);
+        let mut receipt: SignedReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        receipt.statement.packs[0].signature_envelope_sha256 = "0".repeat(64);
+        let statement = serde_json::to_vec(&receipt.statement).unwrap();
+        let mut material = RECEIPT_DOMAIN.to_vec();
+        material.extend_from_slice(&statement);
+        receipt.signature_hex = encode_hex(fixture_key_pair().unwrap().sign(&material).as_ref());
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(
+            verify_published_set(
+                &fixture.output(),
+                &fixture.request,
+                fixture_key_pair().unwrap().public_key().as_ref(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_statement_revalidates_post_sign_manifest_version() {
+        let fixture = Fixture::new(1);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        let public_key = fixture_key_pair().unwrap().public_key().as_ref().to_vec();
+        let mut cuda = inspect_signed_pack(&fixture.output().join("cuda"), &public_key).unwrap();
+        let vulkan = inspect_signed_pack(&fixture.output().join("vulkan"), &public_key).unwrap();
+        cuda.manifest.pack_version = "0.1.0-cross-release".to_owned();
+        assert!(
+            expected_receipt_statement(
+                &fixture.request,
+                &[cuda, vulkan],
+                &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2084,7 +2221,12 @@ mod tests {
             let fixture = Fixture::new(1);
             assert!(fixture.broker.promote(&fixture.request, fault).is_err());
             fixture.broker.recover().unwrap();
-            verify_fixture_output(&fixture.output()).unwrap();
+            verify_fixture_output(
+                &fixture.output(),
+                &fixture.request.release_set_digest,
+                &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+            )
+            .unwrap();
             let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
             let snapshot = load_ledger(&mut ledger).unwrap();
             assert_eq!(
@@ -2092,6 +2234,36 @@ mod tests {
                 LedgerKind::Published
             );
         }
+    }
+
+    #[test]
+    fn recovery_rejects_a_valid_but_cross_release_output_substitution() {
+        let fixture = Fixture::new(1);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        let second = create_request(
+            &fixture.handoff_parent,
+            &fixture.publication_parent,
+            "release-b",
+            1,
+            "two",
+        );
+        assert!(
+            fixture
+                .broker
+                .promote(&second, FaultPoint::AfterReady)
+                .is_err()
+        );
+        let second_stage = fixture
+            .publication_parent
+            .join(format!(".staging-{}", second.release_set_digest));
+        fs::remove_dir_all(&second_stage).unwrap();
+        copy_tree_for_substitution_test(&fixture.output(), &second_stage);
+        let error = fixture.broker.recover().unwrap_err();
+        assert!(error.to_string().contains("does not bind ledger"));
+        assert!(!Path::new(&second.output_root).exists());
     }
 
     #[test]
@@ -2124,7 +2296,12 @@ mod tests {
         let right = thread::spawn(move || right_broker.promote(&right_request, FaultPoint::None));
         let outcomes = [left.join().unwrap(), right.join().unwrap()];
         assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
-        verify_fixture_output(&fixture.output()).unwrap();
+        verify_fixture_output(
+            &fixture.output(),
+            &fixture.request.release_set_digest,
+            &hash_domain(REQUEST_DOMAIN, &fixture.request.canonical_json().unwrap()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2252,6 +2429,73 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_entry_flood_is_rejected_at_the_bounded_enumerator() {
+        let fixture = Fixture::new(1);
+        for index in 0..64 {
+            fs::write(
+                Path::new(&fixture.request.handoff_root).join(format!("unexpected-{index:02}")),
+                b"unexpected",
+            )
+            .unwrap();
+        }
+        assert!(bounded_directory_names(Path::new(&fixture.request.handoff_root), 3).is_err());
+        assert!(
+            fixture
+                .broker
+                .promote(&fixture.request, FaultPoint::None)
+                .is_err()
+        );
+        assert!(!fixture.output().exists());
+        let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
+        assert_eq!(load_ledger(&mut ledger).unwrap().next_sequence, 1);
+    }
+
+    #[test]
+    fn signed_pack_and_public_entry_floods_are_bounded() {
+        let pack_flood = Fixture::new(1);
+        pack_flood
+            .broker
+            .promote(&pack_flood.request, FaultPoint::None)
+            .unwrap();
+        for index in 0..64 {
+            fs::write(
+                pack_flood
+                    .output()
+                    .join(format!("cuda/unexpected-{index:02}.dll")),
+                b"unexpected",
+            )
+            .unwrap();
+        }
+        assert!(
+            verify_fixture_output(
+                &pack_flood.output(),
+                &pack_flood.request.release_set_digest,
+                &hash_domain(
+                    REQUEST_DOMAIN,
+                    &pack_flood.request.canonical_json().unwrap(),
+                ),
+            )
+            .is_err()
+        );
+
+        let public_flood = Fixture::new(1);
+        public_flood
+            .broker
+            .promote(&public_flood.request, FaultPoint::None)
+            .unwrap();
+        for index in 0..64 {
+            fs::write(
+                public_flood
+                    .output()
+                    .join(format!("unexpected-{index:02}.txt")),
+                b"unexpected",
+            )
+            .unwrap();
+        }
+        assert!(bounded_directory_names(&public_flood.output(), 3).is_err());
+    }
+
+    #[test]
     fn traversal_and_oversized_inventory_are_rejected_by_manifest_policy() {
         let fixture = Fixture::new(1);
         let manifest_path =
@@ -2318,5 +2562,53 @@ mod tests {
             );
             assert!(!fixture.output().exists());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let intake = temp.path().join("interop-intake");
+        let publication = temp.path().join("interop-publication");
+        let result = Command::new("pwsh")
+            .args([
+                "-NoProfile",
+                "-File",
+                repository
+                    .join("scripts/test-windows-gpu-pack-promotion.ps1")
+                    .to_str()
+                    .unwrap(),
+                "-InteropFixtureDirectory",
+                intake.to_str().unwrap(),
+                "-InteropPublicationDirectory",
+                publication.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "PowerShell producer failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let request_bytes = fs::read(intake.join("promotion-request.json")).unwrap();
+        let request: PromotionRequest = serde_json::from_slice(&request_bytes).unwrap();
+        assert_eq!(request.canonical_json().unwrap(), request_bytes);
+        let broker = FixtureBroker::initialize(
+            intake.clone(),
+            publication.clone(),
+            temp.path().join("interop-state"),
+        )
+        .unwrap();
+        broker.promote(&request, FaultPoint::None).unwrap();
+        verify_fixture_output(
+            Path::new(&request.output_root),
+            &request.release_set_digest,
+            &hash_domain(REQUEST_DOMAIN, &request.canonical_json().unwrap()),
+        )
+        .unwrap();
     }
 }

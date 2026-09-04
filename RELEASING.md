@@ -68,11 +68,14 @@ compile, runs no repository script, and receives no raw private key. The
 independently installed executable is an unprivileged broker client, not a
 signer. Its digest is pinned in protected environment configuration and the
 workflow holds a read-only, no-write/delete handle from hashing through child
-exit to prevent hash-to-exec replacement. The client has no key, ledger, state
-path, configurable broker endpoint, or fixture mode. A separately privileged
-Windows service or remote HSM broker must copy hostile input into broker-owned
-storage, enforce the approved toolchain/version/security epoch, reject replay
-with independently durable state, sign and verify both packs, and publish only
+exit. This narrows direct leaf-file replacement only: the standard .NET open
+does not provide `FILE_FLAG_OPEN_REPARSE_POINT`, pin ancestor handles, prove the
+installation DACL, or constrain future loader dependencies. The client has no
+key, ledger, state path, configurable broker endpoint, or fixture mode. A
+separately privileged Windows service or remote HSM broker must copy hostile
+input into broker-owned storage, enforce the approved toolchain, version, and
+security epoch, reject replay with independently durable state, sign and verify
+both packs, and publish only
 the complete CUDA+Vulkan pair plus a protected receipt. The
 resulting artifact is not activated or included in the normal release
 automatically.

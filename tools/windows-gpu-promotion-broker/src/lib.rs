@@ -102,7 +102,9 @@ impl PromotionRequest {
                 .map(str::to_owned)
                 .ok_or_else(|| anyhow!("option value is not UTF-8"))
         };
-        let minimum_security_epoch = text("--minimum-security-epoch")?
+        let minimum_security_epoch_text = text("--minimum-security-epoch")?;
+        validate_positive_decimal(&minimum_security_epoch_text, 20)?;
+        let minimum_security_epoch = minimum_security_epoch_text
             .parse::<u64>()
             .map_err(|_| anyhow!("minimum security epoch is noncanonical"))?;
         let request = Self {
@@ -149,6 +151,9 @@ impl PromotionRequest {
             {
                 bail!("source identity is noncanonical");
             }
+        }
+        if self.workflow_source_sha != self.source_revision {
+            bail!("workflow source does not match the default-branch source revision");
         }
         for (value, maximum) in [
             (&self.run_id, 20),
@@ -315,5 +320,32 @@ mod request_tests {
             .unwrap()
             .insert("key_path".into(), "forbidden".into());
         assert!(serde_json::from_value::<PromotionRequest>(value).is_err());
+    }
+
+    #[test]
+    fn default_branch_workflow_source_must_equal_the_pack_source_revision() {
+        let mut arguments = valid_args();
+        let index = arguments
+            .iter()
+            .position(|value| value == "--workflow-source-sha")
+            .unwrap();
+        arguments[index + 1] = OsString::from("f".repeat(40));
+        assert!(PromotionRequest::parse_cli(arguments).is_err());
+    }
+
+    #[test]
+    fn minimum_security_epoch_requires_canonical_positive_u64_decimal() {
+        for invalid in ["01", "+1", "0", "18446744073709551616"] {
+            let mut arguments = valid_args();
+            let index = arguments
+                .iter()
+                .position(|value| value == "--minimum-security-epoch")
+                .unwrap();
+            arguments[index + 1] = OsString::from(invalid);
+            assert!(
+                PromotionRequest::parse_cli(arguments).is_err(),
+                "accepted noncanonical epoch {invalid}"
+            );
+        }
     }
 }
