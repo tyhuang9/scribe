@@ -1671,6 +1671,18 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "SetAccessRuleProtection",
         "S-1-5-32-544",
         "ReadAndExecute",
+        "function Test-FileSystemAccessRuleConstructorNormalization",
+        "0x000200a9",
+        "0x001200a9",
+        "$persistedRights",
+        "FileSystemAccessRule constructor did not normalize",
+        "[Security.AccessControl.FileSystemRights]::ReadAndExecute",
+        "[Security.AccessControl.FileSystemRights]::Synchronize",
+        "[Security.AccessControl.FileSystemRights]::Write",
+        "[Security.AccessControl.FileSystemRights]::Delete",
+        "[Security.AccessControl.FileSystemRights]::ChangePermissions",
+        "[Security.AccessControl.FileSystemRights]::TakeOwnership",
+        "$persistedReadAndExecuteRights",
         "refusing destructive cleanup",
         "FromSeconds(4)",
         "$stopProof = [Diagnostics.Stopwatch]::StartNew()",
@@ -1775,6 +1787,17 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     let non_elevated_return = transport_test
         .find("if (-not $isElevated)")
         .expect("SCM transport harness keeps its non-elevated return");
+    let constructor_normalization_start = transport_test
+        .find("function Test-FileSystemAccessRuleConstructorNormalization")
+        .expect("SCM transport harness defines its pure FileSystemAccessRule constructor-normalization test");
+    let constructor_normalization_call = transport_test
+        .rfind("Test-FileSystemAccessRuleConstructorNormalization")
+        .expect("SCM transport harness invokes its pure FileSystemAccessRule constructor-normalization test");
+    assert!(
+        constructor_normalization_start < constructor_normalization_call
+            && constructor_normalization_call < non_elevated_return,
+        "SCM transport harness must run constructor normalization before its non-elevated return"
+    );
     let ephemeral_account_creation = transport_test
         .find("$ephemeralAccount = New-EphemeralStandardAccount")
         .expect("SCM transport harness creates its ephemeral account");

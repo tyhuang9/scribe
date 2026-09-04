@@ -1895,6 +1895,33 @@ try {
     }
     finally { $squatter.Dispose() }
 
+    function Test-FileSystemAccessRuleConstructorNormalization {
+        $inputRights = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+        Assert-True ([uint32]$inputRights -eq 0x000200a9) 'The input ReadAndExecute access mask changed before FileSystemAccessRule normalization.'
+        $persistedRights = [Security.AccessControl.FileSystemRights](
+            [uint32]$inputRights -bor
+            [uint32][Security.AccessControl.FileSystemRights]::Synchronize
+        )
+        Assert-True ([uint32]$persistedRights -eq 0x001200a9) 'The expected ReadAndExecute|Synchronize access mask changed.'
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+            [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+            $inputRights,
+            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        Assert-True ([uint32]$rule.FileSystemRights -eq [uint32]$persistedRights) 'FileSystemAccessRule constructor did not normalize ReadAndExecute to its persisted ReadAndExecute|Synchronize mask.'
+        foreach ($forbidden in @(
+            [Security.AccessControl.FileSystemRights]::Write,
+            [Security.AccessControl.FileSystemRights]::Delete,
+            [Security.AccessControl.FileSystemRights]::ChangePermissions,
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
+        )) {
+            Assert-True (([uint32]$rule.FileSystemRights -band [uint32]$forbidden) -eq 0) "FileSystemAccessRule constructor granted forbidden authority $forbidden."
+        }
+    }
+
+    Test-FileSystemAccessRuleConstructorNormalization
     $runnerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
         $runnerSid = $runnerIdentity.User.Value
@@ -1941,6 +1968,10 @@ try {
     $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
     $propagation = [Security.AccessControl.PropagationFlags]::None
     $allow = [Security.AccessControl.AccessControlType]::Allow
+    $persistedReadAndExecuteRights = [Security.AccessControl.FileSystemRights](
+        [uint32][Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+        [uint32][Security.AccessControl.FileSystemRights]::Synchronize
+    )
     foreach ($entry in @(
         @('S-1-5-18', [Security.AccessControl.FileSystemRights]::FullControl),
         @('S-1-5-32-544', [Security.AccessControl.FileSystemRights]::FullControl),
@@ -1964,7 +1995,7 @@ try {
         $expectedRights = if ($expectedSid -ceq 'S-1-5-18' -or $expectedSid -ceq 'S-1-5-32-544') {
             [Security.AccessControl.FileSystemRights]::FullControl
         }
-        else { [Security.AccessControl.FileSystemRights]::ReadAndExecute }
+        else { $persistedReadAndExecuteRights }
         Assert-True ([uint32]$matchingRules[0].FileSystemRights -eq [uint32]$expectedRights) "SCM test staging rights changed for $expectedSid."
         Assert-True ($matchingRules[0].InheritanceFlags -eq $inheritance -and $matchingRules[0].PropagationFlags -eq $propagation) "SCM test staging inheritance changed for $expectedSid."
     }

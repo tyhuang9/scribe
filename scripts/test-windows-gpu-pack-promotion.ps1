@@ -368,6 +368,25 @@ try {
     Assert-True ($transportHarness.Contains('RegRenameKey(')) 'Broker harness lacks an exact registry-object boundary-swap test.'
     Assert-True ($transportHarness.Contains('KEY_WRITE | DELETE | KEY_QUERY_VALUE | KEY_WOW64_64KEY')) 'Broker harness boundary rename lacks retained parent/leaf mutation rights.'
     Assert-True ($transportHarness.Contains('DELETE | READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY')) 'Broker harness cleanup does not open the exact no-follow key with delete and validation rights.'
+    $constructorNormalizationStart = $transportHarness.IndexOf('function Test-FileSystemAccessRuleConstructorNormalization', [StringComparison]::Ordinal)
+    $constructorNormalizationCall = $transportHarness.LastIndexOf('Test-FileSystemAccessRuleConstructorNormalization', [StringComparison]::Ordinal)
+    $constructorNormalizationNonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
+    Assert-True ($constructorNormalizationStart -ge 0 -and $constructorNormalizationStart -lt $constructorNormalizationCall -and $constructorNormalizationCall -lt $constructorNormalizationNonElevatedReturn) 'Broker harness does not run its pure FileSystemAccessRule constructor-normalization test before the non-elevated return.'
+    foreach ($requiredConstructorNormalization in @(
+        '0x000200a9',
+        '0x001200a9',
+        '$persistedRights',
+        'FileSystemAccessRule constructor did not normalize',
+        '[Security.AccessControl.FileSystemRights]::ReadAndExecute',
+        '[Security.AccessControl.FileSystemRights]::Synchronize',
+        '[Security.AccessControl.FileSystemRights]::Write',
+        '[Security.AccessControl.FileSystemRights]::Delete',
+        '[Security.AccessControl.FileSystemRights]::ChangePermissions',
+        '[Security.AccessControl.FileSystemRights]::TakeOwnership',
+        '$persistedReadAndExecuteRights'
+    )) {
+        Assert-True ($transportHarness.Contains($requiredConstructorNormalization)) "Broker harness lost FileSystemAccessRule constructor-normalization contract $requiredConstructorNormalization."
+    }
     Assert-True (-not $transportHarness.Contains('.DeleteSubKey(')) 'Broker harness cleanup regained path-based registry deletion.'
     Assert-True ($transportHarness.Contains('PrivilegeRestoreRetryModel')) 'Broker harness lacks deterministic test-only privilege restoration injection.'
     Assert-True ($transportHarness.Contains('marker=incomplete;restore_attempts=3;token_owned=true;previous_state=37')) 'Broker harness does not prove persistent restoration failure retains fail-closed state until process termination.'
