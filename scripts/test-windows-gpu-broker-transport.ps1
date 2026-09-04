@@ -1391,7 +1391,7 @@ function New-EphemeralStandardAccount {
     $standardUsersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
     $users = @(Get-LocalGroupMember -SID $standardUsersSid)
     if (@($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 0) {
-        Add-LocalGroupMember -SID $standardUsersSid -Member $sid
+        Add-LocalGroupMember -SID $standardUsersSid -Member $verified
         $users = @(Get-LocalGroupMember -SID $standardUsersSid)
     }
     Assert-True (@($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 1) 'Ephemeral account is not an exact member of the standard Users group.'

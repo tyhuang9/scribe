@@ -1734,7 +1734,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "RunEphemeralStalledProbe",
         "$current.User.Value -ceq $ExpectedSid",
         "$expectedRid -ge 1000",
-        "Add-LocalGroupMember -SID $standardUsersSid -Member $sid",
+        "Add-LocalGroupMember -SID $standardUsersSid -Member $verified",
         "Assert-True (-not $stalledProcess.HasExited)",
         "Disable-LocalUser -SID $state.Sid",
         "Remove-LocalUser -SID $state.Sid",
