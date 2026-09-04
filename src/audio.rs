@@ -1328,7 +1328,7 @@ fn capture_worker(
             .clamp(1, config::MAX_RECORDING_SECONDS)
             .into(),
     );
-    let mut explicit_stop: Option<(Instant, usize, Duration, Duration)> = None;
+    let mut explicit_stop: Option<(Duration, Duration)> = None;
     let mut restart_policy = RestartPolicy::new(MAX_STREAM_RESTARTS);
     let mut start_notified = false;
     let mut first_sample = None;
@@ -1369,15 +1369,15 @@ fn capture_worker(
             let _ = started_tx.send(Ok(()));
             start_notified = true;
         }
-        if explicit_stop.is_none() && stop_requested.load(Ordering::Acquire) {
-            explicit_stop = Some((
-                Instant::now(),
-                pipeline.source_frames(),
+        if stop_requested.load(Ordering::Acquire) {
+            latch_explicit_stop(
+                &mut explicit_stop,
+                &mut pipeline,
                 elapsed,
                 cancellation
                     .stop_observed_elapsed()
                     .unwrap_or_else(|| context.observed_at.elapsed()),
-            ));
+            );
         }
         if explicit_stop.is_none() {
             pipeline.publish_due_previews();
@@ -1394,7 +1394,7 @@ fn capture_worker(
                     dropped_samples: dropped_samples.load(Ordering::Relaxed).max(1),
                 });
             }
-            FAULT_STREAM => {
+            FAULT_STREAM if should_restart_stream_after_fault(explicit_stop.is_some()) => {
                 drop(stream.take());
                 let restarted =
                     match retry_stream_start(&mut restart_policy, STREAM_RESTART_BACKOFF, || {
@@ -1436,26 +1436,22 @@ fn capture_worker(
                     };
                 stream = Some(restarted);
             }
+            // Once explicit stop is latched, dropping the current stream and
+            // draining its already-queued PCM is both faster and safer than a
+            // device lookup/rebuild that cannot contribute intentional audio.
+            FAULT_STREAM => {}
             _ => {}
         }
 
         if discard_requested.load(Ordering::Acquire) {
             return discard_capture(&mut stream, &mut consumer, &mut pipeline);
         }
-        let explicit_post_roll_complete =
-            explicit_stop.is_some_and(|(stop_seen, source_frame, _, _)| {
-                let post_roll_frames =
-                    duration_to_source_frames(options.vad.post_roll, format.sample_rate);
-                pipeline.source_frames() >= source_frame.saturating_add(post_roll_frames)
-                    || stop_seen.elapsed() >= options.vad.post_roll
-            });
         if let Some(reason) = select_stop_reason(
             explicit_stop.is_some(),
-            explicit_post_roll_complete,
             pipeline.endpoint_triggered(),
             elapsed >= maximum_duration,
         ) {
-            let trigger_elapsed = explicit_stop.map_or(elapsed, |(_, _, trigger, _)| trigger);
+            let trigger_elapsed = explicit_stop.map_or(elapsed, |(trigger, _)| trigger);
             break (reason, trigger_elapsed);
         }
 
@@ -1499,7 +1495,7 @@ fn capture_worker(
         stream_play_returned,
         first_native_callback: decode_elapsed_us(first_callback_us.load(Ordering::Acquire)),
         first_sample: first_sample.unwrap_or_default(),
-        release: explicit_stop.map(|(_, _, _, release)| release),
+        release: explicit_stop.map(|(_, release)| release),
         stream_dropped,
         final_audio_ready,
         finalization: finalization_started.elapsed(),
@@ -1786,19 +1782,13 @@ fn acquire_speech_detector(
         .map(Some)
 }
 
-fn duration_to_source_frames(duration: Duration, sample_rate: u32) -> usize {
-    let scaled = duration.as_nanos() * u128::from(sample_rate);
-    usize::try_from(scaled.div_ceil(1_000_000_000)).unwrap_or(usize::MAX)
-}
-
 fn select_stop_reason(
     explicit_pending: bool,
-    explicit_post_roll_complete: bool,
     endpoint: bool,
     maximum_duration: bool,
 ) -> Option<CaptureStopReason> {
     if explicit_pending {
-        explicit_post_roll_complete.then_some(CaptureStopReason::Explicit)
+        Some(CaptureStopReason::Explicit)
     } else if endpoint {
         Some(CaptureStopReason::Endpoint)
     } else if maximum_duration {
@@ -1806,6 +1796,24 @@ fn select_stop_reason(
     } else {
         None
     }
+}
+
+fn latch_explicit_stop(
+    explicit_stop: &mut Option<(Duration, Duration)>,
+    pipeline: &mut Pipeline,
+    elapsed: Duration,
+    release: Duration,
+) {
+    if explicit_stop.is_some() {
+        return;
+    }
+    *explicit_stop = Some((elapsed, release));
+    // Invalidate at the latch boundary, before FIFO drain/final preparation.
+    pipeline.invalidate_preview();
+}
+
+fn should_restart_stream_after_fault(explicit_stop_latched: bool) -> bool {
+    !explicit_stop_latched
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2081,6 +2089,8 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use crate::streaming::RollingPreviewSession;
+    use crate::transcription::{ModelId, RequestId, SessionId, StreamUpdate};
 
     struct CountingDetectorFactory {
         calls: AtomicUsize,
@@ -2651,18 +2661,98 @@ mod tests {
     #[test]
     fn explicit_stop_has_priority_over_endpoint_and_maximum_duration() {
         assert_eq!(
-            select_stop_reason(true, true, true, true),
+            select_stop_reason(true, true, true),
             Some(CaptureStopReason::Explicit)
         );
-        assert_eq!(select_stop_reason(true, false, true, true), None);
         assert_eq!(
-            select_stop_reason(false, false, true, true),
+            select_stop_reason(false, true, true),
             Some(CaptureStopReason::Endpoint)
         );
         assert_eq!(
-            select_stop_reason(false, false, false, true),
+            select_stop_reason(false, false, true),
             Some(CaptureStopReason::MaximumDuration)
         );
+    }
+
+    #[test]
+    fn explicit_stop_is_immediate_and_drains_all_callback_pcm() {
+        assert_eq!(
+            select_stop_reason(true, true, true),
+            Some(CaptureStopReason::Explicit),
+            "explicit stop must not wait for configured post-roll"
+        );
+        let (mut producer, mut consumer) = ring_buffer(8);
+        for sample in [0.2, 0.3, 0.4] {
+            producer.push(sample).unwrap();
+        }
+        let mut pipeline = Pipeline::new(
+            crate::prepared_audio::PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad_enabled: false,
+                endpointing_enabled: false,
+                ..CaptureOptions::default()
+            },
+            None,
+            Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+
+        drain_ring_all(&mut consumer, &mut pipeline, &AtomicBool::new(false)).unwrap();
+        let audio = pipeline
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(audio.samples.len(), 3);
+        assert_eq!(audio.source_frames, 3);
+    }
+
+    #[test]
+    fn explicit_latch_invalidates_preview_before_finalization() {
+        let mut preview =
+            RollingPreviewSession::<()>::new(|_| Ok(StreamUpdate::default())).unwrap();
+        let publisher =
+            preview.audio_publisher(SessionId(7), RequestId(9), ModelId::new("preview-model"));
+        let mut pipeline = Pipeline::new(
+            crate::prepared_audio::PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad_enabled: false,
+                ..CaptureOptions::default()
+            },
+            None,
+            Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher.clone()));
+        let mut explicit_stop = None;
+
+        latch_explicit_stop(
+            &mut explicit_stop,
+            &mut pipeline,
+            Duration::from_millis(10),
+            Duration::from_millis(9),
+        );
+
+        assert_eq!(
+            explicit_stop,
+            Some((Duration::from_millis(10), Duration::from_millis(9)))
+        );
+        assert!(!publisher.publish_window(0, vec![0.1; 16]).unwrap());
+        assert!(preview.stop_and_join(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn explicit_latch_suppresses_stream_fault_restart() {
+        assert!(should_restart_stream_after_fault(false));
+        assert!(!should_restart_stream_after_fault(true));
     }
 
     #[test]

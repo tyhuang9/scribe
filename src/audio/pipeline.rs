@@ -373,7 +373,14 @@ impl Pipeline {
             source_frames,
         )
         .map_err(|error| CaptureError::Preparation(error.to_string()))?;
-        self.publish_terminal_preview(&audio, start);
+        if stop_reason == CaptureStopReason::Explicit {
+            // Explicit release proceeds directly to the final pass. Invalidate
+            // both queued and late preview work even when an earlier partial
+            // was visible; endpoint/max-duration retain their graceful tail.
+            self.invalidate_preview();
+        } else {
+            self.publish_terminal_preview(&audio, start);
+        }
         Ok(Some(audio))
     }
 
@@ -1520,6 +1527,57 @@ mod tests {
         assert!(preview_session.stop_and_join(Duration::from_secs(1)));
         assert!(audio.samples.len() <= PREVIEW_WINDOW_FRAMES);
         assert!(snapshot_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_stop_invalidates_preview_without_a_terminal_snapshot_after_partial() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx.send(snapshot.identity.sequence).unwrap();
+            Ok(StreamUpdate {
+                tentative: "partial".to_owned(),
+                ..StreamUpdate::default()
+            })
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(14),
+            RequestId(16),
+            ModelId::new("preview-model"),
+        );
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                endpointing_enabled: false,
+                ..CaptureOptions::default()
+            },
+            default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+
+        push_mono_ms(&mut pipeline, 500, 0.5);
+        pipeline.publish_due_previews();
+        assert_eq!(snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !preview_session.has_emitted_partial() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(preview_session.has_emitted_partial());
+
+        let _audio = pipeline
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .unwrap();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        assert!(snapshot_rx.try_recv().is_err());
+        assert!(preview_session.try_next().is_none());
     }
 
     #[test]
