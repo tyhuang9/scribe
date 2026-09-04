@@ -261,6 +261,12 @@ try {
     Assert-True ($brokerNativeProduction.Contains('RegEnumValueW')) 'Broker does not enumerate exact policy value names before case-insensitive lookup.'
     Assert-True ($brokerNativeProduction.Contains('actual_names.as_slice() != expected_names.as_slice()')) 'Broker does not compare policy value-name spelling ordinally.'
     Assert-True ($brokerNativeProduction.Contains('require_user_sid(token.raw(), authorized_client_sid)')) 'Broker does not require exact client TokenUser equality.'
+    foreach ($requiredKernelAccessBoundary in @('LookupAccountSidW', 'SidTypeUser', 'GetKernelObjectSecurity', 'SetKernelObjectSecurity', 'TokenSessionId', 'PROCESS_CLIENT_QUERY_ACCESS', 'TOKEN_CLIENT_QUERY_ACCESS', 'require_exact_query_acl_delta')) {
+        Assert-True ($brokerNativeProduction.Contains($requiredKernelAccessBoundary)) "Broker lost kernel-object query grant boundary $requiredKernelAccessBoundary."
+    }
+    foreach ($forbiddenKernelAccessMechanism in @('ProcessIdToSessionId', 'SetTokenInformation', 'TokenDefaultDacl', 'AdjustTokenPrivileges')) {
+        Assert-True (-not $brokerNativeProduction.Contains($forbiddenKernelAccessMechanism)) "Broker regained forbidden kernel-object access mechanism $forbiddenKernelAccessMechanism."
+    }
     Assert-True (-not $brokerNativeProduction.Contains(';;;AU)')) 'Broker pipe regained Authenticated Users admission.'
     $provisioner = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\provision-windows-gpu-broker-client-policy.ps1') -Raw
     Assert-True ($provisioner.Contains('RegCreateKeyExW')) 'Client policy provisioner is not create-new.'
@@ -376,12 +382,12 @@ try {
         -Source $transportHarness `
         -StartMarker 'function Test-ServerAccessProbeRecord' `
         -EndMarker 'function Test-SanitizedClientDiagnosticCategoryContract'
-    Assert-True ($sanitizationHelpersDigest -ceq '0c8941ed27e7f1f85c346b7628d3b0d357eb37999a6e787df8eaa1cde95627c5') 'Sanitized diagnostic helpers changed; review their exact output behavior before updating the pinned digest.'
+    Assert-True ($sanitizationHelpersDigest -ceq 'f2e1655725a4834ba9465397c63a78b59ef96ca70e279c06a8505c0accd71c93') 'Sanitized diagnostic helpers changed; review their exact output behavior before updating the pinned digest.'
     $authenticatedRegionDigest = Get-NormalizedSourceRegionSha256 `
         -Source $transportHarness `
         -StartMarker $authenticatedCallAssignment `
         -EndMarker '$stop = Invoke-Sc -Arguments @(''stop'', $serviceName) -AllowFailure'
-    Assert-True ($authenticatedRegionDigest -ceq '4658664c96050cd1385f664203eb99a6dac9e2e45b9a1815c73bdce3b40dd175') 'Authenticated real-client region changed; review every captured-output use before updating the pinned digest.'
+    Assert-True ($authenticatedRegionDigest -ceq 'ccd48fcd90b0e5ea291e047f18cb2b614077254371141bb31a8aad171a67cb7c') 'Authenticated real-client region changed; review every captured-output use before updating the pinned digest.'
     $preBlockAliasMutation = $transportHarness.Replace(
         $authenticatedCallAssignment,
         $authenticatedCallAssignment + "`r`n    `$roundTripAlias = `$roundTrip`r`n    throw `$roundTripAlias.PSObject.Properties['Stderr'].Value"
@@ -506,7 +512,7 @@ try {
     $serverAccessDispatch = $transportHarness.IndexOf('if ($RunEphemeralServerAccessProbe)', [StringComparison]::Ordinal)
     $mainNativeTypes = $transportHarness.IndexOf("if (-not ('Scribe.GpuBroker.RegistryCleanupNative' -as [type]))", [StringComparison]::Ordinal)
     Assert-True ($serverAccessNative -ge 0 -and $serverAccessNative -lt $serverAccessDispatch -and $serverAccessDispatch -lt $mainNativeTypes) 'Server-access native probe is not available inside the early credential-child dispatcher.'
-    foreach ($requiredServerAccessProbe in @('PROCESS_QUERY_LIMITED_INFORMATION = 0x1000', 'TOKEN_QUERY = 0x0008', 'ProcessIdToSessionId', 'OpenProcess(', 'OpenProcessToken(', 'CloseHandle(', 'ExpectedBrokerProcessId', 'Test-ServerAccessProbeRecord')) {
+    foreach ($requiredServerAccessProbe in @('PROCESS_QUERY_LIMITED_INFORMATION = 0x1000', 'TOKEN_QUERY = 0x0008', 'ProcessIdToSessionId', 'OpenProcess(', 'OpenProcessToken(', 'GetTokenInformation(', 'ForbiddenProcessRights', 'ForbiddenTokenRights', 'VerifyMinimalRights', 'CloseHandle(', 'ExpectedBrokerProcessId', 'Test-ServerAccessProbeRecord')) {
         Assert-True ($transportHarness.Contains($requiredServerAccessProbe)) "Broker harness lost server-access probe contract $requiredServerAccessProbe."
     }
     $serverAccessTestStart = $transportHarness.IndexOf('function Test-ServerAccessProbeContract', [StringComparison]::Ordinal)
@@ -526,7 +532,7 @@ try {
     $firstCredentialStop = $transportHarness.IndexOf('[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)', $firstCredentialAbsent, [StringComparison]::Ordinal)
     Assert-True ($firstCredentialCall -ge 0 -and $firstCredentialCall -lt $firstCredentialStatus -and $firstCredentialStatus -lt $firstCredentialAbsent -and $firstCredentialAbsent -lt $firstCredentialStop -and $firstCredentialStop -lt $secondCredentialCall) 'First authenticated real-client call does not assert no-touch paths after result/status postconditions and before service stop work.'
     Assert-True ([regex]::Matches($transportHarness.Substring($firstCredentialCall, $secondCredentialCall - $firstCredentialCall), [regex]::Escape($noTouchAssertion)).Count -eq 1) 'First authenticated real-client region must contain exactly one post-call no-touch assertion.'
-    $secondCredentialStatus = $transportHarness.IndexOf('Restarted orphan-policy service was not healthy after denial.', $secondCredentialCall, [StringComparison]::Ordinal)
+    $secondCredentialStatus = $transportHarness.IndexOf('Rejected unmapped-policy restart exposed a broker pipe.', $secondCredentialCall, [StringComparison]::Ordinal)
     $secondCredentialAbsent = $transportHarness.IndexOf($noTouchAssertion, $secondCredentialStatus, [StringComparison]::Ordinal)
     $secondCredentialStop = $transportHarness.IndexOf('[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)', $secondCredentialAbsent, [StringComparison]::Ordinal)
     Assert-True ($secondCredentialCall -lt $secondCredentialStatus -and $secondCredentialStatus -lt $secondCredentialAbsent -and $secondCredentialAbsent -lt $secondCredentialStop) 'Second authenticated real-client call does not assert no-touch paths after result/status postconditions and before service stop work.'

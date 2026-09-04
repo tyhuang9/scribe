@@ -34,11 +34,26 @@ through the Windows Service Control Manager. It refuses to create the pipe
 unless its own token is the expected restricted LocalService token and a fixed
 64-bit `HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization` policy
 fully verifies. The policy contains exactly DWORD `SchemaVersion=1` and a
-canonical `AuthorizedClientSid`, no subkeys or extra values, SYSTEM ownership,
-and a protected noninheriting DACL with exactly SYSTEM/Administrators full
-control plus service-SID read. The service snapshots the SID for its lifetime;
-registry mutation requires restart and never broadens a running instance. A
-valid orphan SID can lock every client out.
+canonical `AuthorizedClientSid` that resolves as a user account, no subkeys or
+extra values, SYSTEM ownership, and a protected noninheriting DACL with exactly
+SYSTEM/Administrators full control plus service-SID read. A resolved group or
+unmapped SID stops startup before any client query grant or pipe is created.
+The service snapshots the SID for its lifetime; registry mutation requires
+restart and never broadens a running instance.
+
+For each service lifetime, the authenticated service adds only
+`TOKEN_QUERY` on its primary token object and
+`PROCESS_QUERY_LIMITED_INFORMATION` on its process object for that snapshotted
+client SID. It preserves and rereads the existing owner and ordered ACE
+inventory before creating the first pipe; an existing client ACE, owner match,
+noncanonical ACL, or imprecise post-write delta stops startup. These transient
+rights belong only to those process/token objects and make no persistent policy
+change; retained query handles can keep the terminated objects alive until the
+handles close. They do not modify the token's `TokenDefaultDacl`, grant process
+memory or control access, or permit token duplication, impersonation,
+adjustment, or ACL changes. The client uses
+the retained query-only token handle to require `TokenSessionId=0` before the
+existing LocalService and restricted-service-SID checks.
 
 The local-only, first-instance-only, message-mode, bounded pipe DACL contains
 exactly service-SID generic-all and the configured client SID with mask
@@ -123,8 +138,8 @@ then enables the account and launches those copies with its primary credentials,
 `LoadUserProfile=false`, and a cleared minimal environment. The policy and
 staging ACL bind only that account's canonical machine SID (RID 1000 or
 greater); the elevated runner remains a wrong-identity fixture. The harness
-proves invalid-policy and wrong-SID denial, exact access-mask and snapshot
-behavior, and performs identity-safe cleanup without creating a profile or
+proves invalid-policy, non-user/unmapped-SID startup denial, wrong-SID denial,
+exact access-mask and snapshot behavior, and performs identity-safe cleanup without creating a profile or
 persisting credential material. Account cleanup validates its exact SID, name,
 unique marker, and expiry, disables it, deletes only by SID, and drops ownership
 immediately after confirmed deletion. The harness

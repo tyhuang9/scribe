@@ -117,6 +117,33 @@ namespace Scribe.GpuBroker {
     public static class ServerAccessProbeNative {
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const uint TOKEN_QUERY = 0x0008;
+        private const uint TOKEN_SESSION_ID = 12;
+        private const int ERROR_ACCESS_DENIED = 5;
+        private static readonly uint[] ForbiddenProcessRights = new uint[] {
+            0x00000001, // PROCESS_TERMINATE
+            0x00000010, // PROCESS_VM_READ
+            0x00000040, // PROCESS_DUP_HANDLE
+            0x00000400, // PROCESS_QUERY_INFORMATION
+            0x00010000, // DELETE
+            0x00020000, // READ_CONTROL
+            0x00040000, // WRITE_DAC
+            0x00080000, // WRITE_OWNER
+            0x00100000  // SYNCHRONIZE
+        };
+        private static readonly uint[] ForbiddenTokenRights = new uint[] {
+            0x00000001, // TOKEN_ASSIGN_PRIMARY
+            0x00000002, // TOKEN_DUPLICATE
+            0x00000004, // TOKEN_IMPERSONATE
+            0x00000010, // TOKEN_QUERY_SOURCE
+            0x00000020, // TOKEN_ADJUST_PRIVILEGES
+            0x00000040, // TOKEN_ADJUST_GROUPS
+            0x00000080, // TOKEN_ADJUST_DEFAULT
+            0x00000100, // TOKEN_ADJUST_SESSIONID
+            0x00010000, // DELETE
+            0x00020000, // READ_CONTROL
+            0x00040000, // WRITE_DAC
+            0x00080000  // WRITE_OWNER
+        };
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -131,6 +158,15 @@ namespace Scribe.GpuBroker {
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool OpenProcessToken(IntPtr process, uint desiredAccess, out IntPtr token);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetTokenInformation(
+            IntPtr token,
+            uint informationClass,
+            out uint information,
+            uint informationLength,
+            out uint returnLength);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -168,6 +204,49 @@ namespace Scribe.GpuBroker {
             return "ephemeral-server-access;session=" + session +
                 ";process=ok:0;token=" + tokenResult;
         }
+
+        public static void VerifyMinimalRights(uint processId) {
+            IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+            if (process == IntPtr.Zero)
+                throw new InvalidOperationException("Exact broker process query access was denied.");
+            IntPtr token = IntPtr.Zero;
+            try {
+                if (!OpenProcessToken(process, TOKEN_QUERY, out token))
+                    throw new InvalidOperationException("Exact broker token query access was denied.");
+                uint sessionId;
+                uint returnLength;
+                if (!GetTokenInformation(token, TOKEN_SESSION_ID, out sessionId, 4, out returnLength) ||
+                    returnLength != 4 || sessionId != 0)
+                    throw new InvalidOperationException("Broker token session identity was rejected.");
+
+                foreach (uint forbidden in ForbiddenProcessRights) {
+                    IntPtr excessive = OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | forbidden,
+                        false,
+                        processId);
+                    if (excessive != IntPtr.Zero) {
+                        CloseHandle(excessive);
+                        throw new InvalidOperationException("Broker process granted excessive client rights.");
+                    }
+                    if (Marshal.GetLastWin32Error() != ERROR_ACCESS_DENIED)
+                        throw new InvalidOperationException("Broker process excess-right denial was noncanonical.");
+                }
+                foreach (uint forbidden in ForbiddenTokenRights) {
+                    IntPtr excessive;
+                    if (OpenProcessToken(process, TOKEN_QUERY | forbidden, out excessive)) {
+                        CloseHandle(excessive);
+                        throw new InvalidOperationException("Broker token granted excessive client rights.");
+                    }
+                    if (Marshal.GetLastWin32Error() != ERROR_ACCESS_DENIED)
+                        throw new InvalidOperationException("Broker token excess-right denial was noncanonical.");
+                }
+            }
+            finally {
+                if (token != IntPtr.Zero)
+                    CloseHandle(token);
+                CloseHandle(process);
+            }
+        }
     }
 }
 '@
@@ -187,6 +266,7 @@ if ($ephemeralProbeCount -eq 1) {
         Assert-True (Test-ServerAccessProbeRecord -Record $serverAccessRecord) 'Server-access probe returned a noncanonical record.'
         [Console]::Out.WriteLine($serverAccessRecord)
         [Console]::Out.Flush()
+        [Scribe.GpuBroker.ServerAccessProbeNative]::VerifyMinimalRights($ExpectedBrokerProcessId)
         return
     }
 
@@ -2683,17 +2763,7 @@ try {
     $provisioned = New-ProtectedPolicy -Sid $orphanSid
     Assert-True ($provisioned.ExitCode -eq 0) 'Could not provision the orphan-SID denial fixture.'
     Assert-ExactPolicyAcl
-    $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
-    Assert-True ($start.ExitCode -eq 0) "SCM rejected the syntactically valid orphan-SID policy: $($start.Stderr)"
-    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
-    $wrongIdentity = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
-    Assert-True ($wrongIdentity.ExitCode -eq 74) 'Wrong TokenUser SID did not fail closed without a response.'
-    Assert-True ($wrongIdentity.Stderr.Contains('transport was rejected', [StringComparison]::Ordinal)) 'Wrong TokenUser SID did not emit the rejected-transport diagnostic.'
-    Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Orphan SID denial stopped the healthy service.'
-    [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
-    $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
-    Assert-True ($stop.ExitCode -eq 0) 'SCM rejected the orphan-policy stop request.'
-    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+    Assert-RejectedServiceStartup -Label 'Unmapped policy SID' -Client $client -ClientArguments $arguments
     Remove-OwnedPolicy
 
     $provisioned = New-ProtectedPolicy -Sid $ephemeralSid
@@ -2752,34 +2822,41 @@ try {
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
     Assert-True ($start.ExitCode -eq 0) "SCM rejected the second service start: $($start.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    $serverAccessService = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
+    $serverAccessController = Get-BrokerService
+    Assert-True ($null -ne $serverAccessController -and $serverAccessController.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Server-access proof requires the exact owned broker service to remain running.'
+    $serverAccessProcessId = [uint32]$serverAccessService.ProcessId
+    Assert-True ($serverAccessProcessId -gt 0) 'Server-access proof requires the exact owned broker service process ID.'
+    $serverAccessProbe = Invoke-EphemeralProcess -FilePath $probePowerShell -Arguments @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-File', $harnessForCredential,
+        '-ExpectedEphemeralSid', $ephemeralSid,
+        '-ExpectedBrokerProcessId', $serverAccessProcessId.ToString([Globalization.CultureInfo]::InvariantCulture),
+        '-RunEphemeralServerAccessProbe'
+    ) -TimeoutSeconds 20 -AllowFailure
+    Assert-True ($serverAccessProbe.Stdout.Length -le 192) 'Server-access proof exceeded its canonical output bound.'
+    $serverAccessProbeRecord = $serverAccessProbe.Stdout.Trim()
+    Assert-True (Test-ServerAccessProbeRecord -Record $serverAccessProbeRecord) 'Server-access proof emitted a noncanonical diagnostic record.'
+    Assert-True ($serverAccessProbe.ExitCode -eq 0) "Exact query or excess-right server-access proof failed after validated record $serverAccessProbeRecord."
+    Assert-True ($serverAccessProbe.Stderr.Length -eq 0) 'Successful server-access proof emitted unexpected diagnostics.'
+    Assert-True ($serverAccessProbeRecord -ceq 'ephemeral-server-access;session=error:5;process=ok:0;token=ok:0') 'Server-access proof did not establish exact query access while retaining ProcessIdToSessionId denial.'
+    $serverAccessServiceAfterProbe = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
+    $serverAccessControllerAfterProbe = Get-BrokerService
+    Assert-True ([uint32]$serverAccessServiceAfterProbe.ProcessId -eq $serverAccessProcessId -and $null -ne $serverAccessControllerAfterProbe -and $serverAccessControllerAfterProbe.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Exact owned broker service identity changed during server-access proof.'
     Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     $roundTrip = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     if ($roundTrip.ExitCode -ne 78) {
         $diagnosticService = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
         $diagnosticController = Get-BrokerService
-        Assert-True ($null -ne $diagnosticController -and $diagnosticController.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Server-access probe requires the exact owned broker service to remain running.'
+        Assert-True ($null -ne $diagnosticController -and $diagnosticController.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Client failure diagnostic requires the exact owned broker service to remain running.'
         $diagnosticProcessId = [uint32]$diagnosticService.ProcessId
-        Assert-True ($diagnosticProcessId -gt 0) 'Server-access probe requires the exact owned broker service process ID.'
-        $serverAccessProbe = Invoke-EphemeralProcess -FilePath $probePowerShell -Arguments @(
-            '-NoProfile',
-            '-NonInteractive',
-            '-File', $harnessForCredential,
-            '-ExpectedEphemeralSid', $ephemeralSid,
-            '-ExpectedBrokerProcessId', $diagnosticProcessId.ToString([Globalization.CultureInfo]::InvariantCulture),
-            '-RunEphemeralServerAccessProbe'
-        ) -TimeoutSeconds 20 -AllowFailure
-        Assert-True ($serverAccessProbe.ExitCode -eq 0) 'Server-access probe did not complete successfully.'
-        Assert-True ($serverAccessProbe.Stderr.Length -eq 0 -and $serverAccessProbe.Stdout.Length -le 192) 'Server-access probe emitted noncanonical output bounds.'
-        $serverAccessProbeRecord = $serverAccessProbe.Stdout.Trim()
-        Assert-True (Test-ServerAccessProbeRecord -Record $serverAccessProbeRecord) 'Server-access probe emitted a noncanonical diagnostic record.'
-        $diagnosticServiceAfterProbe = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
-        $diagnosticControllerAfterProbe = Get-BrokerService
-        Assert-True ([uint32]$diagnosticServiceAfterProbe.ProcessId -eq $diagnosticProcessId -and $null -ne $diagnosticControllerAfterProbe -and $diagnosticControllerAfterProbe.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Exact owned broker service identity changed during the read-only server-access probe.'
+        Assert-True ($diagnosticProcessId -eq $serverAccessProcessId) 'Exact owned broker service identity changed between server-access proof and client failure.'
         throw (Get-SanitizedClientFailureDiagnostic `
             -ExitCode ([int]$roundTrip.ExitCode) `
             -StandardOutput $roundTrip.Stdout `
             -StandardError $roundTrip.Stderr `
-            -ServiceStatus $diagnosticControllerAfterProbe.Status.ToString() `
+            -ServiceStatus $diagnosticController.Status.ToString() `
             -ServerAccessProbe $serverAccessProbeRecord)
     }
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
@@ -2793,16 +2870,13 @@ try {
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
 
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
-    Assert-True ($start.ExitCode -eq 0) 'SCM rejected restart with the mutated, syntactically valid orphan SID.'
-    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    Assert-True ($start.ExitCode -ne 0) 'Service restart accepted the mutated unmapped authorization SID.'
+    Wait-ServiceNotRunning -TimeoutSeconds 10
     $afterRestart = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
-    Assert-True ($afterRestart.ExitCode -eq 74) 'Service restart did not load the mutated authorization SID.'
-    Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Restarted orphan-policy service was not healthy after denial.'
+    Assert-True ($afterRestart.ExitCode -eq 78) 'Rejected unmapped-policy restart did not keep the broker unavailable.'
+    Assert-True ($afterRestart.Stderr.Contains('broker is unavailable', [StringComparison]::Ordinal)) 'Rejected unmapped-policy restart exposed a broker pipe.'
     Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output
     [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
-    $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
-    Assert-True ($stop.ExitCode -eq 0) "SCM rejected the final stop request: $($stop.Stderr)"
-    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
     Remove-OwnedPolicy
     Test-PartialAncestorCleanupOwnershipBoundary
     Set-LocalUser -SID $ephemeralAccount.Sid -Description 'foreign-cleanup-marker'

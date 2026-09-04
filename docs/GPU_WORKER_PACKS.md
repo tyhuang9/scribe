@@ -309,13 +309,15 @@ token contains the exact service SID as an enabled and restricting SID under
 restricted LocalService. Before its first pipe creation it loads and verifies
 the fixed Registry64 policy at
 `HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization`, containing only
-DWORD `SchemaVersion=1` and a canonical `AuthorizedClientSid`. The key must be
+DWORD `SchemaVersion=1` and a canonical `AuthorizedClientSid` that resolves as
+a user account. A resolved group or unmapped SID stops startup before any
+client query grant or pipe is created. The key must be
 SYSTEM-owned, inheritance-protected, have no subkeys or extra values, and have
 exactly SYSTEM/Administrators full-control plus service-SID read ACEs. The SID
 loader enumerates both value names and compares their exact ordinal UTF-16
 spelling before using the registry's case-insensitive query API. The SID is
 snapshotted for the service lifetime, so registry mutation requires restart
-and cannot broaden the running process. A valid orphan SID locks clients out.
+and cannot broaden the running process.
 
 The first-instance local-only message pipe contains exactly service-SID
 generic-all and configured-client mask `0x00100183`; AU, WD, BU, BA, AN,
