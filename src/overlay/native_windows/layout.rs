@@ -119,8 +119,8 @@ impl DisplayLayout {
                     content_center_y,
                     status: recording_mark,
                     recording_mark,
-                    elapsed: centered_rect(72.0, 48.0, 23.0, content_center_y, scale),
-                    lifecycle_status: centered_rect(58.0, 128.0, 23.0, content_center_y, scale),
+                    elapsed: centered_rect(76.0, 48.0, 23.0, content_center_y, scale),
+                    lifecycle_status: centered_rect(50.0, 100.0, 23.0, content_center_y, scale),
                     divider: None,
                     divider_line: None,
                     preview: None,
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_reuses_the_live_logo_timer_and_height_geometry_at_every_supported_dpi() {
+    fn compact_centers_its_timer_in_the_capsule_at_every_supported_dpi() {
         for dpi in [96, 120, 144, 192] {
             let live = DisplayLayout::from_bounds(
                 OverlayMode::Live,
@@ -279,7 +279,8 @@ mod tests {
             assert_eq!(compact.root.height(), live.root.height());
             assert_eq!(compact.content_center_y, live.content_center_y);
             assert_eq!(compact.recording_mark, live.recording_mark);
-            assert_eq!(compact.elapsed, live.elapsed);
+            assert_eq!(compact.elapsed.width(), live.elapsed.width());
+            assert_eq!(compact.elapsed.center_x(), compact.root.center_x());
             assert!(compact.divider.is_none());
             assert!(compact.divider_line.is_none());
             assert!(compact.preview.is_none());
@@ -297,6 +298,7 @@ mod tests {
             assert!(layout.lifecycle_status.x0 >= layout.recording_mark.x1);
             assert!(layout.lifecycle_status.x1 <= layout.root.x1);
             assert!(layout.lifecycle_status.width() > layout.elapsed.width());
+            assert_eq!(layout.lifecycle_status.center_x(), layout.root.center_x());
             assert_eq!(
                 layout.lifecycle_status.center_y(),
                 layout.content_center_y,
