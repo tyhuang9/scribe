@@ -2308,7 +2308,7 @@ mod tests {
         assert!(
             node_names(&microphone)
                 .iter()
-                .any(|name| name == "Try again")
+                .any(|name| name == "Try microphone access again")
         );
         assert!(
             node_names(&microphone)

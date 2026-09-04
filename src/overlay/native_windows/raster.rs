@@ -11,12 +11,12 @@ use windows_sys::Win32::Graphics::GdiPlus::{
     GdipFillPath, GdipGetFontCollectionFamilyCount, GdipGetFontCollectionFamilyList,
     GdipGetGenericFontFamilySansSerif, GdipGetImageGraphicsContext, GdipGraphicsClear,
     GdipMeasureString, GdipNewPrivateFontCollection, GdipPrivateAddMemoryFont,
-    GdipSetSmoothingMode, GdipSetStringFormatAlign, GdipSetStringFormatFlags,
-    GdipSetTextRenderingHint, GdipStringFormatGetGenericTypographic, GdiplusShutdown,
-    GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpFont, GpFontCollection, GpFontFamily,
-    GpGraphics, GpImage, GpPath, GpPen, GpSolidFill, GpStringFormat, Ok as GDI_PLUS_OK, RectF,
-    SmoothingModeAntiAlias8x8, StringAlignmentCenter, StringFormatFlagsMeasureTrailingSpaces,
-    StringFormatFlagsNoWrap, TextRenderingHintAntiAliasGridFit, UnitPixel,
+    GdipSetSmoothingMode, GdipSetStringFormatFlags, GdipSetTextRenderingHint,
+    GdipStringFormatGetGenericTypographic, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput,
+    GpBitmap, GpBrush, GpFont, GpFontCollection, GpFontFamily, GpGraphics, GpImage, GpPath, GpPen,
+    GpSolidFill, GpStringFormat, Ok as GDI_PLUS_OK, RectF, SmoothingModeAntiAlias8x8,
+    StringFormatFlagsMeasureTrailingSpaces, StringFormatFlagsNoWrap,
+    TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
 
 use super::{
@@ -1172,37 +1172,17 @@ impl<'a> Canvas<'a> {
         style: TextStyle,
         color: Argb,
     ) -> Result<(), RasterError> {
-        let font = Font::new(self.rasterizer, style, font_size)?;
-        let format = StringFormat::new()?;
-        status(
-            unsafe { GdipSetStringFormatAlign(format.0, StringAlignmentCenter) },
-            "center text",
+        let measured = self.measure_text(text, font_size, style)?.min(width);
+        self.draw_text_vertically_centered_in_rect(
+            text,
+            center_x - measured / 2.0,
+            width,
+            rect,
+            font_size,
+            style,
+            color,
         )?;
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let length = i32::try_from(wide.len()).map_err(|_| RasterError::TextTooLong)?;
-        let y = rect.center_y() - self.rasterizer.baseline_ink_center_y(font_size, style)?;
-        let layout = RectF {
-            X: center_x - width / 2.0,
-            Y: y,
-            Width: width,
-            Height: rect.height(),
-        };
-        with_brush(color, |brush| {
-            status(
-                unsafe {
-                    GdipDrawString(
-                        self.graphics,
-                        wide.as_ptr(),
-                        length,
-                        font.font,
-                        &layout,
-                        format.0,
-                        brush,
-                    )
-                },
-                "draw centered text",
-            )
-        })
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
