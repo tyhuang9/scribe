@@ -14,7 +14,13 @@ param(
     [switch]$RunEphemeralStalledProbe,
 
     [Parameter(DontShow)]
-    [string]$ExpectedEphemeralSid
+    [switch]$RunEphemeralServerAccessProbe,
+
+    [Parameter(DontShow)]
+    [string]$ExpectedEphemeralSid,
+
+    [Parameter(DontShow)]
+    [uint32]$ExpectedBrokerProcessId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,13 +78,114 @@ function Assert-EphemeralProbeIdentity([string]$ExpectedSid) {
 $ephemeralProbeCount = @(
     $RunEphemeralIdentityProbe,
     $RunEphemeralFullControlProbe,
-    $RunEphemeralStalledProbe
+    $RunEphemeralStalledProbe,
+    $RunEphemeralServerAccessProbe
 ).Where({ $_ }).Count
 if ($ephemeralProbeCount -gt 1) { throw 'Only one fixed ephemeral credential probe may run.' }
+
+function Test-ServerAccessProbeRecord([AllowNull()][string]$Record) {
+    if ($null -eq $Record -or $Record.Length -gt 192) { return $false }
+    $match = [regex]::Match(
+        $Record,
+        '\Aephemeral-server-access;session=(?<sessionState>zero|nonzero|error):(?<sessionStatus>[0-9]{1,10});process=(?<processState>ok|error):(?<processStatus>[0-9]{1,10});token=(?<tokenState>ok|error|not_attempted):(?<tokenStatus>[0-9]{1,10})\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success) { return $false }
+
+    foreach ($field in @('session', 'process', 'token')) {
+        $statusText = $match.Groups["${field}Status"].Value
+        $status = [uint32]0
+        if (-not [uint32]::TryParse($statusText, [ref]$status) -or $status.ToString() -cne $statusText) { return $false }
+        $state = $match.Groups["${field}State"].Value
+        if (($state -ceq 'error') -ne ($status -ne 0)) { return $false }
+        if ($state -ceq 'not_attempted' -and $status -ne 0) { return $false }
+    }
+
+    $processFailed = $match.Groups['processState'].Value -ceq 'error'
+    $tokenNotAttempted = $match.Groups['tokenState'].Value -ceq 'not_attempted'
+    return $processFailed -eq $tokenNotAttempted
+}
+
+if (($ephemeralProbeCount -eq 0 -or $RunEphemeralServerAccessProbe) -and -not ('Scribe.GpuBroker.ServerAccessProbeNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Scribe.GpuBroker {
+    // Read-only test probe for the exact service process identified and
+    // ownership-checked by the elevated parent harness.
+    public static class ServerAccessProbeNative {
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const uint TOKEN_QUERY = 0x0008;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ProcessIdToSessionId(uint processId, out uint sessionId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            uint processId);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool OpenProcessToken(IntPtr process, uint desiredAccess, out IntPtr token);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static string Probe(uint processId) {
+            uint sessionId;
+            string session;
+            if (!ProcessIdToSessionId(processId, out sessionId))
+                session = "error:" + ((uint)Marshal.GetLastWin32Error()).ToString();
+            else
+                session = (sessionId == 0 ? "zero:0" : "nonzero:0");
+
+            IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+            if (process == IntPtr.Zero) {
+                uint processError = (uint)Marshal.GetLastWin32Error();
+                return "ephemeral-server-access;session=" + session +
+                    ";process=error:" + processError.ToString() +
+                    ";token=not_attempted:0";
+            }
+
+            IntPtr token = IntPtr.Zero;
+            string tokenResult;
+            try {
+                if (!OpenProcessToken(process, TOKEN_QUERY, out token))
+                    tokenResult = "error:" + ((uint)Marshal.GetLastWin32Error()).ToString();
+                else
+                    tokenResult = "ok:0";
+            }
+            finally {
+                if (token != IntPtr.Zero)
+                    CloseHandle(token);
+                CloseHandle(process);
+            }
+            return "ephemeral-server-access;session=" + session +
+                ";process=ok:0;token=" + tokenResult;
+        }
+    }
+}
+'@
+}
+
 if ($ephemeralProbeCount -eq 1) {
     Assert-EphemeralProbeIdentity -ExpectedSid $ExpectedEphemeralSid
     if ($RunEphemeralIdentityProbe) {
         [Console]::Out.WriteLine('ephemeral-identity-ok')
+        [Console]::Out.Flush()
+        return
+    }
+
+    if ($RunEphemeralServerAccessProbe) {
+        Assert-True ($ExpectedBrokerProcessId -gt 0) 'Server-access probe requires an exact nonzero broker process ID.'
+        $serverAccessRecord = [Scribe.GpuBroker.ServerAccessProbeNative]::Probe($ExpectedBrokerProcessId)
+        Assert-True (Test-ServerAccessProbeRecord -Record $serverAccessRecord) 'Server-access probe returned a noncanonical record.'
+        [Console]::Out.WriteLine($serverAccessRecord)
         [Console]::Out.Flush()
         return
     }
@@ -2088,7 +2195,8 @@ function Get-SanitizedClientFailureDiagnostic(
     [int]$ExitCode,
     [AllowNull()][string]$StandardOutput,
     [AllowNull()][string]$StandardError,
-    [AllowNull()][string]$ServiceStatus
+    [AllowNull()][string]$ServiceStatus,
+    [AllowNull()][string]$ServerAccessProbe
 ) {
     $allowedServiceStatuses = @(
         'Stopped',
@@ -2105,7 +2213,36 @@ function Get-SanitizedClientFailureDiagnostic(
     $stderrCategory = Get-SanitizedClientDiagnosticCategory -StandardError $StandardError
     $stdoutLength = if ($null -eq $StandardOutput) { 0 } else { $StandardOutput.Length }
     $stderrLength = if ($null -eq $StandardError) { 0 } else { $StandardError.Length }
-    return "Authenticated service response did not map to NotProvisioned. exit_code=$ExitCode; stderr_category=$stderrCategory; stdout_utf16_length=$stdoutLength; stderr_utf16_length=$stderrLength; broker_service_status=$sanitizedServiceStatus"
+    $sanitizedServerAccess = if (Test-ServerAccessProbeRecord -Record $ServerAccessProbe) { $ServerAccessProbe } else { 'invalid' }
+    return "Authenticated service response did not map to NotProvisioned. exit_code=$ExitCode; stderr_category=$stderrCategory; stdout_utf16_length=$stdoutLength; stderr_utf16_length=$stderrLength; broker_service_status=$sanitizedServiceStatus; server_access_probe=$sanitizedServerAccess"
+}
+
+function Test-ServerAccessProbeContract {
+    $valid = @(
+        'ephemeral-server-access;session=zero:0;process=ok:0;token=ok:0',
+        'ephemeral-server-access;session=nonzero:0;process=error:5;token=not_attempted:0',
+        'ephemeral-server-access;session=error:5;process=ok:0;token=error:5'
+    )
+    foreach ($record in $valid) {
+        Assert-True (Test-ServerAccessProbeRecord -Record $record) 'Server-access probe parser rejected a canonical record.'
+    }
+    foreach ($record in @(
+        $null,
+        '',
+        'ephemeral-server-access;session=zero:00;process=ok:0;token=ok:0',
+        'ephemeral-server-access;session=error:0;process=ok:0;token=ok:0',
+        'ephemeral-server-access;session=zero:0;process=error:5;token=ok:0',
+        'ephemeral-server-access;session=zero:0;process=ok:0;token=not_attempted:0',
+        'ephemeral-server-access;session=zero:0;process=ok:0;token=error:4294967296',
+        "ephemeral-server-access;session=zero:0;process=ok:0;token=ok:0`n",
+        "ephemeral-server-access;session=zero:0;process=ok:0;token=ok:0`r`nraw-sensitive-diagnostic-sentinel"
+    )) {
+        Assert-True (-not (Test-ServerAccessProbeRecord -Record $record)) 'Server-access probe parser accepted a noncanonical record.'
+    }
+
+    $currentProcessRecord = [Scribe.GpuBroker.ServerAccessProbeNative]::Probe([uint32][Environment]::ProcessId)
+    Assert-True (Test-ServerAccessProbeRecord -Record $currentProcessRecord) 'Native server-access self-probe returned a noncanonical record.'
+    Assert-True ($currentProcessRecord -cmatch ';process=ok:0;token=ok:0$') 'Native server-access self-probe could not query its own process and token.'
 }
 
 function Test-SanitizedClientDiagnosticCategoryContract {
@@ -2150,14 +2287,18 @@ function Test-SanitizedClientDiagnosticCategoryContract {
         -ExitCode 74 `
         -StandardOutput $rawStdout `
         -StandardError $rawStderr `
-        -ServiceStatus 'service-status-sensitive-sentinel'
-    $expectedFailureDiagnostic = "Authenticated service response did not map to NotProvisioned. exit_code=74; stderr_category=unexpected; stdout_utf16_length=$($rawStdout.Length); stderr_utf16_length=$($rawStderr.Length); broker_service_status=unknown"
+        -ServiceStatus 'service-status-sensitive-sentinel' `
+        -ServerAccessProbe 'server-access-sensitive-sentinel'
+    $expectedFailureDiagnostic = "Authenticated service response did not map to NotProvisioned. exit_code=74; stderr_category=unexpected; stdout_utf16_length=$($rawStdout.Length); stderr_utf16_length=$($rawStderr.Length); broker_service_status=unknown; server_access_probe=invalid"
     Assert-True ($failureDiagnostic -ceq $expectedFailureDiagnostic) 'Unexpected client output did not produce the exact sanitized failure record.'
-    foreach ($rawValue in @($rawStdout, $rawStderr, 'service-status-sensitive-sentinel')) {
+    foreach ($rawValue in @($rawStdout, $rawStderr, 'service-status-sensitive-sentinel', 'server-access-sensitive-sentinel')) {
         Assert-True (-not $failureDiagnostic.Contains($rawValue, [StringComparison]::Ordinal)) 'Sanitized failure record retained untrusted diagnostic content.'
     }
-    $nullDiagnostic = Get-SanitizedClientFailureDiagnostic -ExitCode 1 -StandardOutput $null -StandardError $null -ServiceStatus $null
-    Assert-True ($nullDiagnostic -ceq 'Authenticated service response did not map to NotProvisioned. exit_code=1; stderr_category=unexpected; stdout_utf16_length=0; stderr_utf16_length=0; broker_service_status=unknown') 'Null client output did not produce the exact sanitized failure record.'
+    $validProbeRecord = 'ephemeral-server-access;session=error:5;process=error:5;token=not_attempted:0'
+    $validatedDiagnostic = Get-SanitizedClientFailureDiagnostic -ExitCode 74 -StandardOutput '' -StandardError 'Protected Windows GPU promotion transport was rejected.' -ServiceStatus 'Running' -ServerAccessProbe $validProbeRecord
+    Assert-True ($validatedDiagnostic.EndsWith("server_access_probe=$validProbeRecord", [StringComparison]::Ordinal)) 'Validated server-access probe record was not included exactly.'
+    $nullDiagnostic = Get-SanitizedClientFailureDiagnostic -ExitCode 1 -StandardOutput $null -StandardError $null -ServiceStatus $null -ServerAccessProbe $null
+    Assert-True ($nullDiagnostic -ceq 'Authenticated service response did not map to NotProvisioned. exit_code=1; stderr_category=unexpected; stdout_utf16_length=0; stderr_utf16_length=0; broker_service_status=unknown; server_access_probe=invalid') 'Null client output did not produce the exact sanitized failure record.'
 }
 
 function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
@@ -2184,6 +2325,7 @@ function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
 }
 
 try {
+    Test-ServerAccessProbeContract
     Test-StandardSoftwareCreatorOwnerInheritanceTemplateContract
     Test-EphemeralProcessOwnershipBoundary
     Test-CredentialCommandLineContract
@@ -2613,16 +2755,32 @@ try {
     Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     $roundTrip = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     if ($roundTrip.ExitCode -ne 78) {
-        try {
-            $diagnosticService = Get-BrokerService
-            $diagnosticServiceStatus = if ($null -eq $diagnosticService) { 'absent' } else { $diagnosticService.Status.ToString() }
-        }
-        catch { $diagnosticServiceStatus = 'query_failed' }
+        $diagnosticService = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
+        $diagnosticController = Get-BrokerService
+        Assert-True ($null -ne $diagnosticController -and $diagnosticController.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Server-access probe requires the exact owned broker service to remain running.'
+        $diagnosticProcessId = [uint32]$diagnosticService.ProcessId
+        Assert-True ($diagnosticProcessId -gt 0) 'Server-access probe requires the exact owned broker service process ID.'
+        $serverAccessProbe = Invoke-EphemeralProcess -FilePath $probePowerShell -Arguments @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-File', $harnessForCredential,
+            '-ExpectedEphemeralSid', $ephemeralSid,
+            '-ExpectedBrokerProcessId', $diagnosticProcessId.ToString([Globalization.CultureInfo]::InvariantCulture),
+            '-RunEphemeralServerAccessProbe'
+        ) -TimeoutSeconds 20 -AllowFailure
+        Assert-True ($serverAccessProbe.ExitCode -eq 0) 'Server-access probe did not complete successfully.'
+        Assert-True ($serverAccessProbe.Stderr.Length -eq 0 -and $serverAccessProbe.Stdout.Length -le 192) 'Server-access probe emitted noncanonical output bounds.'
+        $serverAccessProbeRecord = $serverAccessProbe.Stdout.Trim()
+        Assert-True (Test-ServerAccessProbeRecord -Record $serverAccessProbeRecord) 'Server-access probe emitted a noncanonical diagnostic record.'
+        $diagnosticServiceAfterProbe = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
+        $diagnosticControllerAfterProbe = Get-BrokerService
+        Assert-True ([uint32]$diagnosticServiceAfterProbe.ProcessId -eq $diagnosticProcessId -and $null -ne $diagnosticControllerAfterProbe -and $diagnosticControllerAfterProbe.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Exact owned broker service identity changed during the read-only server-access probe.'
         throw (Get-SanitizedClientFailureDiagnostic `
             -ExitCode ([int]$roundTrip.ExitCode) `
             -StandardOutput $roundTrip.Stdout `
             -StandardError $roundTrip.Stderr `
-            -ServiceStatus $diagnosticServiceStatus)
+            -ServiceStatus $diagnosticControllerAfterProbe.Status.ToString() `
+            -ServerAccessProbe $serverAccessProbeRecord)
     }
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
     Assert-True ($roundTrip.Stderr.Trim() -ceq 'Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.') 'Broker client did not emit its fixed authenticated NotProvisioned diagnostic.'

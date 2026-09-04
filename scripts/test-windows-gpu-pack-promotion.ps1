@@ -372,16 +372,16 @@ try {
     Assert-True ($nativeRestore -ge 0 -and $nativeRestore -lt $restoredState -and $restoredState -lt $closeToken -and $closeToken -lt $releaseToken -and $releaseToken -lt $releasePrevious) 'Client policy provisioner can discard token or prior-state ownership before exact restore and successful close.'
     $transportHarness = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\test-windows-gpu-broker-transport.ps1') -Raw
     $authenticatedCallAssignment = '$roundTrip = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure'
-    $classifierDigest = Get-NormalizedSourceRegionSha256 `
+    $sanitizationHelpersDigest = Get-NormalizedSourceRegionSha256 `
         -Source $transportHarness `
-        -StartMarker 'function Get-SanitizedClientDiagnosticCategory' `
+        -StartMarker 'function Test-ServerAccessProbeRecord' `
         -EndMarker 'function Test-SanitizedClientDiagnosticCategoryContract'
-    Assert-True ($classifierDigest -ceq '0b230793315ddbeea87e493a75b8ca9249a57d2e6f643d45324e2df7fc269dd5') 'Sanitized diagnostic helpers changed; review their exact output behavior before updating the pinned digest.'
+    Assert-True ($sanitizationHelpersDigest -ceq '0c8941ed27e7f1f85c346b7628d3b0d357eb37999a6e787df8eaa1cde95627c5') 'Sanitized diagnostic helpers changed; review their exact output behavior before updating the pinned digest.'
     $authenticatedRegionDigest = Get-NormalizedSourceRegionSha256 `
         -Source $transportHarness `
         -StartMarker $authenticatedCallAssignment `
-        -EndMarker '[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)'
-    Assert-True ($authenticatedRegionDigest -ceq 'c0e91770374481e3f056854fc75c92bbc8fc379a4f81aba045524279381c4504') 'Authenticated real-client region changed; review every captured-output use before updating the pinned digest.'
+        -EndMarker '$stop = Invoke-Sc -Arguments @(''stop'', $serviceName) -AllowFailure'
+    Assert-True ($authenticatedRegionDigest -ceq '4658664c96050cd1385f664203eb99a6dac9e2e45b9a1815c73bdce3b40dd175') 'Authenticated real-client region changed; review every captured-output use before updating the pinned digest.'
     $preBlockAliasMutation = $transportHarness.Replace(
         $authenticatedCallAssignment,
         $authenticatedCallAssignment + "`r`n    `$roundTripAlias = `$roundTrip`r`n    throw `$roundTripAlias.PSObject.Properties['Stderr'].Value"
@@ -389,7 +389,7 @@ try {
     Assert-True ((Get-NormalizedSourceRegionSha256 `
         -Source $preBlockAliasMutation `
         -StartMarker $authenticatedCallAssignment `
-        -EndMarker '[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)') -cne $authenticatedRegionDigest) 'Pinned authenticated region did not detect a pre-block indirect Stderr leak.'
+        -EndMarker '$stop = Invoke-Sc -Arguments @(''stop'', $serviceName) -AllowFailure') -cne $authenticatedRegionDigest) 'Pinned authenticated region did not detect a pre-block indirect Stderr leak.'
     Assert-True ($transportHarness.Contains('Assert-OwnedPolicyState -State $state')) 'Broker harness cleanup does not revalidate exact ownership state.'
     Assert-True ($transportHarness.Contains('SecurityFingerprint')) 'Broker harness cleanup does not pin the policy security descriptor.'
     Assert-True ($transportHarness.Contains('CleanupTamper')) 'Broker harness lacks an adversarial same-name cleanup test.'
@@ -502,6 +502,16 @@ try {
     $availabilityTestCall = $transportHarness.LastIndexOf('Test-FixturePathSetAvailabilityContract', [StringComparison]::Ordinal)
     $availabilityTestNonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
     Assert-True ($availabilityTestStart -ge 0 -and $availabilityTestStart -lt $availabilityTestCall -and $availabilityTestCall -lt $availabilityTestNonElevatedReturn) 'Broker harness does not run deterministic three-path collision coverage before its non-elevated return.'
+    $serverAccessNative = $transportHarness.IndexOf('public static class ServerAccessProbeNative', [StringComparison]::Ordinal)
+    $serverAccessDispatch = $transportHarness.IndexOf('if ($RunEphemeralServerAccessProbe)', [StringComparison]::Ordinal)
+    $mainNativeTypes = $transportHarness.IndexOf("if (-not ('Scribe.GpuBroker.RegistryCleanupNative' -as [type]))", [StringComparison]::Ordinal)
+    Assert-True ($serverAccessNative -ge 0 -and $serverAccessNative -lt $serverAccessDispatch -and $serverAccessDispatch -lt $mainNativeTypes) 'Server-access native probe is not available inside the early credential-child dispatcher.'
+    foreach ($requiredServerAccessProbe in @('PROCESS_QUERY_LIMITED_INFORMATION = 0x1000', 'TOKEN_QUERY = 0x0008', 'ProcessIdToSessionId', 'OpenProcess(', 'OpenProcessToken(', 'CloseHandle(', 'ExpectedBrokerProcessId', 'Test-ServerAccessProbeRecord')) {
+        Assert-True ($transportHarness.Contains($requiredServerAccessProbe)) "Broker harness lost server-access probe contract $requiredServerAccessProbe."
+    }
+    $serverAccessTestStart = $transportHarness.IndexOf('function Test-ServerAccessProbeContract', [StringComparison]::Ordinal)
+    $serverAccessTestCall = $transportHarness.LastIndexOf('Test-ServerAccessProbeContract', [StringComparison]::Ordinal)
+    Assert-True ($serverAccessTestStart -ge 0 -and $serverAccessTestStart -lt $serverAccessTestCall -and $serverAccessTestCall -lt $availabilityTestNonElevatedReturn) 'Broker harness does not compile and exercise its native server-access probe before the non-elevated return.'
     $diagnosticContractStart = $transportHarness.IndexOf('function Test-SanitizedClientDiagnosticCategoryContract', [StringComparison]::Ordinal)
     $diagnosticContractCall = $transportHarness.LastIndexOf('Test-SanitizedClientDiagnosticCategoryContract', [StringComparison]::Ordinal)
     Assert-True ($diagnosticContractStart -ge 0 -and $diagnosticContractStart -lt $diagnosticContractCall -and $diagnosticContractCall -lt $availabilityTestNonElevatedReturn) 'Broker harness does not run sanitized client-diagnostic mapping tests before its non-elevated return.'
