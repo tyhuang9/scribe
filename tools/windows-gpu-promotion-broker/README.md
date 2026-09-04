@@ -17,18 +17,39 @@ and final names as `.staging-<release-set-digest>` and
 `<release-set-digest>` respectively. Its `--output-root` value is only the
 test-local publication parent and is not authority input.
 
-The normal `scribe-windows-gpu-promotion-client` binary validates the invocation
-in memory and exits with code 78. It performs no filesystem or IPC operation and
-has no signing key, ledger/state path, configurable broker endpoint, or fixture
-mode.
+On Windows, the normal `scribe-windows-gpu-promotion-client` validates the
+invocation in memory and contacts only the fixed
+`\\.\pipe\ScribeGpuPromotionBroker.v1` endpoint. It authenticates the server as
+the session-zero, restricted LocalService process carrying the exact
+`ScribeGpuPromotionBroker` service SID before writing any request bytes. The
+client opens the pipe with identification-only security quality of service, and
+the service impersonates only long enough to identify a non-anonymous member of
+Authenticated Users. The service always reverts before replying. There is no
+caller-configurable endpoint or service identity.
+
+The corresponding `scribe-windows-gpu-promotion-service` binary runs only
+through the Windows Service Control Manager. It refuses to create the pipe
+unless its own token is the expected restricted LocalService token. The pipe is
+local-only, first-instance-only, message-mode, bounded, and protected by an
+explicit DACL. Authenticated Users receive only the individual data and
+attribute rights needed for a client connection, never generic write or pipe
+instance creation. The service currently accepts no authority: a canonical,
+path-free request can receive only a correlated typed `NotProvisioned`
+response. After validating that response, the client sends a bounded
+request-and-response-correlated acknowledgement before the service disconnects.
+The client maps the authenticated result, or an absent service, to distinct
+fixed diagnostics with exit code 78. Neither process opens the handoff or
+output paths.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
 ledger, signed receipt, recovery state machine, authorizer, and atomic publisher
 are under `cfg(test)` only. They prove the intended broker contract but are not
 deployable production authority. In particular, the tests do not establish:
 
-- a fixed authenticated service/HSM transport;
-- service installation identity and ACLs;
+- production service installation, immutable binary/ancestor ACLs, and update
+  policy;
+- authorization of one dedicated workflow/client principal (this stage proves
+  Windows identity only and admits any local Authenticated Users token);
 - no-follow opening and retained ancestor authority for the workflow client
   executable (the workflow retains only a standard .NET leaf stream);
 - DLL/loader policy for a future nontrivial broker client;
@@ -44,7 +65,10 @@ used-release reservation and security-epoch high-water mark before accepting v2
 traffic; that migration is deferred with the production broker itself.
 
 Production promotion must stay disabled until those controls are implemented
-and independently reviewed. Run the current proof on Windows with:
+and independently reviewed. The repository-level harness temporarily installs
+the zero-authority service on an isolated Windows test host; neither release
+binary contains installation or console-mode behavior. Run the crate proof on
+Windows with:
 
 ```powershell
 cargo test --locked --offline -- --test-threads=1

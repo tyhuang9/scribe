@@ -82,21 +82,25 @@ signer. Its digest is pinned in protected environment configuration and the
 workflow holds a read-only, no-write/delete handle from hashing through child
 exit. This narrows direct leaf-file replacement only: the standard .NET open
 does not provide `FILE_FLAG_OPEN_REPARSE_POINT`, pin ancestor handles, prove the
-installation DACL, or constrain future loader dependencies. The client has no
-key, ledger, state path, configurable broker endpoint, or fixture mode. A
-separately privileged Windows service or remote HSM broker must copy hostile
-input into broker-owned storage, enforce the approved toolchain, version, and
-security epoch, reject replay with independently durable state, sign and verify
-both packs, and publish only
+installation DACL, or constrain import-time loader search. The client has no
+key, ledger, state path, configurable broker endpoint, or fixture mode. It
+connects only to `\\.\pipe\ScribeGpuPromotionBroker.v1`, authenticates the
+connected Session 0 server as the restricted LocalService
+`ScribeGpuPromotionBroker` service, and sends only the canonical path-free
+intent. A separately privileged Windows service or remote HSM broker must copy
+hostile input into broker-owned storage, enforce the approved toolchain,
+version, and security epoch, reject replay with independently durable state,
+sign and verify both packs, and publish only
 the complete CUDA+Vulkan pair plus a protected receipt. The
 resulting artifact is not activated or included in the normal release
 automatically.
 
 The independently locked `tools/windows-gpu-promotion-broker` workspace defines
-the exact intent/invocation schema and a test-only hostile-input state-machine
-proof. Its fixture implementation uses retained no-write/delete file handles, no-follow
-final opens, exact bounded inventories, a domain-separated signed receipt, a
-hash-chained reserve/ready/published ledger, and write-through atomic pair
+the exact intent/invocation schema, the fixed bounded transport, an SCM-only
+Windows service stub, and a test-only hostile-input state-machine
+proof. Its fixture implementation uses retained no-write/delete file handles,
+no-follow final opens, exact bounded inventories, a domain-separated signed
+receipt, a hash-chained reserve/ready/published ledger, and write-through atomic pair
 publication. The fixture seed and ledger code are compiled only under
 `cfg(test)` and are absent from the normal client artifact. Windows does not
 provide a stable handle-relative traversal API through Rust's standard library;
@@ -111,19 +115,31 @@ real v2 broker migration must preserve all earlier used-release reservations and
 security-epoch high-water marks; no production migration is implemented in this
 stage.
 
-The checked-in client intentionally attempts no IPC. Connecting it to a fixed,
-authenticated service/HSM endpoint and provisioning that service are separate
-security-reviewed release work; an endpoint supplied by CLI or environment is
-not accepted.
+The checked-in service transport is deliberately authority-free. The service
+refuses to listen unless SCM starts it as restricted LocalService with the exact
+service SID, creates one local-only message pipe with an explicit protected
+DACL whose server authority belongs only to that service SID, retains its first
+pipe handle across clients and timeouts, identifies the client at
+`SecurityIdentification`, and can return only a correlated `NotProvisioned`
+result. The client authenticates the server process and service token before
+writing, validates that result, and returns a correlated bounded acknowledgement
+before the service disconnects. Neither side serializes or accesses the local
+handoff/output paths.
+Authenticated local users are admitted at the pipe in this zero-authority
+stage; a dedicated provisioned client principal and durable authorization
+policy are mandatory before the service can receive signing authority.
+Production service installation is not part of the application installer yet,
+and an endpoint supplied by CLI or environment is never accepted.
 
 This path is currently a NO-GO: `ProductionTrustRoot`, the privileged broker or
 HSM, its independently durable epoch/replay authority, and the CUDA production
 inventory are not provisioned. The protected job checks that state and stops
 before invoking the client, so a failed run cannot access broker or signing
-authority. Validate only the fixture contracts locally with:
+authority. Validate the fixture and transport contracts locally with:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+pwsh -NoProfile -File .\scripts\test-windows-gpu-broker-transport.ps1
 cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
 ```
 

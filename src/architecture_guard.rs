@@ -1413,7 +1413,19 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     let broker_manifest = include_str!("../tools/windows-gpu-promotion-broker/Cargo.toml");
     let broker_client = include_str!("../tools/windows-gpu-promotion-broker/src/main.rs");
     let broker_contract = include_str!("../tools/windows-gpu-promotion-broker/src/lib.rs");
+    let broker_protocol = include_str!("../tools/windows-gpu-promotion-broker/src/protocol.rs");
+    let (broker_protocol_production, _) = broker_protocol
+        .split_once("#[cfg(test)]")
+        .expect("broker protocol must keep tests behind a production boundary");
+    let broker_native = include_str!("../tools/windows-gpu-promotion-broker/src/windows_native.rs");
+    let (broker_native_production, _) = broker_native
+        .split_once("#[cfg(test)]")
+        .expect("broker native transport must keep tests behind a production boundary");
+    let broker_service = include_str!(
+        "../tools/windows-gpu-promotion-broker/src/bin/scribe-windows-gpu-promotion-service.rs"
+    );
     let broker_fixture = include_str!("../tools/windows-gpu-promotion-broker/src/fixture.rs");
+    let transport_test = include_str!("../scripts/test-windows-gpu-broker-transport.ps1");
     let protected = workflow
         .split("  protected-promote:")
         .nth(1)
@@ -1465,6 +1477,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml",
         "cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
+        "test-windows-gpu-broker-transport.ps1 -RequireScmIntegration",
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
         "SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256",
@@ -1531,6 +1544,130 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         assert!(
             broker_contract.contains(required),
             "broker request contract lost {required:?}"
+        );
+    }
+    for required in [
+        r"\\.\pipe\ScribeGpuPromotionBroker.v1",
+        "ScribeGpuPromotionBroker",
+        "S-1-5-80-3848011089-2849881844-525567724-3342831801-3217684137",
+        "SGPBIPC1",
+        "MAX_REQUEST_PAYLOAD",
+        "MAX_RESPONSE_PAYLOAD",
+        "BrokerRequestV1",
+        "BrokerResponseV1",
+        "BrokerAckV1",
+        "ProductionAuthorityNotProvisioned",
+        "scribe-windows-gpu-promotion-request-v1",
+        "scribe-windows-gpu-promotion-response-v1",
+        "MAX_ACK_PAYLOAD",
+        "from_canonical_json",
+        "#[serde(deny_unknown_fields)]",
+    ] {
+        assert!(
+            broker_protocol.contains(required),
+            "fixed broker wire contract lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "handoff_root",
+        "output_root",
+        "broker_endpoint",
+        "private_key",
+        "ledger_root",
+    ] {
+        assert!(
+            !broker_protocol_production.contains(forbidden),
+            "broker wire contract gained local path or authority field {forbidden:?}"
+        );
+    }
+    for required in [
+        "SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)",
+        "SetDllDirectoryW",
+        "SECURITY_SQOS_PRESENT",
+        "SECURITY_IDENTIFICATION",
+        "SECURITY_EFFECTIVE_ONLY",
+        "GetNamedPipeServerProcessId",
+        "ProcessIdToSessionId",
+        "IsTokenRestricted",
+        "TokenRestrictedSids",
+        "CreateNamedPipeW",
+        "FILE_FLAG_FIRST_PIPE_INSTANCE",
+        "FILE_FLAG_OVERLAPPED",
+        "PIPE_TYPE_MESSAGE",
+        "PIPE_REJECT_REMOTE_CLIENTS",
+        "ImpersonateNamedPipeClient",
+        "RevertToSelf",
+        "revert_or_abort",
+        "SecurityIdentification",
+        "S-1-5-11",
+        "D:P",
+        ";;;AU)",
+        "CancelIoEx",
+        "encode_ack_frame",
+        "decode_ack_frame",
+        "StartServiceCtrlDispatcherW",
+        "ERROR_CALL_NOT_IMPLEMENTED",
+        "SERVICE_WIN32_OWN_PROCESS",
+    ] {
+        assert!(
+            broker_native_production.contains(required),
+            "authenticated Windows broker transport lost {required:?}"
+        );
+    }
+    for forbidden in [
+        ";;;LS)",
+        ";;;BA)",
+        ";;;WD)",
+        ";;;AN)",
+        "--broker-endpoint",
+        "--console",
+        "--install",
+    ] {
+        assert!(
+            !broker_native_production.contains(forbidden),
+            "Windows broker transport gained forbidden authority or ACL input {forbidden:?}"
+        );
+    }
+    assert!(broker_service.contains("run_service_dispatcher"));
+    assert!(!broker_service.contains("std::env::args"));
+    assert!(
+        broker_client.contains("broker authenticated; production authority is not provisioned")
+    );
+    assert!(
+        broker_client.contains("broker is unavailable and production authority is not provisioned")
+    );
+    for required in [
+        "Refusing to modify the pre-existing fixed-name service",
+        "sidtype",
+        "restricted",
+        "$sidTypeMatches.Count -eq 1",
+        "Groups['value'].Value -ceq 'RESTRICTED'",
+        "$primaryFailure",
+        "$cleanupFailures",
+        "$safeToRemoveMachineTarget",
+        "NT AUTHORITY\\LocalService",
+        "SetAccessRuleProtection",
+        "S-1-5-32-544",
+        "ReadAndExecute",
+        "refusing destructive cleanup",
+        "FromSeconds(4)",
+        "$stopProof = [Diagnostics.Stopwatch]::StartNew()",
+        "$stopProof.Elapsed.TotalMilliseconds -lt 4500",
+        "$stalledClientRights -eq 0x00100183",
+        "[IO.Pipes.PipeAccessRights]::Synchronize",
+        "WaitForConnectionAsync",
+        "The client sent request bytes before authenticating the service",
+        "same-name user-process pipe server as rejected authentication",
+        "fixed authenticated NotProvisioned diagnostic",
+        "did not remain running after the authenticated round trip",
+        "3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083",
+        "7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143",
+        "RequireScmIntegration",
+        "WaitForStatus",
+    ] {
+        assert!(
+            transport_test.contains(required),
+            "SCM transport harness lost {required:?}"
         );
     }
     for required in [
