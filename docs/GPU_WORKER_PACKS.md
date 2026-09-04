@@ -294,13 +294,30 @@ ancestor handles, prove the installation DACL, or constrain future loader
 dependencies, so it does not close the complete hash-to-exec path. The client
 accepts only the canonical promotion intent plus process-local invocation
 paths; it has no key, ledger/state path, configurable authority endpoint, or
-fixture flag.
+fixture flag. It can connect only to
+`\\.\pipe\ScribeGpuPromotionBroker.v1`, authenticates the connected Session 0
+server as the restricted LocalService `ScribeGpuPromotionBroker` service before
+sending, and never serializes the local handoff or publication paths.
 
 A separately privileged Windows service or remote HSM broker—not the ephemeral
 runner identity—must own the production key and independently durable replay
 and security-epoch authority. The independently locked
-`tools/windows-gpu-promotion-broker` workspace now proves the broker state
-machine with test-only authority: deny-unknown-fields canonical schemas, exact
+`tools/windows-gpu-promotion-broker` workspace now also contains a fixed,
+bounded, mutually authenticated named-pipe transport and an SCM-only
+no-authority service stub. The service refuses to create its pipe unless its
+token contains the exact service SID as an enabled and restricting SID under
+restricted LocalService. It uses a protected explicit DACL, a first-instance
+local-only message pipe whose original handle remains open across clients and
+timeouts, identification-only client impersonation, and always reverts before
+sending its sole valid outcome: correlated `NotProvisioned`. Only the exact
+service SID has server authority in the pipe DACL.
+Authenticated local users are admitted at this stage only because the service
+has no key, state, pack, or publication authority. A dedicated client principal
+and durable authorization policy are a hard prerequisite for granting any
+authority later.
+
+The same workspace proves the broker state machine with test-only authority:
+deny-unknown-fields canonical schemas, exact
 CUDA-then-Vulkan and provenance bindings, retained no-write/delete input
 handles, bounded inventory and ADS/hardlink/reparse/case/path rejection,
 create-new retained-handle copies, post-copy verification, authority loading
@@ -317,10 +334,12 @@ The fixture ledger starts fresh because it is test-only. A production v2
 migration must retain all v1 used-release reservations and security-epoch
 high-water marks, and remains deferred until the privileged broker exists.
 
-This test proof still uses path-based enumeration before retained final opens;
-it does not prove full NT handle-relative traversal, service ACL enforcement,
-non-resettable state, HSM integration, broker-client authentication, or the
-client installation/ancestor/loader policy. Production therefore remains
+The transport does not install the service in production and its earliest-main
+DLL hardening cannot prove import-time lookup or immutable installation
+ancestors. The test promotion proof still uses path-based enumeration before
+retained final opens; it does not prove full NT handle-relative traversal, a
+dedicated workflow principal, non-resettable state, HSM integration, or the
+client installation/ancestor policy. Production therefore remains
 unprovisioned and the protected job fails before invoking the client or touching
 filesystem, ledger, or signing authority. `ProductionTrustRoot`, production
 catalogs, and Auto eligibility remain empty. The earlier repository fixture
@@ -602,6 +621,15 @@ prepared CUDA/Vulkan manifests through `scribe-worker-pack-tool`, serialize the
 canonical handoff and request, and then feeds those exact bytes into the Rust
 broker proof. This is the producer/consumer drift check; the Rust-only fixtures
 do not substitute for it.
+
+`scripts/test-windows-gpu-broker-transport.ps1` installs the freshly built
+service only on a disposable elevated Windows test host, stages its binary
+under a protected machine-wide DACL, configures the exact LocalService
+restricted-SID contract, proves that a same-name rogue pipe is rejected before
+request transmission, performs a real service/client round trip that ends in
+exit 78, and removes only the service and staging directory it created. The
+service is not registered by the normal Scribe installer and cannot promote a
+pack.
 
 ## Stage 7 Linux GPU contract
 

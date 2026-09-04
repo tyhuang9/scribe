@@ -6,6 +6,7 @@ on:
       - '.github/workflows/windows-gpu-pack-promotion.yml'
       - 'scripts/promote-windows-gpu-worker-packs.ps1'
       - 'scripts/test-windows-gpu-pack-promotion.ps1'
+      - 'scripts/test-windows-gpu-broker-transport.ps1'
       - 'scripts/build-windows-gpu-worker-pack.ps1'
       - 'src/worker_pack_authoring.rs'
       - 'tools/worker-pack-author/**'
@@ -16,6 +17,7 @@ on:
       - '.github/workflows/windows-gpu-pack-promotion.yml'
       - 'scripts/promote-windows-gpu-worker-packs.ps1'
       - 'scripts/test-windows-gpu-pack-promotion.ps1'
+      - 'scripts/test-windows-gpu-broker-transport.ps1'
       - 'scripts/build-windows-gpu-worker-pack.ps1'
       - 'src/worker_pack_authoring.rs'
       - 'tools/worker-pack-author/**'
@@ -39,6 +41,7 @@ jobs:
   contract:
     name: Validate unprivileged promotion contract
     runs-on: windows-2022
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -54,6 +57,9 @@ jobs:
         run: |
           pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
           cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
+      - name: Test fixed authenticated no-authority broker transport
+        shell: pwsh
+        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-broker-transport.ps1 -RequireScmIntegration
 
   prepare-unsigned:
     name: Prepare unsigned CUDA and Vulkan handoff
