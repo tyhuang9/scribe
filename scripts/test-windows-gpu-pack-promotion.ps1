@@ -209,6 +209,7 @@ try {
     Assert-True ($workflow.Contains('cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml')) 'Clean hosted runners do not fetch the independently locked broker-contract dependencies.'
     Assert-True ($workflow.Contains('cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml')) 'Hosted contract validation does not exercise the locked offline broker state-machine proof.'
     Assert-True ($workflow.Contains('test-windows-gpu-broker-transport.ps1 -RequireScmIntegration')) 'Hosted contract validation does not exercise the exact restricted-service transport.'
+    Assert-True ($workflow.Contains("- 'scripts/provision-windows-gpu-broker-client-policy.ps1'")) 'Client policy provisioner changes do not trigger hosted broker verification.'
     Assert-True ($workflow.Contains('github.event.repository.default_branch')) 'Production dispatch is not restricted to the default branch.'
     Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256')) 'Protected broker-client digest is not independently configured.'
     Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED')) 'Separately privileged broker provisioning gate is missing.'

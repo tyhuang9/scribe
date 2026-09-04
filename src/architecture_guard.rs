@@ -1480,6 +1480,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "test-windows-gpu-broker-transport.ps1 -RequireScmIntegration",
+        "scripts/provision-windows-gpu-broker-client-policy.ps1",
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
         "SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256",
