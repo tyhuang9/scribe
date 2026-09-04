@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 
-const DIAGNOSTIC_SCHEMA_VERSION: u32 = 3;
+const DIAGNOSTIC_SCHEMA_VERSION: u32 = 4;
 const DOWNLOAD_EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_SESSION_SNAPSHOTS: usize = 50;
 const MAX_DOWNLOAD_SNAPSHOTS: usize = 100;
@@ -47,6 +47,11 @@ pub(crate) struct SessionMetrics {
     pub first_partial_ms: Option<u64>,
     pub recording_duration_ms: Option<u64>,
     pub stop_to_capture_finalized_ms: Option<u64>,
+    pub stop_to_final_audio_ready_ms: Option<u64>,
+    pub final_audio_ready_to_final_request_registered_ms: Option<u64>,
+    pub final_audio_ready_to_preview_retirement_requested_ms: Option<u64>,
+    pub preview_retirement_requested_to_completed_ms: Option<u64>,
+    pub final_request_registered_to_final_text_ms: Option<u64>,
     pub recording_end_to_final_text_ms: Option<u64>,
     pub post_processing_ms: Option<u64>,
     pub final_text_to_paste_ms: Option<u64>,
@@ -1397,9 +1402,31 @@ mod tests {
         let mut store = DiagnosticsStore::default();
         let mut entry = diagnostic(7);
         entry.output_outcome = Some("inserted_clipboard_restore_skipped".into());
+        entry.metrics.stop_to_final_audio_ready_ms = Some(35);
+        entry
+            .metrics
+            .final_audio_ready_to_final_request_registered_ms = Some(15);
+        entry
+            .metrics
+            .final_audio_ready_to_preview_retirement_requested_ms = Some(1);
+        entry.metrics.preview_retirement_requested_to_completed_ms = Some(12);
+        entry.metrics.final_request_registered_to_final_text_ms = Some(500);
         store.record(entry);
         let json = serde_json::to_string_pretty(&store.report()).unwrap();
-        assert!(json.contains("\"schema_version\": 3"));
+        assert!(json.contains("\"schema_version\": 4"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let metrics = &value["sessions"][0]["metrics"];
+        assert_eq!(metrics["stop_to_final_audio_ready_ms"], 35);
+        assert_eq!(
+            metrics["final_audio_ready_to_final_request_registered_ms"],
+            15
+        );
+        assert_eq!(
+            metrics["final_audio_ready_to_preview_retirement_requested_ms"],
+            1
+        );
+        assert_eq!(metrics["preview_retirement_requested_to_completed_ms"], 12);
+        assert_eq!(metrics["final_request_registered_to_final_text_ms"], 500);
         assert!(json.contains("\"output_outcome\": \"inserted_clipboard_restore_skipped\""));
         assert!(json.contains("\"transcript_content_included\": false"));
         assert!(json.contains("\"audio_content_included\": false"));

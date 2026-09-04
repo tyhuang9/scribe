@@ -587,6 +587,10 @@ impl RollingPreviewHandle {
         self.session.invalidate();
     }
 
+    pub(crate) fn cancel(&mut self) {
+        self.session.cancel();
+    }
+
     pub(crate) fn has_emitted_partial(&self) -> bool {
         self.session.has_emitted_partial()
     }
@@ -609,7 +613,22 @@ impl RollingPreviewHandle {
             + Send
             + 'static,
     {
-        let session = RollingPreviewSession::new(decode)?;
+        Self::simulated_with_cancel(identity, decode, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated_with_cancel<F, C>(
+        identity: StreamIdentity,
+        decode: F,
+        cancel: C,
+    ) -> std::io::Result<(PreviewAudioPublisher, Self)>
+    where
+        F: FnMut(crate::streaming::PreviewSnapshot) -> Result<StreamUpdate, anyhow::Error>
+            + Send
+            + 'static,
+        C: FnOnce() + Send + 'static,
+    {
+        let session = RollingPreviewSession::new_with_cancel(decode, cancel)?;
         let publisher = session.audio_publisher(
             identity.session_id,
             identity.request_id,

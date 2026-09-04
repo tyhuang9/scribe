@@ -524,6 +524,16 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
         self.updates.abort();
     }
 
+    /// Invalidates all pending work/results and requests cancellation of the
+    /// active decoder exactly once. Consuming the callback here guarantees a
+    /// later join or Drop cannot cancel work registered after retirement.
+    pub(crate) fn cancel(&mut self) {
+        self.invalidate();
+        if let Some(cancel_active) = self.cancel_active.take() {
+            cancel_active();
+        }
+    }
+
     /// Returns at most one text-only preview event and never blocks.
     pub fn try_next(&self) -> Option<PreviewEvent<E>> {
         if !self.valid.load(Ordering::Acquire) {
@@ -1409,6 +1419,29 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         dropper.join().unwrap();
+        assert_eq!(cancel_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn explicit_cancel_is_one_shot_and_drop_cannot_cancel_later_work() {
+        let cancel_count = Arc::new(AtomicU64::new(0));
+        let observed_cancel_count = Arc::clone(&cancel_count);
+        let mut session = RollingPreviewSession::<()>::new_with_cancel(
+            |_| Ok(StreamUpdate::default()),
+            move || {
+                observed_cancel_count.fetch_add(1, Ordering::AcqRel);
+            },
+        )
+        .unwrap();
+
+        assert!(session.try_update(snapshot(1)));
+        session.cancel();
+        session.cancel();
+        assert!(!session.try_update(snapshot(2)));
+        assert!(session.try_next().is_none());
+        assert!(session.stop_and_join(Duration::from_secs(1)));
+        drop(session);
+
         assert_eq!(cancel_count.load(Ordering::Acquire), 1);
     }
 

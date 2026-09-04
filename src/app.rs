@@ -4,8 +4,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -715,6 +715,16 @@ struct PendingPreviewDrain {
     timeout_reported: bool,
 }
 
+struct RetiringPreview {
+    preview: RollingPreviewHandle,
+    requested_at: Instant,
+    completed_at: Arc<Mutex<Option<Instant>>>,
+    timeout_reported: bool,
+    final_request_id: Option<RequestId>,
+    timeout_latency: Option<LatencyTrace>,
+    deferred_terminal: Option<AppEvent>,
+}
+
 struct PlaygroundRunState {
     pending_requests: HashMap<RequestId, String>,
     _audio: Arc<PreparedAudio>,
@@ -745,7 +755,9 @@ struct LatencyTrace {
     stream_dropped_at: Option<Instant>,
     final_audio_ready_at: Option<Instant>,
     preview_drained_at: Option<Instant>,
-    transcription_dispatched_at: Option<Instant>,
+    preview_retirement_requested_at: Option<Instant>,
+    preview_retirement_completed_at: Arc<Mutex<Option<Instant>>>,
+    final_request_registered_at: Option<Instant>,
     transcription_job_completed_at: Option<Instant>,
     final_text_ready_at: Option<Instant>,
     ui_result_at: Option<Instant>,
@@ -787,7 +799,9 @@ impl LatencyTrace {
             stream_dropped_at: None,
             final_audio_ready_at: None,
             preview_drained_at: None,
-            transcription_dispatched_at: None,
+            preview_retirement_requested_at: None,
+            preview_retirement_completed_at: Arc::new(Mutex::new(None)),
+            final_request_registered_at: None,
             transcription_job_completed_at: None,
             final_text_ready_at: None,
             ui_result_at: None,
@@ -885,6 +899,10 @@ impl LatencyTrace {
             .zip(self.audio_duration_ms)
             .filter(|(_, audio)| *audio > 0)
             .map(|(processing, audio)| processing as f64 / audio as f64);
+        let preview_retirement_completed_at = *self
+            .preview_retirement_completed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         SessionDiagnostic {
             session_id: session_id.0,
             outcome,
@@ -928,6 +946,26 @@ impl LatencyTrace {
                 stop_to_capture_finalized_ms: millis(
                     self.stop_requested_at,
                     self.capture_finalized_at,
+                ),
+                stop_to_final_audio_ready_ms: millis(
+                    self.stop_requested_at,
+                    self.final_audio_ready_at,
+                ),
+                final_audio_ready_to_final_request_registered_ms: millis(
+                    self.final_audio_ready_at,
+                    self.final_request_registered_at,
+                ),
+                final_audio_ready_to_preview_retirement_requested_ms: millis(
+                    self.final_audio_ready_at,
+                    self.preview_retirement_requested_at,
+                ),
+                preview_retirement_requested_to_completed_ms: millis(
+                    self.preview_retirement_requested_at,
+                    preview_retirement_completed_at,
+                ),
+                final_request_registered_to_final_text_ms: millis(
+                    self.final_request_registered_at,
+                    self.final_text_ready_at,
                 ),
                 recording_end_to_final_text_ms: millis(
                     self.stop_requested_at,
@@ -993,7 +1031,7 @@ impl LatencyTrace {
         }
         if let Some(duration) = duration_between(self.stop_requested_at, self.capture_finalized_at)
         {
-            lines.push(format!("Stop to audio finalized: {duration}"));
+            lines.push(format!("Stop to capture result available: {duration}"));
         }
         if let Some(duration) = duration_between(self.stop_requested_at, self.stream_dropped_at) {
             lines.push(format!("Stop to microphone stream dropped: {duration}"));
@@ -1002,25 +1040,63 @@ impl LatencyTrace {
         {
             lines.push(format!("Stream dropped to final audio ready: {duration}"));
         }
+        if let Some(duration) = duration_between(self.stop_requested_at, self.final_audio_ready_at)
+        {
+            lines.push(format!("Stop to final audio ready: {duration}"));
+        }
+        if let Some(duration) = duration_between(
+            self.final_audio_ready_at,
+            self.preview_retirement_requested_at,
+        ) {
+            lines.push(format!(
+                "Final audio ready to preview retirement requested: {duration}"
+            ));
+        }
+        let preview_retirement_completed_at = *self
+            .preview_retirement_completed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(duration) = duration_between(
+            self.preview_retirement_requested_at,
+            preview_retirement_completed_at,
+        ) {
+            lines.push(format!(
+                "Preview retirement requested to completed: {duration}"
+            ));
+        }
         if let Some(duration) = duration_between(self.final_audio_ready_at, self.preview_drained_at)
         {
             lines.push(format!("Final audio ready to preview drained: {duration}"));
         }
         if let Some(duration) =
-            duration_between(self.preview_drained_at, self.transcription_dispatched_at)
+            duration_between(self.preview_drained_at, self.final_request_registered_at)
         {
             lines.push(format!(
-                "Preview drained to final request dispatch: {duration}"
+                "Preview drained to final request registered: {duration}"
+            ));
+        }
+        if let Some(duration) =
+            duration_between(self.final_audio_ready_at, self.final_request_registered_at)
+        {
+            lines.push(format!(
+                "Final audio ready to final request registered: {duration}"
             ));
         }
         if let Some(duration) = duration_between(
-            self.transcription_dispatched_at,
+            self.final_request_registered_at,
             self.transcription_job_completed_at,
         ) {
             lines.push(format!("Transcription job: {duration}"));
         }
         if let Some(duration) = duration_between(self.stop_requested_at, self.final_text_ready_at) {
             lines.push(format!("Stop to final text: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(self.final_request_registered_at, self.final_text_ready_at)
+        {
+            lines.push(format!(
+                "Final request registered to final text: {duration}"
+            ));
         }
         if let Some(duration) =
             duration_between(self.transcription_job_completed_at, self.ui_result_at)
@@ -3178,6 +3254,7 @@ pub struct LocalTranscriberApp {
     history_playback_stopping: bool,
     rolling_preview: Option<RollingPreviewHandle>,
     pending_preview_drain: Option<PendingPreviewDrain>,
+    retiring_preview: Option<RetiringPreview>,
     transcription_service: TranscriptionService,
     tx: AppEventSink,
     rx: Receiver<AppEvent>,
@@ -3403,6 +3480,7 @@ impl LocalTranscriberApp {
             history_playback_stopping: false,
             rolling_preview: None,
             pending_preview_drain: None,
+            retiring_preview: None,
             transcription_service,
             tx,
             rx,
@@ -4117,6 +4195,7 @@ impl LocalTranscriberApp {
         self.pending_recording.is_some()
             || self.active_recording.is_some()
             || self.pending_preview_drain.is_some()
+            || self.retiring_preview.is_some()
             || !self.abandoned_capture_cleanups.is_empty()
     }
 
@@ -5438,6 +5517,177 @@ impl LocalTranscriberApp {
                 .is_some_and(|pending| pending.preview.identity().session_id == session_id)
     }
 
+    fn terminal_preview_drain_owns_session(&self, session_id: SessionId) -> bool {
+        self.pending_preview_drain.as_ref().is_some_and(|pending| {
+            pending.preview.identity().session_id == session_id
+                && !matches!(&pending.action, PreviewDrainAction::Continue)
+        })
+    }
+
+    /// Explicit release retires preview logically before the final request is
+    /// registered, but keeps physical ownership until the worker joins. This
+    /// separates correctness/cancellation ordering from native join latency.
+    fn begin_explicit_preview_retirement(
+        &mut self,
+        session_id: SessionId,
+        latency: &mut LatencyTrace,
+    ) -> Result<bool, String> {
+        if self.retiring_preview.is_some() {
+            return Err("a previous live preview is still retiring".to_owned());
+        }
+        let mut preview = if self.pending_preview_drain.as_ref().is_some_and(|pending| {
+            pending.preview.identity().session_id == session_id
+                && matches!(&pending.action, PreviewDrainAction::Continue)
+        }) {
+            self.pending_preview_drain
+                .take()
+                .expect("preview drain identity checked above")
+                .preview
+        } else if self
+            .rolling_preview
+            .as_ref()
+            .is_some_and(|preview| preview.identity().session_id == session_id)
+        {
+            self.rolling_preview
+                .take()
+                .expect("rolling preview identity checked above")
+        } else {
+            return Ok(false);
+        };
+
+        let identity = preview.identity().clone();
+        let requested_at = Instant::now();
+        preview.cancel();
+        let finish_result = self.session_coordinator.finish_preview(
+            identity.session_id,
+            identity.request_id,
+            &identity.model_id,
+        );
+        latency.preview_retirement_requested_at = Some(requested_at);
+        let completed_at = Arc::clone(&latency.preview_retirement_completed_at);
+        self.retiring_preview = Some(RetiringPreview {
+            preview,
+            requested_at,
+            completed_at,
+            timeout_reported: false,
+            final_request_id: None,
+            timeout_latency: Some(latency.clone()),
+            deferred_terminal: None,
+        });
+        finish_result
+            .map(|_| true)
+            .map_err(|error| format!("Could not retire live preview: {error}"))
+    }
+
+    fn poll_retiring_preview(&mut self) {
+        if self.poll_retiring_preview_at(Instant::now()) {
+            self.transcription_service.cancel_active();
+        }
+    }
+
+    /// Returns true exactly once when final inference cancellation is required.
+    fn poll_retiring_preview_at(&mut self, now: Instant) -> bool {
+        let Some(retiring) = self.retiring_preview.as_mut() else {
+            return false;
+        };
+        if retiring.preview.is_finished() {
+            let mut retiring = self
+                .retiring_preview
+                .take()
+                .expect("retiring preview checked above");
+            if !retiring.preview.stop_and_join(Duration::ZERO) {
+                self.retiring_preview = Some(retiring);
+                return false;
+            }
+            *retiring
+                .completed_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(now);
+            if let Some(event) = retiring.deferred_terminal.take() {
+                let _ = self.tx.send(event);
+            }
+            return false;
+        }
+
+        if !retiring.timeout_reported
+            && now.saturating_duration_since(retiring.requested_at) >= PREVIEW_CANCEL_ACK_WARNING
+        {
+            retiring.timeout_reported = true;
+            let session_id = retiring.preview.identity().session_id;
+            let deferred_terminal = retiring.deferred_terminal.take();
+            let fallback_latency = retiring.timeout_latency.take();
+            let registered_request_id = retiring.final_request_id;
+            let message = "Live preview did not acknowledge retirement; final transcription and paste were cancelled. New dictation is blocked until the native worker exits";
+            let (request_id, latency) = match deferred_terminal {
+                Some(AppEvent::TranscriptionDone {
+                    request_id,
+                    latency,
+                    ..
+                })
+                | Some(AppEvent::TranscriptionFailed {
+                    request_id,
+                    latency,
+                    ..
+                }) => (Some(request_id), latency.or(fallback_latency)),
+                Some(_) => unreachable!("only terminal transcription events are deferred"),
+                None => (registered_request_id, fallback_latency),
+            };
+            if let Some(request_id) = request_id {
+                self.fail_correlated_history_request(session_id, request_id, message);
+            }
+            if let Some(latency) = latency {
+                self.record_session_diagnostic(
+                    session_id,
+                    &latency,
+                    DiagnosticSessionOutcome::Failed,
+                    Some(DiagnosticFailureStage::Transcription),
+                );
+                self.latest_latency = self.merged_overlay_latency(session_id, Some(latency));
+            }
+            self.pending_output = None;
+            self.fail_dictation_session_now(session_id, message);
+            self.retire_captured_target(session_id);
+            return true;
+        }
+        false
+    }
+
+    /// Returns the event when it should be handled now, or `None` when the
+    /// retiring preview owns and defers its terminal delivery.
+    fn defer_terminal_for_retiring_preview(&mut self, event: AppEvent) -> Option<AppEvent> {
+        let (source, session_id, request_id) = match &event {
+            AppEvent::TranscriptionDone {
+                source,
+                session_id,
+                request_id,
+                ..
+            }
+            | AppEvent::TranscriptionFailed {
+                source,
+                session_id,
+                request_id,
+                ..
+            } => (*source, *session_id, *request_id),
+            _ => return Some(event),
+        };
+        if !self.transcription_event_is_current(source, session_id, request_id) {
+            return Some(event);
+        }
+        let Some(retiring) = self.retiring_preview.as_mut() else {
+            return Some(event);
+        };
+        if source != RecordingSource::Transcribe
+            || retiring.preview.identity().session_id != session_id
+            || retiring.timeout_reported
+        {
+            return Some(event);
+        }
+        if retiring.deferred_terminal.is_none() {
+            retiring.deferred_terminal = Some(event);
+        }
+        None
+    }
+
     fn poll_preview_drain(&mut self) {
         let service = self.transcription_service.clone();
         self.poll_preview_drain_at(Instant::now(), move || service.cancel_active());
@@ -5535,26 +5785,29 @@ impl LocalTranscriberApp {
     }
 
     fn shutdown_rolling_preview(&mut self, deadline: Instant) {
-        let preview = self
-            .pending_preview_drain
-            .take()
-            .map(|pending| pending.preview)
-            .or_else(|| self.rolling_preview.take());
-        let Some(mut preview) = preview else {
-            return;
-        };
-        preview.close();
-        self.transcription_service.cancel_active();
-        if !preview.stop_and_join(deadline.saturating_duration_since(Instant::now())) {
-            eprintln!(
-                "rolling preview did not stop before the process-exit deadline for session {}",
-                preview.identity().session_id.0
-            );
-            // The handle still owns a live native decoder. Returning would
-            // eventually unload its DLL; dropping would have to wait forever.
-            // Abort skips teardown and prevents either unsafe outcome.
-            std::mem::forget(preview);
-            std::process::abort();
+        let mut previews = Vec::new();
+        if let Some(preview) = self.rolling_preview.take() {
+            previews.push(preview);
+        }
+        if let Some(pending) = self.pending_preview_drain.take() {
+            previews.push(pending.preview);
+        }
+        if let Some(retiring) = self.retiring_preview.take() {
+            previews.push(retiring.preview);
+        }
+        for mut preview in previews {
+            preview.cancel();
+            if !preview.stop_and_join(deadline.saturating_duration_since(Instant::now())) {
+                eprintln!(
+                    "rolling preview did not stop before the process-exit deadline for session {}",
+                    preview.identity().session_id.0
+                );
+                // The handle still owns a live native decoder. Returning would
+                // eventually unload its DLL; dropping would have to wait forever.
+                // Abort skips teardown and prevents either unsafe outcome.
+                std::mem::forget(preview);
+                std::process::abort();
+            }
         }
     }
 
@@ -5713,10 +5966,10 @@ impl LocalTranscriberApp {
             active
                 .session
                 .try_finish()
-                .map(|result| (active.source, active.session_id, result))
+                .map(|result| (active.source, active.session_id, result, Instant::now()))
         });
 
-        if let Some((source, session_id, result)) = finished {
+        if let Some((source, session_id, result, capture_available_at)) = finished {
             if let Some(capture_id) = self.controller_capture_id()
                 && self
                     .capture_controller
@@ -5740,6 +5993,35 @@ impl LocalTranscriberApp {
                 latency: active.latency,
                 capture_diagnostics: active.capture_diagnostics,
             };
+            // This is the actual app-observed capture result availability,
+            // before any preview retirement or graceful drain work.
+            capture.latency.capture_finalized_at = Some(capture_available_at);
+            if self.terminal_preview_drain_owns_session(session_id) {
+                // Cancellation/failure/timeout (or an already-owned capture)
+                // remains authoritative. Never replace it with a final pass.
+                return;
+            }
+            let explicit_completion = matches!(
+                &capture.result,
+                Ok(completion)
+                    if completion.stop_reason == CaptureStopReason::Explicit
+                        && completion.audio.is_some()
+            );
+            if explicit_completion {
+                match self.begin_explicit_preview_retirement(session_id, &mut capture.latency) {
+                    Ok(true) => {
+                        self.status_message =
+                            "Retiring live preview and starting the full pass".to_owned();
+                        self.finish_capture(capture);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(message) => {
+                        self.fail_dictation_session_now(session_id, message);
+                        return;
+                    }
+                }
+            }
             let skip_terminal_preview = self
                 .rolling_preview
                 .as_ref()
@@ -5804,7 +6086,6 @@ impl LocalTranscriberApp {
                     capture.latency.stop_requested_at = Some(observed_at);
                 }
                 debug_assert!(self.session_coordinator.stop_reason().is_some());
-                capture.latency.capture_finalized_at = Some(Instant::now());
                 if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
                     self.fail_dictation_session_now(
                         session_id,
@@ -5847,7 +6128,10 @@ impl LocalTranscriberApp {
                 }
             }
             Err(CaptureError::Discarded) => {
-                capture.latency.capture_finalized_at = Some(Instant::now());
+                capture
+                    .latency
+                    .capture_finalized_at
+                    .get_or_insert_with(Instant::now);
                 self.record_session_diagnostic(
                     session_id,
                     &capture.latency,
@@ -5863,7 +6147,10 @@ impl LocalTranscriberApp {
                 self.status_message = "Recording cancelled".to_owned();
             }
             Err(error) => {
-                capture.latency.capture_finalized_at = Some(Instant::now());
+                capture
+                    .latency
+                    .capture_finalized_at
+                    .get_or_insert_with(Instant::now);
                 self.record_session_diagnostic(
                     session_id,
                     &capture.latency,
@@ -6623,7 +6910,7 @@ impl LocalTranscriberApp {
             }
             let mut latency =
                 LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction);
-            latency.transcription_dispatched_at = Some(Instant::now());
+            latency.final_request_registered_at = Some(Instant::now());
             let mut request = TranscriptionRequest::new(
                 session_id,
                 request_id,
@@ -6839,6 +7126,9 @@ impl LocalTranscriberApp {
 
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
+            let Some(event) = self.defer_terminal_for_retiring_preview(event) else {
+                continue;
+            };
             match event {
                 AppEvent::OnnxBundleInstallProgress {
                     job_id,
@@ -8494,6 +8784,10 @@ impl LocalTranscriberApp {
                 return;
             }
         };
+        // A successful ticket capture is the final-request registration
+        // boundary. Record it before optional synchronous history I/O so that
+        // local persistence latency is not attributed to native admission.
+        latency.final_request_registered_at = Some(Instant::now());
         let tx = self.tx.clone();
 
         if let Some(plan) = history_plan {
@@ -8518,8 +8812,13 @@ impl LocalTranscriberApp {
             }
         }
 
+        if let Some(retiring) = self.retiring_preview.as_mut()
+            && retiring.preview.identity().session_id == session_id
+        {
+            retiring.final_request_id = Some(request_id);
+            retiring.timeout_latency = Some(latency.clone());
+        }
         thread::spawn(move || {
-            latency.transcription_dispatched_at = Some(Instant::now());
             let mut request =
                 TranscriptionRequest::new(session_id, request_id, audio, model.id.clone());
             request.model_path = model.local_path.clone();
@@ -10797,9 +11096,11 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_capture_controller();
         self.poll_rolling_preview();
         self.poll_preview_drain();
+        self.poll_retiring_preview();
         self.poll_recording();
         self.poll_microphone_test();
         self.poll_preview_drain();
+        self.poll_retiring_preview();
         // Pending output was created in the prior frame, allowing the overlay
         // to present the correlated Output/Pasting phase before any blocking
         // clipboard or synthetic-input work begins.
@@ -17400,6 +17701,7 @@ mod layout_tests {
             );
             assert_eq!(app.transcript, "keep prior transcript");
             assert!(app.pending_output.is_none());
+            assert!(app.history_requests.is_empty());
             assert_eq!(
                 app.session_coordinator.last_terminal().unwrap().outcome,
                 crate::core::TerminalOutcome::Cancelled
@@ -18253,7 +18555,11 @@ mod layout_tests {
             stream_dropped_at: Some(base + Duration::from_millis(120)),
             final_audio_ready_at: Some(base + Duration::from_millis(135)),
             preview_drained_at: Some(base + Duration::from_millis(145)),
-            transcription_dispatched_at: Some(base + Duration::from_millis(150)),
+            preview_retirement_requested_at: Some(base + Duration::from_millis(136)),
+            preview_retirement_completed_at: Arc::new(Mutex::new(Some(
+                base + Duration::from_millis(148),
+            ))),
+            final_request_registered_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: Some(base + Duration::from_millis(650)),
             ui_result_at: Some(base + Duration::from_millis(660)),
@@ -18284,18 +18590,48 @@ mod layout_tests {
                 "App action to recorder ready: 10 ms",
                 "App action to first meter update: 15 ms",
                 "Model load: 50 ms",
-                "Stop to audio finalized: 40 ms",
+                "Stop to capture result available: 40 ms",
                 "Stop to microphone stream dropped: 20 ms",
                 "Stream dropped to final audio ready: 15 ms",
+                "Stop to final audio ready: 35 ms",
+                "Final audio ready to preview retirement requested: 1 ms",
+                "Preview retirement requested to completed: 12 ms",
                 "Final audio ready to preview drained: 10 ms",
-                "Preview drained to final request dispatch: 5 ms",
+                "Preview drained to final request registered: 5 ms",
+                "Final audio ready to final request registered: 15 ms",
                 "Transcription job: 500 ms",
                 "Stop to final text: 550 ms",
+                "Final request registered to final text: 500 ms",
                 "STT done to UI update: 10 ms",
                 "Final text ready to paste complete: 85 ms",
                 "Focused-app output: 75 ms",
                 "Total observed: 735 ms",
             ]
+        );
+        let snapshot =
+            trace.diagnostic_snapshot(SessionId(91), DiagnosticSessionOutcome::Completed, None);
+        assert_eq!(snapshot.metrics.stop_to_final_audio_ready_ms, Some(35));
+        assert_eq!(
+            snapshot
+                .metrics
+                .final_audio_ready_to_final_request_registered_ms,
+            Some(15)
+        );
+        assert_eq!(
+            snapshot
+                .metrics
+                .final_audio_ready_to_preview_retirement_requested_ms,
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .metrics
+                .preview_retirement_requested_to_completed_ms,
+            Some(12)
+        );
+        assert_eq!(
+            snapshot.metrics.final_request_registered_to_final_text_ms,
+            Some(500)
         );
     }
 
@@ -18341,6 +18677,29 @@ mod layout_tests {
         assert_eq!(snapshot.metrics.maximum_input_peak, Some(0.8));
         assert_eq!(snapshot.metrics.recording_duration_ms, Some(500));
         assert_eq!(snapshot.metrics.stop_to_capture_finalized_ms, Some(20));
+        assert_eq!(snapshot.metrics.stop_to_final_audio_ready_ms, None);
+        assert_eq!(
+            snapshot
+                .metrics
+                .final_audio_ready_to_final_request_registered_ms,
+            None
+        );
+        assert_eq!(
+            snapshot
+                .metrics
+                .final_audio_ready_to_preview_retirement_requested_ms,
+            None
+        );
+        assert_eq!(
+            snapshot
+                .metrics
+                .preview_retirement_requested_to_completed_ms,
+            None
+        );
+        assert_eq!(
+            snapshot.metrics.final_request_registered_to_final_text_ms,
+            None
+        );
         assert_eq!(snapshot.metrics.recording_end_to_final_text_ms, Some(200));
         assert_eq!(snapshot.metrics.final_text_to_paste_ms, Some(50));
         assert_eq!(snapshot.metrics.final_text_to_output_completed_ms, Some(60));
@@ -18378,7 +18737,9 @@ mod layout_tests {
             stream_dropped_at: None,
             final_audio_ready_at: None,
             preview_drained_at: None,
-            transcription_dispatched_at: Some(base + Duration::from_millis(150)),
+            preview_retirement_requested_at: None,
+            preview_retirement_completed_at: Arc::new(Mutex::new(None)),
+            final_request_registered_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: None,
             ui_result_at: Some(base + Duration::from_millis(660)),
@@ -19840,6 +20201,467 @@ mod layout_tests {
             app.status_message
                 .contains("final transcription and paste were cancelled")
         );
+    }
+
+    fn begin_blocked_explicit_preview_retirement(
+        app: &mut LocalTranscriberApp,
+    ) -> (
+        SessionId,
+        RequestId,
+        Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        use std::sync::{Condvar, Mutex, mpsc};
+
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let preview_request_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        app.session_coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        let identity = StreamIdentity {
+            session_id,
+            request_id: preview_request_id,
+            model_id: model_id.clone(),
+            sequence: 0,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let (publisher, preview) = RollingPreviewHandle::simulated(identity, move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*worker_release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        assert!(publisher.publish_window(0, vec![0.2; 1_600]).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        app.rolling_preview = Some(preview);
+        let mut latency = LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction);
+        assert!(
+            app.begin_explicit_preview_retirement(session_id, &mut latency)
+                .unwrap()
+        );
+        app.session_coordinator
+            .capture_finalized(session_id)
+            .unwrap();
+        let request_id = app
+            .session_coordinator
+            .start_request(session_id, model_id)
+            .unwrap();
+        latency.final_audio_ready_at = Some(Instant::now());
+        latency.final_request_registered_at = Some(Instant::now());
+        let retiring = app.retiring_preview.as_mut().unwrap();
+        retiring.final_request_id = Some(request_id);
+        retiring.timeout_latency = Some(latency);
+        (session_id, request_id, release)
+    }
+
+    fn release_retiring_preview(
+        app: &mut LocalTranscriberApp,
+        release: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        let (lock, wake) = &**release;
+        *lock.lock().unwrap() = true;
+        wake.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.retiring_preview.is_some() {
+            assert!(!app.poll_retiring_preview_at(Instant::now()));
+            assert!(Instant::now() < deadline, "preview retirement did not reap");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn same_session_continue_drain_promotes_and_registers_final_without_waiting_for_join() {
+        use std::sync::{Condvar, Mutex, mpsc};
+
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let preview_request_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        app.session_coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+
+        let identity = StreamIdentity {
+            session_id,
+            request_id: preview_request_id,
+            model_id: model_id.clone(),
+            sequence: 0,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let preview_cancelled_at = Arc::new(Mutex::new(None));
+        let observed_preview_cancelled_at = Arc::clone(&preview_cancelled_at);
+        let (publisher, preview) = RollingPreviewHandle::simulated_with_cancel(
+            identity.clone(),
+            move |_| {
+                started_tx.send(()).unwrap();
+                let (lock, wake) = &*worker_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                Ok(StreamUpdate {
+                    committed: "late preview".to_owned(),
+                    ..StreamUpdate::default()
+                })
+            },
+            move || {
+                *observed_preview_cancelled_at.lock().unwrap() = Some(Instant::now());
+            },
+        )
+        .unwrap();
+        assert!(publisher.publish_window(0, vec![0.2; 1_600]).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        app.rolling_preview = Some(preview);
+        assert!(app.begin_preview_drain(session_id, PreviewDrainAction::Continue));
+        assert!(matches!(
+            app.pending_preview_drain
+                .as_ref()
+                .map(|pending| &pending.action),
+            Some(PreviewDrainAction::Continue)
+        ));
+
+        let recording =
+            RecordingSession::simulated(Some(test_prepared_audio()), CaptureStopReason::Explicit);
+        recording.stop();
+        app.active_recording = Some(ActiveRecording {
+            session_id,
+            session: recording,
+            source: RecordingSource::Transcribe,
+            stop_requested: true,
+            started_at: Instant::now(),
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.active_recording.is_some() {
+            app.poll_recording();
+            assert!(Instant::now() < deadline, "capture did not finalize");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.retiring_preview.is_some());
+        assert!(app.pending_preview_drain.is_none());
+        assert!(app.capture_is_active());
+        assert_eq!(
+            app.session_coordinator.pending_request_count(session_id),
+            Some(1),
+            "explicit completion must register exactly one final request"
+        );
+        assert_eq!(
+            app.session_coordinator.phase(),
+            DictationPhase::Transcribing
+        );
+        let retiring = app.retiring_preview.as_ref().unwrap();
+        let final_registered_at = retiring
+            .timeout_latency
+            .as_ref()
+            .and_then(|latency| latency.final_request_registered_at)
+            .expect("final request registration must be timed");
+        let preview_cancelled_at = preview_cancelled_at
+            .lock()
+            .unwrap()
+            .expect("preview cancellation callback must run");
+        assert!(preview_cancelled_at <= final_registered_at);
+        let final_request_id = retiring
+            .final_request_id
+            .expect("retirement must retain the registered final request");
+        assert_ne!(final_request_id, preview_request_id);
+        assert!(app.session_coordinator.is_current_request(
+            SessionPurpose::Dictation,
+            session_id,
+            final_request_id
+        ));
+
+        app.apply_rolling_preview_event(PreviewEvent::Update {
+            identity: StreamIdentity {
+                sequence: 99,
+                ..identity
+            },
+            update: StreamUpdate {
+                committed: "must not apply".to_owned(),
+                ..StreamUpdate::default()
+            },
+        });
+        assert!(
+            app.overlay_controller
+                .state()
+                .transcript
+                .committed
+                .is_empty()
+        );
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_one();
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.retiring_preview.is_some() {
+            assert!(!app.poll_retiring_preview_at(Instant::now()));
+            assert!(Instant::now() < deadline, "preview retirement did not join");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn fast_final_result_waits_for_preview_retirement_then_resumes_once() {
+        let mut app = test_app();
+        app.config.output.auto_insert_transcript = false;
+        app.transcript = "previous transcript".to_owned();
+        app.raw_transcript = "previous raw".to_owned();
+        let (session_id, request_id, release) = begin_blocked_explicit_preview_retirement(&mut app);
+        let latency = app
+            .retiring_preview
+            .as_ref()
+            .and_then(|retiring| retiring.timeout_latency.clone());
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    request_id,
+                    "whisper_cpp_tiny_en",
+                    "accepted after retirement",
+                )),
+                latency,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "previous transcript");
+        assert_eq!(app.raw_transcript, "previous raw");
+        assert_eq!(
+            app.session_coordinator.pending_request_count(session_id),
+            Some(1)
+        );
+        assert!(
+            app.retiring_preview
+                .as_ref()
+                .unwrap()
+                .deferred_terminal
+                .is_some()
+        );
+
+        release_retiring_preview(&mut app, &release);
+        assert_eq!(app.transcript, "previous transcript");
+        app.poll_events();
+
+        assert_eq!(app.transcript, "accepted after retirement");
+        assert_eq!(app.raw_transcript, "accepted after retirement");
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        app.poll_events();
+        assert_eq!(app.transcript, "accepted after retirement");
+    }
+
+    #[test]
+    fn explicit_preview_retirement_timeout_fails_closed_once_and_retains_handle() {
+        let mut app = test_app();
+        app.config.output.auto_insert_transcript = true;
+        app.transcript = "previous transcript".to_owned();
+        app.raw_transcript = "previous raw".to_owned();
+        let (session_id, request_id, release) = begin_blocked_explicit_preview_retirement(&mut app);
+        app.history_requests.insert(
+            (session_id, request_id),
+            HistoryRequestContext {
+                id: 501,
+                kind: HistoryRequestKind::Dictation,
+            },
+        );
+        let latency = app
+            .retiring_preview
+            .as_ref()
+            .and_then(|retiring| retiring.timeout_latency.clone());
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    request_id,
+                    "whisper_cpp_tiny_en",
+                    "must be suppressed",
+                )),
+                latency,
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(
+            app.retiring_preview
+                .as_ref()
+                .unwrap()
+                .deferred_terminal
+                .is_some()
+        );
+        assert_eq!(app.transcript, "previous transcript");
+
+        let timeout_at =
+            app.retiring_preview.as_ref().unwrap().requested_at + PREVIEW_CANCEL_ACK_WARNING;
+        assert!(app.poll_retiring_preview_at(timeout_at));
+        assert!(!app.poll_retiring_preview_at(timeout_at + Duration::from_millis(1)));
+
+        assert!(app.retiring_preview.is_some());
+        assert!(app.capture_is_active());
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Failed
+        );
+        assert_eq!(app.transcript, "previous transcript");
+        assert_eq!(app.raw_transcript, "previous raw");
+        assert!(app.pending_output.is_none());
+        assert!(app.history_requests.is_empty());
+        assert_eq!(app.diagnostics.len(), 1);
+
+        release_retiring_preview(&mut app, &release);
+        app.poll_events();
+        assert!(!app.capture_is_active());
+        assert_eq!(app.transcript, "previous transcript");
+        assert_eq!(app.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn preview_retirement_timeout_before_terminal_cleans_registered_history_request() {
+        let mut app = test_app();
+        let (session_id, request_id, release) = begin_blocked_explicit_preview_retirement(&mut app);
+        app.history_requests.insert(
+            (session_id, request_id),
+            HistoryRequestContext {
+                id: 502,
+                kind: HistoryRequestKind::Dictation,
+            },
+        );
+        let registered_latency = app
+            .retiring_preview
+            .as_ref()
+            .unwrap()
+            .timeout_latency
+            .as_ref()
+            .unwrap();
+        assert!(registered_latency.final_audio_ready_at.is_some());
+        assert!(registered_latency.final_request_registered_at.is_some());
+
+        let timeout_at =
+            app.retiring_preview.as_ref().unwrap().requested_at + PREVIEW_CANCEL_ACK_WARNING;
+        assert!(app.poll_retiring_preview_at(timeout_at));
+
+        assert!(app.history_requests.is_empty());
+        assert_eq!(app.diagnostics.len(), 1);
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Failed
+        );
+
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    request_id,
+                    "whisper_cpp_tiny_en",
+                    "late result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.history_requests.is_empty());
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.diagnostics.len(), 1);
+
+        release_retiring_preview(&mut app, &release);
+    }
+
+    #[test]
+    fn terminal_preview_drain_cannot_be_promoted_into_explicit_final_registration() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let request_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        app.session_coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        let identity = StreamIdentity {
+            session_id,
+            request_id,
+            model_id,
+            sequence: 0,
+        };
+        let (_publisher, preview) =
+            RollingPreviewHandle::simulated(identity, |_| Ok(StreamUpdate::default())).unwrap();
+        app.rolling_preview = Some(preview);
+        assert!(app.begin_preview_drain(session_id, PreviewDrainAction::Cancel { session_id }));
+
+        let recording =
+            RecordingSession::simulated(Some(test_prepared_audio()), CaptureStopReason::Explicit);
+        recording.stop();
+        app.active_recording = Some(ActiveRecording {
+            session_id,
+            session: recording,
+            source: RecordingSource::Transcribe,
+            stop_requested: true,
+            started_at: Instant::now(),
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.active_recording.is_some() {
+            app.poll_recording();
+            assert!(Instant::now() < deadline, "capture did not finalize");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(
+            app.session_coordinator.pending_request_count(session_id),
+            Some(0)
+        );
+        assert!(matches!(
+            app.pending_preview_drain
+                .as_ref()
+                .map(|pending| &pending.action),
+            Some(PreviewDrainAction::Cancel { .. })
+        ));
+        assert!(app.retiring_preview.is_none());
+        app.poll_preview_drain_at(Instant::now(), || {});
     }
 
     #[test]
@@ -21689,6 +22511,7 @@ mod layout_tests {
             history_playback_stopping: false,
             rolling_preview: None,
             pending_preview_drain: None,
+            retiring_preview: None,
             transcription_service,
             tx,
             rx,
