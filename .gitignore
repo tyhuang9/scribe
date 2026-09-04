@@ -2,6 +2,7 @@
 /target-*/
 /artifacts/gpu-worker-packs/
 /tools/worker-pack-author/target/
+/tools/windows-gpu-promotion-broker/target/
 /NUL
 /.stitch/
 
