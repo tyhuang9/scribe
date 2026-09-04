@@ -11,7 +11,11 @@ For automation, a successful Remove closes the outer Inno Setup through its pre-
 
 Focused-app insertion captures the original foreground HWND and process, revalidates it before output, and uses the clipboard plus one `SendInput` batch. Target loss, activation denial, and elevated or higher-integrity applications fall back to copy-only without synthetic keystrokes. A clipboard race instead suppresses the paste and preserves the other app's newer clipboard content; the final transcript remains in Scribe for manual copying.
 
-The normal GGUF path uses a statically linked CPU backend in Scribe's private
-persistent inference child and needs no runtime package. Receipt-backed ONNX
-uses native Sherpa ONNX in that same child. `Auto` resolves to CPU. An explicit
-GPU preference reports that no verified accelerator is available.
+The normal GGUF path uses a statically linked backend in Scribe's private
+persistent inference child and needs no runtime package. Published releases and
+default source builds are CPU-only. A Windows source build can opt into the
+statically linked Vulkan backend with `--features vulkan-acceleration`; this
+requires the Vulkan SDK at build time and a compatible Vulkan driver at run
+time. In that build, `Auto` tries Vulkan before its CPU fallback, while `GPU`
+requires Vulkan and fails rather than falling back. Receipt-backed ONNX uses
+native Sherpa ONNX in the same child and remains CPU-only.

@@ -54,10 +54,13 @@ installer does not need to remove those files for the current catalog to work.
 The application has one logical runtime kind. Only the private `RuntimeRouter` selects it; UI, history, output, settings, and model management use runtime-neutral contracts. Model-format and compatibility distinctions stay below that boundary instead of becoming application handlers.
 
 Normal GGUF inference uses the safe `transcribe-cpp` 0.1.3 API with a statically
-linked CPU backend in Scribe's private persistent inference child. The
-receipt-backed ONNX bundles use native Sherpa ONNX in that same child. Neither
-path requires Python, a localhost service, a dynamic runtime package, a
-GGML/DLL route, or a CLI fallback. Models can remain loaded there for warm reuse.
+linked backend in Scribe's private persistent inference child. Default source
+builds and published releases include the CPU backend only. Source developers
+can opt into a statically linked Vulkan backend with the
+`vulkan-acceleration` Cargo feature. The receipt-backed ONNX bundles use native
+Sherpa ONNX in that same child and remain CPU-only. Neither path requires
+Python, a localhost service, a dynamic runtime package, a GGML/DLL route, or a
+CLI fallback. Models can remain loaded there for warm reuse.
 
 The desktop process uses runtime-neutral contracts; only the private inference
 child owns concrete model and recognizer state. VAD has a separate production
@@ -67,6 +70,13 @@ worker/process path and is not an STT runtime.
 
 Managed model files live under Scribe's app-data `models` directory. Trusted installs use pinned manifests, resumable partials, exact size/hash checks, safe staging, native smoke tests, and atomic activation. Local imports remain at their source path and are rechecked against their stored fingerprint.
 
-The embedded GGUF adapter is CPU-only. `Auto` resolves to CPU, `CPU` requests it explicitly, and `GPU` reports that no verified accelerator is available. Linux and macOS can compile conservative app fallbacks, but their desktop/model combinations are not release-qualified.
+The embedded GGUF adapter advertises GPU support only in a source build compiled
+with `--features vulkan-acceleration`. In that build, `Auto` asks the native
+runtime to try a compatible GPU first and fall back deterministically to CPU;
+the reported device is the device the loaded model actually uses. `CPU` is a
+strict CPU request. `GPU` is a strict Vulkan request and fails if Vulkan cannot
+be initialized instead of silently running on CPU. Moonshine ONNX remains
+CPU-only in every build. Linux and macOS can compile conservative app fallbacks,
+but their desktop/model combinations are not release-qualified.
 
 For packaging, model-validation, and benchmark details, consult the repository’s [technical overview](https://github.com/tyhuang9/scribe/blob/main/docs/TECHNICAL_OVERVIEW.md) and the linked implementation records.
