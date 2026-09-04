@@ -88,6 +88,22 @@ report script validates this schema and emits its deterministic evidence summary
 in Windows CI. A malformed, noncanonical, wrong-platform, unknown-field, or
 nonmatching entry denies Auto GPU use.
 
+The offline Windows qualification boundary is specified in
+[`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md). It digest-binds
+the evaluator, toolchain, Auto manifest, plan, lane identities, 50 paired run
+records, lane-level P-256 capture attestation, exact per-generation SCIF v5
+Hello/Ready frames, separate complete provider-discovery inventories,
+selected-device launches, stable-ID remapping, source artifacts,
+power/mixed-device behavior, lifecycle recovery, and clean-installer evidence.
+Vulkan runtime identities are cross-bound to NVIDIA (`10de`), AMD (`1002` or
+`1022`), and Intel (`8086`) PCI vendor IDs.
+Passing fixtures can emit diagnostic projections but can never become
+Auto-eligible. The checked-in production plan has no lanes, its independent
+approval authority is empty, its runtime-bucket coverage flag is false, and the
+Auto manifest still has no entries. A protected production capture signer and
+campaign-nonce ledger are not implemented, so production qualification remains
+a NO-GO.
+
 ## Signed envelope and digest
 
 Each pack root contains exactly two reserved metadata files:

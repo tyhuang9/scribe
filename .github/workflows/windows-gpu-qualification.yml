@@ -1,0 +1,79 @@
+name: Test Windows GPU qualification evidence
+
+on:
+  push:
+    paths:
+      - '.github/workflows/windows-gpu-qualification.yml'
+      - '.gitattributes'
+      - 'runtime-manifests/gpu-auto-qualification-windows-x64.json'
+      - 'runtime-manifests/gpu-worker-toolchain-windows-x64.json'
+      - 'runtime-manifests/windows-gpu-qualification-plan-x64.json'
+      - 'runtime-manifests/windows-gpu-qualification-production-authority.json'
+      - 'scripts/qualify-windows-gpu-evidence.ps1'
+      - 'scripts/test-windows-gpu-qualification.ps1'
+      - 'docs/WINDOWS_GPU_QUALIFICATION.md'
+      - 'docs/GPU_WORKER_PACKS.md'
+      - 'RELEASING.md'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'src/worker_identity.rs'
+      - 'src/onnx_worker.rs'
+      - 'src/backend_policy.rs'
+      - 'src/gpu_worker_pack/manifest.rs'
+      - 'scripts/build-windows-gpu-worker-pack.ps1'
+      - 'scripts/build-windows-release.ps1'
+      - 'scripts/prepare-windows-gpu-worker-packs.ps1'
+      - 'scripts/prepare-windows-release-inputs.ps1'
+      - 'scripts/resolve-windows-gpu-release-policy.ps1'
+      - 'scripts/run-windows-vulkan-evidence.ps1'
+      - 'scripts/stage-verified-worker-packs.ps1'
+      - 'scripts/test-windows-gpu-worker-pack-tools.ps1'
+      - 'scripts/test-windows-vulkan-evidence.ps1'
+      - 'scripts/windows-cuda-sdk-inventory.ps1'
+      - 'scripts/windows-gpu-worker-cmake-bootstrap.ps1'
+      - 'scripts/windows-vulkan-evidence-preflight.ps1'
+  pull_request:
+    paths:
+      - '.github/workflows/windows-gpu-qualification.yml'
+      - '.gitattributes'
+      - 'runtime-manifests/gpu-auto-qualification-windows-x64.json'
+      - 'runtime-manifests/gpu-worker-toolchain-windows-x64.json'
+      - 'runtime-manifests/windows-gpu-qualification-plan-x64.json'
+      - 'runtime-manifests/windows-gpu-qualification-production-authority.json'
+      - 'scripts/qualify-windows-gpu-evidence.ps1'
+      - 'scripts/test-windows-gpu-qualification.ps1'
+      - 'docs/WINDOWS_GPU_QUALIFICATION.md'
+      - 'docs/GPU_WORKER_PACKS.md'
+      - 'RELEASING.md'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'src/worker_identity.rs'
+      - 'src/onnx_worker.rs'
+      - 'src/backend_policy.rs'
+      - 'src/gpu_worker_pack/manifest.rs'
+      - 'scripts/build-windows-gpu-worker-pack.ps1'
+      - 'scripts/build-windows-release.ps1'
+      - 'scripts/prepare-windows-gpu-worker-packs.ps1'
+      - 'scripts/prepare-windows-release-inputs.ps1'
+      - 'scripts/resolve-windows-gpu-release-policy.ps1'
+      - 'scripts/run-windows-vulkan-evidence.ps1'
+      - 'scripts/stage-verified-worker-packs.ps1'
+      - 'scripts/test-windows-gpu-worker-pack-tools.ps1'
+      - 'scripts/test-windows-vulkan-evidence.ps1'
+      - 'scripts/windows-cuda-sdk-inventory.ps1'
+      - 'scripts/windows-gpu-worker-cmake-bootstrap.ps1'
+      - 'scripts/windows-vulkan-evidence-preflight.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Validate fixture evidence, deterministic math, and default-deny state
+        shell: pwsh
+        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-qualification.ps1

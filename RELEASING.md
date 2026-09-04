@@ -48,6 +48,34 @@ Signing is not performed by repository scripts. Future private signing material
 must come from an explicitly configured external path or masked CI secret, must
 never be printed, and must match a separately reviewed persistent public key.
 
+Windows GPU Auto activation also requires the independent offline evidence
+gate documented in `docs/WINDOWS_GPU_QUALIFICATION.md`. The checked-in plan has
+no representative hardware lanes, `runtime_bucket_complete` is false, the
+production approval authority is empty, and the Windows Auto manifest has no
+entries. Release validation runs only the synthetic contract suite:
+
+```powershell
+pwsh -NoProfile -File .\scripts\test-windows-gpu-qualification.ps1
+```
+
+The evidence gate requires lane-level ECDSA P-256 capture attestation and one
+exact request/Ready SCIF v5 frame pair for every measured worker generation.
+The signed raw captures bind the exact app/worker, protocol/ABI, provider/pack,
+stable device identities, and transient index mapping. A separate discovery
+launch binds the complete provider-eligible device list; measured launches are
+CPU-only or narrowed to the selected stable device. Mixed-GPU evidence proves
+that the same stable device remaps across fresh challenges and different
+process indexes. Enumeration index `0` is never persisted as identity.
+
+A future hardware decision is non-authoritative until its exact reviewed plan
+and capture public key are approved, a protected capture signer and nonce
+ledger exist, its projected runtime bucket has representative coverage, its
+Auto entries are separately reviewed and checked in one-for-one, and production
+pack trust/signing is provisioned. Those protected capture services are not
+built in this stage, so real production qualification remains a NO-GO. Do not
+treat fixture output, a one-machine projection, or successful explicit-GPU
+smoke as release qualification.
+
 ## Publish a version from a tag
 
 1. Update the root `Cargo.toml` version and any appropriate release notes.
