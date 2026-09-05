@@ -428,6 +428,9 @@ impl<'a> PackStore<'a> {
         let prior_epochs = self.load_epochs_with_lock(lock)?;
         require_epoch_from(&verified, &prior_epochs)?;
         let prior_activation = self.load_activation_with_lock(lock)?;
+        if prior_activation.current.as_ref() == Some(&verified) {
+            return Ok(());
+        }
         let mut next_epochs = prior_epochs.clone();
         let old_floor = next_epochs
             .epochs
@@ -2899,6 +2902,22 @@ mod tests {
         (source, trust)
     }
 
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "the Windows tamper fixture must undo the store's read-only file attribute"
+    )]
+    fn make_fixture_file_writable(path: &Path) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(windows)]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
     fn replace_pack_id_with_directory_link(
         root: &Path,
         workers: &Path,
@@ -3072,6 +3091,168 @@ mod tests {
                 .permissions()
                 .readonly()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_activation_preserves_predecessor_and_state_bytes_across_reopen() {
+        let (root, workers, state, verifier, _) = store_fixture("repeat-activation");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        store.activate(&second).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        store.activate(&second).unwrap();
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+        assert_eq!(
+            store.load_activation_strict().unwrap().previous,
+            Some(first.clone())
+        );
+
+        drop(store);
+        let reopened = PackStore::new(&workers, &state, &verifier);
+        reopened.activate(&second).unwrap();
+        assert_eq!(
+            fs::read(reopened.activation_path()).unwrap(),
+            activation_bytes
+        );
+        assert_eq!(fs::read(reopened.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!reopened.pending_path().exists());
+        assert_eq!(
+            reopened.load_activation_strict().unwrap().previous,
+            Some(first.clone())
+        );
+        assert_eq!(reopened.rollback().unwrap(), first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_first_activation_preserves_empty_predecessor_and_state_bytes() {
+        let (root, workers, state, verifier, _) = store_fixture("repeat-first-activation");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        store.activate(&installed).unwrap();
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        let activation = store.load_activation_strict().unwrap();
+        assert_eq!(activation.current, Some(installed));
+        assert_eq!(activation.previous, None);
+        assert!(!store.pending_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_activation_reverifies_descriptor_and_current_pack_before_noop() {
+        let (root, workers, state, verifier, _) = store_fixture("repeat-reverification");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        let mut changed = installed.clone();
+        changed.runtime_abi_version += 1;
+        assert!(matches!(
+            store.activate(&changed),
+            Err(PackStoreError::DescriptorChanged)
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+
+        make_fixture_file_writable(&installed.worker_path());
+        fs::write(installed.worker_path(), b"tampered worker").unwrap();
+        assert!(matches!(
+            store.activate(&installed),
+            Err(PackStoreError::Verification(_))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_activation_rejects_corrupt_state_and_stale_epoch_before_noop() {
+        let (root, workers, state, verifier, _) = store_fixture("repeat-state-validation");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let valid_activation_bytes = fs::read(store.activation_path()).unwrap();
+        let initial_epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        fs::write(store.activation_path(), b"{corrupt").unwrap();
+        let corrupt_activation_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.activate(&installed),
+            Err(PackStoreError::Json(_))
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            corrupt_activation_bytes
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), initial_epoch_bytes);
+        assert!(!store.pending_path().exists());
+
+        fs::write(store.activation_path(), &valid_activation_bytes).unwrap();
+        let mut stale_epochs = store.load_epochs_strict().unwrap();
+        stale_epochs.epochs.insert(
+            installed.pack_id.as_str().to_owned(),
+            installed.security_epoch + 1,
+        );
+        store.persist_epochs(&stale_epochs).unwrap();
+        let stale_epoch_bytes = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.activate(&installed),
+            Err(PackStoreError::SecurityEpochDowngrade {
+                observed: 1,
+                floor: 2
+            })
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            valid_activation_bytes
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), stale_epoch_bytes);
+        assert!(!store.pending_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_activation_strictly_validates_previous_before_noop() {
+        let (root, workers, state, verifier, _) = store_fixture("repeat-previous-validation");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        store.activate(&second).unwrap();
+        let mut corrupt = store.load_activation_strict().unwrap();
+        corrupt.previous.as_mut().unwrap().runtime_abi_version += 1;
+        atomic_write_canonical(&store.activation_path(), &corrupt).unwrap();
+        let corrupt_activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        assert!(matches!(
+            store.activate(&second),
+            Err(PackStoreError::DescriptorChanged)
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            corrupt_activation_bytes
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3344,6 +3525,8 @@ mod tests {
                 store.activate_locked(&next, Some(boundary)),
                 Err(PackStoreError::InjectedInterruption)
             ));
+            assert!(store.pending_path().exists());
+            store.activate(&next).unwrap();
             assert_eq!(current_descriptor(&store), Some(next.clone()));
             let activation = store.load_activation_strict().unwrap();
             assert_eq!(activation.previous, Some(first));
