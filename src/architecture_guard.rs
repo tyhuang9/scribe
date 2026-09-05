@@ -2064,9 +2064,9 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "first authenticated call region must contain exactly one post-call no-touch assertion"
     );
     let second_credential_status = transport_test[second_credential_call..]
-        .find("Restarted orphan-policy service was not healthy after denial.")
+        .find("Rejected unmapped-policy restart exposed a broker pipe.")
         .map(|offset| second_credential_call + offset)
-        .expect("second authenticated call retains its service-status postcondition");
+        .expect("second credentialed call retains its broker-unavailable postcondition");
     let second_credential_absent = transport_test[second_credential_status..]
         .find(no_touch_assertion)
         .map(|offset| second_credential_status + offset)
