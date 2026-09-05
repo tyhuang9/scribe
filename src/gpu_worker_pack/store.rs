@@ -3230,7 +3230,7 @@ mod tests {
 
     #[test]
     fn repeated_activation_strictly_validates_previous_before_noop() {
-        let (root, workers, state, verifier, _) = store_fixture("repeat-previous-validation");
+        let (root, workers, state, verifier, _) = store_fixture("r");
         let store = PackStore::new(&workers, &state, &verifier);
         let first = store.stage_and_install(&root.join("source")).unwrap();
         let (second_source, _) = additional_source(&root, "2.0.0", 1);
