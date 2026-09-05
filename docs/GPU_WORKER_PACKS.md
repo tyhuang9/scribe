@@ -178,9 +178,29 @@ workers/packs/<pack-id>/<version>/<pack-digest>/
 ```
 
 An existing digest directory is never overwritten or repaired in place. A
-private app-data activation record atomically stores current and previous
-`VerifiedPack` descriptors. Activation and rollback reverify the complete pack
-and require the descriptor root to derive exactly from the immutable store.
+private app-data activation record contains a canonical map of at most eight
+pack-ID slots, matching the maximum signed production catalog. Slots are not
+automatically evicted: the retained ID set must stay within eight across
+upgrades, and activation of a ninth distinct ID fails closed before any state
+write. Each slot keeps its own current and previous `VerifiedPack`
+descriptors; activation and
+rollback change only the target ID and preserve every unrelated slot. The map
+is retention metadata, not launch authority. Current selection and explicit
+rollback freshly reverify the complete target pack and require its descriptor
+root to derive exactly from the immutable store. A categorical status API can
+report current and previous eligibility without returning a filesystem lease
+or launching or probing a worker.
+
+Retained state is structurally checked independently from current eligibility:
+the schema, byte and slot bounds, canonical map keys and descriptor fields,
+pack-ID/key agreement, digest, and derived immutable-store root must remain
+safe. A structurally valid predecessor that is missing, corrupt, below the
+current epoch floor, or incompatible with the exact desktop/worker build stays
+represented but cannot be selected. This lets a valid current pack and a
+newly verified successor remain usable without treating stale metadata as
+proof. On successful rollback, the former current remains retained as the new
+previous descriptor even if it is no longer eligible.
+
 A per-pack-ID security-epoch high-water record is durably raised before
 activation; rollback can select a lower version only at or above that floor.
 All store read-modify-write transitions are serialized across processes with a
@@ -190,11 +210,19 @@ directory inode, while Windows retains a non-delete-sharing private lock-file
 handle. A state-root rename or junction swap therefore cannot split the lock
 from the reads and replacements it protects. Epoch-raising activation first writes a
 bounded pending-activation journal containing the verified target and exact
-prior/next state witnesses. Recovery reverifies the target and completes a
+prior/next whole-state witnesses. The journal validator requires that only the
+target slot and its target epoch floor change. Recovery reverifies only the
+target, preserves unrelated and historically ineligible slots, and completes a
 transaction interrupted after the journal, epoch, or activation write without
-lowering the security floor. Corrupt transaction state, interrupted staging,
-or an invalid pack produces no GPU candidate and cannot disable the compiled
-CPU route.
+lowering the security floor. Activation and journal schemas from the former
+single-slot layout are rejected without migration, reset, or mutation; epoch
+state remains on its existing compatible schema. Corrupt transaction state,
+interrupted staging, or an invalid selected pack produces no GPU candidate and
+cannot disable the compiled CPU route.
+
+These are store-level guarantees. Windows catalog discovery and Setup do not
+yet consume the per-ID activation slots; installer retention, restart-safe
+selection, and end-to-end Windows rollback remain separate integration work.
 
 ## Private health quarantine
 

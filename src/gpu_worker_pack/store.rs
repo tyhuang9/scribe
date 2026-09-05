@@ -20,11 +20,16 @@ use thiserror::Error;
 use super::manifest::{
     EMBEDDED_MINIMUM_SECURITY_EPOCH, MAX_AGGREGATE_BYTES, MAX_FILES, MAX_MANIFEST_BYTES,
     MAX_SIGNATURE_BYTES, PackVerificationError, PackVerifier, PinnedPackRoot, StoreComponent,
-    VerifiedCopyEntry, VerifiedPack, VerifiedPackLease, is_canonical_sha256,
+    VerifiedCopyEntry, VerifiedPack, VerifiedPackLease, is_canonical_sha256, validate_identifier,
+    validate_relative_path,
 };
 
 const STATE_SCHEMA_VERSION: u16 = 1;
+const ACTIVATION_SCHEMA_VERSION: u16 = 2;
 pub(super) const MAX_STATE_BYTES: u64 = 256 * 1024;
+/// The signed production catalog is bounded to eight entries. Activation
+/// retains at most one independent current/previous slot for each catalog ID.
+const MAX_ACTIVATION_SLOTS: usize = 8;
 const STORE_LOCK_NAME: &str = ".worker-pack-store.lock";
 pub(super) const DISCOVERY_EPOCH_LOCK_NAME: &str = ".worker-pack-discovery-epoch.lock";
 const DISCOVERY_EPOCH_STATE_NAME: &str = "discovery-security-epochs.json";
@@ -58,18 +63,42 @@ fn run_state_read_hook(path: &Path) {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ActivationState {
     schema_version: u16,
-    pub(crate) current: Option<VerifiedPack>,
-    pub(crate) previous: Option<VerifiedPack>,
+    slots: BTreeMap<String, ActivationSlot>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationSlot {
+    current: Option<VerifiedPack>,
+    previous: Option<VerifiedPack>,
 }
 
 impl ActivationState {
     fn empty() -> Self {
         Self {
-            schema_version: STATE_SCHEMA_VERSION,
-            current: None,
-            previous: None,
+            schema_version: ACTIVATION_SCHEMA_VERSION,
+            slots: BTreeMap::new(),
         }
     }
+
+    fn slot(&self, pack_id: &StoreComponent) -> Option<&ActivationSlot> {
+        self.slots.get(pack_id.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyActivationState {
+    schema_version: u16,
+    current: Option<VerifiedPack>,
+    previous: Option<VerifiedPack>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ActivationStateRecord {
+    Current(ActivationState),
+    Legacy(Box<LegacyActivationState>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,6 +117,83 @@ struct PendingActivation {
     next_activation: ActivationState,
     prior_epochs: EpochState,
     next_epochs: EpochState,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPendingActivation {
+    schema_version: u16,
+    target: VerifiedPack,
+    prior_activation: LegacyActivationState,
+    next_activation: LegacyActivationState,
+    prior_epochs: EpochState,
+    next_epochs: EpochState,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PendingActivationRecord {
+    Current(Box<PendingActivation>),
+    Legacy(Box<LegacyPendingActivation>),
+}
+
+/// Non-authoritative metadata describing whether retained activation entries
+/// would pass a fresh verification now. Only `current_fail_closed` returns a
+/// retained launch authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedActivationStatus {
+    pub(crate) current: RetainedPackStatus,
+    pub(crate) previous: RetainedPackStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedPackStatus {
+    Absent,
+    Eligible,
+    Rejected(RetainedPackRejection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedPackRejection {
+    Missing,
+    Io,
+    Json,
+    NonCanonical,
+    UnsupportedSchema,
+    UnknownKey,
+    InvalidSignatureEncoding,
+    BadSignature,
+    EnvelopeTooLarge,
+    InvalidIdentifier,
+    InvalidSha256,
+    UnsafePath,
+    NonRegularEntry,
+    Hardlink,
+    AlternateDataStream,
+    InventoryNotSorted,
+    CaseCollision,
+    InvalidFileCount,
+    FileTooLarge,
+    AggregateTooLarge,
+    TreeMismatch,
+    SizeMismatch,
+    PayloadDigestMismatch,
+    DigestMismatch,
+    EmbeddedEpochTooOld,
+    ProtocolMismatch,
+    AbiMismatch,
+    BuildMismatch,
+    ArchitectureMismatch,
+    BackendMismatch,
+    WorkerMissing,
+    WorkerNotExecutable,
+    DescriptorChanged,
+    UnsafePackStoreAncestor,
+    PackStoreAncestorChanged,
+    UnsupportedLeasePlatform,
+    DescriptorOutsideStore,
+    BelowSecurityEpoch,
+    UnsafeFilesystem,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,8 +534,19 @@ impl<'a> PackStore<'a> {
         let prior_epochs = self.load_epochs_with_lock(lock)?;
         require_epoch_from(&verified, &prior_epochs)?;
         let prior_activation = self.load_activation_with_lock(lock)?;
-        if prior_activation.current.as_ref() == Some(&verified) {
+        if prior_activation
+            .slot(&verified.pack_id)
+            .and_then(|slot| slot.current.as_ref())
+            == Some(&verified)
+        {
             return Ok(());
+        }
+        if !prior_activation
+            .slots
+            .contains_key(verified.pack_id.as_str())
+            && prior_activation.slots.len() == MAX_ACTIVATION_SLOTS
+        {
+            return Err(PackStoreError::CorruptState("activation slot bound"));
         }
         let mut next_epochs = prior_epochs.clone();
         let old_floor = next_epochs
@@ -442,19 +559,31 @@ impl<'a> PackStore<'a> {
             old_floor.max(verified.security_epoch),
         );
         validate_epoch_state(&next_epochs)?;
-        let next_activation = ActivationState {
-            schema_version: STATE_SCHEMA_VERSION,
-            current: Some(verified.clone()),
-            previous: prior_activation.current.clone(),
-        };
+        let prior_current = prior_activation
+            .slot(&verified.pack_id)
+            .and_then(|slot| slot.current.clone());
+        let mut next_activation = prior_activation.clone();
+        next_activation.slots.insert(
+            verified.pack_id.as_str().to_owned(),
+            ActivationSlot {
+                current: Some(verified.clone()),
+                previous: prior_current,
+            },
+        );
         let pending = PendingActivation {
-            schema_version: STATE_SCHEMA_VERSION,
+            schema_version: ACTIVATION_SCHEMA_VERSION,
             target: verified,
             prior_activation,
             next_activation: next_activation.clone(),
             prior_epochs,
             next_epochs: next_epochs.clone(),
         };
+        // All records are preflighted before the journal can make the
+        // transition authoritative. This avoids a stranded transaction whose
+        // later activation or epoch record cannot fit the state envelope.
+        validate_serialized_state_bound(&next_activation)?;
+        validate_serialized_state_bound(&next_epochs)?;
+        validate_serialized_state_bound(&pending)?;
         self.persist_pending(lock, &pending)?;
         #[cfg(test)]
         if interrupt_after == Some(ActivationBoundary::Journal) {
@@ -474,40 +603,90 @@ impl<'a> PackStore<'a> {
         Ok(())
     }
 
-    pub(crate) fn rollback(&self) -> Result<VerifiedPack, PackStoreError> {
+    pub(crate) fn rollback(
+        &self,
+        pack_id: &StoreComponent,
+    ) -> Result<VerifiedPack, PackStoreError> {
+        validate_requested_pack_id(pack_id)?;
         let lock = self.acquire_lock()?;
         self.recover_pending_activation_with_lock(&lock)?;
-        let state = self.load_activation_with_lock(&lock)?;
-        let previous = state.previous.ok_or(PackStoreError::NoRollbackPack)?;
+        let mut state = self.load_activation_with_lock(&lock)?;
+        let slot = state
+            .slot(pack_id)
+            .cloned()
+            .ok_or(PackStoreError::NoRollbackPack)?;
+        let previous = slot
+            .previous
+            .clone()
+            .ok_or(PackStoreError::NoRollbackPack)?;
         let rollback = self.reverify_descriptor(&previous)?;
         let epochs = self.load_epochs_with_lock(&lock)?;
         require_epoch_from(&rollback, &epochs)?;
-        let prior_current = state
-            .current
-            .as_ref()
-            .and_then(|current| self.reverify_descriptor(current).ok())
-            .filter(|current| require_epoch_from(current, &epochs).is_ok());
-        self.persist_activation(
-            &lock,
-            &ActivationState {
-                schema_version: STATE_SCHEMA_VERSION,
+        state.slots.insert(
+            pack_id.as_str().to_owned(),
+            ActivationSlot {
                 current: Some(rollback.clone()),
-                previous: prior_current,
+                // Metadata does not confer authority. Preserve the former
+                // current even when it is no longer eligible so rollback does
+                // not silently erase retained history.
+                previous: slot.current,
             },
-        )?;
+        );
+        self.persist_activation(&lock, &state)?;
         Ok(rollback)
     }
 
-    /// Corrupt state or invalid packs project to no GPU pack and cannot affect
-    /// the separately compiled CPU route.
-    pub(crate) fn current_fail_closed(&self) -> Option<VerifiedPackLease> {
+    /// Corrupt state or an invalid requested pack projects to no GPU pack and
+    /// cannot affect the separately compiled CPU route.
+    pub(crate) fn current_fail_closed(
+        &self,
+        pack_id: &StoreComponent,
+    ) -> Option<VerifiedPackLease> {
+        validate_requested_pack_id(pack_id).ok()?;
         let lock = self.acquire_lock().ok()?;
         self.recover_pending_activation_with_lock(&lock).ok()?;
-        let descriptor = self.load_activation_with_lock(&lock).ok()?.current?;
+        let state = self.load_activation_with_lock(&lock).ok()?;
+        let descriptor = state.slot(pack_id)?.current.as_ref()?;
         let epochs = self.load_epochs_with_lock(&lock).ok()?;
-        self.reverify_lease_at(&descriptor)
+        self.reverify_lease_at(descriptor)
             .ok()
             .filter(|pack| require_epoch_from(pack.verified_pack(), &epochs).is_ok())
+    }
+
+    /// Reports fresh eligibility categories for retained metadata without
+    /// returning filesystem authority or automatically probing either pack.
+    pub(crate) fn retained_status(
+        &self,
+        pack_id: &StoreComponent,
+    ) -> Result<RetainedActivationStatus, PackStoreError> {
+        validate_requested_pack_id(pack_id)?;
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        let state = self.load_activation_with_lock(&lock)?;
+        let epochs = self.load_epochs_with_lock(&lock)?;
+        let slot = state.slot(pack_id);
+        Ok(RetainedActivationStatus {
+            current: self
+                .retained_descriptor_status(slot.and_then(|slot| slot.current.as_ref()), &epochs),
+            previous: self
+                .retained_descriptor_status(slot.and_then(|slot| slot.previous.as_ref()), &epochs),
+        })
+    }
+
+    fn retained_descriptor_status(
+        &self,
+        descriptor: Option<&VerifiedPack>,
+        epochs: &EpochState,
+    ) -> RetainedPackStatus {
+        let Some(descriptor) = descriptor else {
+            return RetainedPackStatus::Absent;
+        };
+        match require_epoch_from(descriptor, epochs)
+            .and_then(|()| self.reverify_descriptor(descriptor).map(|_| ()))
+        {
+            Ok(()) => RetainedPackStatus::Eligible,
+            Err(error) => RetainedPackStatus::Rejected(retained_rejection(&error)),
+        }
     }
 
     /// Only uniquely named incomplete staging directories and state temporary
@@ -642,17 +821,34 @@ impl<'a> PackStore<'a> {
         Ok((parent, final_root))
     }
 
-    fn validate_activation_descriptors(
-        &self,
-        state: &ActivationState,
-    ) -> Result<(), PackStoreError> {
-        for descriptor in state.current.iter().chain(state.previous.iter()) {
-            let (_, expected_root) = self.store_paths_for(descriptor)?;
-            if descriptor.root.as_os_str() != expected_root.as_os_str() {
-                return Err(PackStoreError::DescriptorOutsideStore);
+    fn validate_activation_state(&self, state: &ActivationState) -> Result<(), PackStoreError> {
+        if state.schema_version != ACTIVATION_SCHEMA_VERSION
+            || state.slots.len() > MAX_ACTIVATION_SLOTS
+        {
+            return Err(PackStoreError::CorruptState("activation state"));
+        }
+        for (key, slot) in &state.slots {
+            let canonical_key = StoreComponent::new(key.clone())
+                .ok_or(PackStoreError::CorruptState("activation slot key"))?;
+            if slot.current.is_none() {
+                return Err(PackStoreError::CorruptState(
+                    "activation slot has no current descriptor",
+                ));
             }
-            if self.reverify_lease_at(descriptor)?.verified_pack() != descriptor {
-                return Err(PackStoreError::DescriptorChanged);
+            if slot.current.is_some() && slot.current == slot.previous {
+                return Err(PackStoreError::CorruptState(
+                    "duplicate activation descriptors",
+                ));
+            }
+            for descriptor in slot.current.iter().chain(slot.previous.iter()) {
+                validate_retained_descriptor(descriptor)?;
+                if descriptor.pack_id != canonical_key {
+                    return Err(PackStoreError::CorruptState("activation slot key mismatch"));
+                }
+                let (_, expected_root) = self.store_paths_for(descriptor)?;
+                if descriptor.root.as_os_str() != expected_root.as_os_str() {
+                    return Err(PackStoreError::DescriptorOutsideStore);
+                }
             }
         }
         Ok(())
@@ -682,11 +878,16 @@ impl<'a> PackStore<'a> {
         if !lock.exists(&path)? {
             return Ok(ActivationState::empty());
         }
-        let state: ActivationState = lock.read(&path)?;
-        if state.schema_version != STATE_SCHEMA_VERSION {
-            return Err(PackStoreError::CorruptState("activation schema"));
+        let state = match lock.read::<ActivationStateRecord>(&path)? {
+            ActivationStateRecord::Current(state) => state,
+            ActivationStateRecord::Legacy(_) => {
+                return Err(PackStoreError::UnsupportedStateSchema("activation"));
+            }
+        };
+        if state.schema_version != ACTIVATION_SCHEMA_VERSION {
+            return Err(PackStoreError::UnsupportedStateSchema("activation"));
         }
-        self.validate_activation_descriptors(&state)?;
+        self.validate_activation_state(&state)?;
         Ok(state)
     }
 
@@ -708,7 +909,8 @@ impl<'a> PackStore<'a> {
         lock: &ExclusiveFileLock,
         state: &ActivationState,
     ) -> Result<(), PackStoreError> {
-        self.validate_activation_descriptors(state)?;
+        self.validate_activation_state(state)?;
+        validate_serialized_state_bound(state)?;
         lock.write(&self.activation_path(), state)
     }
 
@@ -718,6 +920,7 @@ impl<'a> PackStore<'a> {
         state: &EpochState,
     ) -> Result<(), PackStoreError> {
         validate_epoch_state(state)?;
+        validate_serialized_state_bound(state)?;
         lock.write(&self.epoch_path(), state)
     }
 
@@ -726,8 +929,9 @@ impl<'a> PackStore<'a> {
         lock: &ExclusiveFileLock,
         pending: &PendingActivation,
     ) -> Result<(), PackStoreError> {
-        self.validate_pending_descriptors(pending)?;
+        self.validate_pending_state(pending)?;
         validate_pending_activation(pending)?;
+        validate_serialized_state_bound(pending)?;
         lock.write(&self.pending_path(), pending)
     }
 
@@ -743,9 +947,19 @@ impl<'a> PackStore<'a> {
         if !lock.exists(&path)? {
             return Ok(());
         }
-        let pending: PendingActivation = lock.read(&path)?;
-        self.validate_pending_descriptors(&pending)?;
+        let pending = match lock.read::<PendingActivationRecord>(&path)? {
+            PendingActivationRecord::Current(pending) => *pending,
+            PendingActivationRecord::Legacy(_) => {
+                return Err(PackStoreError::UnsupportedStateSchema("pending activation"));
+            }
+        };
+        if pending.schema_version != ACTIVATION_SCHEMA_VERSION {
+            return Err(PackStoreError::UnsupportedStateSchema("pending activation"));
+        }
+        self.validate_pending_state(&pending)?;
         validate_pending_activation(&pending)?;
+        validate_serialized_state_bound(&pending.next_activation)?;
+        validate_serialized_state_bound(&pending.next_epochs)?;
         let target = self.reverify_descriptor(&pending.target)?;
         if target != pending.target {
             return Err(PackStoreError::DescriptorChanged);
@@ -756,13 +970,21 @@ impl<'a> PackStore<'a> {
                 "pending activation epoch witness",
             ));
         }
-        if let Ok(observed_activation) = self.load_activation_with_lock(lock)
-            && observed_activation != pending.prior_activation
-            && observed_activation != pending.next_activation
-        {
-            return Err(PackStoreError::CorruptState(
-                "pending activation state witness",
-            ));
+        match self.load_activation_with_lock(lock) {
+            Ok(observed_activation)
+                if observed_activation != pending.prior_activation
+                    && observed_activation != pending.next_activation =>
+            {
+                return Err(PackStoreError::CorruptState(
+                    "pending activation state witness",
+                ));
+            }
+            Ok(_) => {}
+            // A durable valid journal can repair a genuinely torn JSON write.
+            // Unsupported schemas, valid-but-malformed current-schema state,
+            // unsafe files, and authority errors remain fail-closed.
+            Err(PackStoreError::Json(error)) if error.is_syntax() || error.is_eof() => {}
+            Err(error) => return Err(error),
         }
         // The journal is durable before the floor is raised. A valid pending
         // target is therefore always completed; this never lowers an observed
@@ -773,18 +995,13 @@ impl<'a> PackStore<'a> {
         Ok(())
     }
 
-    fn validate_pending_descriptors(
-        &self,
-        pending: &PendingActivation,
-    ) -> Result<(), PackStoreError> {
-        self.validate_activation_descriptors(&pending.prior_activation)?;
-        self.validate_activation_descriptors(&pending.next_activation)?;
+    fn validate_pending_state(&self, pending: &PendingActivation) -> Result<(), PackStoreError> {
+        self.validate_activation_state(&pending.prior_activation)?;
+        self.validate_activation_state(&pending.next_activation)?;
+        validate_retained_descriptor(&pending.target)?;
         let (_, expected_root) = self.store_paths_for(&pending.target)?;
         if pending.target.root.as_os_str() != expected_root.as_os_str() {
             return Err(PackStoreError::DescriptorOutsideStore);
-        }
-        if self.reverify_lease_at(&pending.target)?.verified_pack() != &pending.target {
-            return Err(PackStoreError::DescriptorChanged);
         }
         Ok(())
     }
@@ -944,20 +1161,35 @@ fn require_epoch_from(
 }
 
 fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackStoreError> {
-    if pending.schema_version != STATE_SCHEMA_VERSION
-        || pending.prior_activation.schema_version != STATE_SCHEMA_VERSION
-        || pending.next_activation.schema_version != STATE_SCHEMA_VERSION
+    let target_key = pending.target.pack_id.as_str();
+    let prior_slot = pending.prior_activation.slots.get(target_key);
+    if pending.schema_version != ACTIVATION_SCHEMA_VERSION
+        || pending.prior_activation.schema_version != ACTIVATION_SCHEMA_VERSION
+        || pending.next_activation.schema_version != ACTIVATION_SCHEMA_VERSION
         || pending.prior_epochs.schema_version != STATE_SCHEMA_VERSION
         || pending.next_epochs.schema_version != STATE_SCHEMA_VERSION
-        || pending.next_activation.current.as_ref() != Some(&pending.target)
-        || pending.next_activation.previous != pending.prior_activation.current
+        || prior_slot.and_then(|slot| slot.current.as_ref()) == Some(&pending.target)
     {
         return Err(PackStoreError::CorruptState(
             "pending activation transaction",
         ));
     }
+    let mut expected_activation = pending.prior_activation.clone();
+    expected_activation.slots.insert(
+        target_key.to_owned(),
+        ActivationSlot {
+            current: Some(pending.target.clone()),
+            previous: prior_slot.and_then(|slot| slot.current.clone()),
+        },
+    );
+    if pending.next_activation != expected_activation {
+        return Err(PackStoreError::CorruptState(
+            "pending activation state transition",
+        ));
+    }
     validate_epoch_state(&pending.prior_epochs)?;
     validate_epoch_state(&pending.next_epochs)?;
+    require_epoch_from(&pending.target, &pending.prior_epochs)?;
     let prior_floor = pending
         .prior_epochs
         .epochs
@@ -981,6 +1213,36 @@ fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackSt
         return Err(PackStoreError::CorruptState(
             "pending activation epoch transition",
         ));
+    }
+    Ok(())
+}
+
+fn validate_requested_pack_id(pack_id: &StoreComponent) -> Result<(), PackStoreError> {
+    if !pack_id.is_canonical() {
+        return Err(PackStoreError::CorruptState("requested pack id"));
+    }
+    Ok(())
+}
+
+fn validate_retained_descriptor(descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
+    validate_descriptor_identity(descriptor)?;
+    if descriptor.security_epoch == 0
+        || descriptor.runtime_abi_version == 0
+        || validate_identifier(&descriptor.provider, "retained provider").is_err()
+        || validate_identifier(&descriptor.target_os, "retained target OS").is_err()
+        || validate_identifier(&descriptor.target_arch, "retained target architecture").is_err()
+        || validate_relative_path(&descriptor.worker_relative_path).is_err()
+    {
+        return Err(PackStoreError::CorruptState(
+            "worker pack descriptor metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_serialized_state_bound<T: Serialize>(value: &T) -> Result<(), PackStoreError> {
+    if serde_json::to_vec(value)?.len() as u64 > MAX_STATE_BYTES {
+        return Err(PackStoreError::CorruptState("state file bounds"));
     }
     Ok(())
 }
@@ -1012,6 +1274,90 @@ fn validate_descriptor_identity(descriptor: &VerifiedPack) -> Result<(), PackSto
         ));
     }
     Ok(())
+}
+
+fn retained_rejection(error: &PackStoreError) -> RetainedPackRejection {
+    match error {
+        PackStoreError::Verification(error) => match error {
+            PackVerificationError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+                RetainedPackRejection::Missing
+            }
+            PackVerificationError::Io(_) => RetainedPackRejection::Io,
+            PackVerificationError::Json(_) => RetainedPackRejection::Json,
+            PackVerificationError::NonCanonical(_) => RetainedPackRejection::NonCanonical,
+            PackVerificationError::UnsupportedSchema => RetainedPackRejection::UnsupportedSchema,
+            PackVerificationError::UnknownKey => RetainedPackRejection::UnknownKey,
+            PackVerificationError::InvalidSignatureEncoding => {
+                RetainedPackRejection::InvalidSignatureEncoding
+            }
+            PackVerificationError::BadSignature => RetainedPackRejection::BadSignature,
+            PackVerificationError::EnvelopeTooLarge => RetainedPackRejection::EnvelopeTooLarge,
+            PackVerificationError::InvalidIdentifier(_) => RetainedPackRejection::InvalidIdentifier,
+            PackVerificationError::InvalidSha256 => RetainedPackRejection::InvalidSha256,
+            PackVerificationError::UnsafePath(_) => RetainedPackRejection::UnsafePath,
+            PackVerificationError::NonRegularEntry(_) => RetainedPackRejection::NonRegularEntry,
+            PackVerificationError::Hardlink(_) => RetainedPackRejection::Hardlink,
+            PackVerificationError::AlternateDataStream(_) => {
+                RetainedPackRejection::AlternateDataStream
+            }
+            PackVerificationError::InventoryNotSorted => RetainedPackRejection::InventoryNotSorted,
+            PackVerificationError::CaseCollision => RetainedPackRejection::CaseCollision,
+            PackVerificationError::InvalidFileCount => RetainedPackRejection::InvalidFileCount,
+            PackVerificationError::FileTooLarge => RetainedPackRejection::FileTooLarge,
+            PackVerificationError::AggregateTooLarge => RetainedPackRejection::AggregateTooLarge,
+            PackVerificationError::TreeMismatch => RetainedPackRejection::TreeMismatch,
+            PackVerificationError::SizeMismatch(_) => RetainedPackRejection::SizeMismatch,
+            PackVerificationError::PayloadDigestMismatch(_) => {
+                RetainedPackRejection::PayloadDigestMismatch
+            }
+            PackVerificationError::DigestMismatch => RetainedPackRejection::DigestMismatch,
+            PackVerificationError::SecurityEpochTooOld => {
+                RetainedPackRejection::EmbeddedEpochTooOld
+            }
+            PackVerificationError::ProtocolMismatch => RetainedPackRejection::ProtocolMismatch,
+            PackVerificationError::AbiMismatch => RetainedPackRejection::AbiMismatch,
+            PackVerificationError::BuildMismatch => RetainedPackRejection::BuildMismatch,
+            PackVerificationError::ArchitectureMismatch => {
+                RetainedPackRejection::ArchitectureMismatch
+            }
+            PackVerificationError::BackendMismatch => RetainedPackRejection::BackendMismatch,
+            PackVerificationError::WorkerMissing => RetainedPackRejection::WorkerMissing,
+            PackVerificationError::WorkerNotExecutable => {
+                RetainedPackRejection::WorkerNotExecutable
+            }
+            PackVerificationError::DescriptorChanged => RetainedPackRejection::DescriptorChanged,
+            PackVerificationError::UnsafePackStoreAncestor(_) => {
+                RetainedPackRejection::UnsafePackStoreAncestor
+            }
+            PackVerificationError::PackStoreAncestorChanged(_) => {
+                RetainedPackRejection::PackStoreAncestorChanged
+            }
+            #[cfg(not(any(unix, windows)))]
+            PackVerificationError::UnsupportedLeasePlatform => {
+                RetainedPackRejection::UnsupportedLeasePlatform
+            }
+        },
+        PackStoreError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            RetainedPackRejection::Missing
+        }
+        PackStoreError::Io(_) => RetainedPackRejection::Io,
+        PackStoreError::DescriptorChanged => RetainedPackRejection::DescriptorChanged,
+        PackStoreError::DescriptorOutsideStore => RetainedPackRejection::DescriptorOutsideStore,
+        PackStoreError::SecurityEpochDowngrade { .. } => RetainedPackRejection::BelowSecurityEpoch,
+        PackStoreError::UnsafeFilesystemEntry(_)
+        | PackStoreError::UnsafeRecoveryTarget(_)
+        | PackStoreError::UnsupportedAnchoredFilesystem => RetainedPackRejection::UnsafeFilesystem,
+        PackStoreError::Json(_) => RetainedPackRejection::Json,
+        PackStoreError::UnsupportedStateSchema(_) => RetainedPackRejection::UnsupportedSchema,
+        PackStoreError::Random(_)
+        | PackStoreError::UnsupportedAtomicPublish
+        | PackStoreError::UnsupportedFileLock
+        | PackStoreError::LockContended
+        | PackStoreError::CorruptState(_)
+        | PackStoreError::NoRollbackPack => RetainedPackRejection::Io,
+        #[cfg(test)]
+        PackStoreError::InjectedInterruption => RetainedPackRejection::Io,
+    }
 }
 
 fn require_same_pack(
@@ -2723,6 +3069,8 @@ pub(crate) enum PackStoreError {
     SecurityEpochDowngrade { observed: u64, floor: u64 },
     #[error("worker-pack activation state is corrupt: {0}")]
     CorruptState(&'static str),
+    #[error("unsupported worker-pack {0} state schema")]
+    UnsupportedStateSchema(&'static str),
     #[error("no verified previous worker pack is available for rollback")]
     NoRollbackPack,
     #[error("worker-pack store contains an unsafe filesystem entry: {0}")]
@@ -2743,8 +3091,26 @@ mod tests {
 
     fn current_descriptor(store: &PackStore<'_>) -> Option<VerifiedPack> {
         store
-            .current_fail_closed()
+            .current_fail_closed(&default_pack_id())
             .map(|lease| lease.verified_pack().clone())
+    }
+
+    fn default_pack_id() -> StoreComponent {
+        StoreComponent::new("scribe-vulkan").unwrap()
+    }
+
+    fn activation_slot<'a>(
+        state: &'a ActivationState,
+        pack_id: &StoreComponent,
+    ) -> &'a ActivationSlot {
+        state.slot(pack_id).unwrap()
+    }
+
+    fn activation_slot_mut<'a>(
+        state: &'a mut ActivationState,
+        pack_id: &StoreComponent,
+    ) -> &'a mut ActivationSlot {
+        state.slots.get_mut(pack_id.as_str()).unwrap()
     }
 
     fn discovery_descriptor(pack_id: &str, epoch: u64) -> VerifiedPack {
@@ -2893,9 +3259,22 @@ mod tests {
         PathBuf,
         &'static super::super::manifest::test_support::FixtureTrustRoot,
     ) {
-        let source = root.join(format!("source-{version}-{epoch}"));
+        additional_pack_source(root, "scribe-vulkan", version, epoch)
+    }
+
+    fn additional_pack_source(
+        root: &Path,
+        pack_id: &str,
+        version: &str,
+        epoch: u64,
+    ) -> (
+        PathBuf,
+        &'static super::super::manifest::test_support::FixtureTrustRoot,
+    ) {
+        let source = root.join(format!("source-{pack_id}-{version}-{epoch}"));
         fs::create_dir(&source).unwrap();
         let mut manifest = base_manifest();
+        manifest.pack_id = StoreComponent::new(pack_id).unwrap();
         manifest.pack_version = StoreComponent::new(version).unwrap();
         manifest.security_epoch = epoch;
         let trust = write_signed(&source, manifest);
@@ -3111,7 +3490,7 @@ mod tests {
         assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
         assert!(!store.pending_path().exists());
         assert_eq!(
-            store.load_activation_strict().unwrap().previous,
+            activation_slot(&store.load_activation_strict().unwrap(), &first.pack_id).previous,
             Some(first.clone())
         );
 
@@ -3125,10 +3504,10 @@ mod tests {
         assert_eq!(fs::read(reopened.epoch_path()).unwrap(), epoch_bytes);
         assert!(!reopened.pending_path().exists());
         assert_eq!(
-            reopened.load_activation_strict().unwrap().previous,
+            activation_slot(&reopened.load_activation_strict().unwrap(), &first.pack_id).previous,
             Some(first.clone())
         );
-        assert_eq!(reopened.rollback().unwrap(), first);
+        assert_eq!(reopened.rollback(&first.pack_id).unwrap(), first);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3145,8 +3524,9 @@ mod tests {
         assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
         assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
         let activation = store.load_activation_strict().unwrap();
-        assert_eq!(activation.current, Some(installed));
-        assert_eq!(activation.previous, None);
+        let slot = activation_slot(&activation, &installed.pack_id);
+        assert_eq!(slot.current, Some(installed));
+        assert_eq!(slot.previous, None);
         assert!(!store.pending_path().exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -3229,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_activation_strictly_validates_previous_before_noop() {
+    fn repeated_activation_ignores_ineligible_previous_and_preserves_state_bytes() {
         let (root, workers, state, verifier, _) = store_fixture("r");
         let store = PackStore::new(&workers, &state, &verifier);
         let first = store.stage_and_install(&root.join("source")).unwrap();
@@ -3238,21 +3618,26 @@ mod tests {
         store.activate(&first).unwrap();
         store.activate(&second).unwrap();
         let mut corrupt = store.load_activation_strict().unwrap();
-        corrupt.previous.as_mut().unwrap().runtime_abi_version += 1;
+        activation_slot_mut(&mut corrupt, &first.pack_id)
+            .previous
+            .as_mut()
+            .unwrap()
+            .runtime_abi_version += 1;
         atomic_write_canonical(&store.activation_path(), &corrupt).unwrap();
         let corrupt_activation_bytes = fs::read(store.activation_path()).unwrap();
         let epoch_bytes = fs::read(store.epoch_path()).unwrap();
 
-        assert!(matches!(
-            store.activate(&second),
-            Err(PackStoreError::DescriptorChanged)
-        ));
+        store.activate(&second).unwrap();
         assert_eq!(
             fs::read(store.activation_path()).unwrap(),
             corrupt_activation_bytes
         );
         assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
         assert!(!store.pending_path().exists());
+        assert_eq!(
+            store.retained_status(&second.pack_id).unwrap().previous,
+            RetainedPackStatus::Rejected(RetainedPackRejection::DescriptorChanged)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3266,10 +3651,10 @@ mod tests {
         store.activate(&first).unwrap();
         store.activate(&second).unwrap();
         assert_eq!(current_descriptor(&store), Some(second.clone()));
-        assert_eq!(store.rollback().unwrap(), first);
+        assert_eq!(store.rollback(&first.pack_id).unwrap(), first);
         assert_eq!(
             store
-                .current_fail_closed()
+                .current_fail_closed(&default_pack_id())
                 .unwrap()
                 .verified_pack()
                 .pack_version
@@ -3291,13 +3676,68 @@ mod tests {
         let epoch_store = PackStore::new(&workers, &state, &verifier_two);
         let epoch_two = epoch_store.stage_and_install(&epoch_two_source).unwrap();
         epoch_store.activate(&epoch_two).unwrap();
+        assert_eq!(
+            epoch_store.retained_status(&epoch_two.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Eligible,
+                previous: RetainedPackStatus::Rejected(RetainedPackRejection::BelowSecurityEpoch),
+            }
+        );
+        let activation_bytes = fs::read(epoch_store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(epoch_store.epoch_path()).unwrap();
         assert!(matches!(
-            epoch_store.rollback(),
+            epoch_store.rollback(&epoch_two.pack_id),
             Err(PackStoreError::SecurityEpochDowngrade {
                 observed: 1,
                 floor: 2
             })
         ));
+        assert_eq!(
+            fs::read(epoch_store.activation_path()).unwrap(),
+            activation_bytes
+        );
+        assert_eq!(fs::read(epoch_store.epoch_path()).unwrap(), epoch_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_floor_rejects_stage_activation_and_rollback_downgrades_without_mutation() {
+        let (root, workers, state, verifier, _) = store_fixture("all-downgrades");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (candidate_source, _) = additional_source(&root, "2.0.0", 2);
+        let (high_source, _) = additional_source(&root, "3.0.0", 3);
+        let candidate = store.stage_and_install(&candidate_source).unwrap();
+        let high = store.stage_and_install(&high_source).unwrap();
+        store.activate(&first).unwrap();
+        store.activate(&candidate).unwrap();
+        store.activate(&high).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        for result in [
+            store.stage_and_install(&candidate_source).map(|_| ()),
+            store.activate(&candidate),
+            store.rollback(&candidate.pack_id).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(PackStoreError::SecurityEpochDowngrade {
+                    observed: 2,
+                    floor: 3
+                })
+            ));
+            assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+            assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+            assert!(!store.pending_path().exists());
+        }
+        assert_eq!(
+            store.retained_status(&high.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Eligible,
+                previous: RetainedPackStatus::Rejected(RetainedPackRejection::BelowSecurityEpoch),
+            }
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3308,7 +3748,7 @@ mod tests {
         let installed = store.stage_and_install(&root.join("source")).unwrap();
         store.activate(&installed).unwrap();
         fs::write(store.activation_path(), b"{corrupt").unwrap();
-        assert!(store.current_fail_closed().is_none());
+        assert!(store.current_fail_closed(&default_pack_id()).is_none());
 
         let staging = workers
             .join("packs")
@@ -3326,7 +3766,7 @@ mod tests {
         assert!(installed.root.exists());
 
         fs::write(store.epoch_path(), b"not-json").unwrap();
-        assert!(store.current_fail_closed().is_none());
+        assert!(store.current_fail_closed(&default_pack_id()).is_none());
         assert!(matches!(
             store.activate(&installed),
             Err(PackStoreError::Json(_))
@@ -3344,13 +3784,17 @@ mod tests {
         store.activate(&first).unwrap();
         store.activate(&second).unwrap();
         let mut activation = store.load_activation_strict().unwrap();
-        activation.previous.as_mut().unwrap().root = root.join("outside-store");
+        activation_slot_mut(&mut activation, &first.pack_id)
+            .previous
+            .as_mut()
+            .unwrap()
+            .root = root.join("outside-store");
         atomic_write_canonical(&store.activation_path(), &activation).unwrap();
         assert!(matches!(
-            store.rollback(),
+            store.rollback(&default_pack_id()),
             Err(PackStoreError::DescriptorOutsideStore)
         ));
-        assert!(store.current_fail_closed().is_none());
+        assert!(store.current_fail_closed(&default_pack_id()).is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3379,7 +3823,10 @@ mod tests {
         for value in hostile {
             for mutate_version in [false, true] {
                 let mut corrupt = baseline.clone();
-                let descriptor = corrupt.current.as_mut().unwrap();
+                let descriptor = activation_slot_mut(&mut corrupt, &installed.pack_id)
+                    .current
+                    .as_mut()
+                    .unwrap();
                 if mutate_version {
                     descriptor.pack_version = StoreComponent::test_unchecked(value);
                 } else {
@@ -3390,7 +3837,7 @@ mod tests {
                     store.load_activation_strict().is_err(),
                     "accepted persisted component {value:?}"
                 );
-                assert!(store.current_fail_closed().is_none());
+                assert!(store.current_fail_closed(&default_pack_id()).is_none());
             }
         }
 
@@ -3398,7 +3845,11 @@ mod tests {
         fs::create_dir(&escaped).unwrap();
         fs::write(escaped.join("sentinel"), b"outside").unwrap();
         let mut corrupt = baseline.clone();
-        corrupt.current.as_mut().unwrap().root = escaped.clone();
+        activation_slot_mut(&mut corrupt, &installed.pack_id)
+            .current
+            .as_mut()
+            .unwrap()
+            .root = escaped.clone();
         atomic_write_canonical(&store.activation_path(), &corrupt).unwrap();
         assert!(matches!(
             store.load_activation_strict(),
@@ -3444,7 +3895,8 @@ mod tests {
                     &mut corrupt.target.pack_id
                 };
                 *target = StoreComponent::test_unchecked(value);
-                corrupt.next_activation.current = Some(corrupt.target.clone());
+                activation_slot_mut(&mut corrupt.next_activation, &default_pack_id()).current =
+                    Some(corrupt.target.clone());
                 atomic_write_canonical(&store.pending_path(), &corrupt).unwrap();
                 assert!(
                     store.recover_pending_activation_locked().is_err(),
@@ -3458,7 +3910,8 @@ mod tests {
         fs::write(escaped.join("sentinel"), b"outside").unwrap();
         let mut corrupt = baseline.clone();
         corrupt.target.root = escaped.clone();
-        corrupt.next_activation.current = Some(corrupt.target.clone());
+        activation_slot_mut(&mut corrupt.next_activation, &default_pack_id()).current =
+            Some(corrupt.target.clone());
         atomic_write_canonical(&store.pending_path(), &corrupt).unwrap();
         assert!(matches!(
             store.recover_pending_activation_locked(),
@@ -3529,7 +3982,10 @@ mod tests {
             store.activate(&next).unwrap();
             assert_eq!(current_descriptor(&store), Some(next.clone()));
             let activation = store.load_activation_strict().unwrap();
-            assert_eq!(activation.previous, Some(first));
+            assert_eq!(
+                activation_slot(&activation, &next.pack_id).previous,
+                Some(first)
+            );
             assert!(!store.pending_path().exists());
             assert_eq!(
                 store
@@ -3544,13 +4000,716 @@ mod tests {
     }
 
     #[test]
+    fn journal_recovery_preserves_other_id_and_does_not_verify_ineligible_history() {
+        for boundary in [
+            ActivationBoundary::Journal,
+            ActivationBoundary::Epochs,
+            ActivationBoundary::Activation,
+        ] {
+            let nonce = random_suffix().unwrap();
+            let (root, workers, state, verifier, _) =
+                store_fixture(&format!("pid-{}", &nonce[..4]));
+            let store = PackStore::new(&workers, &state, &verifier);
+            let first = store.stage_and_install(&root.join("source")).unwrap();
+            let (second_source, _) = additional_source(&root, "2.0.0", 1);
+            let (third_source, _) = additional_source(&root, "3.0.0", 1);
+            let (other_source, _) = additional_pack_source(&root, "alt", "1.0.0", 1);
+            let second = store.stage_and_install(&second_source).unwrap();
+            let third = store.stage_and_install(&third_source).unwrap();
+            let other = store.stage_and_install(&other_source).unwrap();
+            store.activate(&first).unwrap();
+            store.activate(&second).unwrap();
+            store.activate(&other).unwrap();
+            let other_slot =
+                activation_slot(&store.load_activation_strict().unwrap(), &other.pack_id).clone();
+            make_fixture_file_writable(&second.worker_path());
+            fs::write(second.worker_path(), b"tamper worker").unwrap();
+
+            assert!(matches!(
+                store.activate_locked(&third, Some(boundary)),
+                Err(PackStoreError::InjectedInterruption)
+            ));
+            store.recover_pending_activation_locked().unwrap();
+            let activation = store.load_activation_strict().unwrap();
+            assert_eq!(activation_slot(&activation, &other.pack_id), &other_slot);
+            assert_eq!(
+                store.retained_status(&third.pack_id).unwrap(),
+                RetainedActivationStatus {
+                    current: RetainedPackStatus::Eligible,
+                    previous: RetainedPackStatus::Rejected(
+                        RetainedPackRejection::PayloadDigestMismatch
+                    ),
+                }
+            );
+            assert!(!store.pending_path().exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn interleaved_pack_ids_keep_independent_current_previous_histories() {
+        let (root, workers, state, verifier, _) = store_fixture("independent-pack-histories");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first_a = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_a_source, _) = additional_source(&root, "2.0.0", 1);
+        let (first_b_source, _) = additional_pack_source(&root, "alt", "1.0.0", 1);
+        let (second_b_source, _) = additional_pack_source(&root, "alt", "2.0.0", 1);
+        let second_a = store.stage_and_install(&second_a_source).unwrap();
+        let first_b = store.stage_and_install(&first_b_source).unwrap();
+        let second_b = store.stage_and_install(&second_b_source).unwrap();
+
+        for descriptor in [&first_a, &first_b, &second_a, &second_b] {
+            store.activate(descriptor).unwrap();
+        }
+        let activation = store.load_activation_strict().unwrap();
+        assert_eq!(activation.slots.len(), 2);
+        assert_eq!(
+            activation_slot(&activation, &first_a.pack_id),
+            &ActivationSlot {
+                current: Some(second_a.clone()),
+                previous: Some(first_a.clone()),
+            }
+        );
+        let retained_b = activation_slot(&activation, &first_b.pack_id).clone();
+        assert_eq!(
+            retained_b,
+            ActivationSlot {
+                current: Some(second_b.clone()),
+                previous: Some(first_b.clone()),
+            }
+        );
+        assert_eq!(
+            store
+                .current_fail_closed(&second_b.pack_id)
+                .unwrap()
+                .verified_pack(),
+            &second_b
+        );
+        assert_eq!(
+            store.retained_status(&second_b.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Eligible,
+                previous: RetainedPackStatus::Eligible,
+            }
+        );
+
+        assert_eq!(store.rollback(&second_a.pack_id).unwrap(), first_a);
+        let rolled_back = store.load_activation_strict().unwrap();
+        assert_eq!(
+            activation_slot(&rolled_back, &second_b.pack_id),
+            &retained_b,
+            "rolling back one ID changed another ID's retained history"
+        );
+        assert_eq!(
+            activation_slot(&rolled_back, &second_a.pack_id),
+            &ActivationSlot {
+                current: Some(first_a.clone()),
+                previous: Some(second_a),
+            }
+        );
+
+        let absent = StoreComponent::new("not-retained").unwrap();
+        assert!(store.current_fail_closed(&absent).is_none());
+        assert_eq!(
+            store.retained_status(&absent).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Absent,
+                previous: RetainedPackStatus::Absent,
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_activation_and_pending_records_fail_closed_without_changing_bytes_or_floors() {
+        let (root, workers, state, verifier, _) = store_fixture("legacy-state-rejection");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        let current_activation = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        let legacy_activation = LegacyActivationState {
+            schema_version: STATE_SCHEMA_VERSION,
+            current: Some(first.clone()),
+            previous: None,
+        };
+        atomic_write_canonical(&store.activation_path(), &legacy_activation).unwrap();
+        let legacy_activation_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.activate(&second),
+            Err(PackStoreError::UnsupportedStateSchema("activation"))
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            legacy_activation_bytes
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+
+        fs::write(store.activation_path(), &current_activation).unwrap();
+        let epochs = store.load_epochs_strict().unwrap();
+        let legacy_pending = LegacyPendingActivation {
+            schema_version: STATE_SCHEMA_VERSION,
+            target: second.clone(),
+            prior_activation: LegacyActivationState {
+                schema_version: STATE_SCHEMA_VERSION,
+                current: Some(first.clone()),
+                previous: None,
+            },
+            next_activation: LegacyActivationState {
+                schema_version: STATE_SCHEMA_VERSION,
+                current: Some(second.clone()),
+                previous: Some(first.clone()),
+            },
+            prior_epochs: epochs.clone(),
+            next_epochs: epochs,
+        };
+        atomic_write_canonical(&store.pending_path(), &legacy_pending).unwrap();
+        let legacy_pending_bytes = fs::read(store.pending_path()).unwrap();
+        let activation_before = fs::read(store.activation_path()).unwrap();
+        let epochs_before = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.recover_pending_activation_locked(),
+            Err(PackStoreError::UnsupportedStateSchema("pending activation"))
+        ));
+        assert_eq!(
+            fs::read(store.pending_path()).unwrap(),
+            legacy_pending_bytes
+        );
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            activation_before
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epochs_before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valid_new_journal_repairs_torn_json_but_never_overwrites_legacy_activation() {
+        let (root, workers, state, verifier, _) = store_fixture("jsd");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 2);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        assert!(matches!(
+            store.activate_locked(&second, Some(ActivationBoundary::Journal)),
+            Err(PackStoreError::InjectedInterruption)
+        ));
+        let pending_bytes = fs::read(store.pending_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        let legacy_activation = LegacyActivationState {
+            schema_version: STATE_SCHEMA_VERSION,
+            current: Some(first.clone()),
+            previous: None,
+        };
+        atomic_write_canonical(&store.activation_path(), &legacy_activation).unwrap();
+        let legacy_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.recover_pending_activation_locked(),
+            Err(PackStoreError::UnsupportedStateSchema("activation"))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), legacy_bytes);
+        assert_eq!(fs::read(store.pending_path()).unwrap(), pending_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+
+        fs::write(store.activation_path(), b"{torn").unwrap();
+        store.recover_pending_activation_locked().unwrap();
+        assert!(!store.pending_path().exists());
+        let activation = store.load_activation_strict().unwrap();
+        assert_eq!(
+            activation_slot(&activation, &second.pack_id),
+            &ActivationSlot {
+                current: Some(second),
+                previous: Some(first),
+            }
+        );
+        assert_eq!(
+            store
+                .load_epochs_strict()
+                .unwrap()
+                .epochs
+                .get(default_pack_id().as_str()),
+            Some(&2)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activation_slot_bound_rejects_ninth_id_before_journal_or_epoch_changes() {
+        let (root, workers, state, verifier, _) = store_fixture("bounded-activation-slots");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        let mut activation = ActivationState::empty();
+        for index in 0..MAX_ACTIVATION_SLOTS {
+            let pack_id = StoreComponent::new(format!("retained-pack-{index}")).unwrap();
+            let mut descriptor = installed.clone();
+            descriptor.pack_id = pack_id.clone();
+            descriptor.root = workers
+                .join("packs")
+                .join(pack_id.as_str())
+                .join(descriptor.pack_version.as_str())
+                .join(&descriptor.pack_digest);
+            activation.slots.insert(
+                pack_id.as_str().to_owned(),
+                ActivationSlot {
+                    current: Some(descriptor),
+                    previous: None,
+                },
+            );
+        }
+        atomic_write_canonical(&store.activation_path(), &activation).unwrap();
+        store.persist_epochs(&EpochState::empty()).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        assert!(matches!(
+            store.activate(&installed),
+            Err(PackStoreError::CorruptState("activation slot bound"))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_slot_shapes_and_current_schema_fail_closed() {
+        let (root, workers, state, verifier, _) = store_fixture("malformed-slot-shapes");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let baseline = store.load_activation_strict().unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        let mut previous_only = baseline.clone();
+        let slot = activation_slot_mut(&mut previous_only, &installed.pack_id);
+        slot.previous = slot.current.take();
+        atomic_write_canonical(&store.activation_path(), &previous_only).unwrap();
+        let rejected_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.load_activation_strict(),
+            Err(PackStoreError::CorruptState(
+                "activation slot has no current descriptor"
+            ))
+        ));
+        assert!(store.current_fail_closed(&installed.pack_id).is_none());
+        assert_eq!(fs::read(store.activation_path()).unwrap(), rejected_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+
+        let mut duplicate = baseline.clone();
+        let slot = activation_slot_mut(&mut duplicate, &installed.pack_id);
+        slot.previous = slot.current.clone();
+        atomic_write_canonical(&store.activation_path(), &duplicate).unwrap();
+        assert!(matches!(
+            store.load_activation_strict(),
+            Err(PackStoreError::CorruptState(
+                "duplicate activation descriptors"
+            ))
+        ));
+
+        let mut wrong_schema = baseline;
+        wrong_schema.schema_version = STATE_SCHEMA_VERSION;
+        atomic_write_canonical(&store.activation_path(), &wrong_schema).unwrap();
+        let schema_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.activate(&installed),
+            Err(PackStoreError::UnsupportedStateSchema("activation"))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), schema_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_rejects_structurally_valid_unrelated_slot_change_without_mutation() {
+        let (root, workers, state, verifier, _) = store_fixture("journal-unrelated-slot");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (target_source, _) = additional_source(&root, "2.0.0", 2);
+        let (other_first_source, _) = additional_pack_source(&root, "alt", "1.0.0", 1);
+        let (other_second_source, _) = additional_pack_source(&root, "alt", "2.0.0", 1);
+        let target = store.stage_and_install(&target_source).unwrap();
+        let other_first = store.stage_and_install(&other_first_source).unwrap();
+        let other_second = store.stage_and_install(&other_second_source).unwrap();
+        store.activate(&first).unwrap();
+        store.activate(&other_first).unwrap();
+        store.activate(&other_second).unwrap();
+        assert!(matches!(
+            store.activate_locked(&target, Some(ActivationBoundary::Journal)),
+            Err(PackStoreError::InjectedInterruption)
+        ));
+
+        let mut pending: PendingActivation =
+            match read_canonical_state::<PendingActivationRecord>(&store.pending_path()).unwrap() {
+                PendingActivationRecord::Current(pending) => *pending,
+                PendingActivationRecord::Legacy(_) => panic!("new writer emitted legacy journal"),
+            };
+        let unrelated = activation_slot_mut(&mut pending.next_activation, &other_second.pack_id);
+        std::mem::swap(&mut unrelated.current, &mut unrelated.previous);
+        atomic_write_canonical(&store.pending_path(), &pending).unwrap();
+        let pending_bytes = fs::read(store.pending_path()).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.recover_pending_activation_locked(),
+            Err(PackStoreError::CorruptState(
+                "pending activation state transition"
+            ))
+        ));
+        assert_eq!(fs::read(store.pending_path()).unwrap(), pending_bytes);
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_activation_and_journal_writes_preserve_state_files() {
+        let (root, workers, state, verifier, descriptor) = store_fixture("write-bounds");
+        // Exercise persistence's structural metadata checks without creating
+        // oversized filesystem paths or treating this metadata as a verified
+        // launch target. The caller still owns full target verification.
+        let store = PackStore::new(workers.join("r".repeat(20_000)), &state, &verifier);
+        let lock = store.acquire_lock().unwrap();
+        store
+            .persist_activation(&lock, &ActivationState::empty())
+            .unwrap();
+        let epochs = EpochState::empty();
+        store.persist_epochs_with_lock(&lock, &epochs).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+        let initial_names = anchored_child_names(lock.root()).unwrap();
+        let mut prior = ActivationState::empty();
+        for index in 0..MAX_ACTIVATION_SLOTS {
+            let mut retained = descriptor.clone();
+            retained.pack_id = StoreComponent::new(format!("pack-{index}")).unwrap();
+            retained.root = store.store_paths_for(&retained).unwrap().1;
+            prior.slots.insert(
+                retained.pack_id.as_str().to_owned(),
+                ActivationSlot {
+                    current: Some(retained),
+                    previous: None,
+                },
+            );
+        }
+        store.validate_activation_state(&prior).unwrap();
+        validate_serialized_state_bound(&prior).unwrap();
+        let mut oversized_activation = prior.clone();
+        for slot in oversized_activation.slots.values_mut() {
+            let mut previous = slot.current.clone().unwrap();
+            previous.pack_version = StoreComponent::new("0.9.0").unwrap();
+            previous.root = store.store_paths_for(&previous).unwrap().1;
+            slot.previous = Some(previous);
+        }
+        store
+            .validate_activation_state(&oversized_activation)
+            .unwrap();
+        assert!(matches!(
+            store.persist_activation(&lock, &oversized_activation),
+            Err(PackStoreError::CorruptState("state file bounds"))
+        ));
+
+        let target_id = StoreComponent::new("pack-0").unwrap();
+        let mut target = prior.slot(&target_id).unwrap().current.clone().unwrap();
+        target.pack_version = StoreComponent::new("2.0.0").unwrap();
+        target.root = store.store_paths_for(&target).unwrap().1;
+        let mut next = prior.clone();
+        next.slots.insert(
+            target_id.as_str().to_owned(),
+            ActivationSlot {
+                current: Some(target.clone()),
+                previous: prior.slot(&target_id).unwrap().current.clone(),
+            },
+        );
+        let mut next_epochs = epochs.clone();
+        next_epochs
+            .epochs
+            .insert(target_id.as_str().to_owned(), target.security_epoch);
+        let pending = PendingActivation {
+            schema_version: ACTIVATION_SCHEMA_VERSION,
+            target,
+            prior_activation: prior,
+            next_activation: next,
+            prior_epochs: epochs,
+            next_epochs,
+        };
+        store.validate_pending_state(&pending).unwrap();
+        validate_pending_activation(&pending).unwrap();
+        validate_serialized_state_bound(&pending.next_activation).unwrap();
+        assert!(matches!(
+            store.persist_pending(&lock, &pending),
+            Err(PackStoreError::CorruptState("state file bounds"))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+        assert_eq!(anchored_child_names(lock.root()).unwrap(), initial_names);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_target_below_prior_epoch_floor_is_rejected_without_mutation() {
+        let (root, workers, state, verifier, _) = store_fixture("journal-floor");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let low = store.stage_and_install(&root.join("source")).unwrap();
+        let (high_source, _) = additional_source(&root, "2.0.0", 2);
+        let high = store.stage_and_install(&high_source).unwrap();
+        store.activate(&high).unwrap();
+        let prior_activation = store.load_activation_strict().unwrap();
+        let prior_epochs = store.load_epochs_strict().unwrap();
+        let mut next_activation = prior_activation.clone();
+        next_activation.slots.insert(
+            low.pack_id.as_str().to_owned(),
+            ActivationSlot {
+                current: Some(low.clone()),
+                previous: Some(high.clone()),
+            },
+        );
+        let pending = PendingActivation {
+            schema_version: ACTIVATION_SCHEMA_VERSION,
+            target: low,
+            prior_activation,
+            next_activation,
+            prior_epochs: prior_epochs.clone(),
+            next_epochs: prior_epochs,
+        };
+        // Model a canonical but invalid journal; do not use the validated
+        // writer, which must reject the same downgrade before publication.
+        atomic_write_canonical(&store.pending_path(), &pending).unwrap();
+        let pending_bytes = fs::read(store.pending_path()).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.recover_pending_activation_locked(),
+            Err(PackStoreError::SecurityEpochDowngrade {
+                observed: 1,
+                floor: 2
+            })
+        ));
+        assert_eq!(fs::read(store.pending_path()).unwrap(), pending_bytes);
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert_eq!(
+            activation_slot(&store.load_activation_strict().unwrap(), &high.pack_id).current,
+            Some(high)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_different_pack_ids_preserve_both_predecessors() {
+        let (root, workers, state, verifier, _) = store_fixture("concurrent-pack-ids");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first_a = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_a_source, _) = additional_source(&root, "2.0.0", 1);
+        let (first_b_source, _) = additional_pack_source(&root, "alt", "1.0.0", 1);
+        let (second_b_source, _) = additional_pack_source(&root, "alt", "2.0.0", 1);
+        let second_a = store.stage_and_install(&second_a_source).unwrap();
+        let first_b = store.stage_and_install(&first_b_source).unwrap();
+        let second_b = store.stage_and_install(&second_b_source).unwrap();
+        store.activate(&first_a).unwrap();
+        store.activate(&first_b).unwrap();
+
+        let (result_a, result_b) = std::thread::scope(|scope| {
+            let left = PackStore::new(&workers, &state, &verifier);
+            let right = PackStore::new(&workers, &state, &verifier);
+            let target_a = second_a.clone();
+            let target_b = second_b.clone();
+            let left = scope.spawn(move || left.activate(&target_a));
+            let right = scope.spawn(move || right.activate(&target_b));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        for (result, descriptor) in [(result_a, &second_a), (result_b, &second_b)] {
+            match result {
+                Ok(()) => {}
+                Err(PackStoreError::LockContended) => store.activate(descriptor).unwrap(),
+                Err(error) => panic!("unexpected different-ID activation error: {error}"),
+            }
+        }
+
+        let activation = store.load_activation_strict().unwrap();
+        assert_eq!(
+            activation_slot(&activation, &second_a.pack_id),
+            &ActivationSlot {
+                current: Some(second_a),
+                previous: Some(first_a),
+            }
+        );
+        assert_eq!(
+            activation_slot(&activation, &second_b.pack_id),
+            &ActivationSlot {
+                current: Some(second_b),
+                previous: Some(first_b),
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_and_corrupt_previous_are_categorical_and_cannot_mutate_rollback_state() {
+        let (root, workers, state, verifier, _) = store_fixture("previous-status");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        store.activate(&second).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        make_fixture_file_writable(&first.worker_path());
+        fs::remove_file(first.worker_path()).unwrap();
+        assert_eq!(
+            store.retained_status(&first.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Eligible,
+                previous: RetainedPackStatus::Rejected(RetainedPackRejection::TreeMismatch),
+            }
+        );
+        assert!(matches!(
+            store.rollback(&first.pack_id),
+            Err(PackStoreError::Verification(
+                PackVerificationError::TreeMismatch
+            ))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+
+        fs::write(first.worker_path(), b"tamper worker").unwrap();
+        assert_eq!(
+            store.retained_status(&first.pack_id).unwrap().previous,
+            RetainedPackStatus::Rejected(RetainedPackRejection::PayloadDigestMismatch)
+        );
+        assert!(matches!(
+            store.rollback(&first.pack_id),
+            Err(PackStoreError::Verification(
+                PackVerificationError::PayloadDigestMismatch(_)
+            ))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert_eq!(
+            store
+                .current_fail_closed(&second.pack_id)
+                .unwrap()
+                .verified_pack(),
+            &second
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_current_can_roll_back_to_valid_previous_and_retains_rejected_metadata() {
+        let (root, workers, state, verifier, _) = store_fixture("corrupt-current-rollback");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        store.activate(&second).unwrap();
+        make_fixture_file_writable(&second.worker_path());
+        fs::write(second.worker_path(), b"tamper worker").unwrap();
+
+        assert!(store.current_fail_closed(&second.pack_id).is_none());
+        assert_eq!(
+            store.retained_status(&second.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Rejected(RetainedPackRejection::PayloadDigestMismatch),
+                previous: RetainedPackStatus::Eligible,
+            }
+        );
+        assert_eq!(store.rollback(&second.pack_id).unwrap(), first);
+        assert_eq!(
+            store.retained_status(&second.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Eligible,
+                previous: RetainedPackStatus::Rejected(
+                    RetainedPackRejection::PayloadDigestMismatch
+                ),
+            }
+        );
+        let activation = store.load_activation_strict().unwrap();
+        assert_eq!(
+            activation_slot(&activation, &second.pack_id),
+            &ActivationSlot {
+                current: Some(first),
+                previous: Some(second),
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_build_successor_activates_while_old_build_predecessor_stays_retained() {
+        let (root, workers, state, original_verifier, _) = store_fixture("build-transition");
+        let original_store = PackStore::new(&workers, &state, &original_verifier);
+        let original = original_store
+            .stage_and_install(&root.join("source"))
+            .unwrap();
+        original_store.activate(&original).unwrap();
+
+        let successor_source = root.join("source-new-build");
+        fs::create_dir(&successor_source).unwrap();
+        let mut successor_manifest = base_manifest();
+        successor_manifest.pack_version = StoreComponent::new("2.0.0").unwrap();
+        successor_manifest.app_build = "new-desktop-build".to_owned();
+        successor_manifest.worker_build = "new-worker-build".to_owned();
+        let trust = write_signed(&successor_source, successor_manifest);
+        let new_verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: "new-desktop-build",
+                worker_build: "new-worker-build",
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &[PackBackend::Vulkan],
+            },
+        );
+        let new_store = PackStore::new(&workers, &state, &new_verifier);
+        let successor = new_store.stage_and_install(&successor_source).unwrap();
+        new_store.activate(&successor).unwrap();
+
+        assert_eq!(
+            new_store.retained_status(&successor.pack_id).unwrap(),
+            RetainedActivationStatus {
+                current: RetainedPackStatus::Eligible,
+                previous: RetainedPackStatus::Rejected(RetainedPackRejection::BuildMismatch),
+            }
+        );
+        assert_eq!(
+            new_store
+                .current_fail_closed(&successor.pack_id)
+                .unwrap()
+                .verified_pack(),
+            &successor
+        );
+        let activation_bytes = fs::read(new_store.activation_path()).unwrap();
+        assert!(matches!(
+            new_store.rollback(&successor.pack_id),
+            Err(PackStoreError::Verification(
+                PackVerificationError::BuildMismatch
+            ))
+        ));
+        assert_eq!(
+            fs::read(new_store.activation_path()).unwrap(),
+            activation_bytes
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn corrupt_pending_activation_fails_closed_without_lowering_epoch() {
         let (root, workers, state, verifier, _) = store_fixture("corrupt-pending");
         let store = PackStore::new(&workers, &state, &verifier);
         let first = store.stage_and_install(&root.join("source")).unwrap();
         store.activate(&first).unwrap();
         fs::write(store.pending_path(), b"{corrupt").unwrap();
-        assert!(store.current_fail_closed().is_none());
+        assert!(store.current_fail_closed(&default_pack_id()).is_none());
         assert!(store.activate(&first).is_err());
         assert_eq!(
             store
@@ -3583,8 +4742,9 @@ mod tests {
             (left.join().unwrap(), right.join().unwrap())
         });
         let activation = store.load_activation_strict().unwrap();
-        let current = activation.current.unwrap();
-        let previous = activation.previous.unwrap();
+        let slot = activation_slot(&activation, &default_pack_id());
+        let current = slot.current.clone().unwrap();
+        let previous = slot.previous.clone().unwrap();
         match (second_result, third_result) {
             (Ok(()), Ok(())) => assert!(
                 (current == second && previous == third)
@@ -3654,7 +4814,7 @@ mod tests {
         let sentinel = external.join("sentinel.txt");
         fs::write(&sentinel, b"must remain untouched").unwrap();
 
-        assert!(store.current_fail_closed().is_none());
+        assert!(store.current_fail_closed(&default_pack_id()).is_none());
         assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
 
         restore_pack_id_directory(&link, &external);
@@ -3677,7 +4837,7 @@ mod tests {
         let sentinel = external.join("sentinel.txt");
         fs::write(&sentinel, b"must remain untouched").unwrap();
 
-        assert!(store.current_fail_closed().is_none());
+        assert!(store.current_fail_closed(&default_pack_id()).is_none());
         assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
 
         fs::remove_file(&sentinel).unwrap();
@@ -3693,7 +4853,7 @@ mod tests {
         let store = PackStore::new(&workers, &state, &verifier);
         let installed = store.stage_and_install(&root.join("source")).unwrap();
         store.activate(&installed).unwrap();
-        let lease = store.current_fail_closed().unwrap();
+        let lease = store.current_fail_closed(&default_pack_id()).unwrap();
         let pack_id = workers.join("packs").join(installed.pack_id.as_str());
         let moved = root.join("moved-pack-id");
 
@@ -4083,7 +5243,7 @@ mod tests {
                 result,
                 Err(PackStoreError::CorruptState("state file bounds"))
             ));
-            assert!(store.current_fail_closed().is_none());
+            assert!(store.current_fail_closed(&default_pack_id()).is_none());
             fs::remove_dir_all(root).unwrap();
         }
     }
