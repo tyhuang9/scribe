@@ -39,7 +39,7 @@ function ConvertTo-AuthenticatedCudaInventory(
     }
 
     foreach ($required in @($RequiredPaths)) {
-        if (-not $authenticatedByPath.ContainsKey([string]$required)) {
+        if (-not $caseInsensitivePaths.Contains([string]$required)) {
             throw "Production CUDA inventory omitted required input: $required"
         }
     }

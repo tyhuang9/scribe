@@ -1414,7 +1414,7 @@ try {
         'include/cuda.h',
         'lib/x64/cuda.lib',
         'bin/cublas64_12.dll',
-        'bin/cublaslt64_12.dll',
+        'bin/cublasLt64_12.dll',
         'bin/cudart64_12.dll',
         'docs/license.txt'
     )
@@ -1434,12 +1434,77 @@ try {
             sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
         }
     })
-    $requiredCudaInventoryPaths = $cudaInventoryPaths[0..5]
+    $requiredCudaInventoryPaths = @(
+        'bin/nvcc.exe',
+        'include/cuda.h',
+        'lib/x64/cuda.lib',
+        'bin/cublas64_12.dll',
+        'bin/cublaslt64_12.dll',
+        'bin/cudart64_12.dll'
+    )
 
     Assert-AuthenticatedCudaSdkInventory `
         $cudaSdkRoot `
         $cudaInventory `
         $requiredCudaInventoryPaths
+
+    $missingRequiredCudaInventoryRejected = $false
+    try {
+        $null = ConvertTo-AuthenticatedCudaInventory `
+            $cudaInventory `
+            @($requiredCudaInventoryPaths + @('bin/curand64_10.dll'))
+    }
+    catch {
+        $missingRequiredCudaInventoryRejected = $_.Exception.Message.Contains(
+            'omitted required input: bin/curand64_10.dll'
+        )
+    }
+    Assert-True $missingRequiredCudaInventoryRejected 'Production CUDA inventory accepted an omitted required path.'
+
+    $wrongCaseCudaInventory = @($cudaInventory | ForEach-Object {
+        [pscustomobject]@{
+            path = if ($_.path -ceq 'bin/cublasLt64_12.dll') {
+                'bin/cublaslt64_12.dll'
+            } else {
+                $_.path
+            }
+            sha256 = $_.sha256
+        }
+    })
+    $wrongCudaCaseRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $wrongCaseCudaInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $wrongCudaCaseRejected = $_.Exception.Message.Contains(
+            'unexpected, duplicate, or case-colliding file'
+        )
+    }
+    Assert-True $wrongCudaCaseRejected 'Production CUDA inventory accepted a path whose case differs from the physical file.'
+
+    $caseCollidingCudaInventory = @($cudaInventory) + @(
+        [pscustomobject]@{
+            path = 'bin/cublaslt64_12.dll'
+            sha256 = ($cudaInventory | Where-Object {
+                $_.path -ceq 'bin/cublasLt64_12.dll'
+            }).sha256
+        }
+    )
+    $caseCollidingCudaInventoryRejected = $false
+    try {
+        $null = ConvertTo-AuthenticatedCudaInventory `
+            $caseCollidingCudaInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $caseCollidingCudaInventoryRejected = $_.Exception.Message.Contains(
+            'duplicate, unsafe, or noncanonical entry'
+        )
+    }
+    Assert-True $caseCollidingCudaInventoryRejected 'Production CUDA inventory accepted two case variants of one path.'
 
     $wrongHashInventory = @($cudaInventory | ForEach-Object {
         [pscustomobject]@{
