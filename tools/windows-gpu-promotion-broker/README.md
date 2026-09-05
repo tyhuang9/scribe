@@ -22,24 +22,89 @@ invocation in memory and contacts only the fixed
 `\\.\pipe\ScribeGpuPromotionBroker.v1` endpoint. It authenticates the server as
 the session-zero, restricted LocalService process carrying the exact
 `ScribeGpuPromotionBroker` service SID before writing any request bytes. The
-client opens the pipe with identification-only security quality of service, and
-the service impersonates only long enough to identify a non-anonymous member of
-Authenticated Users. The service always reverts before replying. There is no
-caller-configurable endpoint or service identity.
+client opens the pipe with identification-only security quality of service.
+After the bounded read, the service impersonates only long enough to compare
+the client's exact `TokenUser` SID with its startup policy snapshot. Group
+membership and elevation do not authorize a client. Checked reversion completes
+before decoding or replying. There is no caller-configurable endpoint or
+service identity.
 
 The corresponding `scribe-windows-gpu-promotion-service` binary runs only
 through the Windows Service Control Manager. It refuses to create the pipe
-unless its own token is the expected restricted LocalService token. The pipe is
-local-only, first-instance-only, message-mode, bounded, and protected by an
-explicit DACL. Authenticated Users receive only the individual data and
-attribute rights needed for a client connection, never generic write or pipe
-instance creation. The service currently accepts no authority: a canonical,
-path-free request can receive only a correlated typed `NotProvisioned`
-response. After validating that response, the client sends a bounded
-request-and-response-correlated acknowledgement before the service disconnects.
-The client maps the authenticated result, or an absent service, to distinct
-fixed diagnostics with exit code 78. Neither process opens the handoff or
-output paths.
+unless its own token is the expected restricted LocalService token and a fixed
+64-bit `HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization` policy
+fully verifies. The policy contains exactly DWORD `SchemaVersion=1` and a
+canonical `AuthorizedClientSid` that resolves as a user account, no subkeys or
+extra values, SYSTEM ownership, and a protected noninheriting DACL with exactly
+SYSTEM/Administrators full control plus service-SID read. A resolved group or
+unmapped SID stops startup before any client query grant or pipe is created.
+The service snapshots the SID for its lifetime; registry mutation requires
+restart and never broadens a running instance.
+
+For each service lifetime, the authenticated service adds only
+`TOKEN_QUERY` on its primary token object and
+`PROCESS_QUERY_LIMITED_INFORMATION` on its process object for that snapshotted
+client SID. It preserves and rereads the existing owner and ordered ACE
+inventory before creating the first pipe; an existing client ACE, owner match,
+noncanonical ACL, or imprecise post-write delta stops startup. These transient
+rights belong only to those process/token objects and make no persistent policy
+change; retained query handles can keep the terminated objects alive until the
+handles close. They do not modify the token's `TokenDefaultDacl`, grant process
+memory or control access, or permit token duplication, impersonation,
+adjustment, or ACL changes. The client uses
+the retained query-only token handle to require `TokenSessionId=0` before the
+existing LocalService and restricted-service-SID checks.
+
+The local-only, first-instance-only, message-mode, bounded pipe DACL contains
+exactly service-SID generic-all and the configured client SID with mask
+`0x00100183`. The client never receives generic write,
+`FILE_CREATE_PIPE_INSTANCE`, `WRITE_DAC`, or `WRITE_OWNER`. An authorized
+canonical path-free request can receive only a correlated typed
+`NotProvisioned` response. After validating it, the client sends a bounded
+request-and-response-correlated acknowledgement. Neither process opens the
+handoff or output paths.
+
+An elevated administrator can create the absent policy once with:
+
+```powershell
+$nonceBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($nonceBytes)
+$nonce = [Convert]::ToHexString($nonceBytes).ToLowerInvariant()
+pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000' -InvocationNonce $nonce
+```
+
+The provisioner accepts a SID, never an account name, and conservatively
+accepts only canonical `S-1-5-21` account SIDs with RID 1000 or greater. This
+rejects broad/built-in identities, SYSTEM, LocalService, NetworkService, all
+service SID forms, and the broker service SID. It creates rather than updates,
+supplies the final SYSTEM-owned protected descriptor atomically with key
+creation, verifies that protection before its first value write, retains an
+incomplete marker until values verify, and refuses any pre-existing policy. It
+also opens the fixed 64-bit ancestor chain without following registry links,
+refuses ancestors writable by untrusted principals, and atomically protects any
+missing Scribe-specific ancestor before creating the leaf. It enumerates the
+complete raw DACL rather than projected `RegistryAccessRule` entries. A
+non-qualified or non-Allow/Deny ACE fails closed; denies are non-granting and
+inspected raw Allow ACEs without mutation bits remain acceptable. Every mutating
+raw Allow requires an exact trusted SID except for at most one standard
+explicit, non-callback `CommonAce` on exact case-sensitive `SOFTWARE`: AceType
+and qualifier AccessAllowed, SID `S-1-3-0`, mask `0x000f003f`, AceFlags exactly
+ContainerInherit, and no opaque bytes. It does not rewrite the root ACL.
+Descendants, path/case variants, inherited, callback, object, or duplicate
+template ACEs, actual account SIDs, and altered mask or flags still fail the
+normal untrusted-mutation check. On success it writes
+one JSON record bound to the supplied correlation nonce and lists only ancestors
+for which that invocation received `REG_CREATED_NEW_KEY`.
+The native helper captures the caller token's exact prior `SeRestorePrivilege`
+state and restores it before removing the incomplete commit marker. Restore or
+handle-close failure retains the token and captured state for the outer
+`finally` boundary to retry. A persistent retry failure terminates through
+`Environment.FailFast` rather than returning to a long-lived host with uncertain
+privilege state; a successful retry preserves the original provisioning error.
+Success JSON is emitted only after restoration and token closure succeed.
+The nonce is not a credential. Automation must verify the record's version,
+nonce, SID, fixed policy path, and ordered ancestor inventory before claiming
+test cleanup ownership.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
 ledger, signed receipt, recovery state machine, authorizer, and atomic publisher
@@ -48,8 +113,7 @@ deployable production authority. In particular, the tests do not establish:
 
 - production service installation, immutable binary/ancestor ACLs, and update
   policy;
-- authorization of one dedicated workflow/client principal (this stage proves
-  Windows identity only and admits any local Authenticated Users token);
+- durable production service/client installation and update lifecycle;
 - no-follow opening and retained ancestor authority for the workflow client
   executable (the workflow retains only a standard .NET leaf stream);
 - DLL/loader policy for a future nontrivial broker client;
@@ -64,11 +128,31 @@ fresh because it is test-only. A production migration must preserve every v1
 used-release reservation and security-epoch high-water mark before accepting v2
 traffic; that migration is deferred with the production broker itself.
 
-Production promotion must stay disabled until those controls are implemented
-and independently reviewed. The repository-level harness temporarily installs
-the zero-authority service on an isolated Windows test host; neither release
-binary contains installation or console-mode behavior. Run the crate proof on
-Windows with:
+Policy provisioning alone does not provision production authority. Production
+promotion must stay disabled until those controls are implemented and
+independently reviewed. The elevated repository harness temporarily installs
+the zero-authority service and policy. It creates one disabled, one-hour local
+standard account with an in-memory cryptographic `SecureString`, stages
+exact-hash client and fixed-probe copies beneath a protected machine directory,
+then enables the account and launches those copies with its primary credentials,
+`LoadUserProfile=false`, and a cleared minimal environment. The policy and
+staging ACL bind only that account's canonical machine SID (RID 1000 or
+greater); the elevated runner remains a wrong-identity fixture. The harness
+proves invalid-policy, non-user/unmapped-SID startup denial, wrong-SID denial,
+exact access-mask and snapshot behavior, and performs identity-safe cleanup without creating a profile or
+persisting credential material. Account cleanup validates its exact SID, name,
+unique marker, and expiry, disables it, deletes only by SID, and drops ownership
+immediately after confirmed deletion. The harness
+validates and deletes each owned registry object through one
+no-follow handle opened with `DELETE`; handle-bound `NtDeleteKey` prevents a
+same-name replacement from redirecting cleanup after validation. Ownership is
+dropped immediately after each successful deletion, before observing the path
+again, so a replacement cannot be deleted by a later cleanup retry. The
+elevated adversarial test renames the validated object, creates a replacement at
+the fixed path, and proves the retained handle deletes only the renamed original.
+Neither
+release binary contains installation, policy provisioning, or console-mode
+behavior. Run the crate proof on Windows with:
 
 ```powershell
 cargo test --locked --offline -- --test-threads=1

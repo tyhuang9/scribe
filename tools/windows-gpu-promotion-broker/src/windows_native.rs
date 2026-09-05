@@ -8,26 +8,34 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    ERROR_NO_MORE_ITEMS, ERROR_NONE_MAPPED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_REGISTRY_KEY,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, IsTokenRestricted, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
-    SECURITY_ATTRIBUTES, SecurityIdentification, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
-    TokenGroups, TokenImpersonationLevel, TokenRestrictedSids, TokenUser,
+    ACCESS_ALLOWED_ACE, ACL, AddAccessAllowedAceEx, AddAce, DACL_SECURITY_INFORMATION, EqualSid,
+    GetAce, GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, INHERITED_ACE,
+    InitializeAcl, InitializeSecurityDescriptor, IsTokenRestricted, IsValidAcl,
+    IsValidSecurityDescriptor, IsValidSid, LookupAccountSidW, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SecurityIdentification, SetKernelObjectSecurity,
+    SetSecurityDescriptorDacl, SidTypeUser, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups,
+    TokenImpersonationLevel, TokenRestrictedSids, TokenSessionId, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES,
     FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-    ReadFile, SECURITY_EFFECTIVE_ONLY, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
-    WriteFile,
+    READ_CONTROL, ReadFile, SECURITY_EFFECTIVE_ONLY, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, SYNCHRONIZE, WRITE_DAC, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::LibraryLoader::{
@@ -38,7 +46,10 @@ use windows_sys::Win32::System::Pipes::{
     ImpersonateNamedPipeClient, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState, WaitNamedPipeW,
 };
-use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, RegCloseKey,
+    RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
+};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
@@ -47,9 +58,9 @@ use windows_sys::Win32::System::Services::{
     StartServiceCtrlDispatcherW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, OpenProcess,
-    OpenProcessToken, OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION, SetEvent,
-    WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+    OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::protocol::{
@@ -63,16 +74,40 @@ const CONNECT_TIMEOUT_MS: u32 = 2_000;
 const IO_TIMEOUT_MS: u32 = 5_000;
 const ERROR_SERVICE_SPECIFIC_ERROR_CODE: u32 = 1_066;
 const LOCAL_SERVICE_SID: &str = "S-1-5-19";
-const AUTHENTICATED_USERS_SID: &str = "S-1-5-11";
-const ANONYMOUS_SID: &str = "S-1-5-7";
+const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+const AUTHORIZATION_POLICY_PATH: &str = r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization";
+const AUTHORIZATION_SCHEMA_VALUE: &str = "SchemaVersion";
+const AUTHORIZED_CLIENT_SID_VALUE: &str = "AuthorizedClientSid";
+const AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+const KEY_ALL_ACCESS_MASK: u32 = 0x000f_003f;
+const KEY_READ_MASK: u32 = 0x0002_0019;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
+const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
+const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
+const ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: u8 = 12;
+const ACL_REVISION: u8 = 2;
+const ACL_REVISION_DS: u8 = 4;
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const GROUP_ENABLED: u32 = 4;
 const GROUP_USE_FOR_DENY_ONLY: u32 = 16;
-const CLIENT_PIPE_ACCESS: u32 =
-    FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
-const PIPE_SDDL: &str = concat!(
-    "D:P",
-    "(A;;GA;;;S-1-5-80-3848011089-2849881844-525567724-3342831801-3217684137)",
-    "(A;;0x00100183;;;AU)"
+const MAX_KERNEL_SECURITY_DESCRIPTOR_BYTES: u32 = 65_535;
+const MAX_ACCOUNT_NAME_UTF16_UNITS: u32 = 1_024;
+const PROCESS_CLIENT_QUERY_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION;
+const TOKEN_CLIENT_QUERY_ACCESS: u32 = TOKEN_QUERY;
+const SERVICE_TOKEN_MANAGEMENT_ACCESS: u32 = TOKEN_QUERY | READ_CONTROL | WRITE_DAC;
+const CLIENT_PIPE_ACCESS: u32 = 0x00100183;
+const _: () = assert!(
+    CLIENT_PIPE_ACCESS
+        == FILE_READ_DATA
+            | FILE_WRITE_DATA
+            | FILE_READ_ATTRIBUTES
+            | FILE_WRITE_ATTRIBUTES
+            | SYNCHRONIZE
 );
 
 static SERVICE_STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
@@ -277,13 +312,24 @@ fn run_service(argument_count: u32) -> Result<()> {
         bail!("broker service arguments are outside the fixed contract");
     }
     harden_dll_search()?;
-    authenticate_service_process()?;
+    let service = authenticate_service_process()?;
     let stop_event = SERVICE_STOP_EVENT.load(Ordering::Acquire) as HANDLE;
     if stop_event.is_null() {
         bail!("broker service stop event is unavailable");
     }
 
-    let pipe = create_server_pipe()?;
+    let policy = load_authorization_policy()?;
+    grant_authorized_client_query_access(
+        service.token.raw(),
+        &policy.authorized_client_sid,
+        TOKEN_CLIENT_QUERY_ACCESS,
+    )?;
+    grant_authorized_client_query_access(
+        service.process,
+        &policy.authorized_client_sid,
+        PROCESS_CLIENT_QUERY_ACCESS,
+    )?;
+    let pipe = create_server_pipe(&policy)?;
     if unsafe { WaitForSingleObject(stop_event, 0) } == WAIT_OBJECT_0 {
         return Ok(());
     }
@@ -293,7 +339,7 @@ fn run_service(argument_count: u32) -> Result<()> {
         0,
         0,
     )?;
-    serve_loop(pipe, stop_event)
+    serve_loop(pipe, stop_event, &policy)
 }
 
 fn report_stopped(exit_code: u32) {
@@ -343,7 +389,7 @@ fn report_status_raw(
     }
 }
 
-fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
+fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE, policy: &AuthorizationPolicy) -> Result<()> {
     loop {
         match connect_pipe(pipe.raw(), stop_event, IO_TIMEOUT_MS) {
             Ok(()) => {}
@@ -352,7 +398,7 @@ fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
             Err(_) => return Err(anyhow!("broker pipe connect failed")),
         }
 
-        let _ = serve_connection(pipe.raw(), stop_event);
+        let _ = serve_connection(pipe.raw(), stop_event, policy);
         unsafe {
             DisconnectNamedPipe(pipe.raw());
         }
@@ -362,13 +408,13 @@ fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
     }
 }
 
-fn serve_connection(pipe: HANDLE, stop_event: HANDLE) -> Result<()> {
+fn serve_connection(pipe: HANDLE, stop_event: HANDLE, policy: &AuthorizationPolicy) -> Result<()> {
     let frame = match read_message(pipe, MAX_REQUEST_FRAME, Some(stop_event), IO_TIMEOUT_MS) {
         Ok(frame) => frame,
         Err(_) => return Ok(()),
     };
 
-    authenticate_client(pipe)?;
+    authenticate_client(pipe, &policy.authorized_client_sid)?;
     let request = match decode_request_frame(&frame) {
         Ok(request) => request,
         Err(_) => return Ok(()),
@@ -383,8 +429,9 @@ fn serve_connection(pipe: HANDLE, stop_event: HANDLE) -> Result<()> {
     Ok(())
 }
 
-fn create_server_pipe() -> Result<OwnedHandle> {
-    let descriptor = LocalAllocation::security_descriptor(PIPE_SDDL)?;
+fn create_server_pipe(policy: &AuthorizationPolicy) -> Result<OwnedHandle> {
+    let pipe_sddl = policy.pipe_sddl();
+    let descriptor = LocalAllocation::security_descriptor(&pipe_sddl)?;
     let security = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.as_ptr(),
@@ -408,12 +455,752 @@ fn create_server_pipe() -> Result<OwnedHandle> {
     Ok(pipe)
 }
 
-fn authenticate_service_process() -> Result<()> {
-    let process_id = unsafe { GetCurrentProcessId() };
-    require_session_zero(process_id)?;
-    let token = open_process_token(unsafe { GetCurrentProcess() })?;
+#[derive(Debug)]
+struct AuthorizationPolicy {
+    authorized_client_sid: String,
+}
+
+impl AuthorizationPolicy {
+    fn pipe_sddl(&self) -> String {
+        format!(
+            "D:P(A;;GA;;;{SERVICE_SID})(A;;0x{CLIENT_PIPE_ACCESS:08x};;;{})",
+            self.authorized_client_sid
+        )
+    }
+}
+
+fn load_authorization_policy() -> Result<AuthorizationPolicy> {
+    let path = wide(AUTHORIZATION_POLICY_PATH);
+    let mut key: HKEY = null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        bail!("broker client authorization policy is unavailable");
+    }
+    let key = RegistryHandle::new(key)?;
+    require_exact_policy_shape(key.raw())?;
+    require_exact_policy_security(key.raw())?;
+
+    let schema = query_registry_value(key.raw(), AUTHORIZATION_SCHEMA_VALUE, REG_DWORD, 4)?;
+    if schema.as_slice() != AUTHORIZATION_SCHEMA_VERSION.to_le_bytes() {
+        bail!("broker client authorization policy schema is noncanonical");
+    }
+    let sid_bytes = query_registry_value(key.raw(), AUTHORIZED_CLIENT_SID_VALUE, REG_SZ, 184)?;
+    if sid_bytes.len() < 4 || sid_bytes.len() % 2 != 0 {
+        bail!("broker authorized client SID value is noncanonical");
+    }
+    let sid_words = sid_bytes
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .collect::<Vec<_>>();
+    if sid_words.last() != Some(&0) || sid_words[..sid_words.len() - 1].contains(&0) {
+        bail!("broker authorized client SID value is noncanonical");
+    }
+    let authorized_client_sid = String::from_utf16(&sid_words[..sid_words.len() - 1])
+        .context("broker authorized client SID is not valid UTF-16")?;
+    validate_authorized_client_sid(&authorized_client_sid)?;
+
+    // Read both values again after all structural and security checks. An
+    // administrator can replace policy only for a future service lifetime;
+    // a racing mutation must not produce a mixed snapshot.
+    if query_registry_value(key.raw(), AUTHORIZATION_SCHEMA_VALUE, REG_DWORD, 4)? != schema
+        || query_registry_value(key.raw(), AUTHORIZED_CLIENT_SID_VALUE, REG_SZ, 184)? != sid_bytes
+    {
+        bail!("broker client authorization policy changed during startup");
+    }
+    Ok(AuthorizationPolicy {
+        authorized_client_sid,
+    })
+}
+
+fn require_exact_policy_shape(key: HKEY) -> Result<()> {
+    let mut subkeys = 0;
+    let mut values = 0;
+    let status = unsafe {
+        RegQueryInfoKeyW(
+            key,
+            null_mut(),
+            null_mut(),
+            null(),
+            &mut subkeys,
+            null_mut(),
+            null_mut(),
+            &mut values,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS || subkeys != 0 || values != 2 {
+        bail!("broker client authorization policy shape is noncanonical");
+    }
+
+    // Registry lookup is case-insensitive, so querying only the canonical
+    // names would accept differently-cased aliases. Enumerate the exact two
+    // names first and compare their UTF-16 spelling ordinally.
+    let mut actual_names = Vec::with_capacity(2);
+    for index in 0..2 {
+        let mut name = [0_u16; AUTHORIZED_CLIENT_SID_VALUE.len() + 1];
+        let mut length = name.len() as u32;
+        let status = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut length,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS || length == 0 || length as usize >= name.len() {
+            bail!("broker client authorization policy value names are noncanonical");
+        }
+        actual_names.push(name[..length as usize].to_vec());
+    }
+    let mut terminal_name = [0_u16; AUTHORIZED_CLIENT_SID_VALUE.len() + 1];
+    let mut terminal_length = terminal_name.len() as u32;
+    if unsafe {
+        RegEnumValueW(
+            key,
+            2,
+            terminal_name.as_mut_ptr(),
+            &mut terminal_length,
+            null(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        )
+    } != ERROR_NO_MORE_ITEMS
+    {
+        bail!("broker client authorization policy value inventory changed during enumeration");
+    }
+    actual_names.sort_unstable();
+    let mut expected_names = [
+        AUTHORIZATION_SCHEMA_VALUE
+            .encode_utf16()
+            .collect::<Vec<_>>(),
+        AUTHORIZED_CLIENT_SID_VALUE
+            .encode_utf16()
+            .collect::<Vec<_>>(),
+    ];
+    expected_names.sort_unstable();
+    if actual_names.as_slice() != expected_names.as_slice() {
+        bail!("broker client authorization policy value names are noncanonical");
+    }
+    Ok(())
+}
+
+fn query_registry_value(
+    key: HKEY,
+    name: &str,
+    expected_type: u32,
+    maximum_bytes: u32,
+) -> Result<Vec<u8>> {
+    let name = wide(name);
+    let mut value_type = 0;
+    let mut length = 0;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null(),
+            &mut value_type,
+            null_mut(),
+            &mut length,
+        )
+    };
+    if status != ERROR_SUCCESS
+        || value_type != expected_type
+        || length == 0
+        || length > maximum_bytes
+    {
+        bail!("broker client authorization policy value is noncanonical");
+    }
+    let mut value = vec![0_u8; length as usize];
+    let mut read_length = length;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null(),
+            &mut value_type,
+            value.as_mut_ptr(),
+            &mut read_length,
+        )
+    };
+    if status != ERROR_SUCCESS || value_type != expected_type || read_length != length {
+        bail!("broker client authorization policy changed while being read");
+    }
+    Ok(value)
+}
+
+fn require_exact_policy_security(key: HKEY) -> Result<()> {
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            key,
+            SE_REGISTRY_KEY,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        bail!("broker client authorization policy security is unreadable");
+    }
+    let descriptor = LocalAllocation(descriptor.cast());
+    let system = LocalAllocation::sid(SYSTEM_SID)?;
+    if owner.is_null() || unsafe { EqualSid(owner, system.as_sid()) } == 0 {
+        bail!("broker client authorization policy owner is not SYSTEM");
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor.as_ptr(), &mut control, &mut revision) }
+        == 0
+        || control & SE_DACL_PROTECTED == 0
+    {
+        bail!("broker client authorization policy DACL is not protected");
+    }
+    if dacl.is_null()
+        || unsafe { (*dacl).AclRevision } != ACL_REVISION
+        || unsafe { (*dacl).AceCount } != 3
+    {
+        bail!("broker client authorization policy ACE inventory is noncanonical");
+    }
+
+    let expected = [
+        (SYSTEM_SID, KEY_ALL_ACCESS_MASK),
+        (ADMINISTRATORS_SID, KEY_ALL_ACCESS_MASK),
+        (SERVICE_SID, KEY_READ_MASK),
+    ];
+    let mut matched = [false; 3];
+    for index in 0..3 {
+        let mut raw_ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
+            bail!("broker client authorization policy ACE is unreadable");
+        }
+        let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 {
+            bail!("broker client authorization policy ACE type is noncanonical");
+        }
+        let sid: PSID = (&ace.SidStart as *const u32).cast_mut().cast();
+        if unsafe { IsValidSid(sid) } == 0 {
+            bail!("broker client authorization policy ACE SID is invalid");
+        }
+        let expected_ace_size = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+            + unsafe { GetLengthSid(sid) } as usize;
+        if ace.Header.AceSize as usize != expected_ace_size {
+            bail!("broker client authorization policy ACE size is noncanonical");
+        }
+        let mut found = None;
+        for (position, (expected_sid, expected_mask)) in expected.iter().enumerate() {
+            let expected_sid = LocalAllocation::sid(expected_sid)?;
+            if unsafe { EqualSid(sid, expected_sid.as_sid()) } != 0 {
+                if ace.Mask != *expected_mask || matched[position] {
+                    bail!("broker client authorization policy ACE rights are noncanonical");
+                }
+                found = Some(position);
+                break;
+            }
+        }
+        let position = found
+            .ok_or_else(|| anyhow!("broker client authorization policy contains an extra ACE"))?;
+        matched[position] = true;
+    }
+    if matched.iter().any(|present| !present) {
+        bail!("broker client authorization policy is missing a required ACE");
+    }
+    Ok(())
+}
+
+fn validate_authorized_client_sid(value: &str) -> Result<()> {
+    let sid = LocalAllocation::sid(value)?;
+    let canonical = sid.to_string()?;
+    if canonical != value {
+        bail!("broker authorized client SID is noncanonical");
+    }
+    validate_authorized_client_sid_shape(value)?;
+    require_resolved_user_sid(sid.as_sid())
+}
+
+fn validate_authorized_client_sid_shape(value: &str) -> Result<()> {
+    let components = value.split('-').collect::<Vec<_>>();
+    let rid = components
+        .get(7)
+        .and_then(|component| component.parse::<u32>().ok());
+    if components.len() != 8
+        || components[..4] != ["S", "1", "5", "21"]
+        || components[4..]
+            .iter()
+            .any(|component| component.parse::<u32>().is_err())
+        || rid.is_none_or(|rid| rid < 1_000)
+    {
+        bail!("broker authorized client SID is not a dedicated account SID");
+    }
+    Ok(())
+}
+
+fn require_resolved_user_sid(sid: PSID) -> Result<()> {
+    let mut name_length = 0;
+    let mut domain_length = 0;
+    let mut sid_type = 0;
+    let sized = unsafe {
+        LookupAccountSidW(
+            null(),
+            sid,
+            null_mut(),
+            &mut name_length,
+            null_mut(),
+            &mut domain_length,
+            &mut sid_type,
+        )
+    };
+    let size_error = unsafe { GetLastError() };
+    if size_error == ERROR_NONE_MAPPED {
+        bail!("broker authorized client SID does not resolve to an account");
+    }
+    if sized != 0
+        || size_error != ERROR_INSUFFICIENT_BUFFER
+        || name_length == 0
+        || name_length > MAX_ACCOUNT_NAME_UTF16_UNITS
+        || domain_length > MAX_ACCOUNT_NAME_UTF16_UNITS
+    {
+        bail!("broker authorized client account lookup is outside the fixed contract");
+    }
+    let mut name = vec![0_u16; name_length as usize];
+    let mut domain = vec![0_u16; domain_length.max(1) as usize];
+    let mut name_capacity = name.len() as u32;
+    let mut domain_capacity = domain.len() as u32;
+    if unsafe {
+        LookupAccountSidW(
+            null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_capacity,
+            domain.as_mut_ptr(),
+            &mut domain_capacity,
+            &mut sid_type,
+        )
+    } == 0
+    {
+        bail!("broker authorized client SID could not be resolved safely");
+    }
+    require_user_sid_type(sid_type)
+}
+
+fn require_user_sid_type(sid_type: i32) -> Result<()> {
+    if sid_type != SidTypeUser {
+        bail!("broker authorized client SID does not identify a user account");
+    }
+    Ok(())
+}
+
+struct RegistryHandle(HKEY);
+
+impl RegistryHandle {
+    fn new(handle: HKEY) -> Result<Self> {
+        if handle.is_null() {
+            bail!("invalid broker authorization policy handle");
+        }
+        Ok(Self(handle))
+    }
+
+    fn raw(&self) -> HKEY {
+        self.0
+    }
+}
+
+impl Drop for RegistryHandle {
+    fn drop(&mut self) {
+        unsafe {
+            RegCloseKey(self.0);
+        }
+    }
+}
+
+struct AuthenticatedService {
+    process: HANDLE,
+    token: OwnedHandle,
+}
+
+fn authenticate_service_process() -> Result<AuthenticatedService> {
+    let process = unsafe { GetCurrentProcess() };
+    let token = open_process_token_with_access(process, SERVICE_TOKEN_MANAGEMENT_ACCESS)?;
+    require_token_session_zero(token.raw())?;
     require_user_sid(token.raw(), LOCAL_SERVICE_SID)?;
-    require_restricted_service_sid(token.raw())
+    require_restricted_service_sid(token.raw())?;
+    Ok(AuthenticatedService { process, token })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AclSnapshot {
+    revision: u8,
+    aces: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelObjectSecuritySnapshot {
+    owner: Vec<u8>,
+    dacl: AclSnapshot,
+}
+
+fn grant_authorized_client_query_access(
+    handle: HANDLE,
+    authorized_client_sid: &str,
+    access_mask: u32,
+) -> Result<()> {
+    if access_mask != TOKEN_CLIENT_QUERY_ACCESS && access_mask != PROCESS_CLIENT_QUERY_ACCESS {
+        bail!("broker object query access mask is outside the fixed contract");
+    }
+    let client_sid = LocalAllocation::sid(authorized_client_sid)?;
+    let client_sid_bytes = client_sid.sid_bytes()?;
+    let before = read_kernel_object_security(handle)?;
+    if before.owner == client_sid_bytes {
+        bail!("broker client must not own a service kernel object");
+    }
+    expected_query_acl(&before.dacl, &client_sid_bytes, access_mask)?;
+    let replacement = build_query_acl(&before.dacl, client_sid.as_sid(), access_mask)?;
+    require_exact_query_acl_delta(
+        &before.dacl,
+        &snapshot_acl(replacement.as_ptr().cast())?,
+        &client_sid_bytes,
+        access_mask,
+    )?;
+    if read_kernel_object_security(handle)? != before {
+        bail!("broker kernel object security changed before query access was applied");
+    }
+    set_kernel_object_dacl(handle, replacement.as_ptr().cast())?;
+    let after = read_kernel_object_security(handle)?;
+    if after.owner != before.owner || after.owner == client_sid_bytes {
+        bail!("broker kernel object query access failed exact post-write verification");
+    }
+    require_exact_query_acl_delta(&before.dacl, &after.dacl, &client_sid_bytes, access_mask)?;
+    Ok(())
+}
+
+fn read_kernel_object_security(handle: HANDLE) -> Result<KernelObjectSecuritySnapshot> {
+    let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut length = 0;
+    let sized = unsafe { GetKernelObjectSecurity(handle, information, null_mut(), 0, &mut length) };
+    let size_error = unsafe { GetLastError() };
+    if sized != 0
+        || size_error != ERROR_INSUFFICIENT_BUFFER
+        || length < size_of::<SECURITY_DESCRIPTOR>() as u32
+        || length > MAX_KERNEL_SECURITY_DESCRIPTOR_BYTES
+    {
+        bail!("broker kernel object security size is outside the fixed contract");
+    }
+    let words = (length as usize).div_ceil(size_of::<usize>());
+    let mut descriptor = vec![0_usize; words];
+    let mut actual_length = length;
+    let descriptor_pointer = descriptor.as_mut_ptr().cast();
+    if unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            information,
+            descriptor_pointer,
+            length,
+            &mut actual_length,
+        )
+    } == 0
+        || actual_length != length
+        || unsafe { IsValidSecurityDescriptor(descriptor_pointer) } == 0
+    {
+        bail!("broker kernel object security is unreadable");
+    }
+
+    let mut owner: PSID = null_mut();
+    let mut owner_defaulted = 0;
+    if unsafe { GetSecurityDescriptorOwner(descriptor_pointer, &mut owner, &mut owner_defaulted) }
+        == 0
+        || owner.is_null()
+    {
+        bail!("broker kernel object owner is unreadable");
+    }
+    let owner = copy_descriptor_sid(&descriptor, length as usize, owner)?;
+
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    let mut dacl: *mut ACL = null_mut();
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor_pointer,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+        || dacl_present == 0
+        || dacl.is_null()
+        || !pointer_range_is_within(
+            descriptor.as_ptr().cast(),
+            length as usize,
+            dacl.cast(),
+            size_of::<ACL>(),
+        )
+    {
+        bail!("broker kernel object DACL is absent or unreadable");
+    }
+    let acl_size = unsafe { (*dacl).AclSize as usize };
+    if !pointer_range_is_within(
+        descriptor.as_ptr().cast(),
+        length as usize,
+        dacl.cast(),
+        acl_size,
+    ) {
+        bail!("broker kernel object DACL exceeds its security descriptor");
+    }
+    Ok(KernelObjectSecuritySnapshot {
+        owner,
+        dacl: snapshot_acl(dacl)?,
+    })
+}
+
+fn copy_descriptor_sid(
+    descriptor: &[usize],
+    descriptor_length: usize,
+    sid: PSID,
+) -> Result<Vec<u8>> {
+    if unsafe { IsValidSid(sid) } == 0 {
+        bail!("broker kernel object owner SID is invalid");
+    }
+    let sid_length = unsafe { GetLengthSid(sid) } as usize;
+    if !pointer_range_is_within(
+        descriptor.as_ptr().cast(),
+        descriptor_length,
+        sid.cast(),
+        sid_length,
+    ) {
+        bail!("broker kernel object owner SID exceeds its security descriptor");
+    }
+    Ok(unsafe { std::slice::from_raw_parts(sid.cast(), sid_length) }.to_vec())
+}
+
+fn pointer_range_is_within(
+    container: *const u8,
+    container_length: usize,
+    member: *const u8,
+    member_length: usize,
+) -> bool {
+    let start = container as usize;
+    let end = start.checked_add(container_length);
+    let member_start = member as usize;
+    let member_end = member_start.checked_add(member_length);
+    end.is_some_and(|end| member_start >= start && member_end.is_some_and(|value| value <= end))
+}
+
+fn snapshot_acl(acl: *const ACL) -> Result<AclSnapshot> {
+    if acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
+        bail!("broker kernel object DACL is invalid");
+    }
+    let revision = unsafe { (*acl).AclRevision };
+    if revision != ACL_REVISION && revision != ACL_REVISION_DS {
+        bail!("broker kernel object DACL revision is unsupported");
+    }
+    let acl_length = unsafe { (*acl).AclSize as usize };
+    let acl_start = acl.cast::<u8>();
+    let mut aces = Vec::with_capacity(unsafe { (*acl).AceCount as usize });
+    for index in 0..unsafe { (*acl).AceCount as u32 } {
+        let mut raw_ace = null_mut();
+        if unsafe { GetAce(acl, index, &mut raw_ace) } == 0
+            || raw_ace.is_null()
+            || !pointer_range_is_within(acl_start, acl_length, raw_ace.cast(), 4)
+        {
+            bail!("broker kernel object ACE is unreadable");
+        }
+        let ace_size = unsafe { *(raw_ace.cast::<u8>().add(2).cast::<u16>()) } as usize;
+        if ace_size < 4 || !pointer_range_is_within(acl_start, acl_length, raw_ace.cast(), ace_size)
+        {
+            bail!("broker kernel object ACE size is invalid");
+        }
+        aces.push(unsafe { std::slice::from_raw_parts(raw_ace.cast(), ace_size) }.to_vec());
+    }
+    Ok(AclSnapshot { revision, aces })
+}
+
+fn expected_query_acl(
+    original: &AclSnapshot,
+    client_sid: &[u8],
+    access_mask: u32,
+) -> Result<AclSnapshot> {
+    if access_mask != TOKEN_CLIENT_QUERY_ACCESS && access_mask != PROCESS_CLIENT_QUERY_ACCESS {
+        bail!("broker object query access mask is outside the fixed contract");
+    }
+    if client_sid.len() < 8
+        || client_sid[0] != 1
+        || 8_usize
+            .checked_add(client_sid[1] as usize * 4)
+            .is_none_or(|length| length != client_sid.len())
+    {
+        bail!("broker client SID bytes are noncanonical");
+    }
+    if original.revision != ACL_REVISION && original.revision != ACL_REVISION_DS {
+        bail!("broker kernel object DACL revision is unsupported");
+    }
+
+    let mut inherited = false;
+    let mut saw_explicit_allow = false;
+    let mut insertion = original.aces.len();
+    for (index, ace) in original.aces.iter().enumerate() {
+        if ace.len() < 4 || ace[2..4] != (ace.len() as u16).to_le_bytes() {
+            bail!("broker kernel object ACE bytes are noncanonical");
+        }
+        if ace
+            .windows(client_sid.len())
+            .any(|candidate| candidate == client_sid)
+        {
+            bail!("broker client already appears in a service kernel object DACL");
+        }
+        if ace[1] & INHERITED_ACE as u8 != 0 {
+            if !inherited {
+                inherited = true;
+                insertion = index;
+            }
+            continue;
+        }
+        if inherited {
+            bail!("broker kernel object DACL has an explicit ACE after inheritance");
+        }
+        match ace[0] {
+            ACCESS_DENIED_ACE_TYPE
+            | ACCESS_DENIED_OBJECT_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE => {
+                if saw_explicit_allow {
+                    bail!("broker kernel object DACL has a deny ACE after an allow ACE");
+                }
+            }
+            ACCESS_ALLOWED_ACE_TYPE
+            | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+            | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => saw_explicit_allow = true,
+            _ => bail!("broker kernel object DACL has an unsupported explicit ACE type"),
+        }
+    }
+
+    let ace_size = 8_usize
+        .checked_add(client_sid.len())
+        .ok_or_else(|| anyhow!("broker query ACE size overflowed"))?;
+    let ace_size = u16::try_from(ace_size).context("broker query ACE is oversized")?;
+    let mut query_ace = Vec::with_capacity(ace_size as usize);
+    query_ace.push(ACCESS_ALLOWED_ACE_TYPE);
+    query_ace.push(0);
+    query_ace.extend_from_slice(&ace_size.to_le_bytes());
+    query_ace.extend_from_slice(&access_mask.to_le_bytes());
+    query_ace.extend_from_slice(client_sid);
+
+    let mut aces = original.aces.clone();
+    aces.insert(insertion, query_ace);
+    Ok(AclSnapshot {
+        revision: original.revision,
+        aces,
+    })
+}
+
+fn require_exact_query_acl_delta(
+    original: &AclSnapshot,
+    actual: &AclSnapshot,
+    client_sid: &[u8],
+    access_mask: u32,
+) -> Result<()> {
+    if *actual != expected_query_acl(original, client_sid, access_mask)? {
+        bail!("broker query ACL changed the expected ACE inventory");
+    }
+    Ok(())
+}
+
+fn build_query_acl(
+    original: &AclSnapshot,
+    client_sid: PSID,
+    access_mask: u32,
+) -> Result<Vec<usize>> {
+    let client_sid_length = unsafe { GetLengthSid(client_sid) } as usize;
+    let query_ace_length = 8_usize
+        .checked_add(client_sid_length)
+        .ok_or_else(|| anyhow!("broker query ACE size overflowed"))?;
+    let acl_length = original
+        .aces
+        .iter()
+        .try_fold(size_of::<ACL>() + query_ace_length, |length, ace| {
+            length.checked_add(ace.len())
+        })
+        .ok_or_else(|| anyhow!("broker query ACL size overflowed"))?;
+    let acl_length = u32::try_from(acl_length).context("broker query ACL is oversized")?;
+    if acl_length > u16::MAX as u32 {
+        bail!("broker query ACL exceeds the Windows ACL size limit");
+    }
+    let mut allocation = vec![0_usize; (acl_length as usize).div_ceil(size_of::<usize>())];
+    let acl = allocation.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(acl, acl_length, original.revision as u32) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not initialize broker query ACL");
+    }
+    let insertion = original
+        .aces
+        .iter()
+        .position(|ace| ace[1] & INHERITED_ACE as u8 != 0)
+        .unwrap_or(original.aces.len());
+    for index in 0..=original.aces.len() {
+        if index == insertion
+            && unsafe {
+                AddAccessAllowedAceEx(acl, original.revision as u32, 0, access_mask, client_sid)
+            } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("could not add exact broker query ACE");
+        }
+        if let Some(ace) = original.aces.get(index)
+            && unsafe {
+                AddAce(
+                    acl,
+                    original.revision as u32,
+                    u32::MAX,
+                    ace.as_ptr().cast(),
+                    ace.len() as u32,
+                )
+            } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("could not preserve broker kernel object ACE");
+        }
+    }
+    Ok(allocation)
+}
+
+fn set_kernel_object_dacl(handle: HANDLE, dacl: *const ACL) -> Result<()> {
+    if dacl.is_null() || unsafe { IsValidAcl(dacl) } == 0 {
+        bail!("refusing to apply an absent or invalid broker DACL");
+    }
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { zeroed() };
+    let descriptor_pointer = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+    if unsafe { InitializeSecurityDescriptor(descriptor_pointer, SECURITY_DESCRIPTOR_REVISION) }
+        == 0
+        || unsafe { SetSecurityDescriptorDacl(descriptor_pointer, 1, dacl, 0) } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("could not construct broker DACL update");
+    }
+    if unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor_pointer) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("could not apply broker DACL update");
+    }
+    Ok(())
 }
 
 struct AuthenticatedServer {
@@ -424,10 +1211,10 @@ struct AuthenticatedServer {
 
 fn authenticate_server(pipe: HANDLE) -> Result<AuthenticatedServer> {
     let process_id = pipe_server_process_id(pipe)?;
-    require_session_zero(process_id)?;
     let process =
         OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) })?;
     let token = open_process_token(process.raw())?;
+    require_token_session_zero(token.raw())?;
     require_user_sid(token.raw(), LOCAL_SERVICE_SID)?;
     require_restricted_service_sid(token.raw())?;
     if pipe_server_process_id(pipe)? != process_id {
@@ -456,7 +1243,7 @@ fn pipe_server_process_id(pipe: HANDLE) -> Result<u32> {
     Ok(process_id)
 }
 
-fn authenticate_client(pipe: HANDLE) -> Result<()> {
+fn authenticate_client(pipe: HANDLE, authorized_client_sid: &str) -> Result<()> {
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         bail!("could not identify broker pipe client");
     }
@@ -467,8 +1254,7 @@ fn authenticate_client(pipe: HANDLE) -> Result<()> {
     }
     let token = OwnedHandle::new(token)?;
     require_impersonation_level(token.raw())?;
-    reject_user_sid(token.raw(), ANONYMOUS_SID)?;
-    require_enabled_group_sid(token.raw(), AUTHENTICATED_USERS_SID)?;
+    require_user_sid(token.raw(), authorized_client_sid)?;
     drop(token);
     impersonation.revert_or_abort();
     Ok(())
@@ -498,17 +1284,33 @@ impl Drop for ImpersonationGuard {
     }
 }
 
-fn require_session_zero(process_id: u32) -> Result<()> {
+fn require_token_session_zero(token: HANDLE) -> Result<()> {
     let mut session_id = u32::MAX;
-    if unsafe { ProcessIdToSessionId(process_id, &mut session_id) } == 0 || session_id != 0 {
+    let mut length = size_of::<u32>() as u32;
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenSessionId,
+            (&mut session_id as *mut u32).cast(),
+            length,
+            &mut length,
+        )
+    } == 0
+        || length != size_of::<u32>() as u32
+        || session_id != 0
+    {
         bail!("broker service process is outside session zero");
     }
     Ok(())
 }
 
 fn open_process_token(process: HANDLE) -> Result<OwnedHandle> {
+    open_process_token_with_access(process, TOKEN_QUERY)
+}
+
+fn open_process_token_with_access(process: HANDLE, access: u32) -> Result<OwnedHandle> {
     let mut token = null_mut();
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+    if unsafe { OpenProcessToken(process, access, &mut token) } == 0 {
         return Err(std::io::Error::last_os_error()).context("could not inspect broker token");
     }
     OwnedHandle::new(token)
@@ -528,16 +1330,6 @@ fn require_user_sid(token: HANDLE, expected: &str) -> Result<()> {
     let expected = LocalAllocation::sid(expected)?;
     if unsafe { EqualSid(user.User.Sid, expected.as_sid()) } == 0 {
         bail!("broker token user does not match");
-    }
-    Ok(())
-}
-
-fn reject_user_sid(token: HANDLE, rejected: &str) -> Result<()> {
-    let information = token_information(token, TokenUser)?;
-    let user = unsafe { &*(information.as_ptr().cast::<TOKEN_USER>()) };
-    let rejected = LocalAllocation::sid(rejected)?;
-    if unsafe { EqualSid(user.User.Sid, rejected.as_sid()) } != 0 {
-        bail!("anonymous broker client is forbidden");
     }
     Ok(())
 }
@@ -645,8 +1437,32 @@ impl LocalAllocation {
         Ok(Self(descriptor))
     }
 
+    fn to_string(&self) -> Result<String> {
+        let mut value = null_mut();
+        if unsafe { ConvertSidToStringSidW(self.as_sid(), &mut value) } == 0 || value.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("could not canonicalize broker SID");
+        }
+        let value = Self(value.cast());
+        let pointer = value.0.cast::<u16>();
+        let mut length = 0;
+        while unsafe { *pointer.add(length) } != 0 {
+            length += 1;
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) })
+            .context("canonical broker SID is not valid UTF-16")
+    }
+
     fn as_sid(&self) -> PSID {
         self.0
+    }
+
+    fn sid_bytes(&self) -> Result<Vec<u8>> {
+        if unsafe { IsValidSid(self.as_sid()) } == 0 {
+            bail!("broker SID allocation is invalid");
+        }
+        let length = unsafe { GetLengthSid(self.as_sid()) } as usize;
+        Ok(unsafe { std::slice::from_raw_parts(self.as_sid().cast(), length) }.to_vec())
     }
 
     fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
@@ -909,18 +1725,327 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_user_pipe_rights_exclude_instance_and_acl_authority() {
+    fn dedicated_client_pipe_rights_exclude_instance_and_acl_authority() {
         const FILE_APPEND_DATA: u32 = 4;
         const WRITE_DAC: u32 = 0x0004_0000;
         const WRITE_OWNER: u32 = 0x0008_0000;
+        let policy = AuthorizationPolicy {
+            authorized_client_sid: "S-1-5-21-1-2-3-1000".to_owned(),
+        };
+        let pipe_sddl = policy.pipe_sddl();
         assert_eq!(CLIENT_PIPE_ACCESS & FILE_APPEND_DATA, 0);
         assert_eq!(CLIENT_PIPE_ACCESS & WRITE_DAC, 0);
         assert_eq!(CLIENT_PIPE_ACCESS & WRITE_OWNER, 0);
-        assert!(PIPE_SDDL.contains(";;;AU)"));
-        for forbidden in [";;;LS)", ";;;BA)", ";;;WD)", ";;;AN)"] {
-            assert!(!PIPE_SDDL.contains(forbidden));
+        assert!(pipe_sddl.contains("0x00100183;;;S-1-5-21-1-2-3-1000)"));
+        assert!(pipe_sddl.contains(&format!("GA;;;{SERVICE_SID})")));
+        for forbidden in [";;;AU)", ";;;BU)", ";;;BA)", ";;;WD)", ";;;AN)"] {
+            assert!(!pipe_sddl.contains(forbidden));
         }
-        LocalAllocation::security_descriptor(PIPE_SDDL).unwrap();
+        LocalAllocation::security_descriptor(&pipe_sddl).unwrap();
+    }
+
+    #[test]
+    fn authorization_policy_shape_accepts_only_canonical_dedicated_account_sids() {
+        validate_authorized_client_sid_shape("S-1-5-21-1-2-3-1000").unwrap();
+        for forbidden in [
+            "S-1-1-0",
+            "S-1-5-7",
+            "S-1-5-11",
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-32-544",
+            "S-1-5-32-545",
+            SERVICE_SID,
+            "S-1-5-21-1-2-3-500",
+            "s-1-5-21-1-2-3-1000",
+        ] {
+            assert!(
+                validate_authorized_client_sid_shape(forbidden).is_err(),
+                "accepted dangerous or noncanonical SID {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_policy_native_lookup_accepts_user_and_rejects_group() {
+        let token = open_process_token(unsafe { GetCurrentProcess() }).unwrap();
+        let information = token_information(token.raw(), TokenUser).unwrap();
+        let user = unsafe { &*(information.as_ptr().cast::<TOKEN_USER>()) };
+        require_resolved_user_sid(user.User.Sid).unwrap();
+
+        let group = LocalAllocation::sid(ADMINISTRATORS_SID).unwrap();
+        assert!(require_resolved_user_sid(group.as_sid()).is_err());
+    }
+
+    #[test]
+    fn service_snapshots_policy_before_first_pipe_creation() {
+        let source = include_str!("windows_native.rs");
+        let start = source.find("fn run_service(argument_count").unwrap();
+        let end = source[start..].find("\nfn report_stopped").unwrap() + start;
+        let service = &source[start..end];
+        let authenticate = service.find("authenticate_service_process()?").unwrap();
+        let load = service.find("load_authorization_policy()?").unwrap();
+        let token_grant = service.find("TOKEN_CLIENT_QUERY_ACCESS").unwrap();
+        let process_grant = service.find("PROCESS_CLIENT_QUERY_ACCESS").unwrap();
+        let pipe = service.find("create_server_pipe(&policy)?").unwrap();
+        let serve = service
+            .find("serve_loop(pipe, stop_event, &policy)")
+            .unwrap();
+        assert!(
+            authenticate < load
+                && load < token_grant
+                && token_grant < process_grant
+                && process_grant < pipe
+                && pipe < serve
+        );
+    }
+
+    fn test_ace(ace_type: u8, flags: u8, mask: u32, sid: &[u8]) -> Vec<u8> {
+        let size = u16::try_from(8 + sid.len()).unwrap();
+        let mut ace = vec![ace_type, flags];
+        ace.extend_from_slice(&size.to_le_bytes());
+        ace.extend_from_slice(&mask.to_le_bytes());
+        ace.extend_from_slice(sid);
+        ace
+    }
+
+    #[test]
+    fn query_acl_delta_preserves_existing_aces_and_inserts_before_inheritance() {
+        let client_sid = LocalAllocation::sid("S-1-5-21-1-2-3-1000").unwrap();
+        let client = client_sid.sid_bytes().unwrap();
+        let system = LocalAllocation::sid(SYSTEM_SID)
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let service = LocalAllocation::sid(SERVICE_SID)
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let administrators = LocalAllocation::sid(ADMINISTRATORS_SID)
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let original = AclSnapshot {
+            revision: ACL_REVISION,
+            aces: vec![
+                test_ace(ACCESS_DENIED_ACE_TYPE, 0, 0x20, &system),
+                test_ace(ACCESS_ALLOWED_ACE_TYPE, 0, 0x100, &service),
+                test_ace(
+                    ACCESS_ALLOWED_ACE_TYPE,
+                    INHERITED_ACE as u8,
+                    0x200,
+                    &administrators,
+                ),
+            ],
+        };
+        let actual = expected_query_acl(&original, &client, PROCESS_CLIENT_QUERY_ACCESS).unwrap();
+        assert_eq!(actual.revision, original.revision);
+        assert_eq!(actual.aces.len(), original.aces.len() + 1);
+        assert_eq!(actual.aces[0], original.aces[0]);
+        assert_eq!(actual.aces[1], original.aces[1]);
+        assert_eq!(actual.aces[3], original.aces[2]);
+        assert_eq!(actual.aces[2][0], ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(actual.aces[2][1], 0);
+        assert_eq!(
+            u32::from_le_bytes(actual.aces[2][4..8].try_into().unwrap()),
+            0x1000
+        );
+        assert_eq!(&actual.aces[2][8..], client.as_slice());
+        require_exact_query_acl_delta(&original, &actual, &client, PROCESS_CLIENT_QUERY_ACCESS)
+            .unwrap();
+        let built =
+            build_query_acl(&original, client_sid.as_sid(), PROCESS_CLIENT_QUERY_ACCESS).unwrap();
+        assert_eq!(snapshot_acl(built.as_ptr().cast()).unwrap(), actual);
+    }
+
+    #[test]
+    fn query_acl_delta_rejects_preexisting_or_noncanonical_authority() {
+        let client = LocalAllocation::sid("S-1-5-21-1-2-3-1000")
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let system = LocalAllocation::sid(SYSTEM_SID)
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let client_ace = test_ace(ACCESS_ALLOWED_OBJECT_ACE_TYPE, 0, 0x1000, &client);
+        assert!(
+            expected_query_acl(
+                &AclSnapshot {
+                    revision: ACL_REVISION_DS,
+                    aces: vec![client_ace],
+                },
+                &client,
+                PROCESS_CLIENT_QUERY_ACCESS,
+            )
+            .is_err()
+        );
+
+        let allow = test_ace(ACCESS_ALLOWED_ACE_TYPE, 0, 1, &system);
+        let deny = test_ace(ACCESS_DENIED_ACE_TYPE, 0, 2, &system);
+        let inherited = test_ace(ACCESS_ALLOWED_ACE_TYPE, INHERITED_ACE as u8, 3, &system);
+        for invalid in [
+            vec![allow.clone(), deny],
+            vec![inherited, allow.clone()],
+            vec![test_ace(2, 0, 1, &system)],
+            vec![vec![0, 0, 3, 0]],
+        ] {
+            assert!(
+                expected_query_acl(
+                    &AclSnapshot {
+                        revision: ACL_REVISION,
+                        aces: invalid,
+                    },
+                    &client,
+                    TOKEN_CLIENT_QUERY_ACCESS,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            expected_query_acl(
+                &AclSnapshot {
+                    revision: 3,
+                    aces: vec![allow],
+                },
+                &client,
+                TOKEN_CLIENT_QUERY_ACCESS,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn query_acl_delta_rejects_mutation_reordering_and_extra_authority() {
+        let client = LocalAllocation::sid("S-1-5-21-1-2-3-1000")
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let system = LocalAllocation::sid(SYSTEM_SID)
+            .unwrap()
+            .sid_bytes()
+            .unwrap();
+        let original = AclSnapshot {
+            revision: ACL_REVISION,
+            aces: vec![
+                test_ace(ACCESS_DENIED_ACE_TYPE, 0, 1, &system),
+                test_ace(ACCESS_ALLOWED_ACE_TYPE, 0, 2, &system),
+            ],
+        };
+        let expected = expected_query_acl(&original, &client, TOKEN_CLIENT_QUERY_ACCESS).unwrap();
+        let query_index = 2;
+        let mut candidates = Vec::new();
+        let mut wrong_type = expected.clone();
+        wrong_type.aces[query_index][0] = ACCESS_DENIED_ACE_TYPE;
+        candidates.push(wrong_type);
+        let mut wrong_flags = expected.clone();
+        wrong_flags.aces[query_index][1] = INHERITED_ACE as u8;
+        candidates.push(wrong_flags);
+        let mut wrong_mask = expected.clone();
+        wrong_mask.aces[query_index][4] ^= 1;
+        candidates.push(wrong_mask);
+        let mut wrong_sid = expected.clone();
+        *wrong_sid.aces[query_index].last_mut().unwrap() ^= 1;
+        candidates.push(wrong_sid);
+        let mut missing = expected.clone();
+        missing.aces.remove(query_index);
+        candidates.push(missing);
+        let mut extra = expected.clone();
+        extra.aces.push(expected.aces[query_index].clone());
+        candidates.push(extra);
+        let mut reordered = expected.clone();
+        reordered.aces.swap(0, 1);
+        candidates.push(reordered);
+        let mut mutated_existing = expected.clone();
+        mutated_existing.aces[0][4] ^= 1;
+        candidates.push(mutated_existing);
+        for candidate in candidates {
+            assert!(
+                require_exact_query_acl_delta(
+                    &original,
+                    &candidate,
+                    &client,
+                    TOKEN_CLIENT_QUERY_ACCESS,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn client_query_masks_exclude_object_control_and_impersonation_rights() {
+        for forbidden in [
+            0x0000_0001,
+            0x0000_0010,
+            0x0000_0040,
+            0x0000_0400,
+            0x0001_0000,
+            READ_CONTROL,
+            WRITE_DAC,
+            0x0008_0000,
+            SYNCHRONIZE,
+        ] {
+            assert_eq!(PROCESS_CLIENT_QUERY_ACCESS & forbidden, 0);
+        }
+        for forbidden in [
+            0x0000_0001,
+            0x0000_0002,
+            0x0000_0004,
+            0x0000_0010,
+            0x0000_0020,
+            0x0000_0040,
+            0x0000_0080,
+            0x0000_0100,
+            0x0001_0000,
+            READ_CONTROL,
+            WRITE_DAC,
+            0x0008_0000,
+        ] {
+            assert_eq!(TOKEN_CLIENT_QUERY_ACCESS & forbidden, 0);
+        }
+        assert_eq!(PROCESS_CLIENT_QUERY_ACCESS, 0x0000_1000);
+        assert_eq!(TOKEN_CLIENT_QUERY_ACCESS, 0x0000_0008);
+    }
+
+    #[test]
+    fn server_authentication_uses_retained_token_for_session_zero() {
+        let source = include_str!("windows_native.rs");
+        let start = source.find("fn authenticate_server(").unwrap();
+        let end = source[start..].find("\nfn revalidate_server(").unwrap() + start;
+        let authentication = &source[start..end];
+        let process = authentication.find("OpenProcess(").unwrap();
+        let token = authentication
+            .find("open_process_token(process.raw())?")
+            .unwrap();
+        let session = authentication
+            .find("require_token_session_zero(token.raw())?")
+            .unwrap();
+        let user = authentication
+            .find("require_user_sid(token.raw(), LOCAL_SERVICE_SID)?")
+            .unwrap();
+        let restricted = authentication
+            .find("require_restricted_service_sid(token.raw())?")
+            .unwrap();
+        assert!(process < token && token < session && session < user && user < restricted);
+        assert!(!authentication.contains("ProcessIdToSessionId"));
+
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        for forbidden in [
+            "ProcessIdToSessionId",
+            "SetTokenInformation",
+            "TokenDefaultDacl",
+            "AdjustTokenPrivileges",
+        ] {
+            assert!(!production.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn absent_or_invalid_replacement_dacl_is_rejected_before_write() {
+        assert!(set_kernel_object_dacl(null_mut(), null()).is_err());
+        let invalid = [0_usize; 1];
+        assert!(snapshot_acl(invalid.as_ptr().cast()).is_err());
     }
 
     #[test]
@@ -990,7 +2115,9 @@ mod tests {
         let start = source.find("fn serve_connection(").unwrap();
         let end = source[start..].find("\nfn create_server_pipe(").unwrap() + start;
         let connection = &source[start..end];
-        let authenticate = connection.find("authenticate_client(pipe)?").unwrap();
+        let authenticate = connection
+            .find("authenticate_client(pipe, &policy.authorized_client_sid)?")
+            .unwrap();
         let decode = connection.find("decode_request_frame(&frame)").unwrap();
         let respond = connection
             .find("BrokerResponseV1::not_provisioned")
@@ -1018,7 +2145,7 @@ mod tests {
 
         let guard_start = source.find("impl ImpersonationGuard").unwrap();
         let guard_end = source[guard_start..]
-            .find("\nfn require_session_zero")
+            .find("\nfn require_token_session_zero")
             .unwrap()
             + guard_start;
         let guard = &source[guard_start..guard_end];

@@ -1426,6 +1426,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     );
     let broker_fixture = include_str!("../tools/windows-gpu-promotion-broker/src/fixture.rs");
     let transport_test = include_str!("../scripts/test-windows-gpu-broker-transport.ps1");
+    let client_policy_provisioner =
+        include_str!("../scripts/provision-windows-gpu-broker-client-policy.ps1");
     let protected = workflow
         .split("  protected-promote:")
         .nth(1)
@@ -1478,10 +1480,14 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "test-windows-gpu-broker-transport.ps1 -RequireScmIntegration",
+        "scripts/provision-windows-gpu-broker-client-policy.ps1",
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
         "SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256",
+        "SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID",
         "SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED",
+        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        "$currentClientSid -cne $configuredClientSid.Value",
         "--require-unused-release-set",
         "--workflow-source-sha",
         "no filesystem, ledger, or signing authority was accessed",
@@ -1587,7 +1593,15 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "SECURITY_IDENTIFICATION",
         "SECURITY_EFFECTIVE_ONLY",
         "GetNamedPipeServerProcessId",
-        "ProcessIdToSessionId",
+        "LookupAccountSidW",
+        "SidTypeUser",
+        "GetKernelObjectSecurity",
+        "SetKernelObjectSecurity",
+        "AddAccessAllowedAceEx",
+        "TokenSessionId",
+        "PROCESS_CLIENT_QUERY_ACCESS",
+        "TOKEN_CLIENT_QUERY_ACCESS",
+        "require_exact_query_acl_delta",
         "IsTokenRestricted",
         "TokenRestrictedSids",
         "CreateNamedPipeW",
@@ -1599,9 +1613,23 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "RevertToSelf",
         "revert_or_abort",
         "SecurityIdentification",
-        "S-1-5-11",
+        "TokenUser",
+        "require_user_sid(token.raw(), authorized_client_sid)",
+        r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
+        "KEY_READ | KEY_WOW64_64KEY",
+        "RegQueryInfoKeyW",
+        "RegEnumValueW",
+        "RegQueryValueExW",
+        "SchemaVersion",
+        "AuthorizedClientSid",
+        "GetSecurityInfo",
+        "SE_DACL_PROTECTED",
+        "KEY_ALL_ACCESS_MASK",
+        "KEY_READ_MASK",
+        "load_authorization_policy()?",
+        "create_server_pipe(&policy)?",
+        "0x00100183",
         "D:P",
-        ";;;AU)",
         "CancelIoEx",
         "encode_ack_frame",
         "decode_ack_frame",
@@ -1615,6 +1643,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         );
     }
     for forbidden in [
+        ";;;AU)",
+        ";;;BU)",
         ";;;LS)",
         ";;;BA)",
         ";;;WD)",
@@ -1622,6 +1652,10 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "--broker-endpoint",
         "--console",
         "--install",
+        "ProcessIdToSessionId",
+        "SetTokenInformation",
+        "TokenDefaultDacl",
+        "AdjustTokenPrivileges",
     ] {
         assert!(
             !broker_native_production.contains(forbidden),
@@ -1649,11 +1683,23 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "SetAccessRuleProtection",
         "S-1-5-32-544",
         "ReadAndExecute",
+        "function Test-FileSystemAccessRuleConstructorNormalization",
+        "0x000200a9",
+        "0x001200a9",
+        "$persistedRights",
+        "FileSystemAccessRule constructor did not normalize",
+        "[Security.AccessControl.FileSystemRights]::ReadAndExecute",
+        "[Security.AccessControl.FileSystemRights]::Synchronize",
+        "[Security.AccessControl.FileSystemRights]::Write",
+        "[Security.AccessControl.FileSystemRights]::Delete",
+        "[Security.AccessControl.FileSystemRights]::ChangePermissions",
+        "[Security.AccessControl.FileSystemRights]::TakeOwnership",
+        "$persistedReadAndExecuteRights",
         "refusing destructive cleanup",
         "FromSeconds(4)",
         "$stopProof = [Diagnostics.Stopwatch]::StartNew()",
         "$stopProof.Elapsed.TotalMilliseconds -lt 4500",
-        "$stalledClientRights -eq 0x00100183",
+        "$exactRights -eq 0x00100183",
         "[IO.Pipes.PipeAccessRights]::Synchronize",
         "WaitForConnectionAsync",
         "The client sent request bytes before authenticating the service",
@@ -1664,12 +1710,720 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143",
         "RequireScmIntegration",
         "WaitForStatus",
+        "Refusing to modify a pre-existing fixed Windows GPU broker client policy",
+        "Missing policy",
+        "Weak broad-read policy DACL",
+        "Extra policy value",
+        "Malformed policy schema",
+        "Broad malformed policy SID",
+        "Assert-RejectedServiceStartup -Label 'Unmapped policy SID'",
+        "orphan-SID",
+        "Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid",
+        "Rejected unmapped-policy restart did not keep the broker unavailable.",
+        "Rejected unmapped-policy restart exposed a broker pipe.",
+        "PipeAccessRights]::FullControl",
+        "Assert-ExactPolicyAcl",
+        "Assert-OwnedPolicyState -State $state",
+        "SecurityFingerprint",
+        "CleanupTamper",
+        "if ($result.ExitCode -eq 0)",
+        "New-ProvisioningInvocationNonce",
+        "Read-ProvisioningSuccessRecord",
+        "$script:ownedPolicyAncestors = @($ownedPolicyAncestors) + @($createdByInvocation)",
+        "NtDeleteKey(SafeRegistryHandle keyHandle)",
+        "RegRenameKey(",
+        "KEY_WRITE | DELETE | KEY_QUERY_VALUE | KEY_WOW64_64KEY",
+        "DELETE | READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY",
+        "Noncanonical policy value name",
+        "boundary-swap policy",
+        "Policy cleanup retained authority after its exact NtDeleteKey succeeded.",
+        "$script:ownedPolicyAncestors = @($ownedPolicyAncestors | Where-Object { $_ -cne $path })",
+        "Remove-OwnedPolicy",
+        "$ephemeralAccount = New-EphemeralStandardAccount",
+        "$script:ownedEphemeralAccount = [pscustomobject]@{",
+        "-Sid $ephemeralSid",
+        "@($ephemeralSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute)",
+        "$clientForCredential = Join-Path $machineTarget",
+        "$harnessForCredential = Join-Path $machineTarget",
+        "Get-FileHash -Algorithm SHA256 -LiteralPath $clientForCredential",
+        "Get-FileHash -Algorithm SHA256 -LiteralPath $harnessForCredential",
+        "Invoke-EphemeralProcess -FilePath $clientForCredential",
+        "$start.UserName = $script:ownedEphemeralAccount.Name",
+        "$start.Domain = $env:COMPUTERNAME",
+        "$start.Password = $script:ephemeralPassword",
+        "$start.LoadUserProfile = $false",
+        "$start.WorkingDirectory = [IO.Path]::GetFullPath($machineTarget)",
+        "$start.Environment.Clear()",
+        "$candidateToken = New-CryptographicHex -ByteCount 16",
+        "$pathToken = $fixturePaths.Token",
+        "$machineTarget = $fixturePaths.MachineTarget",
+        "$handoff = $fixturePaths.Handoff",
+        "$output = $fixturePaths.Output",
+        "-cmatch '^[0-9a-f]{32}$'",
+        "-cmatch '^s[0-9a-f]{32}$'",
+        r#"$leaf -cmatch "^$Prefix[0-9a-f]{32}$""#,
+        "$serviceForScm = Join-Path $machineTarget 's.exe'",
+        "$clientForCredential = Join-Path $machineTarget 'c.exe'",
+        "$harnessForCredential = Join-Path $machineTarget 'p.ps1'",
+        "Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix 'h' -Token $candidateToken",
+        "Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix 'o' -Token $candidateToken",
+        "Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output",
+        "$DriveRoot -cmatch '^[A-Z]:\\\\$'",
+        "[IO.Path]::IsPathFullyQualified($candidate)",
+        "[IO.Path]::GetFullPath($candidate) -ceq $candidate",
+        "[IO.Path]::GetPathRoot($candidate) -ceq $DriveRoot",
+        "[IO.Path]::GetDirectoryName($candidate) -ceq $DriveRoot",
+        "[IO.Path]::GetFileName($candidate) -ceq $leaf",
+        "[IO.Path]::IsPathFullyQualified($env:SystemRoot)",
+        "Windows system directory is noncanonical.",
+        "[IO.Path]::IsPathFullyQualified($CommonAppData)",
+        "Machine-wide application-data root is noncanonical.",
+        "$HandoffRoot -cne $OutputRoot",
+        "Could not select an absent three-path credentialed fixture set after $maximumAttempts attempts.",
+        "The no-touch handoff path appeared and will be left untouched.",
+        "The no-touch output path appeared and will be left untouched.",
+        "$safeToRemoveMachineTarget = $null -ne $ownedMachineTarget",
+        "Refusing protected staging cleanup while a credentialed process may still be active.",
+        "Refusing protected staging cleanup while the exact broker service still exists.",
+        "Refusing protected staging cleanup outside its exact CommonApplicationData parent.",
+        "Refusing protected staging cleanup through a reparse point.",
+        "Refusing protected staging cleanup containing an unexpected entry.",
+        "public static class CredentialCommandLine",
+        "CreateProcessWithLogonMaximumUtf16Units = 1024",
+        "ReservedUtf16Units = 64",
+        "MaximumUtf16UnitsIncludingNull = 960",
+        "Credentialed command-line bound lost its fixed 64-unit reserve below the native 1024-unit ceiling.",
+        "Render(fileName, arguments).Length + 1",
+        "Char.IsWhiteSpace(value)",
+        "commandLine.Append('\\\\', checked(backslashes * 2 + 1))",
+        "commandLine.Append('\\\\', checked(backslashes * 2))",
+        "Executable path is not canonical for credentialed launch.",
+        "Credentialed launch arguments cannot contain null.",
+        "Credentialed launch arguments cannot contain NUL.",
+        "function Test-CredentialCommandLineContract",
+        "surrogate pair",
+        "non-ASCII whitespace",
+        "backslashes before quote",
+        "quoted trailing backslash",
+        "requires 961 UTF-16 units including NUL; limit is 960.",
+        "$acceptedLength -eq 960",
+        "$maximumShapeLength -le 960",
+        "$maximumArguments = New-ValidClientArguments",
+        "Credentialed command-line preflight failure started or adopted a process.",
+        "RunEphemeralIdentityProbe",
+        "RunEphemeralFullControlProbe",
+        "RunEphemeralStalledProbe",
+        "$current.User.Value -ceq $ExpectedSid",
+        "$expectedRid -ge 1000",
+        "Add-LocalGroupMember -SID $standardUsersSid -Member $verified",
+        "Assert-True (-not $stalledProcess.HasExited)",
+        "Disable-LocalUser -SID $state.Sid",
+        "Remove-LocalUser -SID $state.Sid",
+        "$script:ownedEphemeralAccount = $null",
+        "Assert-NoEphemeralProfileRegistration",
+        "foreign-cleanup-marker",
+        "expected-post-create-pre-enable-failure",
+        "Test-EphemeralProcessOwnershipBoundary",
+        "Release-ExitedEphemeralProcess",
+        "Refusing to release credentialed process ownership before exit is positively confirmed.",
+        "Failed credential-process release discarded exact ownership.",
+        "Credentialed process termination remained uncertain after kill.",
+        "Refusing account cleanup while its exact credentialed process may still be active.",
     ] {
         assert!(
             transport_test.contains(required),
             "SCM transport harness lost {required:?}"
         );
     }
+    for forbidden in [
+        "-Sid $identity.User.Value",
+        "New-ProtectedPolicy -Sid $runnerSid",
+        "Remove-LocalUser -Name",
+        "ConvertFrom-SecureString",
+        "SecureStringToBSTR",
+        "PasswordInClearText",
+        "RunImpersonated",
+        "ArgumentList.Add($script:ephemeralPassword",
+        "Environment['PASSWORD']",
+        "Write-Output $script:ephemeralPassword",
+        "WriteAllText($script:ephemeralPassword",
+        ".Arguments =",
+        "UseShellExecute = $true",
+        "Start-Process",
+        "CreateProcessAsUser",
+        "CreateProcessWithToken",
+        " -EncodedCommand",
+        "cmd.exe /c",
+        "Environment['ARGUMENTS']",
+        "Environment['ARGS']",
+        "Environment['COMMAND_LINE']",
+        "ConvertTo-ResponseFile",
+        "Write-ResponseFile",
+        "Remove-Item -LiteralPath $handoff",
+        "Remove-Item -LiteralPath $output",
+    ] {
+        assert!(
+            !transport_test.contains(forbidden),
+            "SCM transport harness gained forbidden credential behavior {forbidden:?}"
+        );
+    }
+    let non_elevated_return = transport_test
+        .find("if (-not $isElevated)")
+        .expect("SCM transport harness keeps its non-elevated return");
+    let constructor_normalization_start = transport_test
+        .find("function Test-FileSystemAccessRuleConstructorNormalization")
+        .expect("SCM transport harness defines its pure FileSystemAccessRule constructor-normalization test");
+    let constructor_normalization_call = transport_test
+        .rfind("Test-FileSystemAccessRuleConstructorNormalization")
+        .expect("SCM transport harness invokes its pure FileSystemAccessRule constructor-normalization test");
+    assert!(
+        constructor_normalization_start < constructor_normalization_call
+            && constructor_normalization_call < non_elevated_return,
+        "SCM transport harness must run constructor normalization before its non-elevated return"
+    );
+    let command_line_contract_start = transport_test
+        .find("function Test-CredentialCommandLineContract")
+        .expect("SCM transport harness defines its credentialed command-line contract");
+    let command_line_contract_call = transport_test
+        .rfind("Test-CredentialCommandLineContract")
+        .expect("SCM transport harness invokes its credentialed command-line contract");
+    assert!(
+        command_line_contract_start < command_line_contract_call
+            && command_line_contract_call < non_elevated_return,
+        "SCM transport harness must run credentialed command-line checks before its non-elevated return"
+    );
+    let credential_start_begin = transport_test
+        .find("function Start-EphemeralProcess")
+        .expect("SCM transport harness defines its bounded credentialed process start helper");
+    let credential_start_end = transport_test[credential_start_begin..]
+        .find("function Test-CredentialCommandLineContract")
+        .map(|offset| credential_start_begin + offset)
+        .expect("SCM transport harness bounds its credentialed process start helper");
+    let credential_start = &transport_test[credential_start_begin..credential_start_end];
+    let immutable_arguments = credential_start
+        .find("[string[]]$Arguments.Clone()")
+        .expect("credentialed launch clones its argument array");
+    let length_preflight = credential_start
+        .find("CredentialCommandLine]::ValidateLength($FilePath, $immutableArguments)")
+        .expect("credentialed launch preflights its immutable arguments");
+    let structured_arguments = credential_start
+        .find("New-EphemeralProcessStartInfo -FilePath $FilePath -Arguments $immutableArguments")
+        .expect(
+            "credentialed launch passes the preflighted arguments to ArgumentList construction",
+        );
+    let process_start = credential_start
+        .find("[Diagnostics.Process]::Start($start)")
+        .expect("credentialed launch starts through ProcessStartInfo");
+    let process_ownership = credential_start
+        .find("$script:activeCredentialProcess = $process")
+        .expect("credentialed launch establishes exact process ownership");
+    assert!(
+        immutable_arguments < length_preflight
+            && length_preflight < structured_arguments
+            && structured_arguments < process_start
+            && process_start < process_ownership,
+        "credentialed launch must clone, preflight, populate ArgumentList, start, and then establish ownership in order"
+    );
+    let credential_start_info_begin = transport_test
+        .find("function New-EphemeralProcessStartInfo")
+        .expect("SCM transport harness defines its credentialed ProcessStartInfo builder");
+    let credential_start_info_end = transport_test[credential_start_info_begin..]
+        .find("function Start-EphemeralProcess")
+        .map(|offset| credential_start_info_begin + offset)
+        .expect("SCM transport harness bounds its credentialed ProcessStartInfo builder");
+    let credential_start_info =
+        &transport_test[credential_start_info_begin..credential_start_info_end];
+    assert!(
+        credential_start_info
+            .contains("foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }"),
+        "credentialed ProcessStartInfo must populate ArgumentList from the preflighted immutable argument copy"
+    );
+    assert_eq!(
+        transport_test
+            .matches("$candidateToken = New-CryptographicHex -ByteCount 16")
+            .count(),
+        1,
+        "SCM transport harness must generate one 128-bit token per attempted three-path fixture set"
+    );
+    let no_touch_builder_start = transport_test
+        .find("function Get-ValidatedNoTouchPath")
+        .expect("SCM transport harness defines its bounded no-touch path validator");
+    let no_touch_builder_end = transport_test[no_touch_builder_start..]
+        .find("function Assert-NoTouchPathsRemainAbsent")
+        .map(|offset| no_touch_builder_start + offset)
+        .expect("SCM transport harness bounds its no-touch path validator");
+    let no_touch_builder = &transport_test[no_touch_builder_start..no_touch_builder_end];
+    assert!(
+        !no_touch_builder.contains("New-Item")
+            && !no_touch_builder.contains("Remove-Item")
+            && !no_touch_builder.contains("Set-Acl"),
+        "no-touch path validation must not create, reserve, adopt, delete, or change ACLs on a drive-root path"
+    );
+    assert!(
+        !transport_test.contains("New-Item -ItemType Directory -Path $handoff")
+            && !transport_test.contains("New-Item -ItemType Directory -Path $output"),
+        "SCM transport harness must not reserve a no-touch client path"
+    );
+    assert!(
+        !transport_test.contains("Set-Acl -LiteralPath $handoff")
+            && !transport_test.contains("Set-Acl -LiteralPath $output")
+            && !transport_test.contains("Set-Acl -LiteralPath $systemVolumeRoot"),
+        "SCM transport harness must not mutate a no-touch path or drive-root ACL"
+    );
+    let path_set_selector_start = transport_test
+        .find("function Select-AvailableFixturePathSet")
+        .expect("SCM transport harness defines its bounded three-path collision selector");
+    let path_set_selector_end = transport_test[path_set_selector_start..]
+        .find("function Test-FixturePathSetAvailabilityContract")
+        .map(|offset| path_set_selector_start + offset)
+        .expect("SCM transport harness bounds its three-path collision selector");
+    let path_set_selector = &transport_test[path_set_selector_start..path_set_selector_end];
+    for required in [
+        "$maximumAttempts = 8",
+        "$attempt -lt $maximumAttempts",
+        "$candidateToken = New-CryptographicHex -ByteCount 16",
+        "-Token $candidateToken",
+        "Test-Path -LiteralPath $candidateMachineTarget",
+        "Test-Path -LiteralPath $candidateHandoff",
+        "Test-Path -LiteralPath $candidateOutput",
+        "$candidateSetAvailable = Test-FixturePathSetAvailable",
+        "if (-not $candidateSetAvailable) { continue }",
+        "Token = $candidateToken",
+        "MachineTarget = $candidateMachineTarget",
+        "Handoff = $candidateHandoff",
+        "Output = $candidateOutput",
+        "after $maximumAttempts attempts.",
+    ] {
+        assert!(
+            path_set_selector.contains(required),
+            "SCM transport harness collision selector lost {required:?}"
+        );
+    }
+    assert_eq!(
+        path_set_selector.matches("-Token $candidateToken").count(),
+        3,
+        "every attempted staging/handoff/output path must derive from the same candidate token"
+    );
+    assert!(
+        !path_set_selector.contains("New-Item")
+            && !path_set_selector.contains("Remove-Item")
+            && !path_set_selector.contains("Set-Acl"),
+        "three-path collision selection must not mutate, reserve, adopt, or delete a candidate path"
+    );
+    let availability_test_start = transport_test
+        .find("function Test-FixturePathSetAvailabilityContract")
+        .expect("SCM transport harness defines deterministic three-path collision coverage");
+    let availability_test_call = transport_test
+        .rfind("Test-FixturePathSetAvailabilityContract")
+        .expect("SCM transport harness invokes deterministic three-path collision coverage");
+    assert!(
+        availability_test_start < availability_test_call
+            && availability_test_call < non_elevated_return,
+        "SCM transport harness must run deterministic collision coverage before its non-elevated return"
+    );
+    let direct_credential_call = "Invoke-EphemeralProcess -FilePath $clientForCredential";
+    assert_eq!(
+        transport_test.matches(direct_credential_call).count(),
+        2,
+        "SCM transport harness must retain exactly two direct authenticated real-client calls"
+    );
+    let first_credential_call = transport_test
+        .find(direct_credential_call)
+        .expect("SCM transport harness performs its first authenticated real-client call");
+    let second_credential_call = transport_test
+        [first_credential_call + direct_credential_call.len()..]
+        .find(direct_credential_call)
+        .map(|offset| first_credential_call + direct_credential_call.len() + offset)
+        .expect("SCM transport harness performs its second authenticated real-client call");
+    let no_touch_assertion =
+        "Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output";
+    let first_credential_status = transport_test[first_credential_call..]
+        .find("Broker service did not remain running after the authenticated round trip.")
+        .map(|offset| first_credential_call + offset)
+        .expect("first authenticated call retains its service-status postcondition");
+    let first_credential_absent = transport_test[first_credential_status..]
+        .find(no_touch_assertion)
+        .map(|offset| first_credential_status + offset)
+        .expect("first authenticated call retains its post-call no-touch assertion");
+    let first_credential_stop = transport_test[first_credential_absent..]
+        .find("[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)")
+        .map(|offset| first_credential_absent + offset)
+        .expect("first authenticated call retains its service-stop boundary");
+    assert!(
+        first_credential_call < first_credential_status
+            && first_credential_status < first_credential_absent
+            && first_credential_absent < first_credential_stop
+            && first_credential_stop < second_credential_call,
+        "first authenticated call must assert no-touch paths after result/status postconditions and before service-stop work"
+    );
+    assert_eq!(
+        transport_test[first_credential_call..second_credential_call]
+            .matches(no_touch_assertion)
+            .count(),
+        1,
+        "first authenticated call region must contain exactly one post-call no-touch assertion"
+    );
+    let second_credential_status = transport_test[second_credential_call..]
+        .find("Rejected unmapped-policy restart exposed a broker pipe.")
+        .map(|offset| second_credential_call + offset)
+        .expect("second credentialed call retains its broker-unavailable postcondition");
+    let second_credential_absent = transport_test[second_credential_status..]
+        .find(no_touch_assertion)
+        .map(|offset| second_credential_status + offset)
+        .expect("second authenticated call retains its post-call no-touch assertion");
+    let second_credential_stop = transport_test[second_credential_absent..]
+        .find("[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)")
+        .map(|offset| second_credential_absent + offset)
+        .expect("second authenticated call retains its service-stop boundary");
+    assert!(
+        second_credential_call < second_credential_status
+            && second_credential_status < second_credential_absent
+            && second_credential_absent < second_credential_stop,
+        "second authenticated call must assert no-touch paths after result/status postconditions and before service-stop work"
+    );
+    assert_eq!(
+        transport_test[second_credential_call..second_credential_stop]
+            .matches(no_touch_assertion)
+            .count(),
+        1,
+        "second authenticated call region must contain exactly one post-call no-touch assertion"
+    );
+    assert_eq!(
+        transport_test.matches(no_touch_assertion).count(),
+        4,
+        "SCM transport harness must retain initial, two authenticated post-call, and final cleanup no-touch assertions"
+    );
+    let ephemeral_account_creation = transport_test
+        .find("$ephemeralAccount = New-EphemeralStandardAccount")
+        .expect("SCM transport harness creates its ephemeral account");
+    assert!(
+        non_elevated_return < ephemeral_account_creation,
+        "SCM transport harness creates persistent account state before its non-elevated return"
+    );
+    for required in [
+        "[string]$AuthorizedClientSid",
+        "[string]$InvocationNonce",
+        r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
+        "RegistryView]::Registry64",
+        "RegCreateKeyExW",
+        "CreateProtectedKey",
+        "ref SecurityAttributes securityAttributes",
+        "SecurityDescriptor = descriptor",
+        "O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;",
+        "OpenExistingKeyNoFollow",
+        "REG_OPTION_OPEN_LINK",
+        "SymbolicLinkValue",
+        "$mutationMask = [uint32]0x500d0026",
+        "Refusing to modify a pre-existing Windows GPU broker client policy",
+        "RegistryRights]::FullControl",
+        "RegistryRights]::ReadKey",
+        "ProvisioningState",
+        "REG_CREATED_NEW_KEY",
+        "created_ancestors = @($createdAncestorPaths)",
+        "scribe-windows-gpu-broker-client-policy-provisioning-success-v1",
+        "RestorePrivilegeScope : IDisposable",
+        "AdjustTokenPrivilegesAndCapturePrevious",
+        "RestoreTokenPrivileges",
+        "private bool restorationComplete;",
+        "public static void RestoreOrFailFast(RestorePrivilegeScope scope)",
+        "Environment.FailFast(",
+        "Removing the marker is the only commit point",
+        "Assert-Policy -Key $key -ExpectProvisioningMarker $false",
+        "S-1-5-20",
+        "$serviceSid",
+    ] {
+        assert!(
+            client_policy_provisioner.contains(required),
+            "broker client-policy provisioner lost {required:?}"
+        );
+    }
+    let creator_owner_predicate_name = "Test-StandardSoftwareCreatorOwnerInheritanceTemplate";
+    assert_eq!(
+        client_policy_provisioner
+            .matches(creator_owner_predicate_name)
+            .count(),
+        2,
+        "broker client-policy provisioner must define and call its CREATOR OWNER predicate exactly once"
+    );
+    let creator_owner_predicate_start = client_policy_provisioner
+        .find("function Test-StandardSoftwareCreatorOwnerInheritanceTemplate(")
+        .expect("provisioner defines its exact CREATOR OWNER predicate");
+    let raw_acl_classifier_name = "Test-SafePolicyAncestorAcl";
+    assert_eq!(
+        client_policy_provisioner
+            .matches(raw_acl_classifier_name)
+            .count(),
+        2,
+        "broker client-policy provisioner must define and call its raw DACL classifier exactly once"
+    );
+    let raw_acl_classifier_start = client_policy_provisioner[creator_owner_predicate_start..]
+        .find("function Test-SafePolicyAncestorAcl(")
+        .map(|offset| creator_owner_predicate_start + offset)
+        .expect("raw CREATOR OWNER predicate has a bounded source region");
+    let creator_owner_predicate =
+        &client_policy_provisioner[creator_owner_predicate_start..raw_acl_classifier_start];
+    for required in [
+        "$Path -ceq 'SOFTWARE'",
+        "$Ace -is [Security.AccessControl.CommonAce]",
+        "-not $Ace.IsCallback",
+        "$Ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed",
+        "$Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed",
+        "$Ace.AceFlags -eq [Security.AccessControl.AceFlags]::ContainerInherit",
+        "[uint32]$Ace.AccessMask -eq [uint32]0x000f003f",
+        "$Ace.SecurityIdentifier.Value -ceq 'S-1-3-0'",
+        "$Ace.OpaqueLength -eq 0",
+    ] {
+        assert!(
+            creator_owner_predicate.contains(required),
+            "CREATOR OWNER predicate lost exact comparison {required:?}"
+        );
+    }
+    let safe_ancestor_start = client_policy_provisioner[raw_acl_classifier_start..]
+        .find("function Assert-SafePolicyAncestor(")
+        .map(|offset| raw_acl_classifier_start + offset)
+        .expect("raw ancestor-DACL classifier has a bounded source region");
+    let raw_acl_classifier =
+        &client_policy_provisioner[raw_acl_classifier_start..safe_ancestor_start];
+    for required in [
+        "$null -eq $Acl",
+        "$creatorOwnerTemplateCount -gt 1",
+        "Test-StandardSoftwareCreatorOwnerInheritanceTemplate -Ace $ace -Path $Path",
+        "$ace -isnot [Security.AccessControl.QualifiedAce]",
+        "$ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied",
+        "$ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed",
+        "([uint32]$ace.AccessMask -band $MutationMask) -eq 0",
+        "$TrustedOwners -cnotcontains $ace.SecurityIdentifier.Value",
+    ] {
+        assert!(
+            raw_acl_classifier.contains(required),
+            "raw ancestor-DACL classifier lost guard {required:?}"
+        );
+    }
+    for forbidden in [
+        "SetAccessControl",
+        "SetAccessRule",
+        "AddAccessRule",
+        "RemoveAccessRule",
+        "SetValue",
+        "DeleteValue",
+        "CreateSubKey",
+        "RegCreateKey",
+        "RegDeleteKey",
+        "RegSetValue",
+        "NtDeleteKey",
+    ] {
+        assert!(
+            !creator_owner_predicate.contains(forbidden),
+            "CREATOR OWNER predicate gained forbidden mutation API {forbidden:?}"
+        );
+        assert!(
+            !raw_acl_classifier.contains(forbidden),
+            "raw ancestor-DACL classifier gained forbidden mutation API {forbidden:?}"
+        );
+    }
+    let safe_ancestor_end = client_policy_provisioner[safe_ancestor_start..]
+        .find("function Assert-Policy(")
+        .map(|offset| safe_ancestor_start + offset)
+        .expect("ancestor validator has a bounded source region");
+    let safe_ancestor = &client_policy_provisioner[safe_ancestor_start..safe_ancestor_end];
+    assert!(
+        safe_ancestor.contains("[Security.AccessControl.RawSecurityDescriptor]::new($security.GetSecurityDescriptorBinaryForm(), 0)"),
+        "ancestor validator no longer obtains the complete raw DACL"
+    );
+    assert!(
+        safe_ancestor.contains("Test-SafePolicyAncestorAcl -Acl $raw.DiscretionaryAcl -Path $Path -TrustedOwners $trustedOwners -MutationMask $mutationMask"),
+        "ancestor validator no longer classifies the complete raw DACL at its sole trust decision"
+    );
+    assert!(
+        !safe_ancestor.contains("GetAccessRules("),
+        "ancestor validator regressed to projected RegistryAccessRules that can omit raw ACE types"
+    );
+    let born_protected = client_policy_provisioner
+        .rfind("Assert-PolicySecurity -Key $key")
+        .expect("provisioner verifies create-time policy security");
+    let first_value_write = client_policy_provisioner
+        .find("$key.SetValue($provisioningValue")
+        .expect("provisioner writes its incomplete marker");
+    assert!(
+        born_protected < first_value_write,
+        "broker policy must be born protected before its first value write"
+    );
+    let create_method_start = client_policy_provisioner
+        .find("public static int CreateProtectedKey(")
+        .expect("provisioner defines its native create helper");
+    let create_method_end = client_policy_provisioner[create_method_start..]
+        .find("public static int OpenExistingKeyNoFollow(")
+        .map(|offset| create_method_start + offset)
+        .expect("native create helper has a bounded source region");
+    assert!(
+        client_policy_provisioner[create_method_start..create_method_end]
+            .contains("ref securityAttributes"),
+        "native policy creation must pass non-null security attributes"
+    );
+    let ancestor_validation = client_policy_provisioner
+        .find("foreach ($ancestorPath in $policyAncestors)")
+        .expect("provisioner validates the fixed ancestor chain");
+    let leaf_creation = client_policy_provisioner
+        .find("$status = [Scribe.GpuBroker.RegistryNative]::CreateProtectedKey(")
+        .expect("provisioner creates the authorization leaf");
+    assert!(
+        ancestor_validation < leaf_creation,
+        "broker policy ancestor chain must be secured before leaf creation"
+    );
+    let privilege_enable = client_policy_provisioner
+        .find(
+            "$restorePrivilegeScope = [Scribe.GpuBroker.RegistryNative]::EnableRestorePrivilege()",
+        )
+        .expect("provisioner enables restore privilege through a scoped token");
+    let privilege_restore_before_commit = client_policy_provisioner[privilege_enable..]
+        .find("$restorePrivilegeScope.Dispose()")
+        .map(|offset| privilege_enable + offset)
+        .expect("provisioner restores privilege before committing policy");
+    let policy_commit = client_policy_provisioner
+        .find("$key.DeleteValue($provisioningValue")
+        .expect("provisioner removes its incomplete marker at commit");
+    let privilege_restore = client_policy_provisioner
+        .rfind("[Scribe.GpuBroker.RegistryNative]::RestoreOrFailFast($restorePrivilegeScope)")
+        .expect("provisioner retries restoration or terminates at its outer boundary");
+    let success_emission = client_policy_provisioner
+        .rfind("$successRecord | ConvertTo-Json")
+        .expect("provisioner emits its success record");
+    assert!(
+        privilege_enable < ancestor_validation
+            && ancestor_validation < privilege_restore_before_commit
+            && privilege_restore_before_commit < policy_commit
+            && policy_commit < privilege_restore
+            && privilege_restore < success_emission,
+        "broker policy provisioning must restore privileges before policy commit and success output"
+    );
+    let restore_scope_start = client_policy_provisioner
+        .find("public sealed class RestorePrivilegeScope : IDisposable")
+        .expect("provisioner defines its restoration scope");
+    let restore_scope_end = client_policy_provisioner[restore_scope_start..]
+        .find("public static void RestoreOrFailFast(RestorePrivilegeScope scope)")
+        .map(|offset| restore_scope_start + offset)
+        .expect("provisioner bounds its restoration scope implementation");
+    let restore_scope = &client_policy_provisioner[restore_scope_start..restore_scope_end];
+    let native_restore = restore_scope
+        .find("if (!RestoreTokenPrivileges(")
+        .expect("restoration scope invokes the native exact-state restore");
+    let restored_state = restore_scope
+        .find("restorationComplete = true;")
+        .expect("restoration scope records exact restoration");
+    let close_token = restore_scope
+        .find("if (!CloseHandle(token))")
+        .expect("restoration scope closes its owned token");
+    let release_token = restore_scope
+        .find("token = IntPtr.Zero;")
+        .expect("restoration scope eventually relinquishes token ownership");
+    let release_previous = restore_scope
+        .find("previousState = default(TokenPrivileges);")
+        .expect("restoration scope eventually clears captured state");
+    assert!(
+        native_restore < restored_state
+            && restored_state < close_token
+            && close_token < release_token
+            && release_token < release_previous,
+        "broker policy provisioning must retain token and prior state until restore and close succeed"
+    );
+    for forbidden in [
+        "PrivilegeRestoreFailureEvidencePath",
+        "restoreFailuresRemaining",
+    ] {
+        assert!(
+            !client_policy_provisioner.contains(forbidden),
+            "production policy provisioner exposes test failure hook {forbidden:?}"
+        );
+    }
+    for required in [
+        "PrivilegeRestoreRetryModel",
+        "marker=incomplete;restore_attempts=3;token_owned=true;previous_state=37",
+        "Object.ReferenceEquals(provisioningOriginal, provisioningPropagated)",
+        "Console.Out.Flush();",
+        "-MaximumCapturedOutputCharacters 16384",
+    ] {
+        assert!(
+            transport_test.contains(required),
+            "SCM harness lost privilege retry proof {required:?}"
+        );
+    }
+    assert!(
+        !transport_test.contains("PrivilegeRestoreFailureEvidencePath"),
+        "SCM harness persistent-failure fixture exposes an arbitrary evidence path"
+    );
+    assert!(
+        !transport_test.contains(
+            "if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }"
+        ),
+        "SCM harness must not infer destructive policy ownership from path existence"
+    );
+    assert!(
+        !transport_test.contains("initiallyMissingPolicyAncestors"),
+        "SCM harness must not infer ancestor ownership from a missing-path snapshot"
+    );
+    assert!(
+        !transport_test.contains(".DeleteSubKey("),
+        "SCM harness cleanup must not use path-based registry deletion"
+    );
+    let bound_cleanup_start = transport_test
+        .find("function Remove-RegistryKeyByValidatedHandle")
+        .expect("SCM harness defines exact-handle registry cleanup");
+    let bound_cleanup_end = transport_test[bound_cleanup_start..]
+        .find("function Remove-OwnedPolicy")
+        .map(|offset| bound_cleanup_start + offset)
+        .expect("SCM harness exact-handle cleanup has a bounded source region");
+    let bound_cleanup = &transport_test[bound_cleanup_start..bound_cleanup_end];
+    let bound_validation = bound_cleanup
+        .find("& $Validate $key")
+        .expect("SCM harness validates the opened registry object");
+    let boundary_hook = bound_cleanup
+        .find("& $BeforeDelete")
+        .expect("SCM harness supports a deterministic pre-delete boundary test");
+    let bound_deletion = bound_cleanup
+        .find("DeleteExactKey($handle)")
+        .expect("SCM harness deletes through the opened registry handle");
+    assert!(
+        bound_validation < boundary_hook && boundary_hook < bound_deletion,
+        "SCM harness must validate, exercise the boundary, and delete through the same live handle"
+    );
+    let remove_policy_start = transport_test
+        .find("function Remove-OwnedPolicy(")
+        .expect("SCM harness defines policy cleanup");
+    let remove_policy_end = transport_test[remove_policy_start..]
+        .find("function Remove-OwnedPolicyAncestors")
+        .map(|offset| remove_policy_start + offset)
+        .expect("SCM harness policy cleanup has a bounded source region");
+    let remove_policy = &transport_test[remove_policy_start..remove_policy_end];
+    let exact_delete_call = remove_policy
+        .find("Remove-RegistryKeyByValidatedHandle")
+        .expect("SCM harness invokes exact-handle policy deletion");
+    let drop_ownership = remove_policy
+        .find("$script:ownedPolicyState = $null")
+        .expect("SCM harness drops deleted policy ownership");
+    let post_delete_observation = remove_policy
+        .find("Test-Path -LiteralPath $policyRegistryPath")
+        .expect("SCM harness observes the fixed path after deletion");
+    assert!(
+        exact_delete_call < drop_ownership && drop_ownership < post_delete_observation,
+        "SCM harness must drop ownership before observing a post-delete replacement"
+    );
+    for forbidden in [
+        "[string]$AccountName",
+        "LookupAccountName",
+        "Convert-NameToSid",
+        "HKEY_CURRENT_USER",
+    ] {
+        assert!(
+            !client_policy_provisioner.contains(forbidden),
+            "broker client-policy provisioner gained override or account-name input {forbidden:?}"
+        );
+    }
+    assert!(
+        !client_policy_provisioner
+            .to_ascii_lowercase()
+            .contains("env:"),
+        "broker client-policy provisioner gained a case-insensitive environment override"
+    );
     for required in [
         "RECEIPT_DOMAIN",
         "LEDGER_DOMAIN",

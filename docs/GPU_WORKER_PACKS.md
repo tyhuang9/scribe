@@ -306,16 +306,76 @@ and security-epoch authority. The independently locked
 bounded, mutually authenticated named-pipe transport and an SCM-only
 no-authority service stub. The service refuses to create its pipe unless its
 token contains the exact service SID as an enabled and restricting SID under
-restricted LocalService. It uses a protected explicit DACL, a first-instance
-local-only message pipe whose original handle remains open across clients and
-timeouts, identification-only client impersonation, and always reverts before
-sending its sole valid outcome: correlated `NotProvisioned`. The service waits
-for a bounded acknowledgement bound to the request and exact response before it
-disconnects. Only the exact service SID has server authority in the pipe DACL.
-Authenticated local users are admitted at this stage only because the service
-has no key, state, pack, or publication authority. A dedicated client principal
-and durable authorization policy are a hard prerequisite for granting any
-authority later.
+restricted LocalService. Before its first pipe creation it loads and verifies
+the fixed Registry64 policy at
+`HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization`, containing only
+DWORD `SchemaVersion=1` and a canonical `AuthorizedClientSid` that resolves as
+a user account. A resolved group or unmapped SID stops startup before any
+client query grant or pipe is created. The key must be
+SYSTEM-owned, inheritance-protected, have no subkeys or extra values, and have
+exactly SYSTEM/Administrators full-control plus service-SID read ACEs. The SID
+loader enumerates both value names and compares their exact ordinal UTF-16
+spelling before using the registry's case-insensitive query API. The SID is
+snapshotted for the service lifetime, so registry mutation requires restart
+and cannot broaden the running process.
+
+The first-instance local-only message pipe contains exactly service-SID
+generic-all and configured-client mask `0x00100183`; AU, WD, BU, BA, AN,
+generic write, pipe-instance creation, DACL writes, and owner writes are absent.
+After a bounded read, identification-only impersonation compares exact
+`TokenUser`, not group membership or elevation, and checked reversion completes
+before decode or reply. A mismatch receives no response. An authorized request
+can receive only correlated `NotProvisioned`, followed by a bounded
+request/response-bound acknowledgement. Neither side touches supplied paths.
+
+The elevated create-new provisioner accepts only an explicit canonical
+`S-1-5-21` account SID with RID 1000 or greater. It rejects account names,
+broad/built-in identities, SYSTEM, LocalService, NetworkService, service SID
+forms including the broker SID, and any pre-existing policy. An incomplete
+marker keeps interrupted setup unusable. The key is born with its final
+SYSTEM-owned protected ACE inventory through non-null creation security
+attributes, which are verified before the first value write; there is no
+inherited-DACL lockdown window. The provisioner opens every fixed 64-bit path
+ancestor without following registry links, refuses unsafe existing ancestors,
+and atomically protects each missing Scribe-specific ancestor before descending.
+It enumerates the complete raw DACL rather than projected
+`RegistryAccessRule` entries. Non-qualified and non-Allow/Deny ACEs fail closed;
+denies remain non-granting and inspected raw Allow ACEs without mutation bits
+remain acceptable. Every mutating raw Allow requires an exact trusted SID except
+for at most one standard explicit, non-callback `CommonAce` on exact
+case-sensitive `SOFTWARE`: AceType and qualifier AccessAllowed, SID `S-1-3-0`,
+mask `0x000f003f`, AceFlags exactly ContainerInherit, and no opaque bytes. The
+classifier does not write or normalize the root ACL, and it does not exempt a
+descendant, path/case variant, inherited, callback, object, or duplicate
+template ACE, actual account SID, or changed mask or flags from the ordinary
+untrusted-mutation check.
+This prevents an ambient writer from replacing the final key after its DACL is
+verified. This conservative policy intentionally excludes non-account and
+service principals; changing it requires review.
+
+The provisioner requires a caller-generated lowercase 32-byte hexadecimal
+correlation nonce. After the leaf commits, its only stdout is a versioned JSON
+success record containing that nonce, the exact requested SID and policy path,
+and only ancestors whose `RegCreateKeyExW` call returned
+`REG_CREATED_NEW_KEY`. The nonce is correlation data, not a secret or authority.
+The native privilege scope captures the exact prior `TOKEN_PRIVILEGES` entry for
+`SeRestorePrivilege` and restores it before removing the incomplete commit
+marker. It retains the token and captured state after either a restore or
+handle-close failure. The outer `finally` boundary retries once and calls
+`Environment.FailFast` if that retry also fails, preventing a dot-sourced or
+standalone invocation from returning with uncertain privilege state. A
+successful retry preserves the original provisioning exception. Success output
+occurs only after restoration and token closure.
+The elevated harness accepts cleanup ownership only from that exact validated
+record. It opens each cleanup target without following registry links, requests
+`DELETE` plus validation rights, validates through that handle, and calls
+handle-bound `NtDeleteKey` before disposing it. It never deletes the policy or
+owned ancestors by path after a separate validation. Each ownership entry is
+removed immediately when its exact delete succeeds, before any same-name path
+observation or subsequent cleanup attempt. An elevated boundary test renames
+the validated leaf and provisions a fixed-path replacement before deletion,
+then proves the retained handle deletes the renamed original and spares the
+replacement.
 
 The same workspace proves the broker state machine with test-only authority:
 deny-unknown-fields canonical schemas, exact
@@ -335,11 +395,13 @@ The fixture ledger starts fresh because it is test-only. A production v2
 migration must retain all v1 used-release reservations and security-epoch
 high-water marks, and remains deferred until the privileged broker exists.
 
-The transport does not install the service in production and its earliest-main
+The transport and policy provisioner do not install the service in production,
+and its earliest-main
 DLL hardening cannot prove import-time lookup or immutable installation
 ancestors. The test promotion proof still uses path-based enumeration before
-retained final opens; it does not prove full NT handle-relative traversal, a
-dedicated workflow principal, non-resettable state, HSM integration, or the
+retained final opens; it does not prove full NT handle-relative traversal,
+immutable client image/ancestor enforcement, non-resettable state, HSM
+integration, or the
 client installation/ancestor policy. Production therefore remains
 unprovisioned and the protected job fails before invoking the client or touching
 filesystem, ledger, or signing authority. `ProductionTrustRoot`, production
