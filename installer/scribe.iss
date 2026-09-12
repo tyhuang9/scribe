@@ -117,6 +117,7 @@ var
   BoundHandles: array[0..2047] of THandle;
   BoundHandlePaths: array[0..2047] of String;
   BoundHandleReleaseBeforeInnoReplacement: array[0..2047] of Boolean;
+  BoundHandleIsDirectory: array[0..2047] of Boolean;
   BoundHandleCount: Integer;
   TestPauseRequested: Boolean;
   TestContainerRoot: String;
@@ -666,6 +667,7 @@ begin
     BoundHandles[I] := InvalidHandleValue;
     BoundHandlePaths[I] := '';
     BoundHandleReleaseBeforeInnoReplacement[I] := False;
+    BoundHandleIsDirectory[I] := False;
   end;
   BoundHandleCount := 0;
 end;
@@ -701,9 +703,12 @@ begin
         BoundHandlePaths[WriteIndex] := BoundHandlePaths[ReadIndex];
         BoundHandleReleaseBeforeInnoReplacement[WriteIndex] :=
           BoundHandleReleaseBeforeInnoReplacement[ReadIndex];
+        BoundHandleIsDirectory[WriteIndex] :=
+          BoundHandleIsDirectory[ReadIndex];
         BoundHandles[ReadIndex] := InvalidHandleValue;
         BoundHandlePaths[ReadIndex] := '';
         BoundHandleReleaseBeforeInnoReplacement[ReadIndex] := False;
+        BoundHandleIsDirectory[ReadIndex] := False;
       end;
       WriteIndex := WriteIndex + 1;
     end;
@@ -724,6 +729,7 @@ begin
       BoundHandles[I] := InvalidHandleValue;
       BoundHandlePaths[I] := '';
       BoundHandleReleaseBeforeInnoReplacement[I] := False;
+      BoundHandleIsDirectory[I] := False;
     end;
   end;
 end;
@@ -762,6 +768,7 @@ begin
     BoundHandles[MatchingHandleIndex] := InvalidHandleValue;
     BoundHandlePaths[MatchingHandleIndex] := '';
     BoundHandleReleaseBeforeInnoReplacement[MatchingHandleIndex] := False;
+    BoundHandleIsDirectory[MatchingHandleIndex] := False;
   end
   else if MatchingHandleIndex <> -1 then
     RaiseException('Scribe Setup refused a payload file that changed identity before replacement: ' + CurrentPath);
@@ -771,6 +778,7 @@ function RetainBoundHandle(
   Handle: THandle;
   Path: String;
   ReleaseBeforeInnoReplacement: Boolean;
+  IsDirectory: Boolean;
   var ErrorText: String
 ): Boolean;
 begin
@@ -784,6 +792,7 @@ begin
   BoundHandles[BoundHandleCount] := Handle;
   BoundHandlePaths[BoundHandleCount] := Path;
   BoundHandleReleaseBeforeInnoReplacement[BoundHandleCount] := ReleaseBeforeInnoReplacement;
+  BoundHandleIsDirectory[BoundHandleCount] := IsDirectory;
   BoundHandleCount := BoundHandleCount + 1;
   Result := True;
 end;
@@ -969,14 +978,124 @@ begin
   Result := True;
 end;
 
+function FindRetainedDirectoryHandle(
+  const Path: String;
+  var HandleIndex: Integer;
+  var ErrorText: String
+): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  HandleIndex := -1;
+  for I := 0 to BoundHandleCount - 1 do
+  begin
+    if (BoundHandles[I] <> InvalidHandleValue) and
+       SameStr(BoundHandlePaths[I], Path) then
+    begin
+      if not BoundHandleIsDirectory[I] or
+         BoundHandleReleaseBeforeInnoReplacement[I] then
+      begin
+        ErrorText := 'Scribe Setup refused a retained handle whose type changed: ' + Path;
+        Exit;
+      end;
+      if HandleIndex <> -1 then
+      begin
+        ErrorText := 'Scribe Setup refused duplicate retained directory handles: ' + Path;
+        Exit;
+      end;
+      HandleIndex := I;
+    end;
+  end;
+  Result := True;
+end;
+
+function RevalidateRetainedDirectoryHandle(
+  HandleIndex: Integer;
+  const Path: String;
+  var ErrorText: String
+): Boolean;
+var
+  RetainedInformation: TByHandleFileInformation;
+  ProbeInformation: TByHandleFileInformation;
+  ProbeHandle: THandle;
+  ErrorCode: LongInt;
+begin
+  Result := False;
+  if not GetFileInformationByHandle(
+    BoundHandles[HandleIndex], RetainedInformation) then
+  begin
+    ErrorCode := DLLGetLastError;
+    ErrorText := 'Scribe Setup could not revalidate a retained destination directory: ' +
+      Path + ' (' + SysErrorMessage(ErrorCode) + ').';
+    Exit;
+  end;
+  if ((RetainedInformation.FileAttributes and FILE_ATTRIBUTE_DIRECTORY) = 0) or
+     ((RetainedInformation.FileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
+     ((RetainedInformation.FileAttributes and FILE_ATTRIBUTE_DEVICE) <> 0) then
+  begin
+    ErrorText := 'Scribe Setup refused a retained destination directory whose type changed: ' + Path;
+    Exit;
+  end;
+
+  { Keep the original no-delete lease continuously. The temporary no-follow
+    path probe proves the pathname still resolves to that retained directory. }
+  ProbeHandle := CreateFileW(
+    Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting,
+    FileFlagBackupSemantics or FileFlagOpenReparsePoint, 0);
+  if ProbeHandle = InvalidHandleValue then
+  begin
+    ErrorCode := DLLGetLastError;
+    ErrorText := 'Scribe Setup could not reopen a retained destination directory: ' +
+      Path + ' (' + SysErrorMessage(ErrorCode) + ').';
+    Exit;
+  end;
+  try
+    if not GetFileInformationByHandle(ProbeHandle, ProbeInformation) then
+    begin
+      ErrorCode := DLLGetLastError;
+      ErrorText := 'Scribe Setup could not read a retained destination directory identity: ' +
+        Path + ' (' + SysErrorMessage(ErrorCode) + ').';
+      Exit;
+    end;
+    if not SameFileIdentity(RetainedInformation, ProbeInformation) then
+    begin
+      ErrorText := 'Scribe Setup refused a destination directory whose retained path identity changed: ' + Path;
+      Exit;
+    end;
+    if ((ProbeInformation.FileAttributes and FILE_ATTRIBUTE_DIRECTORY) = 0) or
+       ((ProbeInformation.FileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
+       ((ProbeInformation.FileAttributes and FILE_ATTRIBUTE_DEVICE) <> 0) then
+    begin
+      ErrorText := 'Scribe Setup refused a retained destination directory whose path type changed: ' + Path;
+      Exit;
+    end;
+    if not RejectAlternateStreams(Path, True, ErrorText) then
+      Exit;
+  finally
+    CloseHandle(ProbeHandle);
+  end;
+  Result := True;
+end;
+
 function BindDirectory(Path: String; var ErrorText: String): Boolean;
 var
   DirectoryHandle: THandle;
+  RetainedHandleIndex: Integer;
   Attributes: LongWord;
   PathExists: Boolean;
   ErrorCode: LongInt;
 begin
   Result := False;
+  if not FindRetainedDirectoryHandle(
+    Path, RetainedHandleIndex, ErrorText) then
+    Exit;
+  if RetainedHandleIndex <> -1 then
+  begin
+    Result := RevalidateRetainedDirectoryHandle(
+      RetainedHandleIndex, Path, ErrorText);
+    Exit;
+  end;
   DirectoryHandle := CreateFileW(
     Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting,
     FileFlagBackupSemantics or FileFlagOpenReparsePoint, 0);
@@ -987,7 +1106,8 @@ begin
       Path + ' (' + SysErrorMessage(ErrorCode) + ').';
     Exit;
   end;
-  if not RetainBoundHandle(DirectoryHandle, Path, False, ErrorText) then
+  if not RetainBoundHandle(
+    DirectoryHandle, Path, False, True, ErrorText) then
     Exit;
   if not QueryExistingAttributes(Path, Attributes, PathExists, ErrorText) then
     Exit;
@@ -1031,7 +1151,7 @@ begin
     Exit;
   end;
   if not RetainBoundHandle(
-    IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText) then
+    IdentityHandle, Path, ReleaseBeforeInnoReplacement, False, ErrorText) then
     Exit;
   if not QueryExistingAttributes(Path, Attributes, PathExists, ErrorText) then
     Exit;

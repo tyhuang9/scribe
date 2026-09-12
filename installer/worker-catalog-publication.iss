@@ -408,7 +408,7 @@ begin
       Path + ' (' + SysErrorMessage(ErrorCode) + '). Close Scribe and retry.';
     Exit;
   end;
-  if not RetainBoundHandle(FileHandle, Path, False, ErrorText) then
+  if not RetainBoundHandle(FileHandle, Path, False, False, ErrorText) then
     Exit;
   if not GetFileInformationByHandle(FileHandle, BeforeInformation) then
   begin

@@ -1307,8 +1307,9 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'procedure ReleaseInnoUninstallerHandles' -or
         $installer -notmatch 'BoundHandles: array\[0\.\.2047\] of THandle' -or
         $installer -notmatch 'BoundHandleReleaseBeforeInnoReplacement: array\[0\.\.2047\] of Boolean' -or
+        $installer -notmatch 'BoundHandleIsDirectory: array\[0\.\.2047\] of Boolean' -or
         $installer -notmatch 'RetainBoundHandle\(\s*IdentityHandle' -or
-        $installer -notmatch 'RetainBoundHandle\(DirectoryHandle' -or
+        $installer -notmatch 'RetainBoundHandle\(\s*DirectoryHandle' -or
         $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+begin\s+try\s+if CompleteWorkerCatalogPublication\(ErrorText\) then' -or
         $lifecycleSource -notmatch 'except\s+RecordWorkerCatalogLifecycleFailure\(GetExceptionMessage\);\s+end;\s+ReleaseWorkerCatalogLeases\(\);\s+ReleaseBoundHandles\(\);' -or
         $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseWorkerCatalogLeases\(\);\s+ReleaseBoundHandles\(\)' -or
@@ -1325,7 +1326,7 @@ Set-StrictMode -Version Latest
         $uninstallerLifecycleSource -notmatch 'function IsInnoUninstallerArtifact[\s\S]*SameStr\(RelativePath, ''unins000\.exe''\)[\s\S]*SameStr\(RelativePath, ''unins000\.dat''\)' -or
         $uninstallerLifecycleSource -notmatch 'function BindFileForUpdate\([\s\S]*ReleaseBeforeInnoReplacement: Boolean' -or
         $uninstallerLifecycleSource -notmatch 'IdentityAccess := 0;[\s\S]*if not ReleaseBeforeInnoReplacement then[\s\S]*IdentityAccess := GenericRead;[\s\S]*Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting' -or
-        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\([\s\S]*IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText\)' -or
+        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\([\s\S]*IdentityHandle, Path, ReleaseBeforeInnoReplacement, False, ErrorText\)' -or
         $uninstallerLifecycleSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then[\s\S]*CloseHandle\(BoundHandles\[I\]\)' -or
         $installer -notmatch 'if CurStep = ssInstall then[\s\S]*ReleaseInnoUninstallerHandles\(\);[\s\S]*WaitAtTestBoundary\(\)' -or
         $installer -notmatch 'BindFileForUpdate\(\s*ChildPath, IsInnoUninstallerArtifact\(RelativePath\), ErrorText\)') {
@@ -1339,7 +1340,7 @@ Set-StrictMode -Version Latest
     $payloadBindingSource = $installer.Substring($payloadBindingStart, $uninstallerArtifactStart - $payloadBindingStart)
     if ($payloadBindingSource -notmatch "SameStr\(RelativePath, 'local-transcriber\.exe'\)" -or
         $uninstallerLifecycleSource -match 'IsInnoUninstallerArtifact\(Path\)' -or
-        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\(DirectoryHandle, Path, False, ErrorText\)') {
+        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\(\s*DirectoryHandle, Path, False, True, ErrorText\)') {
         throw 'Installer uninstaller release must be selected only from the validated relative path; directories and payload bindings must remain delete-denying.'
     }
     $payloadReleaseStart = $installer.IndexOf('procedure ReleasePayloadHandleForCurrentFile')

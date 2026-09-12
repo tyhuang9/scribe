@@ -13,9 +13,14 @@ $fixtureRoot = Join-Path $temporaryRoot "scribe-worker-catalog-publication-test-
 $fixtureInstallerRoot = Join-Path $fixtureRoot 'installer'
 $fixtureDistRoot = Join-Path $fixtureRoot 'dist'
 $fixturePortableRoot = Join-Path $fixtureDistRoot 'portable'
+$maximumFixtureRoot = Join-Path $fixtureRoot 'maximum'
+$maximumInstallerRoot = Join-Path $maximumFixtureRoot 'installer'
+$maximumDistRoot = Join-Path $maximumFixtureRoot 'dist'
+$maximumPortableRoot = Join-Path $maximumDistRoot 'portable'
 $evidenceRoot = Join-Path $fixtureRoot 'evidence'
 $fixtureVersion = '9.8.7'
 $installerPath = Join-Path $fixtureDistRoot "Scribe-Setup-$fixtureVersion.exe"
+$maximumInstallerPath = Join-Path $maximumDistRoot "Scribe-Setup-$fixtureVersion.exe"
 $catalogLiveName = 'worker-pack-catalog.json'
 $catalogNextName = 'worker-pack-catalog.next.json'
 $catalogPreviousName = 'worker-pack-catalog.previous.json'
@@ -24,6 +29,18 @@ $currentCatalogBytes = [System.Text.UTF8Encoding]::new($false).GetBytes('{"schem
 $historicalCatalogBytes = [System.Text.UTF8Encoding]::new($false).GetBytes('{"schema_version":1,"packs":[],"release":"historical"}')
 $unknownCatalogBytes = [System.Text.UTF8Encoding]::new($false).GetBytes('{"schema_version":1,"packs":[],"release":"unknown"}')
 $currentWorkerBytes = [System.Text.UTF8Encoding]::new($false).GetBytes('{"fixture":"current-worker-pack"}')
+$maximumWorkerLeafDirectories = @(0..897 | ForEach-Object {
+    "workers\packs\maximum-$($_.ToString('D3'))"
+})
+$maximumWorkerDirectories = @('workers', 'workers\packs') + $maximumWorkerLeafDirectories
+$maximumWorkerRelativePaths = @(
+    foreach ($directory in $maximumWorkerLeafDirectories) {
+        "$directory\pack.bin"
+    }
+    for ($index = 0; $index -lt 126; $index++) {
+        "$($maximumWorkerLeafDirectories[0])\extra-$($index.ToString('D3')).bin"
+    }
+)
 $ownedCaseRoots = [System.Collections.Generic.List[string]]::new()
 $ownedShellRoots = [System.Collections.Generic.List[string]]::new()
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -186,6 +203,72 @@ function New-CaseState {
     }
 }
 
+function Add-MaximumCurrentWorkerPayload([object] $Case) {
+    foreach ($relativePath in $maximumWorkerRelativePaths) {
+        Write-Bytes (Join-Path $Case.InstallRoot $relativePath) $currentWorkerBytes
+    }
+}
+
+function Get-MaximumWorkerAllowlistSource {
+    param(
+        [Parameter(Mandatory)] [string] $CurrentWorkerHash,
+        [Parameter(Mandatory)] [string] $CurrentCatalogHash,
+        [Parameter(Mandatory)] [string] $HistoricalCatalogHash
+    )
+
+    $directoryExpression = ($maximumWorkerDirectories | ForEach-Object {
+        "    SameStr(RelativePath, '$($_.Replace("'", "''"))')"
+    }) -join " or`r`n"
+    $fileExpression = ($maximumWorkerRelativePaths | ForEach-Object {
+        "    SameStr(RelativePath, '$($_.Replace("'", "''"))')"
+    }) -join " or`r`n"
+    return @"
+function IsGeneratedWorkerPackDirectory(RelativePath: String): Boolean;
+begin
+  Result :=
+$directoryExpression;
+end;
+
+function IsGeneratedWorkerPackFile(RelativePath: String): Boolean;
+begin
+  Result :=
+$fileExpression;
+end;
+
+function GetGeneratedCurrentWorkerPackFileIdentity(
+  RelativePath: String; var FileSize: Int64; var Sha256: String
+): Boolean;
+begin
+  FileSize := -1;
+  Sha256 := '';
+  Result := IsGeneratedWorkerPackFile(RelativePath);
+  if Result then
+  begin
+    FileSize := $($currentWorkerBytes.Length);
+    Sha256 := '$CurrentWorkerHash';
+  end;
+end;
+
+function GetGeneratedCurrentWorkerPackFileCount(): Integer;
+begin
+  Result := $($maximumWorkerRelativePaths.Count);
+end;
+
+function IsGeneratedCurrentWorkerCatalog(FileSize: Int64; Sha256: String): Boolean;
+begin
+  Result := (FileSize = $($currentCatalogBytes.Length)) and
+    SameStr(Sha256, '$CurrentCatalogHash');
+end;
+
+function IsGeneratedKnownWorkerCatalog(FileSize: Int64; Sha256: String): Boolean;
+begin
+  Result := IsGeneratedCurrentWorkerCatalog(FileSize, Sha256) or
+    ((FileSize = $($historicalCatalogBytes.Length)) and
+     SameStr(Sha256, '$HistoricalCatalogHash'));
+end;
+"@
+}
+
 function Enable-LaunchSentinel([object] $Case) {
     New-Item -ItemType Directory -Path $Case.ShellRoot -Force | Out-Null
     $command = "@echo off`r`n> `"$($Case.LaunchMarker)`" echo launched`r`n"
@@ -225,6 +308,26 @@ function Invoke-FixtureInstaller {
     return Invoke-BoundedOwnedProcess -FilePath $installerPath `
         -ArgumentList $arguments.ToArray() -TimeoutSeconds 60 `
         -Description "fixture installer $Name"
+}
+
+function Invoke-MaximumFixtureInstaller {
+    param(
+        [Parameter(Mandatory)] [object] $Case,
+        [Parameter(Mandatory)] [string] $Name
+    )
+
+    $logPath = Join-Path $evidenceRoot "$Name.log"
+    $script:lastInstallerLog = $logPath
+    return Invoke-BoundedOwnedProcess -FilePath $maximumInstallerPath `
+        -ArgumentList @(
+            '/VERYSILENT',
+            '/SUPPRESSMSGBOXES',
+            '/NORESTART',
+            '/SP-',
+            '/NOICONS',
+            "/SCRIBESTABLETEST=$($Case.Token)",
+            "/LOG=$logPath"
+        ) -TimeoutSeconds 120 -Description "maximum fixture installer $Name"
 }
 
 function Invoke-FixtureInstallerWithStagingConflict {
@@ -321,6 +424,10 @@ function Assert-CatalogState {
 
 try {
     $null = Assert-OwnedTemporaryPath $fixtureRoot '^scribe-worker-catalog-publication-test-[0-9a-f]{32}$'
+    if ($maximumWorkerDirectories.Count -ne 900 -or
+        $maximumWorkerRelativePaths.Count -ne 1024) {
+        throw 'Maximum worker fixture does not exercise the admitted 900-directory/1,024-file bounds.'
+    }
     if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
         throw 'Pass -InnoCompiler with the explicitly acquired Inno Setup 6.7.1 ISCC.exe path.'
     }
@@ -334,11 +441,19 @@ try {
 
     New-Item -ItemType Directory -Path $fixtureInstallerRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $fixturePortableRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $maximumInstallerRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $maximumPortableRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\scribe.iss') -Destination $fixtureInstallerRoot
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\worker-catalog-publication.iss') -Destination $fixtureInstallerRoot
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\scribe.iss') -Destination $maximumInstallerRoot
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\worker-catalog-publication.iss') -Destination $maximumInstallerRoot
     Write-Bytes (Join-Path $fixturePortableRoot $catalogLiveName) $currentCatalogBytes
     Write-Bytes (Join-Path $fixturePortableRoot $workerRelativePath) $currentWorkerBytes
+    Write-Bytes (Join-Path $maximumPortableRoot $catalogLiveName) $currentCatalogBytes
+    foreach ($relativePath in $maximumWorkerRelativePaths) {
+        Write-Bytes (Join-Path $maximumPortableRoot $relativePath) $currentWorkerBytes
+    }
 
     $currentCatalogHash = Get-LowerSha256 $currentCatalogBytes
     $historicalCatalogHash = Get-LowerSha256 $historicalCatalogBytes
@@ -403,6 +518,14 @@ end;
         $allowlist,
         [System.Text.UTF8Encoding]::new($false)
     )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $maximumInstallerRoot 'worker-pack-allowlist.maximum.iss'),
+        (Get-MaximumWorkerAllowlistSource `
+            -CurrentWorkerHash $currentWorkerHash `
+            -CurrentCatalogHash $currentCatalogHash `
+            -HistoricalCatalogHash $historicalCatalogHash),
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     $productionCompileExit = Invoke-BoundedOwnedProcess -FilePath $InnoCompiler `
         -ArgumentList @(
@@ -427,6 +550,20 @@ end;
         -StandardErrorPath (Join-Path $evidenceRoot 'compile.err.log')
     if ($testCompileExit -ne 0 -or -not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
         throw "Pinned Inno compiler failed with exit code $testCompileExit."
+    }
+
+    $maximumCompileExit = Invoke-BoundedOwnedProcess -FilePath $InnoCompiler `
+        -ArgumentList @(
+            "/DAppVersion=$fixtureVersion",
+            '/DWorkerPackAllowlist=worker-pack-allowlist.maximum.iss',
+            '/DWorkerCatalogPublicationTests=1',
+            (Join-Path $maximumInstallerRoot 'scribe.iss')
+        ) -TimeoutSeconds 180 -Description 'maximum fixture compiler' `
+        -StandardOutputPath (Join-Path $evidenceRoot 'maximum-compile.log') `
+        -StandardErrorPath (Join-Path $evidenceRoot 'maximum-compile.err.log')
+    if ($maximumCompileExit -ne 0 -or
+        -not (Test-Path -LiteralPath $maximumInstallerPath -PathType Leaf)) {
+        throw "Pinned Inno compiler maximum build failed with exit code $maximumCompileExit."
     }
 
     $fresh = New-CaseState
@@ -585,6 +722,27 @@ end;
         Invoke-FixtureInstaller $restartOverride 'restart-applications-override' -RestartApplications
     ) '/RESTARTAPPLICATIONS override'
     Assert-CatalogState $restartOverride absent absent absent
+
+    $maximumUpgrade = New-CaseState -Live $historicalCatalogBytes
+    Add-MaximumCurrentWorkerPayload $maximumUpgrade
+    Assert-Success (
+        Invoke-MaximumFixtureInstaller $maximumUpgrade 'maximum-populated-upgrade'
+    ) 'maximum populated historical-to-current update'
+    Assert-CatalogState $maximumUpgrade current absent historical
+    $installedMaximumDirectories = @(
+        Get-ChildItem -LiteralPath $maximumUpgrade.InstallRoot -Directory -Recurse -Force |
+            Where-Object { $_.FullName -like "$(Join-Path $maximumUpgrade.InstallRoot 'workers')*" }
+    )
+    $installedMaximumFiles = @(
+        Get-ChildItem -LiteralPath (Join-Path $maximumUpgrade.InstallRoot 'workers') -File -Recurse -Force
+    )
+    if ($installedMaximumDirectories.Count -ne 900 -or $installedMaximumFiles.Count -ne 1024) {
+        throw "Maximum populated update produced $($installedMaximumDirectories.Count) worker directories and $($installedMaximumFiles.Count) worker files."
+    }
+    foreach ($relativePath in $maximumWorkerRelativePaths) {
+        Assert-Bytes (Join-Path $maximumUpgrade.InstallRoot $relativePath) `
+            $currentWorkerBytes "maximum current worker payload $relativePath"
+    }
 
     Write-Output 'Windows worker catalog publication tests passed.'
 }

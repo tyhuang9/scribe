@@ -805,6 +805,14 @@ states. It retains directory/file identities through the file-installation
 phase and verifies the full current payload identity table and file count before
 publication.
 
+Repeated tree validation reuses each already-retained directory lease after
+matching a temporary no-follow path probe to its volume/file identity and
+rechecking directory attributes/streams. The original lease remains open.
+Directory kind is recorded separately from file-replacement policy, so a file
+lease cannot be mistaken for a reusable directory lease. This avoids counting
+the same directory twice during a populated upgrade while preserving the
+2,048-handle ceiling and the 900-directory/1,024-file generated limits.
+
 After the file phase, publication uses two non-replacing, identity-bound Win32
 renames: live to `worker-pack-catalog.previous.json`, then next to live. Before
 each mutation it upgrades the source lease and rechecks the same volume/file
@@ -814,6 +822,10 @@ as recovery metadata. This is a recoverable two-step transition, not a claim of
 power-fail atomicity or whole-application rollback. If no live catalog remains,
 repair must restage the current application/payload; the installer does not
 restore an older catalog over potentially newer or mixed application files.
+An authenticated next catalog with an incomplete current payload is currently
+refused during preflight; automatic restaging of missing known files in that
+state remains a separate recovery task. Present corrupt or unknown files must
+continue to fail before any installation writes.
 
 Post-file-phase failures set installer exit code 73 and suppress app launch.
 They are explicitly recorded because Inno post-install exceptions do not roll
@@ -839,7 +851,9 @@ These are synthetic catalog-state fixtures, not production signed A/B pack
 installers. Coverage includes fresh installation, update/repair, interrupted
 rename boundaries and restart, occupied destinations, altered catalogs,
 incompatible sharing, incomplete recovery payloads, launch suppression, and
-custom failure exits. Historical GPU payload admission/retirement remains
+custom failure exits. A populated upgrade with 900 worker directories and
+1,024 byte-authenticated worker files also verifies that repeated directory
+validation stays within the retained-handle limit. Historical GPU payload admission/retirement remains
 disabled: a real differing-pack upgrade, authoritative history enforcement,
 handle-based obsolete-file removal, power-loss/hard-termination testing, and
 clean-machine signed installation still require their own verification before
