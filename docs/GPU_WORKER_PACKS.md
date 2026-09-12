@@ -442,7 +442,8 @@ the expected `ask not` phrase, warm reuse, and zero CPU launches. This evidence
 verifies compiler-payload selection across Visual Studio shells; it does not
 replace remote CI, CUDA, production-signing, installer, or Auto qualification.
 
-CUDA was not built or run locally because CUDA Toolkit/nvcc 12.8.93 is absent.
+At that earlier Vulkan checkpoint, CUDA was not built or run locally because
+CUDA Toolkit/nvcc 12.8.93 was absent.
 Fixture mode checks that exact developer-toolkit version. Production mode also
 requires a complete canonical CUDA Toolkit inventory with exact SHA-256 values;
 the checked-in inventory is intentionally empty, so same-version modified inputs
@@ -466,6 +467,38 @@ $env:SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT = 'ask not'
 $env:SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID = 'native:0000:01:00.0'
 cargo test --features inference-worker verified_vulkan_fixture_pack_scif_model_hardware_smoke -- --ignored --nocapture
 ```
+
+### Backend-specific fixture smoke tests
+
+The CPU-only test harness provides separate ignored CUDA and Vulkan smoke tests.
+Both verify a fixture-signed pack, complete the challenge-bound SCIF handshake,
+select the expected backend/provider/pack and stable device, load the pinned GGUF,
+transcribe the pinned WAV, require the known phrase and warm-model reuse, and
+assert that no CPU worker launched. These are functional checks, not performance
+qualification or production signing evidence.
+
+For CUDA, use the same inputs above with the `SCRIBE_CUDA_FIXTURE_` prefix,
+including `PACK_ROOT`, `MODEL`, `MODEL_SHA256`, `WAV`, `WAV_SHA256`,
+`EXPECTED_TRANSCRIPT`, and `STABLE_DEVICE_ID`. Its target must be an NVIDIA
+discrete GPU from `scribe-cuda-windows-x64` using `transcribe-cpp-ggml-cuda`.
+The Vulkan test retains the existing `SCRIBE_GPU_FIXTURE_` prefix and supports
+an explicit AMD or Intel device identity as well as NVIDIA.
+
+Build the pack and CPU-only test harness from the same clean source revision.
+Do not override the harness build identity to accept an older pack. Run exactly
+one selected test and require the result to report one test passed (zero tests
+does not establish a smoke result):
+
+```powershell
+cargo test --locked --offline --bin local-transcriber --features inference-worker onnx_worker::tests::verified_cuda_fixture_pack_scif_model_hardware_smoke -- --ignored --exact --nocapture --test-threads=1
+```
+
+For Vulkan, substitute `verified_vulkan_fixture_pack_scif_model_hardware_smoke`.
+Do not add CUDA or Vulkan compile-time features to this parent harness: GPU
+libraries belong only in the selected external worker. The tests remove their
+temporary retained pack copy after worker shutdown; keep the source pack and
+pinned inputs until all planned checks finish. Failed runs may need separately
+verified cleanup after every worker has been reaped.
 
 ## Stage 4 launch binding
 
