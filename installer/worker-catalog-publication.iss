@@ -434,15 +434,58 @@ begin
   Result := True;
 end;
 
+function ValidateCurrentWorkerPackFileCounts(
+  var ExpectedCount: Integer;
+  var ErrorText: String
+): Boolean;
+begin
+  ExpectedCount := GetGeneratedCurrentWorkerPackFileCount();
+  Result :=
+    (ExpectedCount >= 0) and
+    (ExpectedCount <= 1024) and
+    (ObservedCurrentWorkerPackFileCount >= 0) and
+    (ObservedCurrentWorkerPackFileCount <= 1024) and
+    (ObservedCurrentWorkerPackFileCount <= ExpectedCount);
+  if not Result then
+    ErrorText := 'Scribe Setup refused invalid generated or observed current worker-pack file counts.';
+end;
+
 function CurrentWorkerPackPayloadIsComplete(var ErrorText: String): Boolean;
 var
   ExpectedCount: Integer;
 begin
-  ExpectedCount := GetGeneratedCurrentWorkerPackFileCount();
-  Result := (ExpectedCount >= 0) and (ExpectedCount <= 1024) and
-    (ObservedCurrentWorkerPackFileCount = ExpectedCount);
+  Result := ValidateCurrentWorkerPackFileCounts(ExpectedCount, ErrorText);
+  if not Result then
+    Exit;
+  Result := ObservedCurrentWorkerPackFileCount = ExpectedCount;
   if not Result then
     ErrorText := 'Scribe Setup refused to publish the worker-pack catalog because the complete current worker payload was not authenticated.';
+end;
+
+function WorkerCatalogModePermitsMissingCurrentWorkerPayload(): Boolean;
+begin
+  Result :=
+    (WorkerCatalogMode = wcmRecoverFresh) or
+    (WorkerCatalogMode = wcmRecoverUpdateBeforeFirstRename) or
+    (WorkerCatalogMode = wcmRecoverUpdateBeforeSecondRename) or
+    (WorkerCatalogMode = wcmRepairRedundantNext);
+end;
+
+function CurrentWorkerPackPayloadMayBeRestagedForRecovery(
+  var ErrorText: String
+): Boolean;
+var
+  ExpectedCount: Integer;
+begin
+  Result := ValidateCurrentWorkerPackFileCounts(ExpectedCount, ErrorText);
+  if not Result then
+    Exit;
+  if (ObservedCurrentWorkerPackFileCount < ExpectedCount) and
+     not WorkerCatalogModePermitsMissingCurrentWorkerPayload() then
+  begin
+    ErrorText := 'Scribe Setup refused to restage a missing current worker payload outside an explicit catalog recovery state.';
+    Result := False;
+  end;
 end;
 
 function CatalogPath(Index: Integer): String;
@@ -531,7 +574,7 @@ begin
     (WorkerCatalogMode = wcmCommittedStage);
 
   if WorkerCatalogLeases[1].Present and
-     not CurrentWorkerPackPayloadIsComplete(ErrorText) then
+     not CurrentWorkerPackPayloadMayBeRestagedForRecovery(ErrorText) then
     Exit;
   Result := True;
 end;

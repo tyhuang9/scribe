@@ -17,10 +17,15 @@ $maximumFixtureRoot = Join-Path $fixtureRoot 'maximum'
 $maximumInstallerRoot = Join-Path $maximumFixtureRoot 'installer'
 $maximumDistRoot = Join-Path $maximumFixtureRoot 'dist'
 $maximumPortableRoot = Join-Path $maximumDistRoot 'portable'
+$incompletePayloadFixtureRoot = Join-Path $fixtureRoot 'incomplete-payload'
+$incompletePayloadInstallerRoot = Join-Path $incompletePayloadFixtureRoot 'installer'
+$incompletePayloadDistRoot = Join-Path $incompletePayloadFixtureRoot 'dist'
+$incompletePayloadPortableRoot = Join-Path $incompletePayloadDistRoot 'portable'
 $evidenceRoot = Join-Path $fixtureRoot 'evidence'
 $fixtureVersion = '9.8.7'
 $installerPath = Join-Path $fixtureDistRoot "Scribe-Setup-$fixtureVersion.exe"
 $maximumInstallerPath = Join-Path $maximumDistRoot "Scribe-Setup-$fixtureVersion.exe"
+$incompletePayloadInstallerPath = Join-Path $incompletePayloadDistRoot "Scribe-Setup-$fixtureVersion.exe"
 $catalogLiveName = 'worker-pack-catalog.json'
 $catalogNextName = 'worker-pack-catalog.next.json'
 $catalogPreviousName = 'worker-pack-catalog.previous.json'
@@ -284,6 +289,7 @@ function Invoke-FixtureInstaller {
         [Parameter(Mandatory)] [object] $Case,
         [Parameter(Mandatory)] [string] $Name,
         [string] $Fault,
+        [string] $ExpectedCountOverride = '',
         [switch] $Launch,
         [switch] $RestartApplications
     )
@@ -303,11 +309,41 @@ function Invoke-FixtureInstaller {
         $arguments.Add($argument)
     }
     if ($Fault) { $arguments.Add("/SCRIBECATALOGFAULT=$Fault") }
+    if ($ExpectedCountOverride -ne '') {
+        $arguments.Add("/SCRIBECATALOGEXPECTEDCOUNT=$ExpectedCountOverride")
+    }
     if ($Launch) { $arguments.Add('/SCRIBECATALOGTESTLAUNCH=1') }
     if ($RestartApplications) { $arguments.Add('/RESTARTAPPLICATIONS') }
     return Invoke-BoundedOwnedProcess -FilePath $installerPath `
         -ArgumentList $arguments.ToArray() -TimeoutSeconds 60 `
         -Description "fixture installer $Name"
+}
+
+function Invoke-IncompletePayloadFixtureInstaller {
+    param(
+        [Parameter(Mandatory)] [object] $Case,
+        [Parameter(Mandatory)] [string] $Name,
+        [switch] $Launch
+    )
+
+    $logPath = Join-Path $evidenceRoot "$Name.log"
+    $script:lastInstallerLog = $logPath
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    foreach ($argument in @(
+        '/VERYSILENT',
+        '/SUPPRESSMSGBOXES',
+        '/NORESTART',
+        '/SP-',
+        '/NOICONS',
+        "/SCRIBESTABLETEST=$($Case.Token)",
+        "/LOG=$logPath"
+    )) {
+        $arguments.Add($argument)
+    }
+    if ($Launch) { $arguments.Add('/SCRIBECATALOGTESTLAUNCH=1') }
+    return Invoke-BoundedOwnedProcess -FilePath $incompletePayloadInstallerPath `
+        -ArgumentList $arguments.ToArray() -TimeoutSeconds 60 `
+        -Description "incomplete-payload fixture installer $Name"
 }
 
 function Invoke-MaximumFixtureInstaller {
@@ -394,6 +430,14 @@ function Assert-Failure([int] $ExitCode, [string] $Description) {
     }
 }
 
+function Assert-LastInstallerLogContains([string] $ExpectedText, [string] $Description) {
+    if (-not (Test-Path -LiteralPath $script:lastInstallerLog -PathType Leaf) -or
+        -not (Select-String -LiteralPath $script:lastInstallerLog `
+            -SimpleMatch -Pattern $ExpectedText -Quiet)) {
+        throw "$Description was not recorded in the installer log: $ExpectedText"
+    }
+}
+
 function Assert-CatalogState {
     param(
         [Parameter(Mandatory)] [object] $Case,
@@ -443,17 +487,27 @@ try {
     New-Item -ItemType Directory -Path $fixturePortableRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $maximumInstallerRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $maximumPortableRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $incompletePayloadInstallerRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $incompletePayloadPortableRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\scribe.iss') -Destination $fixtureInstallerRoot
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\worker-catalog-publication.iss') -Destination $fixtureInstallerRoot
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\scribe.iss') -Destination $maximumInstallerRoot
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\worker-catalog-publication.iss') -Destination $maximumInstallerRoot
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\scribe.iss') -Destination $incompletePayloadInstallerRoot
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'installer\worker-catalog-publication.iss') -Destination $incompletePayloadInstallerRoot
     Write-Bytes (Join-Path $fixturePortableRoot $catalogLiveName) $currentCatalogBytes
     Write-Bytes (Join-Path $fixturePortableRoot $workerRelativePath) $currentWorkerBytes
     Write-Bytes (Join-Path $maximumPortableRoot $catalogLiveName) $currentCatalogBytes
     foreach ($relativePath in $maximumWorkerRelativePaths) {
         Write-Bytes (Join-Path $maximumPortableRoot $relativePath) $currentWorkerBytes
     }
+    Write-Bytes (Join-Path $incompletePayloadPortableRoot $catalogLiveName) $currentCatalogBytes
+    [System.IO.File]::WriteAllText(
+        (Join-Path $incompletePayloadPortableRoot 'README.txt'),
+        'Intentional fixture with a declared current worker file omitted from the installer payload.',
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     $currentCatalogHash = Get-LowerSha256 $currentCatalogBytes
     $historicalCatalogHash = Get-LowerSha256 $historicalCatalogBytes
@@ -497,7 +551,11 @@ end;
 
 function GetGeneratedCurrentWorkerPackFileCount(): Integer;
 begin
+#ifdef WorkerCatalogPublicationTests
+  Result := StrToIntDef(ExpandConstant('{param:SCRIBECATALOGEXPECTEDCOUNT|1}'), 1);
+#else
   Result := 1;
+#endif
 end;
 
 function IsGeneratedCurrentWorkerCatalog(FileSize: Int64; Sha256: String): Boolean;
@@ -524,6 +582,11 @@ end;
             -CurrentWorkerHash $currentWorkerHash `
             -CurrentCatalogHash $currentCatalogHash `
             -HistoricalCatalogHash $historicalCatalogHash),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $incompletePayloadInstallerRoot 'worker-pack-allowlist.fixture.iss'),
+        $allowlist,
         [System.Text.UTF8Encoding]::new($false)
     )
 
@@ -564,6 +627,20 @@ end;
     if ($maximumCompileExit -ne 0 -or
         -not (Test-Path -LiteralPath $maximumInstallerPath -PathType Leaf)) {
         throw "Pinned Inno compiler maximum build failed with exit code $maximumCompileExit."
+    }
+
+    $incompletePayloadCompileExit = Invoke-BoundedOwnedProcess -FilePath $InnoCompiler `
+        -ArgumentList @(
+            "/DAppVersion=$fixtureVersion",
+            '/DWorkerPackAllowlist=worker-pack-allowlist.fixture.iss',
+            '/DWorkerCatalogPublicationTests=1',
+            (Join-Path $incompletePayloadInstallerRoot 'scribe.iss')
+        ) -TimeoutSeconds 60 -Description 'incomplete-payload fixture compiler' `
+        -StandardOutputPath (Join-Path $evidenceRoot 'incomplete-payload-compile.log') `
+        -StandardErrorPath (Join-Path $evidenceRoot 'incomplete-payload-compile.err.log')
+    if ($incompletePayloadCompileExit -ne 0 -or
+        -not (Test-Path -LiteralPath $incompletePayloadInstallerPath -PathType Leaf)) {
+        throw "Pinned Inno compiler incomplete-payload build failed with exit code $incompletePayloadCompileExit."
     }
 
     $fresh = New-CaseState
@@ -686,11 +763,102 @@ end;
     Assert-Failure (Invoke-FixtureInstaller $ambiguous 'ambiguous-a-b-a') 'ambiguous A,B,A state'
     Assert-CatalogState $ambiguous historical current historical
 
-    $incompleteRecovery = New-CaseState -Live $historicalCatalogBytes -Next $currentCatalogBytes
+    $invalidHighExpectedCount = New-CaseState -Next $currentCatalogBytes
     Assert-Failure (
-        Invoke-FixtureInstaller $incompleteRecovery 'incomplete-recovery'
-    ) 'incomplete current worker payload recovery'
-    Assert-CatalogState $incompleteRecovery historical current absent
+        Invoke-FixtureInstaller $invalidHighExpectedCount 'invalid-high-expected-count' `
+            -ExpectedCountOverride '1025'
+    ) 'generated current worker count above the release bound'
+    Assert-LastInstallerLogContains `
+        'Scribe Setup refused invalid generated or observed current worker-pack file counts.' `
+        'high generated current worker count refusal'
+    Assert-CatalogState $invalidHighExpectedCount absent current absent
+    Assert-Absent $invalidHighExpectedCount.Worker 'worker payload after invalid high expected-count refusal'
+
+    $invalidNegativeExpectedCount = New-CaseState -Next $currentCatalogBytes
+    Assert-Failure (
+        Invoke-FixtureInstaller $invalidNegativeExpectedCount 'invalid-negative-expected-count' `
+            -ExpectedCountOverride '-1'
+    ) 'negative generated current worker count'
+    Assert-LastInstallerLogContains `
+        'Scribe Setup refused invalid generated or observed current worker-pack file counts.' `
+        'negative generated current worker count refusal'
+    Assert-CatalogState $invalidNegativeExpectedCount absent current absent
+    Assert-Absent $invalidNegativeExpectedCount.Worker 'worker payload after invalid negative expected-count refusal'
+
+    $observedCountExceedsExpected = New-CaseState -Next $currentCatalogBytes -WithCurrentWorker
+    Assert-Failure (
+        Invoke-FixtureInstaller $observedCountExceedsExpected 'observed-count-exceeds-expected' `
+            -ExpectedCountOverride '0'
+    ) 'observed current worker count above the generated count'
+    Assert-LastInstallerLogContains `
+        'Scribe Setup refused invalid generated or observed current worker-pack file counts.' `
+        'observed current worker count refusal'
+    Assert-CatalogState $observedCountExceedsExpected absent current absent
+    Assert-Bytes $observedCountExceedsExpected.Worker $currentWorkerBytes `
+        'worker payload after observed-count refusal'
+
+    $recoverFreshMissingPayload = New-CaseState -Next $currentCatalogBytes
+    Enable-LaunchSentinel $recoverFreshMissingPayload
+    $recoverFreshMissingPayloadExit = Invoke-FixtureInstaller `
+        $recoverFreshMissingPayload 'recover-fresh-missing-payload-boundary' `
+        -Fault 'before-next-to-live' -Launch
+    if ($recoverFreshMissingPayloadExit -ne 73) {
+        throw "Recover-fresh missing-payload boundary returned $recoverFreshMissingPayloadExit instead of 73."
+    }
+    Assert-CatalogState $recoverFreshMissingPayload absent current absent
+    Assert-Bytes $recoverFreshMissingPayload.Worker $currentWorkerBytes `
+        'recover-fresh restaged current worker payload'
+    Assert-Absent $recoverFreshMissingPayload.LaunchMarker `
+        'launch after recover-fresh publication fault'
+    Assert-Success (
+        Invoke-FixtureInstaller $recoverFreshMissingPayload 'recover-fresh-missing-payload-restart'
+    ) 'recover-fresh missing-payload restart'
+    Assert-CatalogState $recoverFreshMissingPayload current absent absent
+
+    $recoverBeforeFirstRenameMissingPayload = New-CaseState `
+        -Live $historicalCatalogBytes -Next $currentCatalogBytes
+    Assert-Success (
+        Invoke-FixtureInstaller `
+            $recoverBeforeFirstRenameMissingPayload 'recover-before-first-rename-missing-payload'
+    ) 'recover-before-first-rename missing-payload recovery'
+    Assert-CatalogState $recoverBeforeFirstRenameMissingPayload current absent historical
+    Assert-Bytes $recoverBeforeFirstRenameMissingPayload.Worker $currentWorkerBytes `
+        'recover-before-first-rename restaged current worker payload'
+
+    $recoverBeforeSecondRenameMissingPayload = New-CaseState `
+        -Next $currentCatalogBytes -Previous $historicalCatalogBytes
+    Assert-Success (
+        Invoke-FixtureInstaller `
+            $recoverBeforeSecondRenameMissingPayload 'recover-before-second-rename-missing-payload'
+    ) 'recover-before-second-rename missing-payload recovery'
+    Assert-CatalogState $recoverBeforeSecondRenameMissingPayload current absent historical
+    Assert-Bytes $recoverBeforeSecondRenameMissingPayload.Worker $currentWorkerBytes `
+        'recover-before-second-rename restaged current worker payload'
+
+    $repairRedundantNextMissingPayload = New-CaseState `
+        -Live $currentCatalogBytes -Next $currentCatalogBytes -Previous $historicalCatalogBytes
+    Assert-Success (
+        Invoke-FixtureInstaller `
+            $repairRedundantNextMissingPayload 'repair-redundant-next-missing-payload'
+    ) 'redundant-next missing-payload repair'
+    Assert-CatalogState $repairRedundantNextMissingPayload current absent historical
+    Assert-Bytes $repairRedundantNextMissingPayload.Worker $currentWorkerBytes `
+        'redundant-next repair restaged current worker payload'
+
+    $postCopyIncompletePayload = New-CaseState -Next $currentCatalogBytes
+    Enable-LaunchSentinel $postCopyIncompletePayload
+    $postCopyIncompletePayloadExit = Invoke-IncompletePayloadFixtureInstaller `
+        $postCopyIncompletePayload 'post-copy-incomplete-payload' -Launch
+    if ($postCopyIncompletePayloadExit -ne 73) {
+        throw "Post-copy incomplete-payload fixture returned $postCopyIncompletePayloadExit instead of 73."
+    }
+    Assert-LastInstallerLogContains `
+        'Scribe Setup refused to publish the worker-pack catalog because the complete current worker payload was not authenticated.' `
+        'post-copy incomplete current worker payload refusal'
+    Assert-CatalogState $postCopyIncompletePayload absent current absent
+    Assert-Absent $postCopyIncompletePayload.Worker 'worker payload omitted from incomplete source fixture'
+    Assert-Absent $postCopyIncompletePayload.LaunchMarker `
+        'launch after post-copy incomplete current worker payload'
 
     $tamperedWorkerRecovery = New-CaseState -Live $historicalCatalogBytes `
         -Next $currentCatalogBytes -WithCurrentWorker

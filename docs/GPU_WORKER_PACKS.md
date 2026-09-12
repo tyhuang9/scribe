@@ -822,10 +822,19 @@ as recovery metadata. This is a recoverable two-step transition, not a claim of
 power-fail atomicity or whole-application rollback. If no live catalog remains,
 repair must restage the current application/payload; the installer does not
 restore an older catalog over potentially newer or mixed application files.
-An authenticated next catalog with an incomplete current payload is currently
-refused during preflight; automatic restaging of missing known files in that
-state remains a separate recovery task. Present corrupt or unknown files must
-continue to fail before any installation writes.
+When an authenticated current next catalog already exists, preflight still
+authenticates every present current worker file. Missing known current files may
+be restaged only in the four explicit next-catalog recovery states: fresh,
+before the first rename, before the second rename, and redundant next. The
+existing next catalog remains under its retained read lease throughout payload
+replay and is not restaged. Publication then reauthenticates that exact catalog
+and upgrades/reopens its lease only for the intended handle-bound mutation.
+Publication still requires the complete generated current size/hash table and
+file count after copying. Present corrupt, unknown, linked, streamed, or reparse
+payload paths continue to fail before payload or catalog mutation; historical
+payload admission and deletion remain disabled. Generated and observed counts
+must both remain within zero through 1,024, and observed files may never exceed
+the generated count.
 
 Post-file-phase failures set installer exit code 73 and suppress app launch.
 They are explicitly recorded because Inno post-install exceptions do not roll
