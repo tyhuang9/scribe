@@ -1,6 +1,9 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+& (Join-Path $PSScriptRoot 'test-windows-gpu-pack-history.ps1')
+& (Join-Path $PSScriptRoot 'test-windows-worker-pack-staging.ps1')
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
@@ -696,10 +699,18 @@ try {
         throw 'Normal release worker-pack catalog must be schema-valid and empty.'
     }
     $emptyAllowlistSource = Get-Content -LiteralPath $emptyPackAllowlist -Raw
-    if ($emptyAllowlistSource -notmatch 'IsGeneratedWorkerPackDirectory' -or
-        $emptyAllowlistSource -notmatch 'IsGeneratedWorkerPackFile' -or
-        @([regex]::Matches($emptyAllowlistSource, 'Result := False;')).Count -ne 2) {
+    if ($emptyAllowlistSource -notmatch '(?s)function IsGeneratedWorkerPackDirectory\(RelativePath: String\): Boolean;\s*begin\s*Result := False;\s*end;' -or
+        $emptyAllowlistSource -notmatch '(?s)function IsGeneratedWorkerPackFile\(RelativePath: String\): Boolean;\s*begin\s*Result := False;\s*end;') {
         throw 'Empty worker-pack installer allowlist must fail closed for files and directories.'
+    }
+    $emptyCatalogPath = Join-Path $emptyPackBundle 'worker-pack-catalog.json'
+    $emptyCatalogSize = (Get-Item -LiteralPath $emptyCatalogPath).Length
+    $emptyCatalogSha256 = (Get-FileHash -LiteralPath $emptyCatalogPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expectedCurrentCatalog = "Result := (FileSize = $emptyCatalogSize) and SameStr(Sha256, '$emptyCatalogSha256');"
+    if (-not $emptyAllowlistSource.Contains($expectedCurrentCatalog, [StringComparison]::Ordinal) -or
+        $emptyAllowlistSource -notmatch 'IsGeneratedKnownWorkerCatalog' -or
+        $emptyAllowlistSource -notmatch '(?s)function IsGeneratedRetiredWorkerPackDirectory\(RelativePath: String\): Boolean;\s*begin\s*Result := False;\s*end;') {
+        throw 'Empty worker-pack staging must bind the exact current catalog without admitting retired directories.'
     }
     $emptySizeReport = Join-Path $testRoot 'empty-worker-pack-size-report.json'
     & (Join-Path $repositoryRoot 'scripts\report-windows-worker-pack-sizes.ps1') `

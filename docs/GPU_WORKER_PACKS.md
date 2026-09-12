@@ -734,6 +734,67 @@ check can reject before Vulkan API use, but cannot retroactively prevent a DLL
 entry point from executing. Production trust and Auto qualification remain
 default-deny; no system-loader fallback is authorized for a verified Vulkan pack.
 
+## Windows installer pack-history foundation
+
+`runtime-manifests/gpu-worker-pack-history-windows-x64.json` records exact
+previously published Windows pack inventories and catalog byte identities.
+It is currently empty: fixture packs and unmerged builds are not published
+release history. The parser/planner in `scripts/windows-gpu-pack-history.ps1`
+does not inspect an installed catalog, delete files, activate packs, or access
+the private AppData store. Installed metadata is never retirement authority.
+
+Each history row binds a release ID, source revision, exact catalog size and
+SHA-256, canonical pack roots/security epochs, and every payload/control file's
+size and SHA-256. Reusing a root requires an identical inventory. The append-only
+comparison rejects changed, reordered, or removed predecessor rows. Before
+retirement can ship, CI and the protected release path must enforce that
+comparison against the authoritative previous history. The tested comparison
+API alone is not that release gate.
+
+The current build is different: its authority comes from freshly verified
+staging, not from a committed history row. Requiring the current pack digest in
+its own source commit would create a self-reference through the compiled app
+build identity. The stager serializes pack roots/files in ordinal order, hashes
+the actual catalog and complete staged inventory, and generates separate
+current-file identity/count, previous-file identity, and catalog predicates for
+the installer. History does not broaden the existing current-only admission
+predicates. The generated include is a build output and must not be committed.
+
+History is bounded to 128 releases, eight packs per release, 3–258 complete
+inventory files per pack, 512 KiB per catalog, and a merged union of 1,024 files
+and 900 ancestor directories. These leave headroom under the
+installer's independent 2,048-handle ceiling; they do not replace its runtime
+accounting. File/envelope limits mirror signed-pack validation. Zero-byte
+payload files are allowed; manifest/signature envelopes must be nonempty.
+Windows history uses an intentionally narrower literal-safe ASCII path grammar
+and depth bound than the generic signed-pack format. Reject an incompatible
+inventory during trusted staging rather than making the installer interpret
+additional path syntax. The build job and its checked-out history must be
+exclusive trusted inputs; pre/post path checks are not a mutable-directory
+race-proof signing boundary.
+
+Run the focused checks with:
+
+```powershell
+./scripts/test-windows-gpu-pack-history.ps1
+./scripts/test-windows-worker-pack-staging.ps1
+```
+
+Both also run through the existing CI/local
+`./scripts/test-windows-release-packaging.ps1` command. Coverage includes skipped
+upgrades, empty pack sets, same-version repair, immutable-root reintroduction,
+zero-byte payloads, malformed/colliding paths, append-only history, exact limit
+boundaries, nonempty generated identities, and culture/input-order invariance.
+Staging fixtures exercise serialization after verification; they do not replace
+the signed-pack verifier's tamper tests.
+
+This foundation does not enable obsolete GPU-payload deletion. Shipping that
+behavior still requires the catalog-publication fault matrix, byte-authenticated
+retained-handle retirement, bounded recovery, authoritative append-only release
+history (including any prior CPU-only catalog), and the private-store selection
+dependency. Keep normal production GPU trust and Auto default-deny until the
+separate release qualification gates pass.
+
 ## Stage 7 Linux GPU contract
 
 Linux GPU support remains default-deny. The only reviewed future worker target is
