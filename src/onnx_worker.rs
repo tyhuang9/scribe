@@ -13932,9 +13932,20 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    #[ignore = "requires a clean-built fixture-signed Vulkan pack, pinned GGUF/WAV fixtures, and a compatible physical GPU"]
-    fn verified_vulkan_fixture_pack_scif_model_hardware_smoke() {
+    #[derive(Clone, Copy)]
+    struct FixtureGpuHardwareSmokeSpec {
+        backend: BackendKind,
+        route_provider: WorkerProvider,
+        provider_id: &'static str,
+        pack_id: &'static str,
+        label: &'static str,
+        environment_prefix: &'static str,
+        expected_vendor: Option<GpuVendor>,
+        expected_device_class: Option<DeviceClass>,
+    }
+
+    #[cfg(windows)]
+    fn verified_fixture_pack_scif_model_hardware_smoke(spec: FixtureGpuHardwareSmokeSpec) {
         let required_path = |name: &str| {
             PathBuf::from(
                 std::env::var_os(name)
@@ -13958,14 +13969,16 @@ mod tests {
             assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected);
             bytes.len() as u64
         };
+        let environment_name = |suffix: &str| format!("{}_{suffix}", spec.environment_prefix);
 
-        let pack_root = required_path("SCRIBE_GPU_FIXTURE_PACK_ROOT");
-        let model_path = required_path("SCRIBE_GPU_FIXTURE_MODEL");
-        let model_sha256 = required_hash("SCRIBE_GPU_FIXTURE_MODEL_SHA256");
-        let wav_path = required_path("SCRIBE_GPU_FIXTURE_WAV");
-        let wav_sha256 = required_hash("SCRIBE_GPU_FIXTURE_WAV_SHA256");
-        let expected_text = std::env::var("SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT")
-            .expect("set SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT to a known spoken phrase")
+        let pack_root = required_path(&environment_name("PACK_ROOT"));
+        let model_path = required_path(&environment_name("MODEL"));
+        let model_sha256 = required_hash(&environment_name("MODEL_SHA256"));
+        let wav_path = required_path(&environment_name("WAV"));
+        let wav_sha256 = required_hash(&environment_name("WAV_SHA256"));
+        let expected_transcript_name = environment_name("EXPECTED_TRANSCRIPT");
+        let expected_text = std::env::var(&expected_transcript_name)
+            .unwrap_or_else(|_| panic!("set {expected_transcript_name} to a known spoken phrase"))
             .to_ascii_lowercase();
         assert!(!expected_text.trim().is_empty());
         let model_size = exact_file(&model_path, &model_sha256);
@@ -13976,17 +13989,25 @@ mod tests {
                 crate::gpu_worker_pack::manifest::test_support::lease_existing_fixture(&pack_root)
                     .expect("fixture pack must verify into an immutable retained lease");
             let probe = InferenceWorkerSupervisor::for_pack_probe(Arc::new(lease));
-            let bindings = probe
-                .verified_pack_bindings()
-                .expect("Vulkan pack probe must complete its challenge-bound SCIF Hello");
+            let bindings = probe.verified_pack_bindings().unwrap_or_else(|error| {
+                panic!(
+                    "{} pack probe must complete its challenge-bound SCIF Hello: {error:#}",
+                    spec.label
+                )
+            });
             probe.shutdown().unwrap();
             drop(probe);
-            let expected_identity = std::env::var("SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID").ok();
+            let expected_identity = std::env::var(environment_name("STABLE_DEVICE_ID")).ok();
             let binding = bindings
                 .into_iter()
                 .find(|candidate| {
                     let target = candidate.backend_target();
-                    target.backend == BackendKind::Vulkan
+                    target.backend == spec.backend
+                        && target.provider_id.as_str() == spec.provider_id
+                        && target
+                            .pack
+                            .as_ref()
+                            .is_some_and(|pack| pack.pack_id == spec.pack_id)
                         && expected_identity.as_ref().map_or_else(
                             || {
                                 target.vendor == GpuVendor::Nvidia
@@ -13995,8 +14016,25 @@ mod tests {
                             |identity| target.device_id.as_str() == identity,
                         )
                 })
-                .expect("fixture pack must advertise a Vulkan device");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fixture pack must advertise the expected {} device",
+                        spec.label
+                    )
+                });
             let target = binding.backend_target();
+            assert_eq!(target.backend, spec.backend);
+            assert_eq!(target.provider_id.as_str(), spec.provider_id);
+            assert_eq!(
+                target.pack.as_ref().map(|pack| pack.pack_id.as_str()),
+                Some(spec.pack_id)
+            );
+            if let Some(expected_vendor) = spec.expected_vendor {
+                assert_eq!(target.vendor, expected_vendor);
+            }
+            if let Some(expected_device_class) = spec.expected_device_class {
+                assert_eq!(target.device_class, expected_device_class);
+            }
             assert!(
                 target
                     .driver_version
@@ -14008,7 +14046,7 @@ mod tests {
                 assert_eq!(target.device_id.as_str(), expected_identity);
             }
             let gpu_route = InferenceWorkerRoute {
-                provider: WorkerProvider::Vulkan,
+                provider: spec.route_provider,
                 supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
                 target: Some(target.clone()),
                 health_key: None,
@@ -14055,7 +14093,12 @@ mod tests {
             });
             let loaded = registry
                 .load(artifact.clone(), AccelerationPreference::Gpu)
-                .expect("explicit GPU load must succeed through the verified Vulkan worker");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "explicit GPU load must succeed through the verified {} worker: {error:#}",
+                        spec.label
+                    )
+                });
             assert_eq!(
                 loaded
                     .diagnostics
@@ -14085,12 +14128,14 @@ mod tests {
                     .text
                     .to_ascii_lowercase()
                     .contains(&expected_text),
-                "Vulkan transcript did not contain the known fixture phrase: {:?}",
+                "{} transcript did not contain the known fixture phrase: {:?}",
+                spec.label,
                 execution.transcript.text
             );
             assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
             println!(
-                "verified Vulkan SCIF smoke: device={} driver={} memory={} transcript_bytes={} warm_reused={}",
+                "verified {} SCIF smoke: device={} driver={} memory={} transcript_bytes={} warm_reused={}",
+                spec.label,
                 target.device_id.as_str(),
                 target.driver_version.as_deref().unwrap(),
                 target.memory_total_bytes,
@@ -14115,6 +14160,38 @@ mod tests {
                 Err(error) => panic!("could not remove reaped fixture-pack lease: {error}"),
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a clean-built fixture-signed Vulkan pack, pinned GGUF/WAV fixtures, and a compatible physical GPU"]
+    fn verified_vulkan_fixture_pack_scif_model_hardware_smoke() {
+        verified_fixture_pack_scif_model_hardware_smoke(FixtureGpuHardwareSmokeSpec {
+            backend: BackendKind::Vulkan,
+            route_provider: WorkerProvider::Vulkan,
+            provider_id: "transcribe-cpp-ggml-vulkan",
+            pack_id: "scribe-vulkan-windows-x64",
+            label: "Vulkan",
+            environment_prefix: "SCRIBE_GPU_FIXTURE",
+            expected_vendor: None,
+            expected_device_class: None,
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a clean-built fixture-signed CUDA pack, pinned GGUF/WAV fixtures, and a compatible NVIDIA GPU"]
+    fn verified_cuda_fixture_pack_scif_model_hardware_smoke() {
+        verified_fixture_pack_scif_model_hardware_smoke(FixtureGpuHardwareSmokeSpec {
+            backend: BackendKind::Cuda,
+            route_provider: WorkerProvider::Cuda,
+            provider_id: "transcribe-cpp-ggml-cuda",
+            pack_id: "scribe-cuda-windows-x64",
+            label: "CUDA",
+            environment_prefix: "SCRIBE_CUDA_FIXTURE",
+            expected_vendor: Some(GpuVendor::Nvidia),
+            expected_device_class: Some(DeviceClass::DiscreteGpu),
+        });
     }
 
     #[cfg(windows)]
