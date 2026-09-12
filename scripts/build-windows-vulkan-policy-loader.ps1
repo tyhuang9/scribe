@@ -281,6 +281,8 @@ try {
         SourceManifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
         LicensePath = (Join-Path $loader 'LICENSE.txt')
         LicenseDirectory = (Join-Path $loader 'LICENSES')
+        HeaderLicensePath = (Join-Path $headers 'LICENSE.md')
+        HeaderLicenseDirectory = (Join-Path $headers 'LICENSES')
     } | ConvertTo-Json -Compress
 } finally {
     foreach ($stream in $streams) { $stream.Dispose() }

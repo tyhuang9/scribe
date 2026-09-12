@@ -117,6 +117,12 @@ mod text_output;
 mod transcription;
 mod tray;
 mod ui;
+#[cfg(windows)]
+#[allow(
+    dead_code,
+    reason = "the desktop uses pack-inventory admission while the dedicated worker uses mapped-module admission"
+)]
+mod windows_vulkan_loader;
 #[allow(
     dead_code,
     reason = "the external worker boundary owns contracts used by role-specific targets and later integrations"

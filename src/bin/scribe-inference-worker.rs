@@ -103,6 +103,9 @@ mod runtime_router;
 mod silero_vad_native;
 #[path = "../support_assets.rs"]
 mod support_assets;
+#[cfg(windows)]
+#[path = "../windows_vulkan_loader.rs"]
+mod windows_vulkan_loader;
 #[allow(
     dead_code,
     reason = "the dedicated worker consumes only the wire-facing subset of shared worker contracts"
@@ -122,6 +125,10 @@ fn main() {
     }
     if let Err(error) = onnx_worker::harden_windows_dll_search() {
         eprintln!("Scribe inference worker could not harden native library loading: {error:#}");
+        std::process::exit(1);
+    }
+    if let Err(error) = onnx_worker::validate_windows_vulkan_worker_entrypoint() {
+        eprintln!("Scribe inference worker rejected its Vulkan loader: {error:#}");
         std::process::exit(1);
     }
     std::process::exit(inference_server::run());

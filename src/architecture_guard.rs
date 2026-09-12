@@ -1188,7 +1188,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
     assert_eq!(qualification_value["target_arch"], "x86_64");
     assert_eq!(qualification_value["entries"], serde_json::json!([]));
     for required in [
-        "ash::Entry::load()",
+        "crate::windows_vulkan_loader::ash_entry(require_policy_loader)",
         "PhysicalDeviceIDProperties",
         "PhysicalDeviceDriverProperties",
         "native:luid:",
@@ -1201,6 +1201,10 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
             "worker-only Vulkan stable-identity contract lost {required:?}"
         );
     }
+    let loader = include_str!("windows_vulkan_loader.rs");
+    assert!(loader.contains("ash::Entry::from_static_fn(static_fn)"));
+    assert!(loader.contains("GetProcAddress("));
+    assert!(worker.contains("VulkanDeviceCatalog::discover(true)"));
 }
 
 #[test]

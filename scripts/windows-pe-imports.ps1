@@ -5,6 +5,8 @@ $ReviewedWindowsSystemDlls = @(
     "api-ms-win-shcore-scaling-l1-1-1.dll",
     "bcrypt.dll",
     "bcryptprimitives.dll",
+    # Windows Configuration Manager; a direct import of the pinned policy loader.
+    "cfgmgr32.dll",
     "comctl32.dll",
     "dbghelp.dll",
     "dwmapi.dll",
