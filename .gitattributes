@@ -21,3 +21,7 @@ scripts/test-windows-gpu-qualification.ps1 text eol=lf
 scripts/inspect-linux-deb.py text eol=lf
 scripts/qualify-linux-gpu-evidence.py text eol=lf
 scripts/test-linux-gpu-qualification.py text eol=lf
+# A unified diff represents an empty context line with one required space.
+native/vulkan-policy-loader/*.patch text eol=lf whitespace=-blank-at-eol
+native/vulkan-policy-loader/*.json text eol=lf
+native/vulkan-policy-loader/tests/*.json text eol=lf

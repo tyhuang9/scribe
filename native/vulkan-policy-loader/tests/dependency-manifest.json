@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "scope": "vulkan-policy-loader-tests-only",
+  "dependencies": [
+    {
+      "name": "googletest",
+      "revision": "f8d7d77c06936315286eb55f8de22cd23c188571",
+      "upstream_tag": "v1.14.0",
+      "archive": {
+        "url": "https://codeload.github.com/google/googletest/zip/f8d7d77c06936315286eb55f8de22cd23c188571",
+        "size_bytes": 1109627,
+        "sha256": "b976cf4fd57b318afdb1bdb27fc708904b3e4bed482859eb94ba2b4bdd077fe2",
+        "root_directory": "googletest-f8d7d77c06936315286eb55f8de22cd23c188571"
+      }
+    },
+    {
+      "name": "detours",
+      "revision": "4b8c659f549b0ab21cf649377c7a84eb708f5e68",
+      "archive": {
+        "url": "https://codeload.github.com/microsoft/Detours/zip/4b8c659f549b0ab21cf649377c7a84eb708f5e68",
+        "size_bytes": 603044,
+        "sha256": "08d965a8374ca1e56bcf05380d2ee7daa846080b85d568223a41c20b5913bbf8",
+        "root_directory": "Detours-4b8c659f549b0ab21cf649377c7a84eb708f5e68"
+      }
+    }
+  ]
+}
