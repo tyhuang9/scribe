@@ -140,8 +140,16 @@ mod tests {
 
     impl Fixture {
         fn new(label: &str) -> Self {
+            Self::new_under(label, &std::env::temp_dir())
+        }
+
+        fn new_under(label: &str, temp_root: &Path) -> Self {
+            // macOS exposes its system temporary directory through /var. Resolve
+            // only this test-owned anchor; SDK paths still reject every link.
+            #[cfg(unix)]
+            let temp_root = fs::canonicalize(temp_root).expect("physical fixture temp root");
             let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
+            let root = temp_root.join(format!(
                 "scribe-windows-cuda-link-{label}-{}-{id}",
                 std::process::id()
             ));
@@ -194,6 +202,29 @@ mod tests {
                 .iter()
                 .all(|line| !line.contains("rustc-link-search"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_temp_alias_resolves_without_weakening_sdk_link_rejection() {
+        let owner = Fixture::new("temp-alias-owner");
+        let physical = owner.root.join("physical-temp");
+        fs::create_dir(&physical).unwrap();
+        let alias = owner.root.join("temp-alias");
+        create_directory_link(&physical, &alias);
+
+        let fixture = Fixture::new_under("aliased-temp", &alias);
+        assert_eq!(fixture.root.parent(), Some(physical.as_path()));
+        assert_eq!(fixture.resolve().unwrap().len(), CUDA_LIBRARIES.len());
+
+        let linked_sdk = alias.join(fixture.root.file_name().unwrap());
+        assert!(
+            resolve_with_path(Some(linked_sdk.as_os_str()))
+                .unwrap_err()
+                .contains("physical non-reparse directories")
+        );
+        drop(fixture);
+        remove_directory_link(&alias);
     }
 
     #[test]
