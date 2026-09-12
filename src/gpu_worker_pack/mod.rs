@@ -894,10 +894,14 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
         .and_then(|cache| cache.lookup(&catalog.fingerprint));
     if let Some(discovery) = cached_discovery {
         #[cfg(target_os = "macos")]
-        return enforce_production_discovery_epochs(discovery, &release_authority);
+        {
+            return enforce_production_discovery_epochs(discovery, &release_authority);
+        }
         #[cfg(windows)]
-        let discovery = enforce_production_discovery_epochs(discovery);
-        return select_windows_private_store_packs(discovery, &catalog_content_sha256);
+        {
+            let discovery = enforce_production_discovery_epochs(discovery);
+            return select_windows_private_store_packs(discovery, &catalog_content_sha256);
+        }
     }
     let fingerprint = catalog.fingerprint;
     let generation = fingerprint.generation_id();
@@ -906,10 +910,14 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
         cache.replace(fingerprint, discovery.clone());
     }
     #[cfg(target_os = "macos")]
-    return enforce_production_discovery_epochs(discovery, &release_authority);
+    {
+        return enforce_production_discovery_epochs(discovery, &release_authority);
+    }
     #[cfg(windows)]
-    let discovery = enforce_production_discovery_epochs(discovery);
-    select_windows_private_store_packs(discovery, &catalog_content_sha256)
+    {
+        let discovery = enforce_production_discovery_epochs(discovery);
+        select_windows_private_store_packs(discovery, &catalog_content_sha256)
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
