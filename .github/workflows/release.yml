@@ -64,6 +64,169 @@ jobs:
           # Keep the CI formatting and linting tools available for this pinned Rust release.
           components: rustfmt, clippy
 
+      - name: Install and verify pinned CMake
+        shell: pwsh
+        env:
+          CMAKE_VERSION: 4.4.2
+          CMAKE_ARCHIVE_SIZE: '54405968'
+          CMAKE_ARCHIVE_SHA256: e8139d85b3813bc38833142ae1940472e9a587e9b5d2718ac1804c60f4e57a64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          function Get-NormalizedFullPath([string]$Path) {
+            $full = [System.IO.Path]::GetFullPath($Path)
+            $root = [System.IO.Path]::GetPathRoot($full)
+            if ([string]::Equals($full, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+              return $root
+            }
+            return $full.TrimEnd([char[]]@('\', '/'))
+          }
+
+          function Assert-PhysicalDirectoryWithAncestors([string]$Path, [string]$Label) {
+            $current = Get-NormalizedFullPath $Path
+            while ($current) {
+              $item = Get-Item -LiteralPath $current -Force
+              if (-not $item.PSIsContainer -or
+                  ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Label and every ancestor must be physical non-reparse directories: $current"
+              }
+              $parent = Split-Path -Parent $current
+              if (-not $parent -or $parent -eq $current) { break }
+              $current = $parent
+            }
+          }
+
+          function Assert-ContainedPath([string]$Path, [string]$Root, [string]$Label) {
+            $full = Get-NormalizedFullPath $Path
+            $canonicalRoot = Get-NormalizedFullPath $Root
+            if (-not [string]::Equals($full, $canonicalRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $full.StartsWith("$canonicalRoot\", [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw "$Label escaped its trusted root."
+            }
+            return $full
+          }
+
+          if ($env:CMAKE_VERSION -cnotmatch '^\d+\.\d+\.\d+$' -or
+              $env:CMAKE_ARCHIVE_SIZE -cnotmatch '^\d+$' -or
+              $env:CMAKE_ARCHIVE_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Pinned CMake download metadata is not canonical.'
+          }
+          if ($env:GITHUB_RUN_ID -cnotmatch '^\d+$' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '^\d+$') {
+            throw 'GitHub run identity is not canonical.'
+          }
+
+          $toolchainManifestPath = Join-Path $env:GITHUB_WORKSPACE 'runtime-manifests\gpu-worker-toolchain-windows-x64.json'
+          $toolchainManifestItem = Get-Item -LiteralPath $toolchainManifestPath -Force
+          if ($toolchainManifestItem.PSIsContainer -or
+              ($toolchainManifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'GPU worker toolchain manifest must be a regular non-reparse file.'
+          }
+          $toolchainManifest = Get-Content -LiteralPath $toolchainManifestPath -Raw | ConvertFrom-Json
+          if ([string]$toolchainManifest.msvc.cmake_version -cne $env:CMAKE_VERSION) {
+            throw 'Hosted CI CMake version does not match the reviewed GPU worker toolchain pin.'
+          }
+
+          $runnerTemp = Get-NormalizedFullPath $env:RUNNER_TEMP
+          Assert-PhysicalDirectoryWithAncestors $runnerTemp 'GitHub runner temporary root'
+          $scratchRoot = Assert-ContainedPath `
+            (Join-Path $runnerTemp "scribe-cmake-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT") `
+            $runnerTemp `
+            'Pinned CMake scratch root'
+          if (Test-Path -LiteralPath $scratchRoot) {
+            throw 'Pinned CMake scratch root must be fresh.'
+          }
+          New-Item -ItemType Directory -Path $scratchRoot | Out-Null
+          Assert-PhysicalDirectoryWithAncestors $scratchRoot 'Pinned CMake scratch root'
+
+          $archiveName = "cmake-$env:CMAKE_VERSION-windows-x86_64.zip"
+          $archivePath = Assert-ContainedPath (Join-Path $scratchRoot $archiveName) $scratchRoot 'Pinned CMake archive'
+          $extractRoot = Assert-ContainedPath (Join-Path $scratchRoot 'expanded') $scratchRoot 'Pinned CMake extraction root'
+          $url = "https://github.com/Kitware/CMake/releases/download/v$env:CMAKE_VERSION/$archiveName"
+          curl.exe `
+            --fail `
+            --location `
+            --proto '=https' `
+            --proto-redir '=https' `
+            --connect-timeout 30 `
+            --max-time 300 `
+            --max-filesize $env:CMAKE_ARCHIVE_SIZE `
+            --retry 3 `
+            --retry-delay 2 `
+            --output $archivePath `
+            $url
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download pinned CMake $env:CMAKE_VERSION." }
+
+          $archive = Get-Item -LiteralPath $archivePath -Force
+          if ($archive.PSIsContainer -or
+              ($archive.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Pinned CMake archive is not a regular non-reparse file.'
+          }
+          if ($archive.Length -ne [int64]$env:CMAKE_ARCHIVE_SIZE) {
+            throw "Unexpected pinned CMake archive size: $($archive.Length)"
+          }
+          $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveHash -cne $env:CMAKE_ARCHIVE_SHA256) {
+            throw "Unexpected pinned CMake archive SHA-256: $archiveHash"
+          }
+
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot
+          Assert-PhysicalDirectoryWithAncestors $extractRoot 'Pinned CMake extraction root'
+          $expectedBundleName = "cmake-$env:CMAKE_VERSION-windows-x86_64"
+          $topLevelEntries = @(Get-ChildItem -LiteralPath $extractRoot -Force)
+          if ($topLevelEntries.Count -ne 1 -or
+              -not $topLevelEntries[0].PSIsContainer -or
+              $topLevelEntries[0].Name -cne $expectedBundleName -or
+              ($topLevelEntries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Pinned CMake archive has an unexpected top-level layout.'
+          }
+          $bundleRoot = Assert-ContainedPath $topLevelEntries[0].FullName $extractRoot 'Pinned CMake bundle root'
+          foreach ($entry in @(Get-ChildItem -LiteralPath $bundleRoot -Recurse -Force)) {
+            $null = Assert-ContainedPath $entry.FullName $bundleRoot 'Pinned CMake extracted entry'
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Pinned CMake archive contains a reparse entry: $($entry.FullName)"
+            }
+          }
+
+          $cmakeBin = Assert-ContainedPath (Join-Path $bundleRoot 'bin') $bundleRoot 'Pinned CMake bin directory'
+          Assert-PhysicalDirectoryWithAncestors $cmakeBin 'Pinned CMake bin directory'
+          $cmakePath = Assert-ContainedPath (Join-Path $cmakeBin 'cmake.exe') $cmakeBin 'Pinned CMake executable'
+          $cmake = Get-Item -LiteralPath $cmakePath -Force
+          if ($cmake.PSIsContainer -or
+              ($cmake.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Pinned CMake executable is not a regular non-reparse file.'
+          }
+          $cmakeVersion = @(& $cmakePath --version 2>&1)
+          if ($LASTEXITCODE -ne 0 -or
+              $cmakeVersion.Count -lt 1 -or
+              [string]$cmakeVersion[0] -cne "cmake version $env:CMAKE_VERSION") {
+            throw 'Pinned CMake executable did not report the exact reviewed version.'
+          }
+
+          $githubPath = Get-NormalizedFullPath $env:GITHUB_PATH
+          Assert-PhysicalDirectoryWithAncestors `
+            (Split-Path -Parent $githubPath) `
+            'GitHub PATH command-file parent'
+          $githubPathItem = Get-Item -LiteralPath $githubPath -Force
+          if ($githubPathItem.PSIsContainer -or
+              ($githubPathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'GitHub PATH command file is not a regular non-reparse file.'
+          }
+          if ($cmakeBin.IndexOfAny([char[]]@("`r", "`n")) -ge 0) {
+            throw 'Pinned CMake bin directory cannot be published safely.'
+          }
+          $cmakeBin | Out-File -LiteralPath $githubPath -Encoding utf8NoBOM -Append
+          $env:PATH = "$cmakeBin;$env:PATH"
+          $resolvedCmake = (Get-Command cmake.exe -CommandType Application | Select-Object -First 1).Source
+          if (-not [string]::Equals(
+            (Get-NormalizedFullPath $resolvedCmake),
+            $cmakePath,
+            [System.StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw 'Pinned CMake did not take precedence in command resolution.'
+          }
+          Write-Output "Verified pinned CMake at $cmakePath"
+
       - name: Install and verify pinned Vulkan SDK for all-feature checks
         shell: pwsh
         # Version, URL, and digest match the reviewed KhronosGroup.VulkanSDK
