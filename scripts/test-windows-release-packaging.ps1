@@ -47,6 +47,23 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
 }
 
+function Assert-InstallerCatalogDeletionContract([string]$Installer) {
+    $sections = [regex]::Matches($Installer, '(?ims)^\[UninstallDelete\]\s*\r?\n(.*?)(?=^\[|\z)')
+    $expected = @(
+        'Type: files; Name: "{app}\worker-pack-catalog.json"',
+        'Type: files; Name: "{app}\worker-pack-catalog.next.json"',
+        'Type: files; Name: "{app}\worker-pack-catalog.previous.json"'
+    )
+    if ($sections.Count -ne 1) {
+        throw 'Installer catalog cleanup must contain exactly one fixed catalog-only section.'
+    }
+    $actual = @($sections[0].Groups[1].Value -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($actual.Count -ne $expected.Count -or
+        ($actual -join "`n") -cne ($expected -join "`n")) {
+        throw 'Installer catalog cleanup must contain only the three exact app-local files.'
+    }
+}
+
 function Start-TestLogHandleHolder(
     [string]$PowerShellPath,
     [string]$LogPath,
@@ -1243,9 +1260,26 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'Setup did not delete or change any existing content' -or
         $installer -notmatch 'VerificationInstallDir\(Token\)' -or
         $installer -notmatch 'WizardDirValue' -or
-        $installer -match '(?m)^\[(?:InstallDelete|UninstallDelete|Registry|INI)\]') {
+        $installer -match '(?mi)^\[(?:InstallDelete|Registry|INI)\]') {
         throw "Windows installer must preflight and recursively install only the validated portable payload."
     }
+    Assert-InstallerCatalogDeletionContract $installer
+    foreach ($invalidCatalogDelete in @(
+        'Type: files; Name: "{localappdata}\worker-pack-catalog.json"',
+        'Type: files; Name: "{app}\worker-pack-catalog*.json"',
+        'Type: filesandordirs; Name: "{app}\worker-pack-catalog.json"',
+        'Type: files; Name: "{app}\..\worker-pack-catalog.json"'
+    )) {
+        $mutatedInstaller = $installer.Replace(
+            'Type: files; Name: "{app}\worker-pack-catalog.json"', $invalidCatalogDelete
+        )
+        Invoke-ExpectedFailure { Assert-InstallerCatalogDeletionContract $mutatedInstaller } 'three exact app-local files'
+    }
+    Invoke-ExpectedFailure {
+        Assert-InstallerCatalogDeletionContract ($installer.Replace(
+            '[UninstallDelete]', '[UninstallDelete]' + "`n" + 'Type: files; Name: "{app}\extra.bin"'
+        ))
+    } 'three exact app-local files'
     if ([regex]::Matches($installer, 'GetFileAttributesW\(').Count -ne 2) {
         throw "Every installer attribute query must use the fail-closed error-classifying helper."
     }
@@ -1275,8 +1309,10 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'BoundHandleReleaseBeforeInnoReplacement: array\[0\.\.2047\] of Boolean' -or
         $installer -notmatch 'RetainBoundHandle\(\s*IdentityHandle' -or
         $installer -notmatch 'RetainBoundHandle\(DirectoryHandle' -or
-        $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+ReleaseBoundHandles\(\)' -or
-        $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseBoundHandles\(\)') {
+        $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+begin\s+try\s+if CompleteWorkerCatalogPublication\(ErrorText\) then' -or
+        $lifecycleSource -notmatch 'except\s+RecordWorkerCatalogLifecycleFailure\(GetExceptionMessage\);\s+end;\s+ReleaseWorkerCatalogLeases\(\);\s+ReleaseBoundHandles\(\);' -or
+        $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseWorkerCatalogLeases\(\);\s+ReleaseBoundHandles\(\)' -or
+        $lifecycleSource -notmatch 'function GetCustomSetupExitCode\(\): Integer;\s+begin\s+Result := WorkerCatalogLifecycleExitCode;') {
         throw "Installer identity handles must remain bound through file installation and close on every completion path."
     }
     $uninstallerLifecycleStart = $installer.IndexOf('procedure ReleaseInnoUninstallerHandles')
@@ -1322,9 +1358,14 @@ Set-StrictMode -Version Latest
         $payloadReleaseSource -notmatch 'else if MatchingHandleIndex <> -1 then\s+RaiseException') {
         throw 'Payload BeforeInstall handling must release exactly one retained payload handle immediately before replacement and fail closed on absent, ambiguous, metadata, or changed paths.'
     }
+    if (-not $installer.Contains('#include "worker-catalog-publication.iss"')) {
+        throw 'Installer must include its fixed catalog publication policy.'
+    }
+    $catalogPublicationSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'installer\worker-catalog-publication.iss') -Raw
+    $installerPolicySource = $installer + "`n" + $catalogPublicationSource
     foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
         $innoPath = $existingAllowedPath.Replace('/', '\')
-        if (-not $installer.Contains("'$innoPath'")) {
+        if (-not $installerPolicySource.Contains("'$innoPath'")) {
             throw "Windows installer existing-tree preflight is missing canonical path $existingAllowedPath."
         }
     }

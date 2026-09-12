@@ -435,6 +435,12 @@ jobs:
           "INNO_ISCC_SHA256=$($env:INNO_COMPILER_SHA256)" >> $env:GITHUB_ENV
           "INNO_ISCC_SIZE=$($env:INNO_COMPILER_SIZE)" >> $env:GITHUB_ENV
 
+      - name: Test Windows worker catalog publication
+        shell: pwsh
+        run: |
+          & .\scripts\test-windows-worker-catalog-publication.ps1 `
+            -InnoCompiler $env:INNO_ISCC
+
       - name: Build and normalize Windows installer
         shell: pwsh
         run: |

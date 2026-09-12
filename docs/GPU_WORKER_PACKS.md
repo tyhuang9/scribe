@@ -795,6 +795,57 @@ history (including any prior CPU-only catalog), and the private-store selection
 dependency. Keep normal production GPU trust and Auto default-deny until the
 separate release qualification gates pass.
 
+## Windows installer catalog publication
+
+The installer copies the new catalog to `worker-pack-catalog.next.json`, never
+directly over the live catalog. An existing next file is not overwritten.
+Preflight classifies live/next/previous catalogs by generated exact size/hash
+identities and rejects unknown, corrupt, linked, streamed, locked, or ambiguous
+states. It retains directory/file identities through the file-installation
+phase and verifies the full current payload identity table and file count before
+publication.
+
+After the file phase, publication uses two non-replacing, identity-bound Win32
+renames: live to `worker-pack-catalog.previous.json`, then next to live. Before
+each mutation it upgrades the source lease and rechecks the same volume/file
+identity and snapshot; afterward it reopens and verifies the result. A raced
+destination fails without replacement. The previous catalog remains available
+as recovery metadata. This is a recoverable two-step transition, not a claim of
+power-fail atomicity or whole-application rollback. If no live catalog remains,
+repair must restage the current application/payload; the installer does not
+restore an older catalog over potentially newer or mixed application files.
+
+Post-file-phase failures set installer exit code 73 and suppress app launch.
+They are explicitly recorded because Inno post-install exceptions do not roll
+back file copies. Automatic app restart is disabled and its command-line
+override is rejected. Normal launch remains postinstall and requires successful
+catalog publication. Uninstall metadata cleanup is limited to the three exact
+app-local catalog filenames; there are no wildcard or install-time deletion
+directives, and private user data remains outside this cleanup.
+
+Run the compiled state-machine fixtures using the reviewed Inno 6.7.1 compiler:
+
+```powershell
+./scripts/test-windows-worker-catalog-publication.ps1 -InnoCompiler <verified-ISCC.exe-path>
+```
+
+CI runs the same command after acquiring/verifying the pinned compiler. The
+harness verifies its digest, builds production and test variants, bounds every
+owned process, and cleans only its exact temporary fixture roots after process
+shutdown. If a process cannot be reaped, it preserves those roots and reports
+them. Test-only fault and launch hooks are compiled out of the normal installer.
+
+These are synthetic catalog-state fixtures, not production signed A/B pack
+installers. Coverage includes fresh installation, update/repair, interrupted
+rename boundaries and restart, occupied destinations, altered catalogs,
+incompatible sharing, incomplete recovery payloads, launch suppression, and
+custom failure exits. Historical GPU payload admission/retirement remains
+disabled: a real differing-pack upgrade, authoritative history enforcement,
+handle-based obsolete-file removal, power-loss/hard-termination testing, and
+clean-machine signed installation still require their own verification before
+release. The private verified-pack store retains its separate activation and
+rollback guarantees.
+
 ## Stage 7 Linux GPU contract
 
 Linux GPU support remains default-deny. The only reviewed future worker target is

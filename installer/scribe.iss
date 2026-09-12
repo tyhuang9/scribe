@@ -21,6 +21,7 @@ DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
 CloseApplications=yes
+RestartApplications=no
 OutputDir=..\dist
 OutputBaseFilename=Scribe-Setup-{#AppVersion}
 Compression=lzma2
@@ -40,7 +41,8 @@ VersionInfoVersion={#AppVersion}
 WizardStyle=modern
 
 [Files]
-Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; BeforeInstall: ReleasePayloadHandleForCurrentFile
+Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "worker-pack-catalog.json"; BeforeInstall: ReleasePayloadHandleForCurrentFile
+Source: "..\dist\portable\worker-pack-catalog.json"; DestDir: "{app}"; DestName: "worker-pack-catalog.next.json"; Flags: ignoreversion onlyifdoesntexist; Check: ShouldStageWorkerCatalog; BeforeInstall: PrepareWorkerCatalogStaging
 
 [Icons]
 Name: "{code:ResolveStartMenuDirectory}\{#AppName}"; Filename: "{code:ResolveLaunchTarget}"; Check: IsNormalInstall
@@ -50,7 +52,15 @@ Name: "{code:ResolveDesktopDirectory}\{#AppName}"; Filename: "{code:ResolveLaunc
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Check: IsNormalInstall
 
 [Run]
-Filename: "{code:ResolveLaunchTarget}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent; Check: IsNormalInstall
+Filename: "{code:ResolveLaunchTarget}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent; Check: IsNormalInstallAndLifecycleSuccessful
+#ifdef WorkerCatalogPublicationTests
+Filename: "{cmd}"; Parameters: "{code:ResolveCatalogTestLaunchParameters}"; Flags: runhidden postinstall; Check: ShouldRunCatalogTestLaunch
+#endif
+
+[UninstallDelete]
+Type: files; Name: "{app}\worker-pack-catalog.json"
+Type: files; Name: "{app}\worker-pack-catalog.next.json"
+Type: files; Name: "{app}\worker-pack-catalog.previous.json"
 
 [Code]
 type
@@ -660,6 +670,47 @@ begin
   BoundHandleCount := 0;
 end;
 
+function HasExactCommandLineArgument(const Argument: String): Boolean;
+var
+  Index: Integer;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+  begin
+    if SameText(ParamStr(Index), Argument) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure CompactBoundHandles();
+var
+  ReadIndex: Integer;
+  WriteIndex: Integer;
+begin
+  WriteIndex := 0;
+  for ReadIndex := 0 to BoundHandleCount - 1 do
+  begin
+    if BoundHandles[ReadIndex] <> InvalidHandleValue then
+    begin
+      if WriteIndex <> ReadIndex then
+      begin
+        BoundHandles[WriteIndex] := BoundHandles[ReadIndex];
+        BoundHandlePaths[WriteIndex] := BoundHandlePaths[ReadIndex];
+        BoundHandleReleaseBeforeInnoReplacement[WriteIndex] :=
+          BoundHandleReleaseBeforeInnoReplacement[ReadIndex];
+        BoundHandles[ReadIndex] := InvalidHandleValue;
+        BoundHandlePaths[ReadIndex] := '';
+        BoundHandleReleaseBeforeInnoReplacement[ReadIndex] := False;
+      end;
+      WriteIndex := WriteIndex + 1;
+    end;
+  end;
+  BoundHandleCount := WriteIndex;
+end;
+
 procedure ReleaseInnoUninstallerHandles();
 var
   I: Integer;
@@ -739,6 +790,30 @@ end;
 
 #include WorkerPackAllowlist
 
+function QueryExistingAttributes(
+  Path: String;
+  var Attributes: LongWord;
+  var PathExists: Boolean;
+  var ErrorText: String
+): Boolean;
+  forward;
+
+function RejectAlternateStreams(
+  Path: String;
+  IsDirectory: Boolean;
+  var ErrorText: String
+): Boolean;
+  forward;
+
+function ValidateAndBindInstallTree(
+  InstallRoot: String;
+  RequireCompleteCurrentWorkerPayload: Boolean;
+  var ErrorText: String
+): Boolean;
+  forward;
+
+#include "worker-catalog-publication.iss"
+
 function IsAllowedExistingDirectory(RelativePath: String): Boolean;
 begin
   Result := SameStr(RelativePath, 'licenses') or
@@ -750,7 +825,7 @@ begin
   Result :=
     SameStr(RelativePath, 'bundle-inventory.json') or
     SameStr(RelativePath, 'bundled-model-manifest.json') or
-    SameStr(RelativePath, 'worker-pack-catalog.json') or
+    IsCatalogRecoveryRelativePath(RelativePath) or
     SameStr(RelativePath, 'local-transcriber.exe') or
     SameStr(RelativePath, 'scribe-inference-worker.exe') or
     SameStr(RelativePath, 'README.txt') or
@@ -1154,9 +1229,20 @@ begin
             ErrorText := 'Scribe Setup refused the destination because it contains an unexpected or legacy file: ' + RelativePath;
             Exit;
           end;
-          if not BindFileForUpdate(
-            ChildPath, IsInnoUninstallerArtifact(RelativePath), ErrorText) then
-            Exit;
+          if IsGeneratedWorkerPackFile(RelativePath) then
+          begin
+            if not VerifyAndBindCurrentWorkerPackFile(
+              ChildPath, RelativePath, ErrorText) then
+              Exit;
+            ObservedCurrentWorkerPackFileCount :=
+              ObservedCurrentWorkerPackFileCount + 1;
+          end
+          else if not IsCatalogRecoveryRelativePath(RelativePath) then
+          begin
+            if not BindFileForUpdate(
+              ChildPath, IsInnoUninstallerArtifact(RelativePath), ErrorText) then
+              Exit;
+          end;
           if SameStr(RelativePath, 'unins000.exe') then
             HasUninstallerExe := True;
           if SameStr(RelativePath, 'unins000.dat') then
@@ -1181,7 +1267,11 @@ begin
   Result := True;
 end;
 
-function ValidateAndBindInstallTree(InstallRoot: String; var ErrorText: String): Boolean;
+function ValidateAndBindInstallTree(
+  InstallRoot: String;
+  RequireCompleteCurrentWorkerPayload: Boolean;
+  var ErrorText: String
+): Boolean;
 var
   Attributes: LongWord;
   PathExists: Boolean;
@@ -1191,6 +1281,7 @@ var
   HasUninstallerData: Boolean;
 begin
   Result := False;
+  ObservedCurrentWorkerPackFileCount := 0;
   if not ValidateNoReparseAncestors(InstallRoot, ErrorText) then
     Exit;
   if not QueryExistingAttributes(InstallRoot, Attributes, PathExists, ErrorText) then
@@ -1202,6 +1293,8 @@ begin
     if not CreateAndBindDirectory(AddBackslash(InstallRoot) + 'licenses', ErrorText) then
       Exit;
     Result := ValidateNoReparseAncestors(InstallRoot, ErrorText);
+    if Result and RequireCompleteCurrentWorkerPayload then
+      Result := CurrentWorkerPackPayloadIsComplete(ErrorText);
     Exit;
   end;
   if ((Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0) or
@@ -1234,6 +1327,9 @@ begin
     if not CreateAndBindDirectory(AddBackslash(InstallRoot) + 'licenses', ErrorText) then
       Exit;
   if not ValidateNoReparseAncestors(InstallRoot, ErrorText) then
+    Exit;
+  if RequireCompleteCurrentWorkerPayload and
+     not CurrentWorkerPackPayloadIsComplete(ErrorText) then
     Exit;
   Result := True;
 end;
@@ -1382,13 +1478,26 @@ var
   TestToken: String;
   FindDataLayoutProbe: TWin32FindDataW;
   StreamDataLayoutProbe: TWin32FindStreamData;
+  RenameInfoLayoutProbe: TFileRenameInformation;
+  FileInfoLayoutProbe: TByHandleFileInformation;
+  DispositionInfoLayoutProbe: TFileDispositionInformation;
+#ifdef WorkerCatalogPublicationTests
+  CatalogFault: String;
+#endif
 begin
   Result := False;
   BoundHandleCount := 0;
+  InitializeWorkerCatalogLifecycle();
   if SizeOf(FindDataLayoutProbe) <> 592 then
     RaiseException('Unsupported WIN32_FIND_DATAW ABI layout.');
   if SizeOf(StreamDataLayoutProbe) <> 600 then
     RaiseException('Unsupported WIN32_FIND_STREAM_DATA ABI layout.');
+  if SizeOf(RenameInfoLayoutProbe) <> 532 then
+    RaiseException('Unsupported FILE_RENAME_INFO ABI layout.');
+  if SizeOf(FileInfoLayoutProbe) <> 52 then
+    RaiseException('Unsupported BY_HANDLE_FILE_INFORMATION ABI layout.');
+  if SizeOf(DispositionInfoLayoutProbe) <> 4 then
+    RaiseException('Unsupported FILE_DISPOSITION_INFO ABI layout.');
   VerifyToken := VerificationToken();
   TestToken := StableTestToken();
   if (VerifyToken <> '') and (TestToken <> '') then
@@ -1396,6 +1505,17 @@ begin
   TestPauseRequested := ExpandConstant('{param:SCRIBETESTPAUSE|}') = '1';
   if TestPauseRequested and (VerifyToken = '') and (TestToken = '') then
     RaiseException('/SCRIBETESTPAUSE is restricted to a bounded installer test token.');
+  if HasExactCommandLineArgument('/RESTARTAPPLICATIONS') then
+    RaiseException('/RESTARTAPPLICATIONS is disabled because catalog publication must complete before any application restart.');
+#ifdef WorkerCatalogPublicationTests
+  CatalogFault := WorkerCatalogTestFault();
+  if not IsAllowedWorkerCatalogTestFault(CatalogFault) then
+    RaiseException('Unknown bounded worker-catalog test fault.');
+  if (CatalogFault <> '') and (ActiveTestToken() = '') then
+    RaiseException('/SCRIBECATALOGFAULT is restricted to a bounded installer test token.');
+  if WorkerCatalogTestLaunchRequested() and (ActiveTestToken() = '') then
+    RaiseException('/SCRIBECATALOGTESTLAUNCH is restricted to a bounded installer test token.');
+#endif
   Result := True;
 end;
 
@@ -1406,6 +1526,7 @@ var
   InstallRoot: String;
 begin
   Result := '';
+  ReleaseWorkerCatalogLeases();
   ReleaseBoundHandles();
   TestContainerRoot := '';
   VerifyToken := VerificationToken();
@@ -1415,7 +1536,12 @@ begin
   if VerifyToken <> '' then
   begin
     if not PrepareVerificationRoot(VerifyToken, InstallRoot, Result) then
+      ReleaseBoundHandles()
+    else if not PrepareWorkerCatalogPublication(InstallRoot, Result) then
+    begin
+      ReleaseWorkerCatalogLeases();
       ReleaseBoundHandles();
+    end;
     Exit;
   end;
 
@@ -1444,18 +1570,23 @@ begin
     end;
     if not SameStr(InstallRoot, RemoveBackslashUnlessRoot(StableTestInstallDir(TestToken))) then
       Result := 'Scribe stable-upgrade testing refused a destination outside its exact token-bound temporary directory.'
-    else if not ValidateAndBindInstallTree(InstallRoot, Result) then
+    else if not ValidateAndBindInstallTree(InstallRoot, False, Result) then
     begin
     end;
   end
   else if not IsAllowedNormalInstallRoot(InstallRoot) then
     Result := 'Scribe Setup refused the destination. Fresh installs must use the canonical per-user program directory; updates and repairs must use the exact registered installation directory.'
-  else if not ValidateAndBindInstallTree(InstallRoot, Result) then
+  else if not ValidateAndBindInstallTree(InstallRoot, False, Result) then
+  begin
+  end;
+
+  if (Result = '') and not PrepareWorkerCatalogPublication(InstallRoot, Result) then
   begin
   end;
 
   if Result <> '' then
   begin
+    ReleaseWorkerCatalogLeases();
     ReleaseBoundHandles();
     Result := Result + #13#10 + #13#10 +
       'Setup did not delete or change any existing content. Close Scribe, then choose whether to back up the program directory, uninstall the previous version, or remove the unexpected content yourself before retrying. Do not delete Scribe app-data settings, history, downloaded models, imported GGUF files, or external sentinels.';
@@ -1463,6 +1594,8 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ErrorText: String;
 begin
   if CurStep = ssInstall then
   begin
@@ -1470,10 +1603,27 @@ begin
     WaitAtTestBoundary();
   end;
   if CurStep = ssPostInstall then
+  begin
+    try
+      if CompleteWorkerCatalogPublication(ErrorText) then
+        WorkerCatalogLifecycleSuccessful := True
+      else
+        RecordWorkerCatalogLifecycleFailure(ErrorText);
+    except
+      RecordWorkerCatalogLifecycleFailure(GetExceptionMessage);
+    end;
+    ReleaseWorkerCatalogLeases();
     ReleaseBoundHandles();
+  end;
+end;
+
+function GetCustomSetupExitCode(): Integer;
+begin
+  Result := WorkerCatalogLifecycleExitCode;
 end;
 
 procedure DeinitializeSetup();
 begin
+  ReleaseWorkerCatalogLeases();
   ReleaseBoundHandles();
 end;
