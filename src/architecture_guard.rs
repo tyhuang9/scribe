@@ -1204,6 +1204,99 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
 }
 
 #[test]
+fn windows_pack_store_selection_keeps_epoch_import_and_launch_authority_ordered() {
+    let module = production_source(include_str!("gpu_worker_pack/mod.rs"));
+    let store = production_source(include_str!("gpu_worker_pack/store.rs"));
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
+
+    let discovery =
+        named_function_bodies(&module, "discover_pack_leases_from_install_root").join("\n");
+    let source_epoch = discovery
+        .find("enforce_production_discovery_epochs(discovery)")
+        .expect("installed catalog must be epoch-admitted");
+    let private_import = discovery
+        .find("select_windows_private_store_packs(discovery")
+        .expect("Windows discovery must enter the private immutable store");
+    assert!(
+        source_epoch < private_import,
+        "installed catalog epoch authority must be admitted before private-store writes"
+    );
+
+    let selector =
+        named_function_bodies(&module, "select_windows_private_store_packs_at").join("\n");
+    for required in [
+        "import_generation_recorded",
+        "stage_and_install",
+        "activate_import_generation",
+        "current_descriptor_matches",
+        "lease.recheck()",
+        "current_fail_closed",
+        "selected_catalog_generation",
+    ] {
+        assert!(
+            selector.contains(required),
+            "Windows private-store selection lost {required:?}"
+        );
+    }
+    assert!(
+        selector.find("import_generation_recorded") < selector.find("stage_and_install")
+            && selector.find("stage_and_install") < selector.find("activate_import_generation")
+            && selector.find("activate_import_generation") < selector.find("let cached = match")
+            && selector.find("let cached = match") < selector.find("current_descriptor_matches")
+            && selector.find("current_descriptor_matches") < selector.find("lease.recheck()")
+            && selector.find("lease.recheck()") < selector.find("current_fail_closed"),
+        "receipt replay suppression, immutable copy, activation, and fresh selection changed order"
+    );
+    assert!(
+        !selector.contains("retained_status"),
+        "retained status metadata must never create launch authority"
+    );
+    assert!(store.contains("activate_import_generation"));
+    assert!(store.contains("import_generation_recorded"));
+    assert!(store.contains("current_descriptor_matches"));
+    assert!(
+        module.contains("!pack_ids.insert(&entry.pack_id)"),
+        "duplicate catalog pack IDs must fail before private-store mutation"
+    );
+    let production_selector = named_function_bodies(&module, "select_windows_private_store_packs")
+        .into_iter()
+        .find(|body| body.contains("project_dirs"))
+        .expect("production Windows selector");
+    assert!(
+        !production_selector.contains("cache.lock()"),
+        "production selection must not hold the process cache lock across cold pack verification"
+    );
+
+    let explicit_fingerprint =
+        named_function_bodies(&worker, "explicit_gpu_discovery_fingerprint").join("\n");
+    for required in [
+        "for lease in &discovery.leases",
+        "pack.pack_id.as_str()",
+        "pack.pack_version.as_str()",
+        "pack.pack_digest",
+        "pack.security_epoch",
+    ] {
+        assert!(
+            explicit_fingerprint.contains(required),
+            "explicit GPU cache fingerprint lost selected-pack identity {required:?}"
+        );
+    }
+    for required in [
+        "replay-suppression metadata",
+        "exact application and worker build",
+        "removed catalog ID",
+        "cross-application-version rollback",
+        "before-launch verification remains mandatory",
+    ] {
+        assert!(
+            documentation.contains(required),
+            "Windows retained-pack documentation lost {required:?}"
+        );
+    }
+}
+
+#[test]
 fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
     let root_manifest = include_str!("../Cargo.toml");
     let desktop = include_str!("main.rs");

@@ -429,6 +429,7 @@ pub(crate) enum PackDiscoveryIssue {
     NotAutoQualified,
     ProviderProbeRejected,
     DriverVersionUnavailable,
+    PrivateStoreRejected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -504,6 +505,9 @@ impl PackDiscoveryDiagnostic {
             }
             PackDiscoveryIssue::DriverVersionUnavailable => {
                 format!("{subject} driver version is unavailable from the pinned provider API")
+            }
+            PackDiscoveryIssue::PrivateStoreRejected => {
+                format!("{subject} private immutable store was rejected")
             }
         }
     }
@@ -880,15 +884,24 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
                 };
             }
         };
+    #[cfg(windows)]
+    let catalog_content_sha256 = catalog.fingerprint.content_sha256_hex();
     let cache =
         PRODUCTION_DISCOVERY_CACHE.get_or_init(|| Mutex::new(CatalogDiscoveryCache::default()));
-    if let Ok(cache) = cache.lock()
-        && let Some(discovery) = cache.lookup(&catalog.fingerprint)
-    {
+    let cached_discovery = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.lookup(&catalog.fingerprint));
+    if let Some(discovery) = cached_discovery {
         #[cfg(target_os = "macos")]
-        return enforce_production_discovery_epochs(discovery, &release_authority);
+        {
+            return enforce_production_discovery_epochs(discovery, &release_authority);
+        }
         #[cfg(windows)]
-        return enforce_production_discovery_epochs(discovery);
+        {
+            let discovery = enforce_production_discovery_epochs(discovery);
+            return select_windows_private_store_packs(discovery, &catalog_content_sha256);
+        }
     }
     let fingerprint = catalog.fingerprint;
     let generation = fingerprint.generation_id();
@@ -897,9 +910,271 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
         cache.replace(fingerprint, discovery.clone());
     }
     #[cfg(target_os = "macos")]
-    return enforce_production_discovery_epochs(discovery, &release_authority);
+    {
+        return enforce_production_discovery_epochs(discovery, &release_authority);
+    }
     #[cfg(windows)]
-    enforce_production_discovery_epochs(discovery)
+    {
+        let discovery = enforce_production_discovery_epochs(discovery);
+        select_windows_private_store_packs(discovery, &catalog_content_sha256)
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn select_windows_private_store_packs(
+    discovery: PackLeaseDiscovery,
+    catalog_content_sha256: &str,
+) -> PackLeaseDiscovery {
+    let Ok(directories) = crate::config::project_dirs() else {
+        return reject_private_store(discovery);
+    };
+    let root = directories
+        .data_local_dir()
+        .join("gpu-worker-pack-immutable-store");
+    let trust = manifest::ProductionTrustRoot;
+    let verifier = manifest::PackVerifier::new(
+        &trust,
+        manifest::Compatibility::current(&[
+            manifest::PackBackend::Cuda,
+            manifest::PackBackend::Vulkan,
+        ]),
+    );
+    let cache = PRODUCTION_WINDOWS_PACK_SELECTION_CACHE
+        .get_or_init(|| Mutex::new(WindowsPrivateStoreSelectionCache::default()));
+    let selected = select_windows_private_store_packs_at(
+        discovery,
+        catalog_content_sha256,
+        root.join("workers"),
+        root.join("state"),
+        &verifier,
+        cache,
+    );
+    // The signed installed catalog was admitted before any private-store write.
+    // Re-admit freshly selected currents so retained state can never bypass the
+    // same append-only discovery floor at publication time.
+    enforce_production_discovery_epochs(selected)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn select_windows_private_store_packs_at(
+    discovery: PackLeaseDiscovery,
+    catalog_content_sha256: &str,
+    workers_root: PathBuf,
+    state_root: PathBuf,
+    verifier: &manifest::PackVerifier<'_>,
+    cache: &Mutex<WindowsPrivateStoreSelectionCache>,
+) -> PackLeaseDiscovery {
+    let store = store::PackStore::new(workers_root, state_root, verifier);
+    let declared_pack_ids = discovery
+        .leases
+        .iter()
+        .map(|lease| lease.verified_pack().pack_id.clone())
+        .collect::<Vec<_>>();
+    {
+        let Ok(mut cache) = cache.lock() else {
+            return reject_private_store(discovery);
+        };
+        cache.retain_declared(&declared_pack_ids);
+    }
+    let mut selected = Vec::new();
+    let mut diagnostics = discovery.diagnostics;
+    for source in discovery.leases.into_iter().take(MAX_PRODUCTION_PACKS) {
+        let source_pack = source.verified_pack();
+        let pack_id = source_pack.pack_id.clone();
+        let pack_digest = source_pack.pack_digest.clone();
+        let imported = store
+            .import_generation_recorded(&pack_id, catalog_content_sha256, &pack_digest)
+            .and_then(|recorded| {
+                if recorded {
+                    return Ok(());
+                }
+                let installed = store.stage_and_install(&source_pack.root)?;
+                store.activate_import_generation(&installed, catalog_content_sha256)
+            });
+        if imported.is_err() {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::PrivateStoreRejected,
+                &pack_id,
+                source_pack.backend,
+            ));
+            continue;
+        }
+        let cached = match cache.lock() {
+            Ok(cache) => cache.get(&pack_id),
+            Err(_) => {
+                diagnostics.push(PackDiscoveryDiagnostic::pack(
+                    PackDiscoveryIssue::PrivateStoreRejected,
+                    &pack_id,
+                    source_pack.backend,
+                ));
+                continue;
+            }
+        };
+        let lease = cached.as_ref().and_then(|lease| {
+            let descriptor = lease.verified_pack();
+            (selected_pack_matches_declared_lineage(source_pack, descriptor)
+                && store
+                    .current_descriptor_matches(&pack_id, descriptor)
+                    .unwrap_or(false)
+                && lease.recheck().is_ok())
+            .then(|| Arc::clone(lease))
+        });
+        let lease = if let Some(lease) = lease {
+            Some(lease)
+        } else {
+            if let Ok(mut cache) = cache.lock() {
+                if let Some(stale) = cached.as_ref() {
+                    cache.remove_if_same(&pack_id, stale);
+                }
+            } else {
+                diagnostics.push(PackDiscoveryDiagnostic::pack(
+                    PackDiscoveryIssue::PrivateStoreRejected,
+                    &pack_id,
+                    source_pack.backend,
+                ));
+                continue;
+            }
+            store.current_fail_closed(&pack_id).and_then(|lease| {
+                let lease = Arc::new(lease);
+                if !selected_pack_matches_declared_lineage(source_pack, lease.verified_pack()) {
+                    return None;
+                }
+                cache
+                    .lock()
+                    .ok()
+                    .map(|mut cache| cache.replace(pack_id.clone(), lease))
+            })
+        };
+        match lease {
+            Some(lease) => selected.push(lease),
+            None => diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::PrivateStoreRejected,
+                &pack_id,
+                source_pack.backend,
+            )),
+        }
+    }
+    PackLeaseDiscovery {
+        catalog_generation: selected_catalog_generation(
+            discovery.catalog_generation.as_deref(),
+            &selected,
+        ),
+        leases: selected,
+        diagnostics,
+    }
+}
+
+/// Process-local handle cache for already verified immutable-store selections.
+/// Fresh store state and epoch metadata are checked on every discovery. The
+/// cache avoids hashing a large retained payload again on an unchanged warm
+/// request; it is never launch authority, and the launch path still performs
+/// its existing full signature and inventory verification.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Default)]
+struct WindowsPrivateStoreSelectionCache {
+    entries: Vec<(manifest::StoreComponent, Arc<manifest::VerifiedPackLease>)>,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl WindowsPrivateStoreSelectionCache {
+    fn retain_declared(&mut self, declared: &[manifest::StoreComponent]) {
+        self.entries
+            .retain(|(pack_id, _)| declared.iter().any(|item| item == pack_id));
+    }
+
+    fn get(&self, pack_id: &manifest::StoreComponent) -> Option<Arc<manifest::VerifiedPackLease>> {
+        self.entries
+            .iter()
+            .find(|(item, _)| item == pack_id)
+            .map(|(_, lease)| Arc::clone(lease))
+    }
+
+    fn remove_if_same(
+        &mut self,
+        pack_id: &manifest::StoreComponent,
+        expected: &Arc<manifest::VerifiedPackLease>,
+    ) {
+        self.entries
+            .retain(|(item, lease)| item != pack_id || !Arc::ptr_eq(lease, expected));
+    }
+
+    fn replace(
+        &mut self,
+        pack_id: manifest::StoreComponent,
+        lease: Arc<manifest::VerifiedPackLease>,
+    ) -> Arc<manifest::VerifiedPackLease> {
+        if let Some(position) = self.entries.iter().position(|(item, _)| item == &pack_id) {
+            self.entries[position].1 = Arc::clone(&lease);
+        } else if self.entries.len() < MAX_PRODUCTION_PACKS {
+            self.entries.push((pack_id, Arc::clone(&lease)));
+        }
+        lease
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+static PRODUCTION_WINDOWS_PACK_SELECTION_CACHE: OnceLock<Mutex<WindowsPrivateStoreSelectionCache>> =
+    OnceLock::new();
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn selected_pack_matches_declared_lineage(
+    declared: &manifest::VerifiedPack,
+    selected: &manifest::VerifiedPack,
+) -> bool {
+    selected.pack_id == declared.pack_id
+        && selected.runtime_abi_version == declared.runtime_abi_version
+        && selected.backend == declared.backend
+        && selected.provider == declared.provider
+        && selected.target_os == declared.target_os
+        && selected.target_arch == declared.target_arch
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn reject_private_store(mut discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    discovery
+        .diagnostics
+        .extend(discovery.leases.iter().map(|lease| {
+            let pack = lease.verified_pack();
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::PrivateStoreRejected,
+                &pack.pack_id,
+                pack.backend,
+            )
+        }));
+    discovery.leases.clear();
+    discovery
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn selected_catalog_generation(
+    source_generation: Option<&str>,
+    leases: &[Arc<manifest::VerifiedPackLease>],
+) -> Option<String> {
+    let source_generation = source_generation?;
+    let mut identities = leases
+        .iter()
+        .map(|lease| {
+            let pack = lease.verified_pack();
+            (
+                pack.pack_id.as_str(),
+                pack.pack_version.as_str(),
+                pack.pack_digest.as_str(),
+                pack.security_epoch,
+            )
+        })
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(b"scribe-windows-private-pack-selection-v1\0");
+    digest.update(source_generation.as_bytes());
+    for (pack_id, pack_version, pack_digest, security_epoch) in identities {
+        for value in [pack_id, pack_version, pack_digest] {
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        digest.update(security_epoch.to_le_bytes());
+    }
+    Some(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(any(
@@ -1105,6 +1380,20 @@ fn verify_catalog_entries_with_verifier(
             catalog_generation: Some(catalog_generation),
         };
     }
+    let mut pack_ids = std::collections::BTreeSet::new();
+    if catalog
+        .packs
+        .iter()
+        .any(|entry| !pack_ids.insert(&entry.pack_id))
+    {
+        return PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::CatalogRejected,
+            )],
+            catalog_generation: Some(catalog_generation),
+        };
+    }
     let packs_root = install_root.join("workers").join("packs");
     let mut leases = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1249,6 +1538,13 @@ struct CatalogFingerprint {
     )
 ))]
 impl CatalogFingerprint {
+    fn content_sha256_hex(&self) -> String {
+        self.content_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     fn generation_id(&self) -> String {
         #[cfg(windows)]
         {
@@ -1256,10 +1552,7 @@ impl CatalogFingerprint {
                 "{:08x}{:016x}{}",
                 self.volume_serial_number,
                 self.file_index,
-                self.content_sha256
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
+                self.content_sha256_hex()
             )
         }
         #[cfg(unix)]
@@ -1268,10 +1561,7 @@ impl CatalogFingerprint {
                 "{:016x}{:016x}{}",
                 self.device,
                 self.inode,
-                self.content_sha256
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
+                self.content_sha256_hex()
             )
         }
     }
@@ -2453,6 +2743,318 @@ mod tests {
 
         drop(success);
         drop(fixture_lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn duplicate_catalog_pack_ids_fail_before_private_store_mutation() {
+        let install_root = super::manifest::test_support::temp_root("wps-dup-src");
+        let private_root = super::manifest::test_support::temp_root("wps-dup-dst");
+        let (verifier, source_lease) = super::manifest::test_support::leased_fixture(&install_root);
+        let relative_root = format!(
+            "workers/packs/{}/{}/{}",
+            source_lease.verified_pack().pack_id.as_str(),
+            source_lease.verified_pack().pack_version.as_str(),
+            source_lease.verified_pack().pack_digest
+        );
+        let mut files = source_lease
+            .copy_entries()
+            .iter()
+            .map(|entry| format!("{relative_root}/{}", entry.path))
+            .collect::<Vec<_>>();
+        files.sort();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&fixture_catalog_bytes(&source_lease, files)).unwrap();
+        let original = catalog["packs"][0].clone();
+        let mut different_digest = original.clone();
+        different_digest["pack_version"] = serde_json::json!("1.2.4");
+        different_digest["pack_digest"] = serde_json::json!("1".repeat(64));
+        different_digest["root"] = serde_json::json!(format!(
+            "workers/packs/{}/1.2.4/{}",
+            source_lease.verified_pack().pack_id.as_str(),
+            "1".repeat(64)
+        ));
+
+        for (label, entries) in [
+            ("exact", vec![original.clone(), original.clone()]),
+            ("different-digest", vec![original.clone(), different_digest]),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "packs": entries,
+            }))
+            .unwrap();
+            let rejected = super::verify_catalog_entries_with_verifier(
+                &install_root,
+                &bytes,
+                format!("duplicate-{label}"),
+                &verifier,
+            );
+            assert!(rejected.leases.is_empty(), "{label} duplicate escaped");
+            assert_eq!(
+                rejected.diagnostics,
+                vec![PackDiscoveryDiagnostic::catalog(
+                    PackDiscoveryIssue::CatalogRejected,
+                )]
+            );
+
+            let workers_root = private_root.join(label).join("workers");
+            let state_root = private_root.join(label).join("state");
+            let cache = std::sync::Mutex::new(super::WindowsPrivateStoreSelectionCache::default());
+            let selected = super::select_windows_private_store_packs_at(
+                rejected,
+                &"d".repeat(64),
+                workers_root.clone(),
+                state_root.clone(),
+                &verifier,
+                &cache,
+            );
+            assert!(selected.leases.is_empty());
+            assert!(!workers_root.exists(), "{label} duplicate mutated workers");
+            assert!(!state_root.exists(), "{label} duplicate mutated state");
+        }
+
+        drop(source_lease);
+        std::fs::remove_dir_all(install_root).unwrap();
+        std::fs::remove_dir_all(private_root).unwrap();
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn windows_catalog_import_selects_only_private_store_lease() {
+        let source_root = super::manifest::test_support::temp_root("wps-src");
+        let private_root = super::manifest::test_support::temp_root("wps-dst");
+        let (verifier, source_lease) = super::manifest::test_support::leased_fixture(&source_root);
+        let source_pack = source_lease.verified_pack().clone();
+        let source_lease = Arc::new(source_lease);
+        let source_generation = "installed-catalog-generation".to_owned();
+        let discovery = super::PackLeaseDiscovery {
+            leases: vec![Arc::clone(&source_lease)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some(source_generation.clone()),
+        };
+        let workers_root = private_root.join("workers");
+        let state_root = private_root.join("state");
+        let cache = std::sync::Mutex::new(super::WindowsPrivateStoreSelectionCache::default());
+        let selected = super::select_windows_private_store_packs_at(
+            discovery,
+            &"a".repeat(64),
+            workers_root.clone(),
+            state_root.clone(),
+            &verifier,
+            &cache,
+        );
+
+        assert!(selected.diagnostics.is_empty());
+        assert_eq!(selected.leases.len(), 1);
+        let selected_pack = selected.leases[0].verified_pack();
+        assert_eq!(selected_pack.pack_id, source_pack.pack_id);
+        assert_eq!(selected_pack.pack_digest, source_pack.pack_digest);
+        assert!(selected_pack.root.starts_with(workers_root.join("packs")));
+        assert!(!selected_pack.root.starts_with(&source_root));
+        assert_ne!(
+            selected.catalog_generation.as_deref(),
+            Some(source_generation.as_str())
+        );
+
+        let warm = super::select_windows_private_store_packs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![source_lease],
+                diagnostics: Vec::new(),
+                catalog_generation: Some(source_generation),
+            },
+            &"a".repeat(64),
+            workers_root.clone(),
+            state_root,
+            &verifier,
+            &cache,
+        );
+        assert_eq!(warm.leases.len(), 1);
+        assert!(Arc::ptr_eq(&selected.leases[0], &warm.leases[0]));
+
+        std::fs::remove_dir_all(&source_root).unwrap();
+        selected.leases[0].recheck().unwrap();
+        drop(warm);
+        drop(selected);
+        drop(cache);
+        std::fs::remove_dir_all(private_root).unwrap();
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn same_catalog_after_rollback_and_restart_preserves_rolled_back_selection() {
+        let first_root = super::manifest::test_support::temp_root("wps-rb-a");
+        let second_root = super::manifest::test_support::temp_root("wps-rb-b");
+        let private_root = super::manifest::test_support::temp_root("wps-rb-dst");
+        let (verifier, first_lease) = super::manifest::test_support::leased_fixture(&first_root);
+        let first_pack = first_lease.verified_pack().clone();
+
+        let second_source = second_root.join("source");
+        let mut second_manifest = super::manifest::test_support::base_manifest();
+        second_manifest.pack_version =
+            super::manifest::StoreComponent::new("2.0.0").expect("canonical fixture version");
+        super::manifest::test_support::write_signed(&second_source, second_manifest);
+        let (second_owner, second_lease) =
+            super::manifest::test_support::lease_existing_fixture(&second_source).unwrap();
+        let second_pack = second_lease.verified_pack().clone();
+        assert_eq!(first_pack.pack_id, second_pack.pack_id);
+        assert_ne!(first_pack.pack_digest, second_pack.pack_digest);
+
+        let workers_root = private_root.join("workers");
+        let state_root = private_root.join("state");
+        let cache = std::sync::Mutex::new(super::WindowsPrivateStoreSelectionCache::default());
+        let first_source = Arc::new(first_lease);
+        let second_source = Arc::new(second_lease);
+        let first = super::select_windows_private_store_packs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![Arc::clone(&first_source)],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("catalog-a".to_owned()),
+            },
+            &"a".repeat(64),
+            workers_root.clone(),
+            state_root.clone(),
+            &verifier,
+            &cache,
+        );
+        assert_eq!(
+            first.leases[0].verified_pack().pack_digest,
+            first_pack.pack_digest
+        );
+
+        let second = super::select_windows_private_store_packs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![Arc::clone(&second_source)],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("catalog-b".to_owned()),
+            },
+            &"b".repeat(64),
+            workers_root.clone(),
+            state_root.clone(),
+            &verifier,
+            &cache,
+        );
+        assert_eq!(
+            second.leases[0].verified_pack().pack_digest,
+            second_pack.pack_digest
+        );
+        let second_generation = second.catalog_generation.clone();
+        drop(first);
+        drop(second);
+        drop(cache);
+
+        let store =
+            super::store::PackStore::new(workers_root.clone(), state_root.clone(), &verifier);
+        let rolled_back = store.rollback(&second_pack.pack_id).unwrap();
+        assert_eq!(rolled_back.pack_id, first_pack.pack_id);
+        assert_eq!(rolled_back.pack_version, first_pack.pack_version);
+        assert_eq!(rolled_back.pack_digest, first_pack.pack_digest);
+        assert!(rolled_back.root.starts_with(workers_root.join("packs")));
+        drop(store);
+
+        let restarted_cache =
+            std::sync::Mutex::new(super::WindowsPrivateStoreSelectionCache::default());
+        let restarted = super::select_windows_private_store_packs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![second_source],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("catalog-b".to_owned()),
+            },
+            &"b".repeat(64),
+            workers_root,
+            state_root,
+            &verifier,
+            &restarted_cache,
+        );
+        assert!(restarted.diagnostics.is_empty());
+        assert_eq!(restarted.leases.len(), 1);
+        assert_eq!(
+            restarted.leases[0].verified_pack().pack_digest,
+            first_pack.pack_digest
+        );
+        assert_ne!(restarted.catalog_generation, second_generation);
+
+        drop(restarted);
+        drop(restarted_cache);
+        drop(first_source);
+        std::fs::remove_dir_all(first_root).unwrap();
+        std::fs::remove_dir_all(second_owner).unwrap();
+        std::fs::remove_dir_all(second_root).unwrap();
+        std::fs::remove_dir_all(private_root).unwrap();
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn removed_catalog_id_stays_retained_but_is_not_discoverable() {
+        let source_root = super::manifest::test_support::temp_root("wps-rm-src");
+        let private_root = super::manifest::test_support::temp_root("wps-rm-dst");
+        let (verifier, source_lease) = super::manifest::test_support::leased_fixture(&source_root);
+        let pack_id = source_lease.verified_pack().pack_id.clone();
+        let workers_root = private_root.join("workers");
+        let state_root = private_root.join("state");
+        let cache = std::sync::Mutex::new(super::WindowsPrivateStoreSelectionCache::default());
+        let imported = super::select_windows_private_store_packs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![Arc::new(source_lease)],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("catalog-with-pack".to_owned()),
+            },
+            &"b".repeat(64),
+            workers_root.clone(),
+            state_root.clone(),
+            &verifier,
+            &cache,
+        );
+        assert_eq!(imported.leases.len(), 1);
+        drop(imported);
+
+        let removed = super::select_windows_private_store_packs_at(
+            super::PackLeaseDiscovery {
+                leases: Vec::new(),
+                diagnostics: Vec::new(),
+                catalog_generation: Some("catalog-without-pack".to_owned()),
+            },
+            &"c".repeat(64),
+            workers_root.clone(),
+            state_root.clone(),
+            &verifier,
+            &cache,
+        );
+        assert!(removed.leases.is_empty());
+        assert!(cache.lock().unwrap().entries.is_empty());
+        let store = super::store::PackStore::new(workers_root, state_root, &verifier);
+        let retained = store.current_fail_closed(&pack_id).unwrap();
+        assert_eq!(retained.verified_pack().pack_id, pack_id);
+
+        drop(retained);
+        drop(store);
+        drop(cache);
+        std::fs::remove_dir_all(source_root).unwrap();
+        std::fs::remove_dir_all(private_root).unwrap();
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn retained_selection_cannot_change_catalog_declared_provider_lineage() {
+        let root = super::manifest::test_support::temp_root("windows-pack-lineage");
+        let (_verifier, lease) = super::manifest::test_support::leased_fixture(&root);
+        let declared = lease.verified_pack();
+        let mut selected = declared.clone();
+        assert!(super::selected_pack_matches_declared_lineage(
+            declared, &selected
+        ));
+        selected.provider = "different-provider".to_owned();
+        assert!(!super::selected_pack_matches_declared_lineage(
+            declared, &selected
+        ));
+        selected = declared.clone();
+        selected.backend = PackBackend::Cuda;
+        assert!(!super::selected_pack_matches_declared_lineage(
+            declared, &selected
+        ));
+
+        drop(lease);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
