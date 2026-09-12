@@ -23,6 +23,9 @@ mod onnx_worker {
         DESKTOP_BUILD_ID, INFERENCE_WORKER_BUILD_ID, PROTOCOL_VERSION, WORKER_ABI_VERSION,
     };
 }
+#[cfg(test)]
+#[path = "../../../build_support/windows_cuda_link.rs"]
+mod windows_cuda_link;
 #[path = "../../../src/worker_identity.rs"]
 mod worker_identity;
 #[path = "../../../src/worker_pack_authoring.rs"]

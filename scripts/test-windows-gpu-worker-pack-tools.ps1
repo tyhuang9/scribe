@@ -1412,6 +1412,9 @@ try {
     $cudaInventoryPaths = @(
         'bin/nvcc.exe',
         'include/cuda.h',
+        'lib/x64/cudart_static.lib',
+        'lib/x64/cublas.lib',
+        'lib/x64/cublasLt.lib',
         'lib/x64/cuda.lib',
         'bin/cublas64_12.dll',
         'bin/cublasLt64_12.dll',
@@ -1437,6 +1440,9 @@ try {
     $requiredCudaInventoryPaths = @(
         'bin/nvcc.exe',
         'include/cuda.h',
+        'lib/x64/cudart_static.lib',
+        'lib/x64/cublas.lib',
+        'lib/x64/cublasLt.lib',
         'lib/x64/cuda.lib',
         'bin/cublas64_12.dll',
         'bin/cublaslt64_12.dll',
@@ -1632,6 +1638,20 @@ try {
     $env:SCRIBE_BUILD_REVISION = $revision
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
     $env:SCRIBE_BUILDING_WORKER = '1'
+    $cudaLinkTestList = Invoke-NativeProcess $cargo @(
+        'test', '--locked', '--offline',
+        '--manifest-path', (Join-Path $repositoryRoot 'tools\worker-pack-author\Cargo.toml'),
+        'windows_cuda_link::tests::', '--', '--list'
+    )
+    $cudaLinkTests = @($cudaLinkTestList.Stdout -split "`r?`n" | Where-Object {
+        $_ -match '^windows_cuda_link::tests::.+: test$'
+    })
+    Assert-True ($cudaLinkTests.Count -gt 0) 'Windows CUDA static-link helper tests were not discovered.'
+    $null = Invoke-NativeProcess $cargo @(
+        'test', '--locked', '--offline',
+        '--manifest-path', (Join-Path $repositoryRoot 'tools\worker-pack-author\Cargo.toml'),
+        'windows_cuda_link::tests::'
+    )
     $null = Invoke-NativeProcess $cargo @(
         'build', '--locked', '--offline',
         '--bin', 'scribe-worker-pack-tool',
