@@ -59,6 +59,7 @@ jobs:
         shell: pwsh
         run: |
           & .\scripts\test-windows-vulkan-policy-loader.ps1
+          & .\scripts\test-windows-vulkan-pack-loader.ps1
 
       - name: Install Rust
         # Official dtolnay/rust-toolchain branch 1.96.0 resolved on 2026-08-27;

@@ -894,8 +894,15 @@ foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--igno
 foreach ($required in @('$operationFailure = $null', '$restoreFailure = $null', 'Add-ScribeEvidenceSecondaryFailures $operationFailure @($restoreFailure)', 'if ($null -ne $restoreFailure) { throw $restoreFailure }')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Pinned toolchain failure provenance is missing: $required" }
 }
-foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'New-ScribeEvidenceFixturePackVersion $revision', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
+foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'Fixture pack build identity is not bound', 'New-ScribeEvidenceFixturePackVersion $revision', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required safety contract: $required" }
+}
+$manifestSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../src/gpu_worker_pack/manifest.rs') -Raw
+$manifestNameMatch = [regex]::Match($manifestSource, 'const MANIFEST_NAME: &str = "([^"]+)";')
+if (-not $manifestNameMatch.Success) { throw 'Could not resolve the authoritative pack manifest filename.' }
+$manifestRead = '(Join-Path $packRoot ''' + $manifestNameMatch.Groups[1].Value + ''') -Raw | ConvertFrom-Json'
+if (-not $runner.Contains($manifestRead)) {
+    throw 'Runner must read the exact manifest filename produced by pack authoring.'
 }
 foreach ($required in @('Independent consumer-bound SHA-256 (capture this stdout value)', 'The on-disk evidence path is untrusted without that independently captured digest', 'Read-ScribeVerifiedEvidenceReport')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing consumer-bound output guidance: $required" }

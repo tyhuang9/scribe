@@ -13,6 +13,7 @@ param(
     [string]$ProductionKeyId,
     [string]$ToolchainManifestPath,
     [string]$NativeArchiveDirectory,
+    [string]$VulkanSourceArchiveDirectory,
     [string]$CargoTargetDirectory,
     [switch]$ToolchainCheckOnly,
     [switch]$ExportPinnedMsvcEnvironment
@@ -22,6 +23,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1')
 . (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
+. (Join-Path $PSScriptRoot 'windows-vulkan-policy-pack.ps1')
+. (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
 
 if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
     throw 'Pinned MSVC environment export is only available with ToolchainCheckOnly.'
@@ -1057,9 +1060,9 @@ function Copy-ReviewedGpuWorkerDependencyClosure(
     [string]$SdkRoot,
     [string]$PackBin,
     [string[]]$SystemDriverImports,
-    [string[]]$PackagedRuntimeImports
+    [string[]]$PackagedRuntimeImports,
+    [Collections.IDictionary]$PinnedRuntimeSources = @{}
 ) {
-    . (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
     $system = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $systemDrivers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($name in @($ReviewedWindowsSystemDlls) + @($SystemDriverImports)) {
@@ -1110,12 +1113,14 @@ function Copy-ReviewedGpuWorkerDependencyClosure(
             }
             $observedProviderDependency = $true
             $destination = Join-Path $PackBin ([string]$import)
-            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
-                $source = Join-Path $SdkRoot "bin\$import"
-                $null = Assert-RegularNonReparseFile $source "Pinned provider runtime $import"
-                Copy-Item -LiteralPath $source -Destination $destination
-                $null = Assert-RegularNonReparseFile $destination "Materialized provider runtime $import"
+            $source = Join-Path $SdkRoot "bin\$import"
+            $digest = ''
+            if ($PinnedRuntimeSources.Contains($import)) {
+                $source = [string]$PinnedRuntimeSources[$import].Path
+                $digest = [string]$PinnedRuntimeSources[$import].Sha256
+                if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw 'Pinned provider runtime digest is missing.' }
             }
+            Copy-ScribePackRuntimeFile $source $destination $digest
             $pending.Enqueue($destination)
         }
     }
@@ -1144,7 +1149,7 @@ foreach ($payloadProfile in $payloadProfiles) {
     Assert-MsvcPayloadProfileContract $payloadProfile
 }
 Assert-ExactProperties $contract.build @('profile', 'static_cpu_scheduling', 'dynamic_backends', 'openmp') 'Worker build contract'
-Assert-ExactProperties $contract.vulkan @('sdk_version', 'provider', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'Vulkan provider contract'
+Assert-ExactProperties $contract.vulkan @('sdk_version', 'provider', 'policy_loader', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'Vulkan provider contract'
 Assert-ExactProperties $contract.cuda @('sdk_directory_version', 'nvcc_version', 'provider', 'cmake_architectures', 'required_files', 'production_inventory', 'system_driver_imports', 'packaged_runtime_imports') 'CUDA provider contract'
 if ($contract.schema_version -ne 1 -or
     $contract.app_version -cnotmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$' -or
@@ -1180,6 +1185,13 @@ if ($archiveItem.Length -ne [int64]$archiveContract.size_bytes) {
 Assert-ExactHash $nativeArchive ([string]$archiveContract.sha256) 'Pinned Sherpa ONNX archive'
 $backendName = $Backend.ToLowerInvariant()
 $providerContract = if ($Backend -eq 'Vulkan') { $contract.vulkan } else { $contract.cuda }
+$vulkanPolicy = if ($Backend -eq 'Vulkan') {
+    if (@($contract.vulkan.system_driver_imports).Count -ne 0 -or
+        (@($contract.vulkan.packaged_runtime_imports) -join '|') -cne 'vulkan-1.dll') {
+        throw 'Windows Vulkan workers must bundle their policy loader, not use a system-loader exemption.'
+    }
+    Get-ScribeVulkanPolicyManifest $repositoryRoot $contract.vulkan.policy_loader
+} else { $null }
 $sdkRoot = if ($Backend -eq 'Vulkan') {
     Resolve-VulkanSdk $contract
 } else {
@@ -1247,6 +1259,26 @@ $previousLocalAppData = $env:LOCALAPPDATA
 $previousPinnedMsvcEnvironment = $null
 $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
 $stagingCreated = $false
+$builtVulkanLoader = $null
+$pinnedRuntimeSources = @{}
+
+if ($Backend -eq 'Vulkan') {
+    if (-not $VulkanSourceArchiveDirectory) { $VulkanSourceArchiveDirectory = $nativeArchiveRoot }
+    $loaderBuildRoot = Join-Path (Split-Path -Parent $cargoTarget) "vkl-$PackVersion"
+    # Build before activating the worker's compiler environment: the native
+    # loader independently rejects ambient overrides and applies its own pins.
+    $builtVulkanLoader = (& (Join-Path $PSScriptRoot 'build-windows-vulkan-policy-loader.ps1') `
+        -SourceArchiveDirectory $VulkanSourceArchiveDirectory -BuildDirectory $loaderBuildRoot `
+        -NativeArchiveDirectory $nativeArchiveRoot) | ConvertFrom-Json
+    if ($builtVulkanLoader.SourceManifestSha256 -cne $contract.vulkan.policy_loader.manifest_sha256 -or
+        $builtVulkanLoader.DllSha256 -cne $vulkanPolicy.artifact.sha256 -or
+        $builtVulkanLoader.InstalledBytes -ne $vulkanPolicy.artifact.size_bytes) {
+        throw 'Built Vulkan policy loader does not match the pack toolchain contract.'
+    }
+    $pinnedRuntimeSources['vulkan-1.dll'] = [pscustomobject]@{
+        Path = $builtVulkanLoader.DllPath; Sha256 = $vulkanPolicy.artifact.sha256
+    }
+}
 
 try {
     $previousPinnedMsvcEnvironment = Set-PinnedMsvcBuildEnvironment $msvcToolchain
@@ -1346,7 +1378,11 @@ try {
         $sdkRoot `
         (Join-Path $stagingRoot 'bin') `
         @($providerContract.system_driver_imports) `
-        @($providerContract.packaged_runtime_imports)
+        @($providerContract.packaged_runtime_imports) `
+        $pinnedRuntimeSources
+    if ($Backend -eq 'Vulkan') {
+        Copy-ScribeVulkanPolicyLicenses $builtVulkanLoader $stagingRoot
+    }
 
     $packId = "scribe-$backendName-windows-x64"
     $authorArguments = @(

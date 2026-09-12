@@ -93,6 +93,10 @@
   "vulkan": {
     "sdk_version": "1.4.357.0",
     "provider": "transcribe-cpp-ggml-vulkan",
+    "policy_loader": {
+      "manifest_path": "native/vulkan-policy-loader/source-manifest.json",
+      "manifest_sha256": "5929d445a3f09c2565bea376c334fb843a99a386fed4d97617acde83167a182a"
+    },
     "required_files": [
       {
         "path": "Bin/glslc.exe",
@@ -103,10 +107,8 @@
         "sha256": "02caa31b8665a79f327cbfe97286fd7d0017c0b1f9b39eb78687b7a509de52b3"
       }
     ],
-    "system_driver_imports": [
-      "vulkan-1.dll"
-    ],
-    "packaged_runtime_imports": []
+    "system_driver_imports": [],
+    "packaged_runtime_imports": ["vulkan-1.dll"]
   },
   "cuda": {
     "sdk_directory_version": "12.8",

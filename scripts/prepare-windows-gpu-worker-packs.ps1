@@ -8,7 +8,8 @@ param(
     [string]$ProductionPrivateKeyPath,
     [Parameter(Mandatory = $true)]
     [string]$ProductionKeyId,
-    [string]$NativeArchiveDirectory
+    [string]$NativeArchiveDirectory,
+    [string]$VulkanSourceArchiveDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +51,7 @@ $vulkanRoot = Join-Path $outputRoot 'vulkan'
 $cudaRoot = Join-Path $outputRoot 'cuda'
 $vulkan = & $buildScript @shared `
     -Backend Vulkan `
+    -VulkanSourceArchiveDirectory $VulkanSourceArchiveDirectory `
     -OutputDirectory $vulkanRoot
 $cuda = & $buildScript @shared `
     -Backend Cuda `
