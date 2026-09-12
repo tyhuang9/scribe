@@ -25,7 +25,7 @@ use super::manifest::{
 };
 
 const STATE_SCHEMA_VERSION: u16 = 1;
-const ACTIVATION_SCHEMA_VERSION: u16 = 2;
+const ACTIVATION_SCHEMA_VERSION: u16 = 3;
 pub(super) const MAX_STATE_BYTES: u64 = 256 * 1024;
 /// The signed production catalog is bounded to eight entries. Activation
 /// retains at most one independent current/previous slot for each catalog ID.
@@ -71,6 +71,19 @@ pub(crate) struct ActivationState {
 struct ActivationSlot {
     current: Option<VerifiedPack>,
     previous: Option<VerifiedPack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_import: Option<ImportGenerationReceipt>,
+}
+
+/// Replay-suppression metadata for one catalog import. This is deliberately
+/// stored in the activation slot and journaled with its transition so a
+/// restart after explicit rollback cannot reactivate the catalog target.
+/// It never grants a descriptor or filesystem lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportGenerationReceipt {
+    catalog_content_sha256: String,
+    imported_pack_digest: String,
 }
 
 impl ActivationState {
@@ -113,6 +126,8 @@ struct EpochState {
 struct PendingActivation {
     schema_version: u16,
     target: VerifiedPack,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_receipt: Option<ImportGenerationReceipt>,
     prior_activation: ActivationState,
     next_activation: ActivationState,
     prior_epochs: EpochState,
@@ -520,24 +535,97 @@ impl<'a> PackStore<'a> {
     pub(crate) fn activate(&self, descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
         let lock = self.acquire_lock()?;
         self.recover_pending_activation_with_lock(&lock)?;
-        self.activate_with_lock(&lock, descriptor, None)
+        self.activate_with_lock(&lock, descriptor, None, None)
+    }
+
+    pub(crate) fn activate_import_generation(
+        &self,
+        descriptor: &VerifiedPack,
+        catalog_content_sha256: &str,
+    ) -> Result<(), PackStoreError> {
+        let receipt = import_generation_receipt(catalog_content_sha256, &descriptor.pack_digest)?;
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        self.activate_with_lock(&lock, descriptor, Some(receipt), None)
+    }
+
+    /// Reports only whether the exact catalog/pack import was already
+    /// committed. The receipt is replay-suppression metadata, not pack or
+    /// launch authority; callers must obtain any selected lease separately
+    /// through `current_fail_closed`.
+    pub(crate) fn import_generation_recorded(
+        &self,
+        pack_id: &StoreComponent,
+        catalog_content_sha256: &str,
+        pack_digest: &str,
+    ) -> Result<bool, PackStoreError> {
+        validate_requested_pack_id(pack_id)?;
+        let receipt = import_generation_receipt(catalog_content_sha256, pack_digest)?;
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        let activation = self.load_activation_with_lock(&lock)?;
+        // A corrupt epoch record must not be hidden by a matching receipt.
+        self.load_epochs_with_lock(&lock)?;
+        Ok(activation
+            .slot(pack_id)
+            .and_then(|slot| slot.last_import.as_ref())
+            == Some(&receipt))
+    }
+
+    /// Compares fresh persisted selection metadata without granting launch
+    /// authority or reading the retained pack. A pending journal deliberately
+    /// fails closed: callers must fall back to `current_fail_closed`, whose
+    /// authoritative recovery path reverifies the target before committing it.
+    pub(crate) fn current_descriptor_matches(
+        &self,
+        pack_id: &StoreComponent,
+        expected: &VerifiedPack,
+    ) -> Result<bool, PackStoreError> {
+        validate_requested_pack_id(pack_id)?;
+        let lock = self.acquire_lock()?;
+        if lock.exists(&self.pending_path())? {
+            return Err(PackStoreError::CorruptState(
+                "pending activation requires authoritative recovery",
+            ));
+        }
+        let activation = self.load_activation_with_lock(&lock)?;
+        let epochs = self.load_epochs_with_lock(&lock)?;
+        let Some(current) = activation
+            .slot(pack_id)
+            .and_then(|slot| slot.current.as_ref())
+        else {
+            return Ok(false);
+        };
+        require_epoch_from(current, &epochs)?;
+        Ok(current == expected)
     }
 
     fn activate_with_lock(
         &self,
         lock: &ExclusiveFileLock,
         descriptor: &VerifiedPack,
+        import_receipt: Option<ImportGenerationReceipt>,
         #[cfg(test)] interrupt_after: Option<ActivationBoundary>,
         #[cfg(not(test))] _interrupt_after: Option<()>,
     ) -> Result<(), PackStoreError> {
         let verified = self.reverify_descriptor(descriptor)?;
+        if import_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.imported_pack_digest != verified.pack_digest)
+        {
+            return Err(PackStoreError::CorruptState("import generation receipt"));
+        }
         let prior_epochs = self.load_epochs_with_lock(lock)?;
         require_epoch_from(&verified, &prior_epochs)?;
         let prior_activation = self.load_activation_with_lock(lock)?;
-        if prior_activation
-            .slot(&verified.pack_id)
-            .and_then(|slot| slot.current.as_ref())
-            == Some(&verified)
+        let prior_slot = prior_activation.slot(&verified.pack_id);
+        if import_receipt.as_ref().is_some_and(|receipt| {
+            prior_slot.and_then(|slot| slot.last_import.as_ref()) == Some(receipt)
+        }) {
+            return Ok(());
+        }
+        if import_receipt.is_none()
+            && prior_slot.and_then(|slot| slot.current.as_ref()) == Some(&verified)
         {
             return Ok(());
         }
@@ -559,20 +647,36 @@ impl<'a> PackStore<'a> {
             old_floor.max(verified.security_epoch),
         );
         validate_epoch_state(&next_epochs)?;
-        let prior_current = prior_activation
-            .slot(&verified.pack_id)
-            .and_then(|slot| slot.current.clone());
+        let prior_current = prior_slot.and_then(|slot| slot.current.clone());
+        let prior_previous = prior_slot.and_then(|slot| slot.previous.clone());
+        let next_previous = if prior_current.as_ref() == Some(&verified) {
+            prior_previous
+        } else {
+            prior_current
+        };
+        let last_import = import_receipt.clone().or_else(|| {
+            prior_slot
+                .and_then(|slot| slot.last_import.clone())
+                .filter(|receipt| {
+                    receipt.imported_pack_digest == verified.pack_digest
+                        || next_previous.as_ref().is_some_and(|descriptor| {
+                            descriptor.pack_digest == receipt.imported_pack_digest
+                        })
+                })
+        });
         let mut next_activation = prior_activation.clone();
         next_activation.slots.insert(
             verified.pack_id.as_str().to_owned(),
             ActivationSlot {
                 current: Some(verified.clone()),
-                previous: prior_current,
+                previous: next_previous,
+                last_import,
             },
         );
         let pending = PendingActivation {
             schema_version: ACTIVATION_SCHEMA_VERSION,
             target: verified,
+            import_receipt,
             prior_activation,
             next_activation: next_activation.clone(),
             prior_epochs,
@@ -630,6 +734,7 @@ impl<'a> PackStore<'a> {
                 // current even when it is no longer eligible so rollback does
                 // not silently erase retained history.
                 previous: slot.current,
+                last_import: slot.last_import,
             },
         );
         self.persist_activation(&lock, &state)?;
@@ -850,6 +955,19 @@ impl<'a> PackStore<'a> {
                     return Err(PackStoreError::DescriptorOutsideStore);
                 }
             }
+            if let Some(receipt) = &slot.last_import {
+                validate_import_generation_receipt(receipt)?;
+                if !slot
+                    .current
+                    .iter()
+                    .chain(slot.previous.iter())
+                    .any(|descriptor| descriptor.pack_digest == receipt.imported_pack_digest)
+                {
+                    return Err(PackStoreError::CorruptState(
+                        "import generation receipt target",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -897,6 +1015,13 @@ impl<'a> PackStore<'a> {
     ) -> Result<EpochState, PackStoreError> {
         let path = self.epoch_path();
         if !lock.exists(&path)? {
+            if lock.exists(&self.activation_path())?
+                && !self.load_activation_with_lock(lock)?.slots.is_empty()
+            {
+                return Err(PackStoreError::CorruptState(
+                    "security epoch state is missing for retained activation",
+                ));
+            }
             return Ok(EpochState::empty());
         }
         let state: EpochState = lock.read(&path)?;
@@ -1031,7 +1156,20 @@ impl<'a> PackStore<'a> {
         interrupt_after: Option<ActivationBoundary>,
     ) -> Result<(), PackStoreError> {
         let lock = self.acquire_lock()?;
-        self.activate_with_lock(&lock, descriptor, interrupt_after)
+        self.activate_with_lock(&lock, descriptor, None, interrupt_after)
+    }
+
+    #[cfg(test)]
+    fn activate_import_generation_locked(
+        &self,
+        descriptor: &VerifiedPack,
+        catalog_content_sha256: &str,
+        interrupt_after: Option<ActivationBoundary>,
+    ) -> Result<(), PackStoreError> {
+        let receipt = import_generation_receipt(catalog_content_sha256, &descriptor.pack_digest)?;
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        self.activate_with_lock(&lock, descriptor, Some(receipt), interrupt_after)
     }
 
     #[cfg(test)]
@@ -1163,23 +1301,46 @@ fn require_epoch_from(
 fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackStoreError> {
     let target_key = pending.target.pack_id.as_str();
     let prior_slot = pending.prior_activation.slots.get(target_key);
+    let prior_current_is_target =
+        prior_slot.and_then(|slot| slot.current.as_ref()) == Some(&pending.target);
     if pending.schema_version != ACTIVATION_SCHEMA_VERSION
         || pending.prior_activation.schema_version != ACTIVATION_SCHEMA_VERSION
         || pending.next_activation.schema_version != ACTIVATION_SCHEMA_VERSION
         || pending.prior_epochs.schema_version != STATE_SCHEMA_VERSION
         || pending.next_epochs.schema_version != STATE_SCHEMA_VERSION
-        || prior_slot.and_then(|slot| slot.current.as_ref()) == Some(&pending.target)
+        || (prior_current_is_target && pending.import_receipt.is_none())
+        || pending.import_receipt.as_ref().is_some_and(|receipt| {
+            validate_import_generation_receipt(receipt).is_err()
+                || receipt.imported_pack_digest != pending.target.pack_digest
+                || prior_slot.and_then(|slot| slot.last_import.as_ref()) == Some(receipt)
+        })
     {
         return Err(PackStoreError::CorruptState(
             "pending activation transaction",
         ));
     }
+    let expected_previous = if prior_current_is_target {
+        prior_slot.and_then(|slot| slot.previous.clone())
+    } else {
+        prior_slot.and_then(|slot| slot.current.clone())
+    };
+    let expected_receipt = pending.import_receipt.clone().or_else(|| {
+        prior_slot
+            .and_then(|slot| slot.last_import.clone())
+            .filter(|receipt| {
+                receipt.imported_pack_digest == pending.target.pack_digest
+                    || expected_previous.as_ref().is_some_and(|descriptor| {
+                        descriptor.pack_digest == receipt.imported_pack_digest
+                    })
+            })
+    });
     let mut expected_activation = pending.prior_activation.clone();
     expected_activation.slots.insert(
         target_key.to_owned(),
         ActivationSlot {
             current: Some(pending.target.clone()),
-            previous: prior_slot.and_then(|slot| slot.current.clone()),
+            previous: expected_previous,
+            last_import: expected_receipt,
         },
     );
     if pending.next_activation != expected_activation {
@@ -1220,6 +1381,29 @@ fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackSt
 fn validate_requested_pack_id(pack_id: &StoreComponent) -> Result<(), PackStoreError> {
     if !pack_id.is_canonical() {
         return Err(PackStoreError::CorruptState("requested pack id"));
+    }
+    Ok(())
+}
+
+fn import_generation_receipt(
+    catalog_content_sha256: &str,
+    imported_pack_digest: &str,
+) -> Result<ImportGenerationReceipt, PackStoreError> {
+    let receipt = ImportGenerationReceipt {
+        catalog_content_sha256: catalog_content_sha256.to_owned(),
+        imported_pack_digest: imported_pack_digest.to_owned(),
+    };
+    validate_import_generation_receipt(&receipt)?;
+    Ok(receipt)
+}
+
+fn validate_import_generation_receipt(
+    receipt: &ImportGenerationReceipt,
+) -> Result<(), PackStoreError> {
+    if !is_canonical_sha256(&receipt.catalog_content_sha256)
+        || !is_canonical_sha256(&receipt.imported_pack_digest)
+    {
+        return Err(PackStoreError::CorruptState("import generation receipt"));
     }
     Ok(())
 }
@@ -4000,6 +4184,555 @@ mod tests {
     }
 
     #[test]
+    fn import_generation_is_idempotent_and_restart_after_rollback_does_not_reactivate() {
+        let (root, workers, state, verifier, _) = store_fixture("import-restart-rollback");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        let first_catalog = "a".repeat(64);
+        let second_catalog = "b".repeat(64);
+
+        store
+            .activate_import_generation(&first, &first_catalog)
+            .unwrap();
+        assert!(
+            store
+                .import_generation_recorded(&first.pack_id, &first_catalog, &first.pack_digest,)
+                .unwrap()
+        );
+        let first_activation_bytes = fs::read(store.activation_path()).unwrap();
+        let first_epoch_bytes = fs::read(store.epoch_path()).unwrap();
+        store
+            .activate_import_generation(&first, &first_catalog)
+            .unwrap();
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            first_activation_bytes,
+            "same import generation must not rewrite activation state"
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), first_epoch_bytes);
+
+        store
+            .activate_import_generation(&second, &second_catalog)
+            .unwrap();
+        assert_eq!(current_descriptor(&store), Some(second.clone()));
+        assert_eq!(store.rollback(&second.pack_id).unwrap(), first.clone());
+        let rolled_back_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+        let reopened = PackStore::new(&workers, &state, &verifier);
+        assert!(
+            reopened
+                .import_generation_recorded(&second.pack_id, &second_catalog, &second.pack_digest,)
+                .unwrap()
+        );
+        reopened
+            .activate_import_generation(&second, &second_catalog)
+            .unwrap();
+        assert_eq!(current_descriptor(&reopened), Some(first));
+        assert_eq!(
+            fs::read(reopened.activation_path()).unwrap(),
+            rolled_back_bytes
+        );
+        assert_eq!(fs::read(reopened.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!reopened.pending_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_import_generation_updates_selection_or_receipt_without_rotating_history() {
+        let (root, workers, state, verifier, _) = store_fixture("import-generation-change");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        let first_catalog = "1".repeat(64);
+        let second_catalog = "2".repeat(64);
+        let replacement_catalog = "3".repeat(64);
+
+        store
+            .activate_import_generation(&first, &first_catalog)
+            .unwrap();
+        store
+            .activate_import_generation(&second, &second_catalog)
+            .unwrap();
+        let before = store.load_activation_strict().unwrap();
+        assert_eq!(
+            activation_slot(&before, &second.pack_id).previous,
+            Some(first.clone())
+        );
+        store
+            .activate_import_generation(&second, &replacement_catalog)
+            .unwrap();
+        let after = store.load_activation_strict().unwrap();
+        let slot = activation_slot(&after, &second.pack_id);
+        assert_eq!(slot.current, Some(second.clone()));
+        assert_eq!(slot.previous, Some(first));
+        assert_eq!(
+            slot.last_import,
+            Some(ImportGenerationReceipt {
+                catalog_content_sha256: replacement_catalog.clone(),
+                imported_pack_digest: second.pack_digest.clone(),
+            })
+        );
+        assert!(
+            store
+                .import_generation_recorded(
+                    &second.pack_id,
+                    &replacement_catalog,
+                    &second.pack_digest,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .import_generation_recorded(&second.pack_id, &second_catalog, &second.pack_digest,)
+                .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_activation_clears_receipt_only_when_its_target_is_evicted() {
+        let (root, workers, state, verifier, _) = store_fixture("import-receipt-eviction");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let (third_source, _) = additional_source(&root, "3.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        let third = store.stage_and_install(&third_source).unwrap();
+        let catalog = "9".repeat(64);
+
+        store.activate_import_generation(&first, &catalog).unwrap();
+        store.activate(&second).unwrap();
+        assert!(
+            store
+                .import_generation_recorded(&first.pack_id, &catalog, &first.pack_digest)
+                .unwrap()
+        );
+
+        store.activate(&third).unwrap();
+        let activation = store.load_activation_strict().unwrap();
+        let slot = activation_slot(&activation, &third.pack_id);
+        assert_eq!(slot.current, Some(third));
+        assert_eq!(slot.previous, Some(second));
+        assert_eq!(slot.last_import, None);
+        assert!(
+            !store
+                .import_generation_recorded(&first.pack_id, &catalog, &first.pack_digest)
+                .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_descriptor_match_tracks_activation_and_rollback() {
+        let (root, workers, state, verifier, _) = store_fixture("current-match-transition");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+
+        store.activate(&first).unwrap();
+        assert!(
+            store
+                .current_descriptor_matches(&first.pack_id, &first)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .current_descriptor_matches(&first.pack_id, &second)
+                .unwrap()
+        );
+
+        store.activate(&second).unwrap();
+        assert!(
+            !store
+                .current_descriptor_matches(&first.pack_id, &first)
+                .unwrap()
+        );
+        assert!(
+            store
+                .current_descriptor_matches(&first.pack_id, &second)
+                .unwrap()
+        );
+
+        assert_eq!(store.rollback(&first.pack_id).unwrap(), first);
+        assert!(
+            store
+                .current_descriptor_matches(&second.pack_id, &first)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .current_descriptor_matches(&second.pack_id, &second)
+                .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_descriptor_match_does_not_verify_or_read_pack_payload() {
+        let (root, workers, state, verifier, _) = store_fixture("current-match-metadata-only");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+
+        make_fixture_file_writable(&installed.worker_path());
+        fs::remove_file(installed.worker_path()).unwrap();
+        assert!(
+            store
+                .current_descriptor_matches(&installed.pack_id, &installed)
+                .unwrap()
+        );
+        assert!(store.current_fail_closed(&installed.pack_id).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_descriptor_match_fails_closed_on_corrupt_activation_or_epoch() {
+        let (root, workers, state, verifier, _) = store_fixture("current-match-corrupt-state");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        fs::write(store.activation_path(), b"{corrupt").unwrap();
+        let corrupt_activation = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.current_descriptor_matches(&installed.pack_id, &installed),
+            Err(PackStoreError::Json(_))
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            corrupt_activation
+        );
+
+        fs::write(store.activation_path(), &activation_bytes).unwrap();
+        fs::write(store.epoch_path(), b"{corrupt").unwrap();
+        let corrupt_epoch = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.current_descriptor_matches(&installed.pack_id, &installed),
+            Err(PackStoreError::Json(_))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), corrupt_epoch);
+
+        fs::write(store.epoch_path(), &epoch_bytes).unwrap();
+        let mut raised_floor = store.load_epochs_strict().unwrap();
+        raised_floor.epochs.insert(
+            installed.pack_id.as_str().to_owned(),
+            installed.security_epoch + 1,
+        );
+        atomic_write_canonical(&store.epoch_path(), &raised_floor).unwrap();
+        let raised_floor_bytes = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.current_descriptor_matches(&installed.pack_id, &installed),
+            Err(PackStoreError::SecurityEpochDowngrade { .. })
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), raised_floor_bytes);
+
+        fs::remove_file(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.current_descriptor_matches(&installed.pack_id, &installed),
+            Err(PackStoreError::CorruptState(
+                "security epoch state is missing for retained activation"
+            ))
+        ));
+        assert!(store.current_fail_closed(&installed.pack_id).is_none());
+        assert!(matches!(
+            store.import_generation_recorded(
+                &installed.pack_id,
+                &"e".repeat(64),
+                &installed.pack_digest,
+            ),
+            Err(PackStoreError::CorruptState(
+                "security epoch state is missing for retained activation"
+            ))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert!(!store.epoch_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_descriptor_match_defers_pending_journal_to_authoritative_recovery() {
+        let (root, workers, state, verifier, _) = store_fixture("current-match-pending");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        store.activate(&first).unwrap();
+        assert!(matches!(
+            store.activate_locked(&second, Some(ActivationBoundary::Journal)),
+            Err(PackStoreError::InjectedInterruption)
+        ));
+        let pending_bytes = fs::read(store.pending_path()).unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        assert!(matches!(
+            store.current_descriptor_matches(&second.pack_id, &second),
+            Err(PackStoreError::CorruptState(
+                "pending activation requires authoritative recovery"
+            ))
+        ));
+        assert_eq!(fs::read(store.pending_path()).unwrap(), pending_bytes);
+        assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert_eq!(current_descriptor(&store), Some(second.clone()));
+        assert!(!store.pending_path().exists());
+        assert!(
+            store
+                .current_descriptor_matches(&second.pack_id, &second)
+                .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_generation_journal_recovers_receipt_epoch_and_activation_boundaries() {
+        for boundary in [
+            ActivationBoundary::Journal,
+            ActivationBoundary::Epochs,
+            ActivationBoundary::Activation,
+        ] {
+            let nonce = random_suffix().unwrap();
+            let (root, workers, state, verifier, _) =
+                store_fixture(&format!("igr-{}-{}", boundary as u8, &nonce[..6]));
+            let store = PackStore::new(&workers, &state, &verifier);
+            let first = store.stage_and_install(&root.join("source")).unwrap();
+            let (second_source, _) = additional_source(&root, "2.0.0", 2);
+            let second = store.stage_and_install(&second_source).unwrap();
+            let first_catalog = "c".repeat(64);
+            let second_catalog = "d".repeat(64);
+            store
+                .activate_import_generation(&first, &first_catalog)
+                .unwrap();
+
+            assert!(matches!(
+                store.activate_import_generation_locked(&second, &second_catalog, Some(boundary),),
+                Err(PackStoreError::InjectedInterruption)
+            ));
+            assert!(store.pending_path().exists());
+            assert!(
+                store
+                    .import_generation_recorded(
+                        &second.pack_id,
+                        &second_catalog,
+                        &second.pack_digest,
+                    )
+                    .unwrap()
+            );
+            let activation = store.load_activation_strict().unwrap();
+            let slot = activation_slot(&activation, &second.pack_id);
+            assert_eq!(slot.current, Some(second.clone()));
+            assert_eq!(slot.previous, Some(first));
+            assert_eq!(
+                slot.last_import,
+                Some(ImportGenerationReceipt {
+                    catalog_content_sha256: second_catalog.clone(),
+                    imported_pack_digest: second.pack_digest.clone(),
+                })
+            );
+            assert_eq!(
+                store
+                    .load_epochs_strict()
+                    .unwrap()
+                    .epochs
+                    .get(second.pack_id.as_str()),
+                Some(&2)
+            );
+            assert!(!store.pending_path().exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn import_receipts_are_per_id_and_unrelated_slots_are_unchanged() {
+        let (root, workers, state, verifier, _) = store_fixture("import-per-id");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first_a = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_a_source, _) = additional_source(&root, "2.0.0", 1);
+        let (first_b_source, _) = additional_pack_source(&root, "alt", "1.0.0", 1);
+        let second_a = store.stage_and_install(&second_a_source).unwrap();
+        let first_b = store.stage_and_install(&first_b_source).unwrap();
+        let catalog_a = "4".repeat(64);
+        let catalog_b = "5".repeat(64);
+        let catalog_a_next = "6".repeat(64);
+        store
+            .activate_import_generation(&first_a, &catalog_a)
+            .unwrap();
+        store
+            .activate_import_generation(&first_b, &catalog_b)
+            .unwrap();
+        let retained_b =
+            activation_slot(&store.load_activation_strict().unwrap(), &first_b.pack_id).clone();
+
+        store
+            .activate_import_generation(&second_a, &catalog_a_next)
+            .unwrap();
+        let activation = store.load_activation_strict().unwrap();
+        assert_eq!(activation_slot(&activation, &first_b.pack_id), &retained_b);
+        assert!(
+            store
+                .import_generation_recorded(&first_b.pack_id, &catalog_b, &first_b.pack_digest)
+                .unwrap()
+        );
+        assert!(
+            store
+                .import_generation_recorded(
+                    &second_a.pack_id,
+                    &catalog_a_next,
+                    &second_a.pack_digest,
+                )
+                .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_lower_epoch_and_corrupt_import_receipts_preserve_state_bytes() {
+        let (root, workers, state, verifier, _) = store_fixture("import-receipt-rejection");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let low = store.stage_and_install(&root.join("source")).unwrap();
+        let (high_source, _) = additional_source(&root, "2.0.0", 2);
+        let high = store.stage_and_install(&high_source).unwrap();
+        let high_catalog = "7".repeat(64);
+        store
+            .activate_import_generation(&high, &high_catalog)
+            .unwrap();
+        let activation_bytes = fs::read(store.activation_path()).unwrap();
+        let epoch_bytes = fs::read(store.epoch_path()).unwrap();
+
+        assert!(matches!(
+            store.activate_import_generation(&low, &"8".repeat(64)),
+            Err(PackStoreError::SecurityEpochDowngrade {
+                observed: 1,
+                floor: 2
+            })
+        ));
+        for invalid in [
+            String::new(),
+            "A".repeat(64),
+            "9".repeat(63),
+            "a\n".repeat(32),
+            "a".repeat(MAX_STATE_BYTES as usize),
+        ] {
+            assert!(matches!(
+                store.import_generation_recorded(&high.pack_id, &invalid, &high.pack_digest,),
+                Err(PackStoreError::CorruptState("import generation receipt"))
+            ));
+            assert_eq!(fs::read(store.activation_path()).unwrap(), activation_bytes);
+            assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        }
+        assert!(matches!(
+            store.import_generation_recorded(&high.pack_id, &high_catalog, &"f".repeat(65),),
+            Err(PackStoreError::CorruptState("import generation receipt"))
+        ));
+
+        let mut corrupt = store.load_activation_strict().unwrap();
+        activation_slot_mut(&mut corrupt, &high.pack_id)
+            .last_import
+            .as_mut()
+            .unwrap()
+            .catalog_content_sha256 = "g".repeat(64);
+        atomic_write_canonical(&store.activation_path(), &corrupt).unwrap();
+        let corrupt_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.import_generation_recorded(&high.pack_id, &high_catalog, &high.pack_digest,),
+            Err(PackStoreError::CorruptState("import generation receipt"))
+        ));
+        assert_eq!(fs::read(store.activation_path()).unwrap(), corrupt_bytes);
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+
+        let mut wrong_target = corrupt;
+        let receipt = activation_slot_mut(&mut wrong_target, &high.pack_id)
+            .last_import
+            .as_mut()
+            .unwrap();
+        receipt.catalog_content_sha256 = high_catalog.clone();
+        receipt.imported_pack_digest = "e".repeat(64);
+        atomic_write_canonical(&store.activation_path(), &wrong_target).unwrap();
+        let wrong_target_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.import_generation_recorded(&high.pack_id, &high_catalog, &high.pack_digest,),
+            Err(PackStoreError::CorruptState(
+                "import generation receipt target"
+            ))
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            wrong_target_bytes
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_import_and_rollback_have_only_serialized_outcomes() {
+        let (root, workers, state, verifier, _) = store_fixture("import-rollback-race");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let (third_source, _) = additional_source(&root, "3.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        let third = store.stage_and_install(&third_source).unwrap();
+        store
+            .activate_import_generation(&first, &"a".repeat(64))
+            .unwrap();
+        store
+            .activate_import_generation(&second, &"b".repeat(64))
+            .unwrap();
+        let third_catalog = "c".repeat(64);
+
+        let (import_result, rollback_result) = std::thread::scope(|scope| {
+            let importer = PackStore::new(&workers, &state, &verifier);
+            let rollback_store = PackStore::new(&workers, &state, &verifier);
+            let target = third.clone();
+            let pack_id = second.pack_id.clone();
+            let catalog = third_catalog.clone();
+            let import =
+                scope.spawn(move || importer.activate_import_generation(&target, &catalog));
+            let rollback = scope.spawn(move || rollback_store.rollback(&pack_id));
+            (import.join().unwrap(), rollback.join().unwrap())
+        });
+        let activation = store.load_activation_strict().unwrap();
+        let slot = activation_slot(&activation, &second.pack_id);
+        match (&import_result, &rollback_result) {
+            (Ok(()), Ok(_)) => assert!(
+                (slot.current.as_ref() == Some(&third) && slot.previous.as_ref() == Some(&first))
+                    || (slot.current.as_ref() == Some(&second)
+                        && slot.previous.as_ref() == Some(&third))
+            ),
+            (Ok(()), Err(PackStoreError::LockContended)) => {
+                assert_eq!(slot.current.as_ref(), Some(&third));
+                assert_eq!(slot.previous.as_ref(), Some(&second));
+            }
+            (Err(PackStoreError::LockContended), Ok(rolled_back)) => {
+                assert_eq!(rolled_back, &first);
+                assert_eq!(slot.current.as_ref(), Some(&first));
+                assert_eq!(slot.previous.as_ref(), Some(&second));
+            }
+            results => panic!("unexpected import/rollback race results: {results:?}"),
+        }
+        if import_result.is_ok() {
+            assert_eq!(
+                slot.last_import,
+                Some(ImportGenerationReceipt {
+                    catalog_content_sha256: third_catalog,
+                    imported_pack_digest: third.pack_digest,
+                })
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn journal_recovery_preserves_other_id_and_does_not_verify_ineligible_history() {
         for boundary in [
             ActivationBoundary::Journal,
@@ -4068,6 +4801,7 @@ mod tests {
             &ActivationSlot {
                 current: Some(second_a.clone()),
                 previous: Some(first_a.clone()),
+                last_import: None,
             }
         );
         let retained_b = activation_slot(&activation, &first_b.pack_id).clone();
@@ -4076,6 +4810,7 @@ mod tests {
             ActivationSlot {
                 current: Some(second_b.clone()),
                 previous: Some(first_b.clone()),
+                last_import: None,
             }
         );
         assert_eq!(
@@ -4105,6 +4840,7 @@ mod tests {
             &ActivationSlot {
                 current: Some(first_a.clone()),
                 previous: Some(second_a),
+                last_import: None,
             }
         );
 
@@ -4131,6 +4867,21 @@ mod tests {
         let current_activation = fs::read(store.activation_path()).unwrap();
         let epoch_bytes = fs::read(store.epoch_path()).unwrap();
 
+        let mut version_two = store.load_activation_strict().unwrap();
+        version_two.schema_version = 2;
+        atomic_write_canonical(&store.activation_path(), &version_two).unwrap();
+        let version_two_bytes = fs::read(store.activation_path()).unwrap();
+        assert!(matches!(
+            store.activate(&second),
+            Err(PackStoreError::UnsupportedStateSchema("activation"))
+        ));
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            version_two_bytes
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epoch_bytes);
+        assert!(!store.pending_path().exists());
+
         let legacy_activation = LegacyActivationState {
             schema_version: STATE_SCHEMA_VERSION,
             current: Some(first.clone()),
@@ -4150,6 +4901,34 @@ mod tests {
         assert!(!store.pending_path().exists());
 
         fs::write(store.activation_path(), &current_activation).unwrap();
+        assert!(matches!(
+            store.activate_locked(&second, Some(ActivationBoundary::Journal)),
+            Err(PackStoreError::InjectedInterruption)
+        ));
+        let mut version_two_pending: PendingActivation =
+            read_canonical_state(&store.pending_path()).unwrap();
+        version_two_pending.schema_version = 2;
+        version_two_pending.prior_activation.schema_version = 2;
+        version_two_pending.next_activation.schema_version = 2;
+        atomic_write_canonical(&store.pending_path(), &version_two_pending).unwrap();
+        let version_two_pending_bytes = fs::read(store.pending_path()).unwrap();
+        let activation_before = fs::read(store.activation_path()).unwrap();
+        let epochs_before = fs::read(store.epoch_path()).unwrap();
+        assert!(matches!(
+            store.recover_pending_activation_locked(),
+            Err(PackStoreError::UnsupportedStateSchema("pending activation"))
+        ));
+        assert_eq!(
+            fs::read(store.pending_path()).unwrap(),
+            version_two_pending_bytes
+        );
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            activation_before
+        );
+        assert_eq!(fs::read(store.epoch_path()).unwrap(), epochs_before);
+        fs::remove_file(store.pending_path()).unwrap();
+
         let epochs = store.load_epochs_strict().unwrap();
         let legacy_pending = LegacyPendingActivation {
             schema_version: STATE_SCHEMA_VERSION,
@@ -4226,6 +5005,7 @@ mod tests {
             &ActivationSlot {
                 current: Some(second),
                 previous: Some(first),
+                last_import: None,
             }
         );
         assert_eq!(
@@ -4259,6 +5039,7 @@ mod tests {
                 ActivationSlot {
                     current: Some(descriptor),
                     previous: None,
+                    last_import: None,
                 },
             );
         }
@@ -4393,6 +5174,7 @@ mod tests {
                 ActivationSlot {
                     current: Some(retained),
                     previous: None,
+                    last_import: None,
                 },
             );
         }
@@ -4423,6 +5205,7 @@ mod tests {
             ActivationSlot {
                 current: Some(target.clone()),
                 previous: prior.slot(&target_id).unwrap().current.clone(),
+                last_import: None,
             },
         );
         let mut next_epochs = epochs.clone();
@@ -4432,6 +5215,7 @@ mod tests {
         let pending = PendingActivation {
             schema_version: ACTIVATION_SCHEMA_VERSION,
             target,
+            import_receipt: None,
             prior_activation: prior,
             next_activation: next,
             prior_epochs: epochs,
@@ -4468,11 +5252,13 @@ mod tests {
             ActivationSlot {
                 current: Some(low.clone()),
                 previous: Some(high.clone()),
+                last_import: None,
             },
         );
         let pending = PendingActivation {
             schema_version: ACTIVATION_SCHEMA_VERSION,
             target: low,
+            import_receipt: None,
             prior_activation,
             next_activation,
             prior_epochs: prior_epochs.clone(),
@@ -4538,6 +5324,7 @@ mod tests {
             &ActivationSlot {
                 current: Some(second_a),
                 previous: Some(first_a),
+                last_import: None,
             }
         );
         assert_eq!(
@@ -4545,6 +5332,7 @@ mod tests {
             &ActivationSlot {
                 current: Some(second_b),
                 previous: Some(first_b),
+                last_import: None,
             }
         );
         fs::remove_dir_all(root).unwrap();
@@ -4639,6 +5427,7 @@ mod tests {
             &ActivationSlot {
                 current: Some(first),
                 previous: Some(second),
+                last_import: None,
             }
         );
         fs::remove_dir_all(root).unwrap();
@@ -4651,12 +5440,13 @@ mod tests {
         let original = original_store
             .stage_and_install(&root.join("source"))
             .unwrap();
-        original_store.activate(&original).unwrap();
+        original_store
+            .activate_import_generation(&original, &"1".repeat(64))
+            .unwrap();
 
         let successor_source = root.join("source-new-build");
         fs::create_dir(&successor_source).unwrap();
         let mut successor_manifest = base_manifest();
-        successor_manifest.pack_version = StoreComponent::new("2.0.0").unwrap();
         successor_manifest.app_build = "new-desktop-build".to_owned();
         successor_manifest.worker_build = "new-worker-build".to_owned();
         let trust = write_signed(&successor_source, successor_manifest);
@@ -4672,7 +5462,20 @@ mod tests {
         );
         let new_store = PackStore::new(&workers, &state, &new_verifier);
         let successor = new_store.stage_and_install(&successor_source).unwrap();
-        new_store.activate(&successor).unwrap();
+        let successor_catalog = "2".repeat(64);
+        new_store
+            .activate_import_generation(&successor, &successor_catalog)
+            .unwrap();
+        assert!(
+            new_store
+                .current_descriptor_matches(&successor.pack_id, &successor)
+                .unwrap()
+        );
+        assert!(
+            !new_store
+                .current_descriptor_matches(&original.pack_id, &original)
+                .unwrap()
+        );
 
         assert_eq!(
             new_store.retained_status(&successor.pack_id).unwrap(),
@@ -4698,6 +5501,15 @@ mod tests {
         assert_eq!(
             fs::read(new_store.activation_path()).unwrap(),
             activation_bytes
+        );
+        assert!(
+            new_store
+                .import_generation_recorded(
+                    &successor.pack_id,
+                    &successor_catalog,
+                    &successor.pack_digest,
+                )
+                .unwrap()
         );
         fs::remove_dir_all(root).unwrap();
     }

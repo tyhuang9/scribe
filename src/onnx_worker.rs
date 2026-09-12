@@ -7108,6 +7108,15 @@ fn explicit_gpu_discovery_fingerprint(
             .as_deref()
             .unwrap_or("catalog-unavailable"),
     );
+    for lease in &discovery.leases {
+        let pack = lease.verified_pack();
+        update_health_digest(&mut digest, pack.pack_id.as_str());
+        update_health_digest(&mut digest, pack.pack_version.as_str());
+        update_health_digest(&mut digest, &pack.pack_digest);
+        digest.update(pack.security_epoch.to_le_bytes());
+        digest.update(pack.runtime_abi_version.to_le_bytes());
+        update_health_digest(&mut digest, &pack.provider);
+    }
     for diagnostic in &discovery.diagnostics {
         update_health_digest(&mut digest, &format!("{:?}", diagnostic.issue));
         update_health_digest(
@@ -15232,6 +15241,47 @@ mod tests {
             )]
         );
         drop(filtered);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_discovery_fingerprint_changes_with_selected_pack_identity() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root(
+            "explicit-selection-fingerprint",
+        );
+        let (_verifier, lease) =
+            crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let selected = crate::gpu_worker_pack::PackLeaseDiscovery {
+            leases: vec![Arc::new(lease)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("same-installed-catalog".to_owned()),
+        };
+        let absent = crate::gpu_worker_pack::PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: Vec::new(),
+            catalog_generation: Some("same-installed-catalog".to_owned()),
+        };
+
+        let selected_fingerprint = explicit_gpu_discovery_fingerprint(&selected);
+        let absent_fingerprint = explicit_gpu_discovery_fingerprint(&absent);
+        assert_ne!(selected_fingerprint, absent_fingerprint);
+
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut catalog = verified_gpu_catalog(vec![verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )]);
+        catalog.discovery_fingerprint = selected_fingerprint;
+        cache.record_probe(catalog, now);
+        assert!(matches!(
+            cache.lookup(&absent_fingerprint, now),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        drop(selected);
         std::fs::remove_dir_all(root).unwrap();
     }
 

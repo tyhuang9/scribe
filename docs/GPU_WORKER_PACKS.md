@@ -216,13 +216,59 @@ target, preserves unrelated and historically ineligible slots, and completes a
 transaction interrupted after the journal, epoch, or activation write without
 lowering the security floor. Activation and journal schemas from the former
 single-slot layout are rejected without migration, reset, or mutation; epoch
-state remains on its existing compatible schema. Corrupt transaction state,
+state remains on its existing compatible schema. A missing private epoch file
+alongside retained activation history is corrupt state and is not silently
+recreated. Corrupt transaction state,
 interrupted staging, or an invalid selected pack produces no GPU candidate and
 cannot disable the compiled CPU route.
 
-These are store-level guarantees. Windows catalog discovery and Setup do not
-yet consume the per-ID activation slots; installer retention, restart-safe
-selection, and end-to-end Windows rollback remain separate integration work.
+On Windows, production discovery first verifies the current installed catalog
+and its signed pack trees, then admits those source descriptors through the
+existing append-only discovery epoch ledger. Only after that admission may it
+copy a declared pack into the per-user immutable pack store and atomically
+record its per-ID import generation with activation state. The import receipt
+is replay-suppression metadata, never launch authority: a restart that sees the
+same catalog-content digest does not reactivate the installer target after an
+explicit rollback. A new catalog generation activates only its declared ID;
+the same already-current target refreshes its receipt without rotating the
+previous slot.
+
+A catalog with repeated pack IDs is rejected as a whole before any private
+store write, including when the repeated entries name different versions or
+digests. One catalog generation therefore has at most one import and selected
+current for each retained activation slot.
+
+Every request rereads the selected current slot and epoch floor. An unchanged
+selection may reuse its process-local retained handle lease only after the
+fresh metadata exactly matches that lease and the pinned root identity is
+rechecked. This avoids repeatedly hashing or copying a large unchanged payload
+on the warm path; a cache miss or selection change performs the complete store
+verification, and the existing before-launch verification remains mandatory.
+The source-verification cache never caches private selection authority.
+Selected descriptors are re-admitted before publication. The discovery
+generation includes the sorted selected ID/version/digest/epoch identities, so
+a rollback invalidates both explicit and Auto route caches and retires a warm
+worker before the next request probes. Work already active at that transition
+is allowed to finish. A removed catalog ID remains retained metadata but is
+undiscoverable and its process-local lease cache entry is evicted.
+
+Setup remains an immutable source producer and never reads, resets, migrates,
+or deletes private pack-store state. Copying signed payloads into app data is a
+deliberate disk-space tradeoff that preserves same-build predecessors across
+program-directory repair or replacement. Complete verification still requires
+the exact application and worker build, protocol, ABI, platform, backend,
+signature, digest, inventory, and security epoch. A predecessor from another
+application commit therefore remains retained but unlaunchable; this does not
+provide cross-application-version rollback. The eight lifetime-ID bound and
+unbounded immutable digest retention remain, with no automatic eviction or
+garbage collection. Old program-tree retirement during an installer update is
+also not solved here and must not weaken Setup's existing destination checks.
+The per-user immutable store is not a privilege boundary against a writer who
+already controls the user's complete app-data and installed-catalog state;
+preventing whole-state same-user deletion requires separate non-resettable
+Windows authority. This slice never turns such state into unsigned launch
+authority: exact signature, build, compatibility, inventory, epoch, and
+before-launch checks still apply.
 
 ## Private health quarantine
 
