@@ -1368,19 +1368,192 @@ fn decode_hex_exact(value: &str, bytes: usize) -> Option<Vec<u8>> {
 }
 
 #[cfg(windows)]
-pub(super) fn reject_named_streams(path: &Path) -> Result<(), PackVerificationError> {
+fn unsafe_windows_stream_path(path: &Path) -> PackVerificationError {
+    PackVerificationError::UnsafePath(path.display().to_string())
+}
+
+#[cfg(windows)]
+fn is_windows_separator(character: u16) -> bool {
+    character == u16::from(b'\\') || character == u16::from(b'/')
+}
+
+#[cfg(windows)]
+fn is_windows_ascii_alphanumeric(character: u16) -> bool {
+    matches!(character, 0x30..=0x39 | 0x41..=0x5a | 0x61..=0x7a)
+}
+
+#[cfg(windows)]
+fn is_reserved_windows_wide_name(component: &[u16]) -> bool {
+    let Ok(name) = String::from_utf16(component) else {
+        return false;
+    };
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(&name)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if is_reserved_windows_name(&stem) {
+        return true;
+    }
+    if matches!(stem.as_str(), "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let characters = stem.chars().collect::<Vec<_>>();
+    characters.len() == 4
+        && matches!(characters[..3], ['C', 'O', 'M'] | ['L', 'P', 'T'])
+        && matches!(characters[3], '\u{00b9}' | '\u{00b2}' | '\u{00b3}')
+}
+
+#[cfg(windows)]
+fn validate_windows_stream_component(
+    component: &[u16],
+    path: &Path,
+) -> Result<(), PackVerificationError> {
+    let invalid_character = |character| {
+        character < 0x20
+            || [b'"', b'*', b':', b'<', b'>', b'?', b'|']
+                .map(u16::from)
+                .contains(&character)
+    };
+    if component.is_empty()
+        || component == [u16::from(b'.')]
+        || component == [u16::from(b'.'), u16::from(b'.')]
+        || component
+            .last()
+            .is_some_and(|character| matches!(*character, 0x20 | 0x2e))
+        || component.iter().copied().any(invalid_character)
+        || is_reserved_windows_wide_name(component)
+    {
+        return Err(unsafe_windows_stream_path(path));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_unc_server(server: &[u16], path: &Path) -> Result<(), PackVerificationError> {
+    validate_windows_stream_component(server, path)?;
+    let is_server_character = |character: u16| {
+        is_windows_ascii_alphanumeric(character)
+            || [b'.', b'-', b'_'].map(u16::from).contains(&character)
+    };
+    if !server.iter().copied().all(is_server_character)
+        || !server
+            .first()
+            .copied()
+            .is_some_and(is_windows_ascii_alphanumeric)
+        || !server
+            .last()
+            .copied()
+            .is_some_and(is_windows_ascii_alphanumeric)
+        || server
+            .windows(2)
+            .any(|pair| pair == [u16::from(b'.'), u16::from(b'.')])
+    {
+        return Err(unsafe_windows_stream_path(path));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn append_validated_windows_components(
+    wide: &mut Vec<u16>,
+    raw: &[u16],
+    path: &Path,
+) -> Result<(), PackVerificationError> {
+    if raw.is_empty() {
+        return Ok(());
+    }
+    for component in raw.split(|character| is_windows_separator(*character)) {
+        validate_windows_stream_component(component, path)?;
+        if wide.last() != Some(&u16::from(b'\\')) {
+            wide.push(u16::from(b'\\'));
+        }
+        wide.extend_from_slice(component);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_stream_enumeration_path(path: &Path) -> Result<Vec<u16>, PackVerificationError> {
     use std::os::windows::ffi::OsStrExt;
+    use std::path::Prefix;
+
+    let raw = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if raw.contains(&0) {
+        return Err(unsafe_windows_stream_path(path));
+    }
+
+    let prefix = match path.components().next() {
+        Some(Component::Prefix(prefix)) if path.is_absolute() => prefix,
+        _ => return Err(unsafe_windows_stream_path(path)),
+    };
+    let mut wide = match prefix.kind() {
+        Prefix::Disk(drive) if drive.is_ascii_alphabetic() => {
+            if raw.len() < 3 || raw[1] != u16::from(b':') || !is_windows_separator(raw[2]) {
+                return Err(unsafe_windows_stream_path(path));
+            }
+            let mut extended = r"\\?\".encode_utf16().collect::<Vec<_>>();
+            extended.extend([u16::from(drive), u16::from(b':'), u16::from(b'\\')]);
+            append_validated_windows_components(&mut extended, &raw[3..], path)?;
+            extended
+        }
+        Prefix::UNC(server, share) => {
+            let server = server.encode_wide().collect::<Vec<_>>();
+            let share = share.encode_wide().collect::<Vec<_>>();
+            validate_windows_unc_server(&server, path)?;
+            validate_windows_stream_component(&share, path)?;
+            let prefix_length = prefix.as_os_str().encode_wide().count();
+            if raw.len() < prefix_length
+                || raw.len() > prefix_length
+                    && (!is_windows_separator(raw[prefix_length]) || raw.len() == prefix_length + 1)
+            {
+                return Err(unsafe_windows_stream_path(path));
+            }
+            let mut extended = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+            extended.extend_from_slice(&server);
+            extended.push(u16::from(b'\\'));
+            extended.extend_from_slice(&share);
+            if raw.len() > prefix_length {
+                append_validated_windows_components(
+                    &mut extended,
+                    &raw[prefix_length + 1..],
+                    path,
+                )?;
+            }
+            extended
+        }
+        Prefix::VerbatimDisk(drive) if drive.is_ascii_alphabetic() => {
+            if raw.contains(&u16::from(b'/')) {
+                return Err(unsafe_windows_stream_path(path));
+            }
+            raw
+        }
+        Prefix::VerbatimUNC(server, share) => {
+            if raw.contains(&u16::from(b'/')) {
+                return Err(unsafe_windows_stream_path(path));
+            }
+            validate_windows_unc_server(&server.encode_wide().collect::<Vec<_>>(), path)?;
+            validate_windows_stream_component(&share.encode_wide().collect::<Vec<_>>(), path)?;
+            raw
+        }
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            return Err(unsafe_windows_stream_path(path));
+        }
+    };
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+pub(super) fn reject_named_streams(path: &Path) -> Result<(), PackVerificationError> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
         WIN32_FIND_STREAM_DATA,
     };
 
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    let wide = windows_stream_enumeration_path(path)?;
     let mut data = unsafe { std::mem::zeroed::<WIN32_FIND_STREAM_DATA>() };
     let handle = unsafe {
         FindFirstStreamW(
@@ -1834,6 +2007,57 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[cfg(windows)]
+    fn verbatim_local_path(path: &Path) -> PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        assert!(path.is_absolute());
+        let mut wide = r"\\?\".encode_utf16().collect::<Vec<_>>();
+        wide.extend(path.as_os_str().encode_wide());
+        PathBuf::from(OsString::from_wide(&wide))
+    }
+
+    #[cfg(windows)]
+    struct OwnedWindowsFixture(PathBuf);
+
+    #[cfg(windows)]
+    impl OwnedWindowsFixture {
+        fn new(label: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "scribe-pack-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for OwnedWindowsFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(verbatim_local_path(&self.0));
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_new_windows_file(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
 
     struct EndlessReader {
         consumed: usize,
@@ -2410,6 +2634,147 @@ mod tests {
         ));
         fs::remove_file(directory_stream).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stream_enumeration_path_accepts_only_safe_absolute_namespaces() {
+        fn converted(path: &str) -> Result<String, PackVerificationError> {
+            let wide = windows_stream_enumeration_path(Path::new(path))?;
+            assert_eq!(wide.last(), Some(&0));
+            Ok(String::from_utf16(&wide[..wide.len() - 1]).unwrap())
+        }
+
+        assert_eq!(
+            converted(r"C:\workers\packs\worker.exe").unwrap(),
+            r"\\?\C:\workers\packs\worker.exe"
+        );
+        assert_eq!(
+            converted("C:/workers/packs/worker.exe").unwrap(),
+            r"\\?\C:\workers\packs\worker.exe"
+        );
+        assert_eq!(
+            converted(r"\\server\share\packs\worker.exe").unwrap(),
+            r"\\?\UNC\server\share\packs\worker.exe"
+        );
+        assert_eq!(
+            converted(r"\\?\C:\workers\packs\worker.exe").unwrap(),
+            r"\\?\C:\workers\packs\worker.exe"
+        );
+        assert_eq!(
+            converted(r"\\?\UNC\server\share\packs\worker.exe").unwrap(),
+            r"\\?\UNC\server\share\packs\worker.exe"
+        );
+        assert_eq!(
+            converted(r"\\?\C:\workers\victim.\marker").unwrap(),
+            r"\\?\C:\workers\victim.\marker"
+        );
+
+        for unsafe_path in [
+            r"packs\worker.exe",
+            r"C:packs\worker.exe",
+            r"\packs\worker.exe",
+            r"C:\workers\.\worker.exe",
+            r"C:\workers\..\worker.exe",
+            r"C:\workers\victim.\marker",
+            "C:\\workers\\victim \\marker",
+            r"C:\workers\marker:untrusted",
+            r"C:\workers\CON\marker",
+            r"C:\workers\com1.txt\marker",
+            r"C:\workers\NUL .txt\marker",
+            "C:\\workers\\LPT\u{00b9}.txt\\marker",
+            r"C:\workers\\marker",
+            "C:\\workers\\marker\\",
+            r"\\server..\share\worker.exe",
+            r"\\server@ssl\share\worker.exe",
+            r"\\server\CON\worker.exe",
+            r"\\server\share.\worker.exe",
+            r"\\server\share\\worker.exe",
+            r"\\.\C:\workers\packs\worker.exe",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\worker.exe",
+            r"\\?\C:/workers/packs/worker.exe",
+        ] {
+            assert!(matches!(
+                converted(unsafe_path),
+                Err(PackVerificationError::UnsafePath(path)) if path == unsafe_path
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalized_dotted_component_cannot_redirect_stream_enumeration_to_a_decoy() {
+        let fixture = OwnedWindowsFixture::new("windows-dotted-decoy");
+        let normalized_directory = fixture.0.join("victim");
+        fs::create_dir(&normalized_directory).unwrap();
+        let normalized_file = normalized_directory.join("marker");
+        create_new_windows_file(&normalized_file, b"normalized target");
+
+        let literal_directory = fixture.0.join("victim.");
+        fs::create_dir(verbatim_local_path(&literal_directory)).unwrap();
+        let literal_file = literal_directory.join("marker");
+        let verbatim_literal_file = verbatim_local_path(&literal_file);
+        create_new_windows_file(&verbatim_literal_file, b"literal decoy");
+
+        let mut stream = verbatim_local_path(&normalized_file).into_os_string();
+        stream.push(":untrusted");
+        create_new_windows_file(&PathBuf::from(stream), b"hidden");
+
+        let normalization_sensitive = fixture.0.join("victim.").join("marker");
+        assert_eq!(
+            fs::read(&normalization_sensitive).unwrap(),
+            b"normalized target"
+        );
+        assert_eq!(fs::read(&verbatim_literal_file).unwrap(), b"literal decoy");
+        assert!(matches!(
+            reject_named_streams(&normalized_file),
+            Err(PackVerificationError::AlternateDataStream(path)) if path == normalized_file
+        ));
+        reject_named_streams(&verbatim_literal_file).unwrap();
+
+        assert!(matches!(
+            reject_named_streams(&normalization_sensitive),
+            Err(PackVerificationError::UnsafePath(path))
+                if path == normalization_sensitive.display().to_string()
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_stream_checks_support_production_length_paths() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let fixture = OwnedWindowsFixture::new("windows-long-path");
+
+        let mut directory = fixture.0.clone();
+        for component in [
+            "workers".to_owned(),
+            "packs".to_owned(),
+            "scribe-cuda-windows-x64".to_owned(),
+            "0.1.0-fixture".to_owned(),
+            "a".repeat(64),
+            format!(".staging-{}", "b".repeat(32)),
+            "worker".to_owned(),
+            format!("runtime-dependencies-{}", "c".repeat(32)),
+        ] {
+            directory.push(component);
+            fs::create_dir(verbatim_local_path(&directory)).unwrap();
+        }
+        let file = directory.join("scribe-inference-worker.exe");
+        create_new_windows_file(&verbatim_local_path(&file), b"signed worker");
+
+        assert!(directory.as_os_str().encode_wide().count() >= 260);
+        assert!(file.as_os_str().encode_wide().count() >= 260);
+        reject_named_streams(&directory).unwrap();
+        reject_named_streams(&file).unwrap();
+
+        let mut stream = verbatim_local_path(&file).into_os_string();
+        stream.push(":untrusted");
+        create_new_windows_file(&PathBuf::from(stream), b"hidden");
+        assert!(matches!(
+            reject_named_streams(&file),
+            Err(PackVerificationError::AlternateDataStream(path)) if path == file
+        ));
     }
 
     #[cfg(unix)]
