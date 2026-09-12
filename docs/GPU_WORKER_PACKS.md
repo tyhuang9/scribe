@@ -694,6 +694,46 @@ exit 78, and removes only the service and staging directory it created. The
 service is not registered by the normal Scribe installer and cannot promote a
 pack.
 
+## Windows Vulkan policy loader integration
+
+Windows Vulkan pack builds now require the reviewed Scribe policy loader from
+`native/vulkan-policy-loader/source-manifest.json`. Its digest is bound by the
+Windows toolchain contract. `vulkan-1.dll` is a packaged runtime, not an allowed
+system-driver dependency. The builder compiles it offline in a fresh short
+directory, authenticates the resulting DLL, and includes it beside the worker.
+The signed inventory also includes both upstream license indexes and all seven
+loader/header license texts under `licenses/`.
+
+Acquire the exact loader/header source archives named by the source manifest
+before building. Put them in `NativeArchiveDirectory`, or pass an explicit
+`-VulkanSourceArchiveDirectory` to the pack builder, preparation script, or
+Vulkan evidence runner. This is a build-time cache only: Scribe does not download
+or install these sources or executable components at runtime. The compiler and
+source trust boundary remains the trusted, exclusive job documented in the
+native loader README.
+
+Run `scripts/test-windows-vulkan-pack-loader.ps1` for manifest binding, runtime
+copy/admission, and license inventory checks. In particular, a preexisting
+runtime file must match the authenticated source bytes; it is never trusted just
+because it already exists and is never silently overwritten on mismatch.
+
+The desktop verifies the exact signed, worker-adjacent loader entry against an
+identity compiled from the reviewed source manifest and retains the pack lease
+through the worker lifetime. Before provider initialization, worker bootstrap
+requires exactly one already-mapped loader, compares its Windows file identity
+with the adjacent file, checks size and SHA-256, and pins the module and file
+handle. Vulkan identity discovery resolves its entry point from that admitted
+module, without performing another DLL search. The fixed layer-disable variable
+is set only for verified Windows Vulkan packs; other backends are unchanged.
+
+This integration remains in development pending exact signed-pack
+SCIF/model/warm verification and native CI/hardware qualification.
+The Windows static import is mapped before Rust `main`; prelaunch full-pack
+verification and retained payload handles remain essential. A later bootstrap
+check can reject before Vulkan API use, but cannot retroactively prevent a DLL
+entry point from executing. Production trust and Auto qualification remain
+default-deny; no system-loader fallback is authorized for a verified Vulkan pack.
+
 ## Stage 7 Linux GPU contract
 
 Linux GPU support remains default-deny. The only reviewed future worker target is

@@ -16,9 +16,12 @@ const MACOS_KEYCHAIN_NAMESPACE_MANIFEST: &str =
 const LINUX_WORKER_INSTALL_CONTRACT: &str =
     "runtime-manifests/linux-worker-install-contract-x86_64.json";
 const LINUX_RELEASE_PACKAGE_CONTRACT: &str = "runtime-manifests/linux-release-package-x86_64.json";
+const WINDOWS_VULKAN_POLICY_LOADER_MANIFEST: &str =
+    "native/vulkan-policy-loader/source-manifest.json";
 
 fn main() {
     reject_multiple_gpu_features();
+    embed_windows_vulkan_policy_loader_identity();
     emit_build_revision();
     embed_gpu_pack_release_authority();
     emit_bundled_worker_trust_anchor();
@@ -53,6 +56,55 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn embed_windows_vulkan_policy_loader_identity() {
+    println!("cargo:rerun-if-changed={WINDOWS_VULKAN_POLICY_LOADER_MANIFEST}");
+    let bytes = fs::read(WINDOWS_VULKAN_POLICY_LOADER_MANIFEST)
+        .expect("could not read the pinned Windows Vulkan policy-loader manifest");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+        .expect("the pinned Windows Vulkan policy-loader manifest must be valid JSON");
+    let artifact = manifest
+        .get("artifact")
+        .and_then(serde_json::Value::as_object)
+        .expect("the pinned Windows Vulkan policy-loader manifest must contain artifact metadata");
+    let filename = artifact
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .expect("the pinned Windows Vulkan policy-loader artifact must name its DLL");
+    assert_eq!(
+        filename, "vulkan-1.dll",
+        "the pinned Windows Vulkan policy-loader must retain its audited DLL name"
+    );
+    let size_bytes = artifact
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .expect("the pinned Windows Vulkan policy-loader artifact must have a positive size");
+    assert!(
+        size_bytes != 0,
+        "the pinned Windows Vulkan policy-loader artifact must not be empty"
+    );
+    let sha256 = artifact
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .expect("the pinned Windows Vulkan policy-loader artifact must have a SHA-256");
+    assert!(
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "the pinned Windows Vulkan policy-loader SHA-256 must be canonical lowercase hex"
+    );
+
+    let generated = format!(
+        "pub(crate) const PINNED_VULKAN_LOADER_FILENAME: &str = {filename:?};\n\
+         pub(crate) const PINNED_VULKAN_LOADER_SIZE_BYTES: u64 = {size_bytes};\n\
+         pub(crate) const PINNED_VULKAN_LOADER_SHA256: &str = {sha256:?};\n"
+    );
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"))
+        .join("windows_vulkan_policy_loader_identity.rs");
+    fs::write(output, generated)
+        .expect("could not embed the pinned Windows Vulkan policy-loader identity");
 }
 
 #[cfg(feature = "cuda-acceleration")]

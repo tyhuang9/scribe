@@ -1388,7 +1388,7 @@ struct VulkanDeviceCatalog {
 #[cfg(all(windows, any(feature = "inference-worker", test)))]
 impl VulkanDeviceCatalog {
     #[cfg(feature = "vulkan-acceleration")]
-    fn discover() -> Result<Self> {
+    fn discover(require_policy_loader: bool) -> Result<Self> {
         use ash::vk;
         use std::ffi::CStr;
 
@@ -1402,11 +1402,7 @@ impl VulkanDeviceCatalog {
             encoded
         }
 
-        // SAFETY: loading occurs only inside the verified Vulkan worker after
-        // its environment and DLL search path have been sanitized. The desktop
-        // does not compile this feature in production or call this code.
-        let entry =
-            unsafe { ash::Entry::load() }.context("could not load the Windows Vulkan loader")?;
+        let entry = crate::windows_vulkan_loader::ash_entry(require_policy_loader)?;
         let application_name = c"scribe-gpu-worker";
         let application = vk::ApplicationInfo::builder()
             .application_name(application_name)
@@ -1666,6 +1662,10 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
     if role != WorkerRole::Inference {
         bail!("only the inference role may advertise a GPU worker pack");
     }
+    #[cfg(all(windows, feature = "vulkan-acceleration"))]
+    if expectation.backend == WorkerProvider::Vulkan {
+        crate::windows_vulkan_loader::require_policy_loader()?;
+    }
     transcribe_cpp::init_backends_default()
         .context("could not initialize the compiled GPU provider for Hello")?;
     let expected_kind = match expectation.backend {
@@ -1794,7 +1794,7 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         .context("could not obtain authoritative GPU driver identity")?;
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     let mut vulkan_catalog = (expectation.backend == WorkerProvider::Vulkan)
-        .then(VulkanDeviceCatalog::discover)
+        .then(|| VulkanDeviceCatalog::discover(true))
         .transpose()
         .context("could not obtain Vulkan LUID/UUID identity")?;
     #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
@@ -3064,6 +3064,8 @@ fn resolve_verified_pack_executable(
     let launchable = verifier
         .launchable_worker(&lease)
         .context("GPU worker pack changed before launch")?;
+    #[cfg(windows)]
+    crate::windows_vulkan_loader::validate_verified_pack_loader(&lease)?;
     let worker_path = launchable.path();
     let expected_sha256 = lease
         .copy_entries()
@@ -3447,6 +3449,10 @@ fn worker_pack_environment_bindings(context: &PackLaunchContext) -> Vec<(String,
             bindings.push((PACK_DRIVER_ID_ENV.to_owned(), driver.clone()));
         }
     }
+    #[cfg(windows)]
+    if pack.backend == WorkerProvider::Vulkan {
+        bindings.push(("VK_LOADER_LAYERS_DISABLE".to_owned(), "~all~".to_owned()));
+    }
     bindings
 }
 
@@ -3510,8 +3516,37 @@ pub(crate) fn harden_windows_dll_search() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[allow(
+    dead_code,
+    reason = "only the dedicated worker binary invokes its Windows entrypoint admission"
+)]
+pub(crate) fn validate_windows_vulkan_worker_entrypoint() -> Result<()> {
+    match std::env::var(PACK_BACKEND_ENV) {
+        Ok(backend) if backend == "vulkan" => {
+            crate::windows_vulkan_loader::validate_fixed_layer_disable(
+                std::env::var_os("VK_LOADER_LAYERS_DISABLE").as_deref(),
+            )?;
+            crate::windows_vulkan_loader::bootstrap_mapped_policy_loader()
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("GPU worker pack backend is not valid Unicode")
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn harden_windows_dll_search() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[allow(
+    dead_code,
+    reason = "only the dedicated worker binary invokes its platform entrypoint admission"
+)]
+pub(crate) fn validate_windows_vulkan_worker_entrypoint() -> Result<()> {
     Ok(())
 }
 
@@ -11380,22 +11415,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn fixture_pack_launch_reverifies_with_fixture_only_trust() {
+    fn fixture_pack_launch_rejects_a_vulkan_inventory_without_the_reviewed_loader() {
         let root =
             crate::gpu_worker_pack::manifest::test_support::temp_root("pack-fixture-launch-trust");
         let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
-        let executable = resolve_verified_pack_executable(Arc::new(lease), None)
-            .expect("fixture launch must reverify with its test-only trust authority");
-        assert_eq!(
-            executable
-                .pack_launch
-                .as_ref()
-                .expect("fixture launch keeps verified pack authority")
-                .expectation
-                .backend,
-            WorkerProvider::Vulkan
+        let error = resolve_verified_pack_executable(Arc::new(lease), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inventory omitted its adjacent policy loader")
         );
-        drop(executable);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -11496,6 +11525,23 @@ mod tests {
             Some("native:luid:0000000000000001")
         );
         assert!(!environment.contains_key("SCRIBE_PRIVATE_PACK_DEVICE_PROCESS_INDEX"));
+        #[cfg(windows)]
+        assert_eq!(
+            environment
+                .get("VK_LOADER_LAYERS_DISABLE")
+                .map(String::as_str),
+            Some("~all~")
+        );
+
+        let mut non_vulkan_context =
+            PackLaunchContext::fixture(Arc::clone(&context.lease), context.expected_device.clone());
+        non_vulkan_context.expectation.backend = WorkerProvider::Cuda;
+        assert!(
+            worker_pack_environment_bindings(&non_vulkan_context)
+                .iter()
+                .all(|(name, _)| name != "VK_LOADER_LAYERS_DISABLE")
+        );
+        drop(non_vulkan_context);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -11821,7 +11867,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!devices.is_empty());
         #[cfg(feature = "vulkan-acceleration")]
-        let mut vulkan_catalog = VulkanDeviceCatalog::discover().unwrap();
+        let mut vulkan_catalog = VulkanDeviceCatalog::discover(false).unwrap();
         for device in devices {
             let (stable, driver) = if let Some(native_id) = device.device_id {
                 let stable = format!("native:{}", native_id.to_ascii_lowercase());
