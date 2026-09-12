@@ -1,0 +1,82 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -155,7 +155,13 @@
+ endif()
+ 
+ add_library(loader_common_options INTERFACE)
++# Scribe's signed Windows worker pack owns this loader policy. This is not an
++# upstream default and must never be a runtime/environment-controlled option.
++if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
++    message(FATAL_ERROR "Scribe policy loader requires Windows x64")
++endif()
++target_compile_definitions(loader_common_options INTERFACE SCRIBE_VULKAN_PACK_POLICY=1)
+ target_link_libraries(loader_common_options INTERFACE platform_wsi)
+ 
+ # Enable beta Vulkan extensions
+ target_compile_definitions(loader_common_options INTERFACE VK_ENABLE_BETA_EXTENSIONS)
+diff --git a/loader/loader.c b/loader/loader.c
+--- a/loader/loader.c
++++ b/loader/loader.c
+@@ -4281,5 +4281,12 @@
+ VkResult loader_scan_for_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
+                                 const struct loader_envvar_all_filters *filters) {
++#if defined(SCRIBE_VULKAN_PACK_POLICY)
++    // No manifests, settings, override layers, or layer libraries are consulted.
++    (void)inst;
++    (void)filters;
++    memset(instance_layers, 0, sizeof(*instance_layers));
++    return VK_SUCCESS;
++#else
+     VkResult res = VK_SUCCESS;
+     struct loader_layer_list settings_layers = {0};
+     struct loader_layer_list regular_instance_layers = {0};
+@@ -4360,9 +4367,17 @@
+     free_string_list(inst, &override_paths);
+     return res;
++#endif
+ }
+ 
+ VkResult loader_scan_for_implicit_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
+                                          const struct loader_envvar_all_filters *layer_filters) {
++#if defined(SCRIBE_VULKAN_PACK_POLICY)
++    // Also cover pre-instance extension and version discovery.
++    (void)inst;
++    (void)layer_filters;
++    memset(instance_layers, 0, sizeof(*instance_layers));
++    return VK_SUCCESS;
++#else
+     VkResult res = VK_SUCCESS;
+     struct loader_layer_list settings_layers = {0};
+     struct loader_layer_list regular_instance_layers = {0};
+@@ -4462,6 +4477,7 @@
+ 
+     free_string_list(inst, &override_paths);
+     return res;
++#endif
+ }
+ 
+ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL loader_gpdpa_instance_terminator(VkInstance inst, const char *pName) {
+diff --git a/loader/settings.c b/loader/settings.c
+--- a/loader/settings.c
++++ b/loader/settings.c
+@@ -677,4 +677,11 @@
+ VkResult get_loader_settings(const struct loader_instance* inst, loader_settings* loader_settings) {
++#if defined(SCRIBE_VULKAN_PACK_POLICY)
++    // Ignore settings before any registry/file lookup. Forced-on layers and
++    // settings-added drivers must not bypass the pack's compile-time policy.
++    (void)inst;
++    memset(loader_settings, 0, sizeof(*loader_settings));
++    return VK_SUCCESS;
++#else
+     VkResult res = VK_SUCCESS;
+     cJSON* json = NULL;
+     char* file_format_version_string = NULL;
+@@ -872,6 +879,7 @@
+ 
+     loader_instance_heap_free(inst, file_format_version_string);
+     return res;
++#endif
+ }
+ 
+ TEST_FUNCTION_EXPORT VkResult update_global_loader_settings(void) {
