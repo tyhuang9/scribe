@@ -116,6 +116,9 @@
     "required_files": [
       "bin/nvcc.exe",
       "include/cuda.h",
+      "lib/x64/cudart_static.lib",
+      "lib/x64/cublas.lib",
+      "lib/x64/cublasLt.lib",
       "lib/x64/cuda.lib"
     ],
     "production_inventory": [],

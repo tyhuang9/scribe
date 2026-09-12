@@ -4,6 +4,10 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "cuda-acceleration")]
+#[path = "build_support/windows_cuda_link.rs"]
+mod windows_cuda_link;
+
 const SILERO_VAD_ASSET: &str = "resources/silero-vad/silero_vad.int8.onnx";
 const SILERO_VAD_SIZE: usize = 212_860;
 const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20";
@@ -19,6 +23,13 @@ fn main() {
     embed_gpu_pack_release_authority();
     emit_bundled_worker_trust_anchor();
     require_windows_static_crt();
+    #[cfg(feature = "cuda-acceleration")]
+    if windows_cuda_link::is_windows_cuda_build(
+        true,
+        &std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+    ) {
+        prepare_windows_cuda_static_link();
+    }
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     prepare_windows_vulkan_import_library();
     prepare_macos_native_shims();
@@ -41,6 +52,28 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
+    }
+}
+
+#[cfg(feature = "cuda-acceleration")]
+fn prepare_windows_cuda_static_link() {
+    use windows_cuda_link::{WindowsCudaLinkInputs, resolve_windows_cuda_link_args};
+
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
+    let cuda_path = std::env::var_os("CUDA_PATH");
+    let directives = resolve_windows_cuda_link_args(WindowsCudaLinkInputs {
+        target_arch: &target_arch,
+        target_env: &target_env,
+        building_worker: building_worker.as_deref(),
+        cuda_path: cuda_path.as_deref(),
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+
+    for directive in directives {
+        println!("{directive}");
     }
 }
 
