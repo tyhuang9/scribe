@@ -228,6 +228,38 @@ function ConvertTo-WindowsGpuPackHistoryValidatedDocument(
     return ConvertFrom-WindowsGpuPackHistoryJson -Json $json -SourceLabel $Label
 }
 
+function Update-WindowsGpuPackHistorySecurityEpochHighWater(
+    [object[]]$Packs,
+    [System.Collections.Generic.Dictionary[string, uint64]]$HighWater,
+    [string]$Label
+) {
+    # Only normalized packs enter here. Every root in a release is a catalog
+    # member, so a lower-epoch root cannot be treated as inactive rollback data.
+    $releaseEpochs = [System.Collections.Generic.Dictionary[string, uint64]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($pack in $Packs) {
+        $packId = [string]$pack.pack_id
+        $epoch = [uint64]$pack.security_epoch
+        if ($releaseEpochs.ContainsKey($packId) -and
+            $releaseEpochs[$packId] -ne $epoch) {
+            throw "$Label mixes security epochs for one pack ID: $packId"
+        }
+        $releaseEpochs[$packId] = $epoch
+    }
+    foreach ($packId in $releaseEpochs.Keys) {
+        if ($HighWater.ContainsKey($packId) -and
+            $releaseEpochs[$packId] -lt $HighWater[$packId]) {
+            throw "$Label security epoch is below the historical high-water mark for pack ID: $packId"
+        }
+    }
+    # Advance only after the entire row passes. Empty rows deliberately leave
+    # all existing floors intact, and direct UInt64 comparisons avoid overflow.
+    foreach ($packId in $releaseEpochs.Keys) {
+        $HighWater[$packId] = $releaseEpochs[$packId]
+    }
+}
+
 function ConvertFrom-WindowsGpuPackHistoryJson {
     [CmdletBinding()]
     param(
@@ -273,6 +305,9 @@ function ConvertFrom-WindowsGpuPackHistoryJson {
     )
     $catalogIdentities = [System.Collections.Generic.Dictionary[string, string]]::new(
         [System.StringComparer]::Ordinal
+    )
+    $securityEpochHighWater = [System.Collections.Generic.Dictionary[string, uint64]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
     )
     $releases = [System.Collections.Generic.List[object]]::new()
 
@@ -554,6 +589,8 @@ function ConvertFrom-WindowsGpuPackHistoryJson {
             throw "$SourceLabel assigns one catalog byte identity to different pack-root sets."
         }
         $catalogIdentities[$catalogIdentity] = $catalogRootMaterial
+        Update-WindowsGpuPackHistorySecurityEpochHighWater `
+            -Packs $packs.ToArray() -HighWater $securityEpochHighWater -Label $releaseLabel
         $releases.Add([pscustomobject][ordered]@{
             release_id = $releaseId
             source_revision = $sourceRevision
@@ -788,7 +825,13 @@ function Get-WindowsGpuPackRetirementPlan {
     $currentRoots = [System.Collections.Generic.Dictionary[string, object]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
+    $securityEpochHighWater = [System.Collections.Generic.Dictionary[string, uint64]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
     foreach ($release in $history.releases) {
+        Update-WindowsGpuPackHistorySecurityEpochHighWater `
+            -Packs $release.packs -HighWater $securityEpochHighWater `
+            -Label 'Historical Windows GPU pack release'
         foreach ($pack in $release.packs) {
             if (-not $historicalRoots.ContainsKey($pack.root)) {
                 $historicalRoots.Add($pack.root, $pack)
@@ -806,6 +849,9 @@ function Get-WindowsGpuPackRetirementPlan {
         }
         $currentRoots.Add($pack.root, $pack)
     }
+    Update-WindowsGpuPackHistorySecurityEpochHighWater `
+        -Packs $currentRelease.packs -HighWater $securityEpochHighWater `
+        -Label 'Current Windows GPU pack release'
 
     $allFiles = [System.Collections.Generic.Dictionary[string, object]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
