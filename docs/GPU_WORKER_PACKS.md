@@ -747,9 +747,28 @@ Each history row binds a release ID, source revision, exact catalog size and
 SHA-256, canonical pack roots/security epochs, and every payload/control file's
 size and SHA-256. Reusing a root requires an identical inventory. The append-only
 comparison rejects changed, reordered, or removed predecessor rows. Before
-retirement can ship, CI and the protected release path must enforce that
-comparison against the authoritative previous history. The tested comparison
-API alone is not that release gate.
+retirement can ship, the protected release path must enforce that comparison
+against authoritative released history. Repository CI is not that authority.
+
+`scripts/assert-windows-gpu-pack-history-git-append-only.ps1` implements the
+unprivileged repository regression check. It requires exact base/candidate
+40-hex commit IDs and complete ancestry, then reads the fixed history path
+directly from each commit's regular blob. Missing objects/files, shallow
+repositories, non-ancestor inputs, linked entries, invalid UTF-8/BOMs, and
+oversized histories fail; it never substitutes working-tree bytes or `HEAD`.
+Git replacement refs are ignored, local grafts are refused, and lazy fetches
+are disabled. Git subprocesses have bounded deadlines. The dedicated
+`windows-gpu-pack-history.yml` workflow uses the exact PR base or pre-push commit
+and event candidate, with complete history, credential persistence disabled,
+and read-only permissions. This check detects repository regressions; a passing candidate
+workflow does not authorize release, signing, or installed-file deletion.
+
+Protected release-history enforcement remains unimplemented. It needs a
+server-owned durable predecessor, an operator-reviewed historical bootstrap,
+per-pack security-epoch high-water marks, and a checkpoint binding exactly one
+new staging-produced row to the final release. This must include CPU-only
+catalogs as well as GPU releases. Do not reconstruct historical catalog bytes
+using today's generator or treat a caller-supplied predecessor as authority.
 
 The current build is different: its authority comes from freshly verified
 staging, not from a committed history row. Requiring the current pack digest in
@@ -777,10 +796,11 @@ Run the focused checks with:
 
 ```powershell
 ./scripts/test-windows-gpu-pack-history.ps1
+./scripts/test-windows-gpu-pack-history-git.ps1
 ./scripts/test-windows-worker-pack-staging.ps1
 ```
 
-Both also run through the existing CI/local
+All also run through the existing CI/local
 `./scripts/test-windows-release-packaging.ps1` command. Coverage includes skipped
 upgrades, empty pack sets, same-version repair, immutable-root reintroduction,
 zero-byte payloads, malformed/colliding paths, append-only history, exact limit

@@ -1,0 +1,55 @@
+name: Check Windows worker-pack history regression
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-gpu-pack-history.yml'
+      - 'runtime-manifests/gpu-worker-pack-history-windows-x64.json'
+      - 'scripts/windows-gpu-pack-history.ps1'
+      - 'scripts/assert-windows-gpu-pack-history-git-append-only.ps1'
+      - 'scripts/test-windows-gpu-pack-history*.ps1'
+      - 'scripts/test-windows-release-packaging.ps1'
+      - 'docs/GPU_WORKER_PACKS.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-gpu-pack-history.yml'
+      - 'runtime-manifests/gpu-worker-pack-history-windows-x64.json'
+      - 'scripts/windows-gpu-pack-history.ps1'
+      - 'scripts/assert-windows-gpu-pack-history-git-append-only.ps1'
+      - 'scripts/test-windows-gpu-pack-history*.ps1'
+      - 'scripts/test-windows-release-packaging.ps1'
+      - 'docs/GPU_WORKER_PACKS.md'
+
+# Regression enforcement only. This job has no release/signing authority and
+# must never be used as a protected released-history checkpoint.
+permissions:
+  contents: read
+
+jobs:
+  history:
+    name: Compare immutable repository history
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test offline Git-object history comparisons
+        shell: pwsh
+        run: ./scripts/test-windows-gpu-pack-history-git.ps1
+      - name: Compare exact event base and candidate
+        shell: pwsh
+        env:
+          BASE_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checkout = (git --no-replace-objects rev-parse --verify HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $checkout -cne $env:CANDIDATE_REVISION) {
+            throw 'History comparison checkout does not match the exact event candidate.'
+          }
+          & ./scripts/assert-windows-gpu-pack-history-git-append-only.ps1 `
+            -BaseRevision $env:BASE_REVISION -CandidateRevision $env:CANDIDATE_REVISION

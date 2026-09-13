@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 & (Join-Path $PSScriptRoot 'test-windows-gpu-pack-history.ps1')
+& (Join-Path $PSScriptRoot 'test-windows-gpu-pack-history-git.ps1')
 & (Join-Path $PSScriptRoot 'test-windows-worker-pack-staging.ps1')
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -45,6 +46,29 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
         return
     }
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
+}
+
+function Assert-HistoryGitWorkflowContract([string]$Workflow) {
+    foreach ($required in @(
+        'actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09',
+        'ref: ${{ github.sha }}',
+        'fetch-depth: 0',
+        'persist-credentials: false',
+        'contents: read',
+        'timeout-minutes: 10',
+        'run: ./scripts/test-windows-gpu-pack-history-git.ps1',
+        'github.event.pull_request.base.sha || github.event.before',
+        'CANDIDATE_REVISION: ${{ github.sha }}',
+        '$checkout -cne $env:CANDIDATE_REVISION',
+        '-BaseRevision $env:BASE_REVISION -CandidateRevision $env:CANDIDATE_REVISION'
+    )) {
+        if (-not $Workflow.Contains($required)) {
+            throw "Git history regression workflow lost required control: $required"
+        }
+    }
+    if ($Workflow -match 'pull_request_target|secrets\.|contents:\s*write|id-token:|environment:') {
+        throw 'Git history regression workflow must remain unprivileged and separate from release authority.'
+    }
 }
 
 function Assert-InstallerCatalogDeletionContract([string]$Installer) {
@@ -886,6 +910,23 @@ try {
     } "reparse point"
 
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
+    $historyGateWorkflow = Get-Content -Raw -LiteralPath (
+        Join-Path $repositoryRoot '.github/workflows/windows-gpu-pack-history.yml'
+    )
+    Assert-HistoryGitWorkflowContract $historyGateWorkflow
+    foreach ($mutation in @(
+        @('fetch-depth: 0', 'fetch-depth: 1'),
+        @('ref: ${{ github.sha }}', 'ref: main'),
+        @('github.event.pull_request.base.sha || github.event.before', 'github.ref_name'),
+        @('persist-credentials: false', 'persist-credentials: true')
+    )) {
+        Invoke-ExpectedFailure {
+            Assert-HistoryGitWorkflowContract ($historyGateWorkflow.Replace($mutation[0], $mutation[1]))
+        } 'Git history regression workflow lost required control'
+    }
+    Invoke-ExpectedFailure {
+        Assert-HistoryGitWorkflowContract ($historyGateWorkflow + "`nenvironment: production")
+    } 'Git history regression workflow must remain unprivileged'
     Assert-ReleaseCargoFeatureContract $source
     Assert-VulkanSdkWorkflowContract $workflow
     Assert-GpuWorkerPackWorkflowContract $workflow
