@@ -147,6 +147,16 @@ harness precompilation and exact execution, and supplies that digest through
 evidence run. This fixture-only runner behavior neither changes the default-deny
 Auto policy nor makes fixture evidence Auto-eligible.
 
+The separate `scripts/run-windows-cuda-evidence.ps1` contract performs the same
+bounded five-cold and twenty-warm comparison for explicit CUDA versus the fresh
+matching-revision CPU worker. It requires one exact stable NVIDIA PCI binding
+reported as CUDA, NVIDIA, and discrete; binds the source revision, CUDA pack,
+CPU worker SHA-256, model, WAV, and idle `nvidia-smi` baseline; and publishes a
+distinct `windows-cuda-fixture-performance` metadata schema. Consumers must
+retain the independently printed SHA-256 and use
+`Read-ScribeVerifiedCudaEvidenceReport`; the report remains fixture-only,
+untrusted, and ineligible for Auto, production trust, or promotion.
+
 The offline Windows qualification boundary is specified in
 [`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md). It digest-binds
 the evaluator, toolchain, Auto manifest, plan, lane identities, 50 paired run
@@ -526,6 +536,45 @@ $env:SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT = 'ask not'
 $env:SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID = 'native:0000:01:00.0'
 cargo test --features inference-worker verified_vulkan_fixture_pack_scif_model_hardware_smoke -- --ignored --nocapture
 ```
+
+### Matching-release fixture checkpoint (2026-09-13)
+
+On clean `4920b6174de368f44c36cce146ecd5e23e0ab70f`, CUDA Toolkit 12.8.1
+(nvcc 12.8.93) built a release CUDA fixture pack that passed
+`onnx_worker::tests::verified_cuda_fixture_pack_scif_model_hardware_smoke`
+with the matching CPU-only release parent. The NVIDIA RTX 4080 SUPER binding
+was `native:0000:01:00.0`; SCIF reported driver
+`windows-display:32.0.16.1692`. The test asserted CUDA/NVIDIA/discrete identity,
+explicit-GPU model load/transcription, the pinned phrase, warm reuse, and zero
+launches of its fake CPU fallback launcher. One test passed without a worker
+crash. Its 5.36-second whole-test duration is not an inference benchmark.
+
+The CUDA pack version was `fixture-4920b6174de3-cuda1`, digest
+`2a635e8f5602f60463525bedd1a7eac54bc5a683861bb1f279a22ac952299a00`;
+smoke transcript SHA-256 was
+`02b4aaba5d7b0425ae6138aa1c34f6bec7ea341f9895e5cf59d216d422350f8d`.
+The pack contained 1,002,480,309 installed bytes (five files) and measured
+756,719,700 ZIP Optimal bytes. The retained matching-source Vulkan pack measured
+98,881,834 installed bytes (13 files) and 32,107,827 ZIP Optimal bytes. Both
+inventories verified before and after measurement. These are fixture-pack disk
+estimates, not final installer sizes or RAM/VRAM measurements. Size transcript
+SHA-256 was `f610c8c7d9bb9badbbdc5eeae9c44179a56d84dc3ce5eee0fc373cc9ea2e94c0`.
+
+A separate matching-release CPU/Vulkan run completed five cold and twenty warm
+requests per backend, with normalized transcript parity and stable-device
+assertions. Its report SHA-256 is
+`cc1b45487832f5c9e55fbf34555efaa4c6696e54be8761ff6dd2dd0215b20516`;
+consume only through `Read-ScribeVerifiedEvidenceReport` using that independently
+captured digest. Registry request timing excludes initial pack verification,
+provider discovery, route setup, and audio preparation; it is not full app
+startup or representative release qualification. The new CUDA performance
+capture has not run; the CUDA smoke must not be relabeled as timing evidence.
+
+The [PR161 evidence record](https://github.com/tyhuang9/scribe/pull/161) includes
+artifact identities and verification limits. Temporary smoke leases and size
+ZIPs were removed; original packs, logs and matching symbols remain retained.
+No production trust, signing, Auto eligibility, installer, power-policy, device
+loss or broad reliability qualification is established by this checkpoint.
 
 ### Backend-specific fixture smoke tests
 

@@ -36,6 +36,9 @@ on:
       - 'scripts/windows-cuda-sdk-inventory.ps1'
       - 'scripts/windows-gpu-worker-cmake-bootstrap.ps1'
       - 'scripts/windows-vulkan-evidence-preflight.ps1'
+      - 'scripts/run-windows-cuda-evidence.ps1'
+      - 'scripts/test-windows-cuda-evidence.ps1'
+      - 'scripts/windows-cuda-evidence-preflight.ps1'
   pull_request:
     paths:
       - '.github/workflows/windows-gpu-qualification.yml'
@@ -71,6 +74,9 @@ on:
       - 'scripts/windows-cuda-sdk-inventory.ps1'
       - 'scripts/windows-gpu-worker-cmake-bootstrap.ps1'
       - 'scripts/windows-vulkan-evidence-preflight.ps1'
+      - 'scripts/run-windows-cuda-evidence.ps1'
+      - 'scripts/test-windows-cuda-evidence.ps1'
+      - 'scripts/windows-cuda-evidence-preflight.ps1'
 
 permissions:
   contents: read
@@ -85,6 +91,9 @@ jobs:
       - name: Validate Vulkan fixture runner and publication contracts
         shell: pwsh
         run: pwsh -NoProfile -File .\scripts\test-windows-vulkan-evidence.ps1
+      - name: Validate CUDA fixture runner and publication contracts
+        shell: pwsh
+        run: pwsh -NoProfile -File .\scripts\test-windows-cuda-evidence.ps1
       - name: Validate fixture evidence, deterministic math, and default-deny state
         shell: pwsh
         run: pwsh -NoProfile -File .\scripts\test-windows-gpu-qualification.ps1
