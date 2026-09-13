@@ -2953,6 +2953,68 @@ fn verify_worker_executable(
     })
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsVulkanProcessPathIncompatible;
+
+#[cfg(windows)]
+impl std::fmt::Display for WindowsVulkanProcessPathIncompatible {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Windows Vulkan worker process path is incompatible")
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for WindowsVulkanProcessPathIncompatible {}
+
+/// Conservatively admit only rooted local-drive worker paths whose process
+/// representation is no longer than 255 UTF-16 code units. The captured NVIDIA
+/// driver failed at the 255/256 process-representation boundary. This is not a
+/// general Windows long-path policy: the verified canonical path remains the
+/// one passed to `Command`.
+#[cfg(windows)]
+fn windows_vulkan_process_path_is_compatible(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Prefix;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return false;
+    }
+    let verbatim_prefix_units = match prefix.kind() {
+        Prefix::Disk(_) => 0,
+        Prefix::VerbatimDisk(_) => 4,
+        Prefix::UNC(_, _)
+        | Prefix::VerbatimUNC(_, _)
+        | Prefix::Verbatim(_)
+        | Prefix::DeviceNS(_) => {
+            return false;
+        }
+    };
+    wide.len()
+        .checked_sub(verbatim_prefix_units)
+        .is_some_and(|units| {
+            units <= 255 && crate::windows_vulkan_loader::is_strict_windows_local_disk_path(path)
+        })
+}
+
+#[cfg(windows)]
+fn validate_windows_vulkan_process_path(path: &Path) -> Result<()> {
+    if windows_vulkan_process_path_is_compatible(path) {
+        Ok(())
+    } else {
+        Err(WindowsVulkanProcessPathIncompatible.into())
+    }
+}
+
 fn worker_provider_from_pack_backend(backend: PackBackend) -> WorkerProvider {
     match backend {
         PackBackend::Cuda => WorkerProvider::Cuda,
@@ -3080,6 +3142,10 @@ fn resolve_verified_pack_executable(
         .file_name()
         .ok_or_else(|| anyhow!("GPU worker pack executable has no filename"))?;
     let mut executable = verify_worker_executable(worker_path, root, name, expected_sha256)?;
+    #[cfg(windows)]
+    if pack.backend == PackBackend::Vulkan {
+        validate_windows_vulkan_process_path(&executable.path)?;
+    }
     #[cfg(unix)]
     let unix_exec_authority =
         crate::gpu_worker_pack::UnixPackExecAuthority::from_verified_pack_lease(Arc::clone(&lease))
@@ -6845,11 +6911,24 @@ fn discover_pack_launch_bindings_with_budget(
                     }
                 }
             }
-            Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::ProviderProbeRejected,
-                &probe.pack_id,
-                probe.backend,
-            )),
+            Err(_error) => {
+                #[cfg(windows)]
+                let issue = if _error
+                    .downcast_ref::<WindowsVulkanProcessPathIncompatible>()
+                    .is_some()
+                {
+                    PackDiscoveryIssue::VulkanProcessPathIncompatible
+                } else {
+                    PackDiscoveryIssue::ProviderProbeRejected
+                };
+                #[cfg(not(windows))]
+                let issue = PackDiscoveryIssue::ProviderProbeRejected;
+                diagnostics.push(PackDiscoveryDiagnostic::pack(
+                    issue,
+                    &probe.pack_id,
+                    probe.backend,
+                ));
+            }
         }
         if probe.supervisor.retire().is_err() {
             diagnostics.push(PackDiscoveryDiagnostic::pack(
@@ -10667,6 +10746,28 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum PackProbeLaunchFailure {
+        VulkanProcessPathIncompatible,
+        Other,
+    }
+
+    #[cfg(windows)]
+    struct FailingPackProbeLauncher(PackProbeLaunchFailure);
+
+    #[cfg(windows)]
+    impl WorkerLauncher for FailingPackProbeLauncher {
+        fn launch(&self) -> Result<SpawnedWorker> {
+            match self.0 {
+                PackProbeLaunchFailure::VulkanProcessPathIncompatible => {
+                    Err(WindowsVulkanProcessPathIncompatible.into())
+                }
+                PackProbeLaunchFailure::Other => bail!("injected generic pack probe failure"),
+            }
+        }
+    }
+
     fn read_parent_control(input: &mut impl Read) -> (u64, u64, Control) {
         parse_parent_control(read_frame(input).unwrap()).unwrap()
     }
@@ -12078,6 +12179,82 @@ mod tests {
                     .iter()
                     .all(|(name, value)| name != stripped || value.is_none()),
                 "worker inherited forbidden environment variable {stripped}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vulkan_process_path_compatibility_counts_utf16_without_rewriting() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let disk_short = PathBuf::from(r"C:\Scribe\worker.exe");
+        let verbatim_short = PathBuf::from(r"\\?\C:\Scribe\worker.exe");
+        let disk_255 = PathBuf::from(format!(r"C:\{}", "x".repeat(252)));
+        let disk_256 = PathBuf::from(format!(r"C:\{}", "x".repeat(253)));
+        let verbatim_255 = PathBuf::from(format!(r"\\?\C:\{}", "x".repeat(252)));
+        let verbatim_256 = PathBuf::from(format!(r"\\?\C:\{}", "x".repeat(253)));
+        let unicode_255 = PathBuf::from(format!("C:\\{}\u{1f600}", "\u{00e9}".repeat(250)));
+        let unicode_256 = PathBuf::from(format!("C:\\{}\u{1f600}", "\u{00e9}".repeat(251)));
+
+        assert_eq!(disk_255.as_os_str().encode_wide().count(), 255);
+        assert_eq!(disk_256.as_os_str().encode_wide().count(), 256);
+        assert_eq!(verbatim_255.as_os_str().encode_wide().count(), 259);
+        assert_eq!(verbatim_256.as_os_str().encode_wide().count(), 260);
+        assert_eq!(unicode_255.as_os_str().encode_wide().count(), 255);
+        assert_eq!(unicode_256.as_os_str().encode_wide().count(), 256);
+        assert!(windows_vulkan_process_path_is_compatible(&disk_short));
+        assert!(windows_vulkan_process_path_is_compatible(&verbatim_short));
+        assert!(windows_vulkan_process_path_is_compatible(&disk_255));
+        assert!(windows_vulkan_process_path_is_compatible(&verbatim_255));
+        assert!(windows_vulkan_process_path_is_compatible(&unicode_255));
+        assert!(!windows_vulkan_process_path_is_compatible(&disk_256));
+        assert!(!windows_vulkan_process_path_is_compatible(&verbatim_256));
+        assert!(!windows_vulkan_process_path_is_compatible(&unicode_256));
+        assert!(
+            validate_windows_vulkan_process_path(&disk_256)
+                .unwrap_err()
+                .downcast_ref::<WindowsVulkanProcessPathIncompatible>()
+                .is_some()
+        );
+
+        let original = verbatim_short.clone();
+        validate_windows_vulkan_process_path(&verbatim_short).unwrap();
+        assert_eq!(verbatim_short, original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vulkan_process_path_compatibility_rejects_nul_and_nonstandard_paths() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let nul = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'w' as u16,
+            0,
+            b'r' as u16,
+        ]));
+        assert!(!windows_vulkan_process_path_is_compatible(&nul));
+        for path in [
+            Path::new(r"C:relative\worker.exe"),
+            Path::new(r"\\server\share\worker.exe"),
+            Path::new(r"\\?\UNC\server\share\worker.exe"),
+            Path::new(r"\\.\COM1"),
+            Path::new(r"\\?\GLOBALROOT\Device\worker.exe"),
+            Path::new(r"\\?\C:\Scribe\Pack.\worker.exe"),
+            Path::new(r"\\?\C:\Scribe\Pack \worker.exe"),
+            Path::new(r"\\?\C:\Scribe\.\worker.exe"),
+            Path::new(r"\\?\C:\Scribe\..\worker.exe"),
+            Path::new(r"\\?\C:\Scribe\\worker.exe"),
+            Path::new(r"\\?\C:\Scribe\CON\worker.exe"),
+            Path::new(r"\\?\C:\Scribe\COM¹\worker.exe"),
+        ] {
+            assert!(
+                !windows_vulkan_process_path_is_compatible(path),
+                "must reject nonstandard Windows path: {}",
+                path.display()
             );
         }
     }
@@ -16279,6 +16456,110 @@ mod tests {
             ),
             GpuRouteCatalogLookup::Successful(catalog) if catalog.routes.len() == 2
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vulkan_path_incompatibility_reaches_no_route_planning_without_health_failure() {
+        let supervisor = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(FailingPackProbeLauncher(
+                    PackProbeLaunchFailure::VulkanProcessPathIncompatible,
+                )),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let registry = discover_pack_launch_bindings_with_budget(
+            vec![PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-vulkan-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Vulkan,
+                supervisor: supervisor.clone(),
+            }],
+            Vec::new(),
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(supervisor.transport.current_generation().unwrap(), None);
+        let catalog =
+            verified_gpu_route_catalog(registry, "windows-vulkan-path-incompatibility".to_owned());
+        assert!(catalog.routes.is_empty());
+        assert!(!catalog.provider_probe_incomplete);
+        assert_eq!(
+            catalog.diagnostic.as_deref(),
+            Some(
+                "Vulkan pack scribe-vulkan-windows-x64 requires a short, standard local Windows installation path"
+            )
+        );
+
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let mut inference = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
+        );
+        inference.gpu_routes_for_testing = Some(catalog);
+        let artifact = missing_gguf_artifact();
+
+        let explicit_plan = inference
+            .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+            .unwrap();
+        assert!(explicit_plan.routes.is_empty());
+        assert!(explicit_plan.diagnostic.is_some_and(|diagnostic| {
+            diagnostic.contains("short, standard local Windows installation path")
+        }));
+        let explicit_error = inference
+            .load(artifact.clone(), AccelerationPreference::Gpu)
+            .unwrap_err()
+            .to_string();
+        assert!(explicit_error.contains("short, standard local Windows installation path"));
+        assert!(explicit_error.contains("CPU fallback is forbidden for explicit GPU"));
+
+        let auto_plan = inference
+            .routes_for_preference(AccelerationPreference::Auto, &artifact)
+            .unwrap();
+        assert_eq!(auto_plan.routes.len(), 1);
+        assert_eq!(auto_plan.routes[0].provider, WorkerProvider::Cpu);
+        assert!(auto_plan.health.is_none());
+        assert!(auto_plan.diagnostic.is_some_and(|diagnostic| {
+            diagnostic.contains("short, standard local Windows installation path")
+        }));
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert!(inference.gpu_routes.lock().unwrap().failed.is_none());
+        assert!(inference.auto_gpu_routes.lock().unwrap().failed.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_pack_probe_failures_remain_generic_provider_probe_rejections() {
+        let supervisor = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(FailingPackProbeLauncher(PackProbeLaunchFailure::Other)),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let registry = discover_pack_launch_bindings_with_budget(
+            vec![PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-cuda-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Cuda,
+                supervisor,
+            }],
+            Vec::new(),
+            Duration::from_secs(1),
+        );
+
+        let (bindings, diagnostics) = registry.into_parts();
+        assert!(bindings.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].issue,
+            crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
+        );
     }
 
     #[test]
