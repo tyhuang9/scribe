@@ -30,7 +30,10 @@ function ConvertTo-AuthenticatedCudaInventory(
 
         $relative = ([string]$authenticated.path).Replace('\', '/')
         $sha256 = [string]$authenticated.sha256
-        if ($relative -cnotmatch '^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$' -or
+        $segments = @($relative -split '/')
+        $hasDotSegment = $segments -contains '.' -or $segments -contains '..'
+        if ($relative -cnotmatch '\A[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\z' -or
+            $hasDotSegment -or
             -not $caseInsensitivePaths.Add($relative) -or
             $sha256 -cnotmatch '^[0-9a-f]{64}$') {
             throw "Production CUDA inventory contains a duplicate, unsafe, or noncanonical entry: $relative"
