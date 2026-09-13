@@ -88,6 +88,14 @@ report script validates this schema and emits its deterministic evidence summary
 in Windows CI. A malformed, noncanonical, wrong-platform, unknown-field, or
 nonmatching entry denies Auto GPU use.
 
+The canonical Windows Vulkan evidence runner builds and runs its parent harness
+with Cargo's `--release` profile. It immediately anchors the verified
+single-link release CPU worker's lowercase SHA-256, rehashes it before both
+harness precompilation and exact execution, and supplies that digest through
+`SCRIBE_BUNDLED_WORKER_SHA256`; a changed worker or worker-build mode fails the
+evidence run. This fixture-only runner behavior neither changes the default-deny
+Auto policy nor makes fixture evidence Auto-eligible.
+
 The offline Windows qualification boundary is specified in
 [`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md). It digest-binds
 the evaluator, toolchain, Auto manifest, plan, lane identities, 50 paired run
