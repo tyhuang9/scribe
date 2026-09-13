@@ -13582,9 +13582,8 @@ mod tests {
         end_to_end: VulkanEvidenceStatistics,
         backend_processing_ms: Vec<u64>,
         backend_processing: VulkanEvidenceStatistics,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        // The strict evidence schema requires explicit nulls for warm runs.
         model_load_ms: Option<Vec<u64>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         model_load: Option<VulkanEvidenceStatistics>,
     }
 
@@ -14136,6 +14135,37 @@ mod tests {
         assert_eq!(std::fs::read(&partial_output).unwrap(), b"{");
         assert!(!final_output.exists());
         std::fs::remove_dir_all(root).unwrap();
+
+        // Assert the actual writer's exact run-set shape. In particular, absent
+        // warm-load keys are not equivalent to the consumer's required nulls.
+        let serialized: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for backend in ["cpu", "vulkan"] {
+            let runs = serialized.get(backend).unwrap();
+            assert_eq!(
+                runs.get("cold"),
+                Some(&serde_json::json!({
+                    "end_to_end_ms": vec![10; 5],
+                    "end_to_end": { "p50_ms": 10, "p95_ms": 10 },
+                    "backend_processing_ms": vec![9; 5],
+                    "backend_processing": { "p50_ms": 9, "p95_ms": 9 },
+                    "model_load_ms": vec![1; 5],
+                    "model_load": { "p50_ms": 1, "p95_ms": 1 }
+                })),
+                "{backend} cold report schema"
+            );
+            assert_eq!(
+                runs.get("warm"),
+                Some(&serde_json::json!({
+                    "end_to_end_ms": vec![8; 20],
+                    "end_to_end": { "p50_ms": 8, "p95_ms": 8 },
+                    "backend_processing_ms": vec![7; 20],
+                    "backend_processing": { "p50_ms": 7, "p95_ms": 7 },
+                    "model_load_ms": null,
+                    "model_load": null
+                })),
+                "{backend} warm report schema"
+            );
+        }
     }
 
     #[cfg(windows)]
