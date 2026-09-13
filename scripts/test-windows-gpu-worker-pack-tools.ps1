@@ -1411,6 +1411,7 @@ New-Item -ItemType Directory -Path $cudaSdkRoot | Out-Null
 try {
     $cudaInventoryPaths = @(
         'bin/nvcc.exe',
+        'bin/cudafe++.exe',
         'include/cuda.h',
         'lib/x64/cudart_static.lib',
         'lib/x64/cublas.lib',
@@ -1529,6 +1530,76 @@ try {
         $wrongCudaHashRejected = $_.Exception.Message.Contains('SHA-256 mismatch')
     }
     Assert-True $wrongCudaHashRejected 'Production CUDA inventory accepted an altered file hash.'
+
+    $wrongCudafeHashInventory = @($cudaInventory | ForEach-Object {
+        [pscustomobject]@{
+            path = $_.path
+            sha256 = if ($_.path -ceq 'bin/cudafe++.exe') { '0' * 64 } else { $_.sha256 }
+        }
+    })
+    $wrongCudafeHashRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $wrongCudafeHashInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $wrongCudafeHashRejected = $_.Exception.Message.Contains('SHA-256 mismatch')
+    }
+    Assert-True $wrongCudafeHashRejected 'Production CUDA inventory accepted an altered cudafe++ hash.'
+
+    foreach ($malformedPlusCudaPath in @(
+        'bin/cudafe++.exe:stream',
+        'bin/cudafe++?.exe',
+        '/bin/cudafe++.exe',
+        'bin//cudafe++.exe',
+        'bin/cudafe++ .exe',
+        'bin/cudafe++.exe ',
+        "bin/cudafe++.exe`n",
+        "bin/cudafe++.exe`r`n",
+        'bin/./cudafe++.exe',
+        'bin/../cudafe++.exe'
+    )) {
+        $malformedPlusCudaPathRejected = $false
+        try {
+            $null = ConvertTo-AuthenticatedCudaInventory `
+                @([pscustomobject]@{
+                    path = $malformedPlusCudaPath
+                    sha256 = '0' * 64
+                }) `
+                @()
+        }
+        catch {
+            $malformedPlusCudaPathRejected = $_.Exception.Message.Contains(
+                'duplicate, unsafe, or noncanonical entry'
+            )
+        }
+        Assert-True $malformedPlusCudaPathRejected `
+            "Production CUDA inventory accepted malformed plus-bearing path: $malformedPlusCudaPath"
+    }
+
+    $caseCollidingPlusCudaInventory = @($cudaInventory) + @(
+        [pscustomobject]@{
+            path = 'bin/CUDAFE++.EXE'
+            sha256 = ($cudaInventory | Where-Object {
+                $_.path -ceq 'bin/cudafe++.exe'
+            }).sha256
+        }
+    )
+    $caseCollidingPlusCudaInventoryRejected = $false
+    try {
+        $null = ConvertTo-AuthenticatedCudaInventory `
+            $caseCollidingPlusCudaInventory `
+            @()
+    }
+    catch {
+        $caseCollidingPlusCudaInventoryRejected = $_.Exception.Message.Contains(
+            'duplicate, unsafe, or noncanonical entry'
+        )
+    }
+    Assert-True $caseCollidingPlusCudaInventoryRejected `
+        'Production CUDA inventory accepted case-colliding cudafe++ paths.'
 
     $missingCudaFile = Join-Path $cudaSdkRoot 'docs\license.txt'
     Remove-Item -LiteralPath $missingCudaFile -Force
