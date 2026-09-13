@@ -665,6 +665,235 @@ foreach ($packTargetMutation in $packTargetMutations.GetEnumerator()) {
     if ($null -eq $mutationFailure) { throw "Vulkan pack-build mutation was accepted: $($packTargetMutation.Key)" }
 }
 Write-Output 'Vulkan pack-build target forwarding tests passed (4 mutations).'
+function Get-ScribeEvidenceReleaseHarnessBlocks([string]$RunnerSource, [string]$CaseName) {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($RunnerSource, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw "Release harness case '$CaseName' did not parse." }
+
+    $pinnedInvocations = @($ast.FindAll({
+        param($Ast)
+        if ($Ast -isnot [Management.Automation.Language.CommandAst] -or
+            $Ast.GetCommandName() -cne 'Invoke-ScribeEvidenceWithPinnedMsvcEnvironment') {
+            return $false
+        }
+        $elements = @($Ast.CommandElements)
+        return $elements.Count -eq 3 -and
+            $elements[1].Extent.Text -ceq '$pinnedMsvcEnvironment' -and
+            $elements[2] -is [Management.Automation.Language.ScriptBlockExpressionAst]
+    }, $true))
+    $phases = [System.Collections.Generic.List[psobject]]::new()
+    foreach ($invocation in $pinnedInvocations) {
+        $block = $invocation.CommandElements[2].ScriptBlock
+        $precompile = @($block.FindAll({
+            param($Ast)
+            $Ast -is [Management.Automation.Language.CommandAst] -and
+                $Ast.GetCommandName() -ceq 'Invoke-ScribeEvidenceCargoWithCmakeRetry' -and
+                $Ast.Extent.Text -match "'--no-run'"
+        }, $true))
+        $execution = @($block.FindAll({
+            param($Ast)
+            $Ast -is [Management.Automation.Language.CommandAst] -and
+                $Ast.GetCommandName() -ceq 'Invoke-ScribeEvidence' -and
+                $Ast.Extent.Text -match "'--ignored'"
+        }, $true))
+        if ($precompile.Count -eq 1) {
+            $phases.Add([pscustomobject]@{ Name = 'precompile'; Invocation = $invocation; Block = $block; Command = $precompile[0] }) | Out-Null
+        }
+        if ($execution.Count -eq 1) {
+            $phases.Add([pscustomobject]@{ Name = 'execution'; Invocation = $invocation; Block = $block; Command = $execution[0] }) | Out-Null
+        }
+    }
+    if ($phases.Count -ne 2 -or
+        @($phases | Where-Object Name -ceq 'precompile').Count -ne 1 -or
+        @($phases | Where-Object Name -ceq 'execution').Count -ne 1) {
+        throw "Release harness case '$CaseName' must contain exactly one pinned precompile and one pinned execution block."
+    }
+
+    foreach ($phase in $phases) {
+        $blockText = $phase.Block.Extent.Text
+        $modeAt = $blockText.IndexOf('Set-ScribeEvidenceWorkerBuildMode $false', [StringComparison]::Ordinal)
+        $rehashAt = $blockText.IndexOf('$observedCpuWorkerDigest = (Get-FileHash -LiteralPath $cpuWorker -Algorithm SHA256).Hash.ToLowerInvariant()', [StringComparison]::Ordinal)
+        $absenceAt = $blockText.IndexOf('if ($null -ne $env:SCRIBE_BUILDING_WORKER)', [StringComparison]::Ordinal)
+        $bindingAt = $blockText.IndexOf('$env:SCRIBE_BUNDLED_WORKER_SHA256 = $cpuWorkerDigest', [StringComparison]::Ordinal)
+        $cargoAt = $blockText.IndexOf($phase.Command.Extent.Text, [StringComparison]::Ordinal)
+        if ($modeAt -lt 0 -or $rehashAt -le $modeAt -or $absenceAt -le $rehashAt -or
+            $bindingAt -le $absenceAt -or $cargoAt -le $bindingAt -or
+            @([regex]::Matches($blockText, [regex]::Escape("'--release'"))).Count -ne 1) {
+            throw "Release harness case '$CaseName' lost the ordered $($phase.Name) CPU digest binding."
+        }
+    }
+
+    $cpuWorkerAt = $RunnerSource.IndexOf('$cpuWorker = Assert-ScribeEvidenceSingleLinkFile', [StringComparison]::Ordinal)
+    $cpuDigestAt = $RunnerSource.IndexOf('$cpuWorkerDigest = (Get-FileHash -LiteralPath $cpuWorker -Algorithm SHA256).Hash.ToLowerInvariant()', [StringComparison]::Ordinal)
+    $packAt = $RunnerSource.IndexOf('$packRoot = Join-Path $workRoot', [StringComparison]::Ordinal)
+    if ($cpuWorkerAt -lt 0 -or $cpuDigestAt -le $cpuWorkerAt -or $packAt -le $cpuDigestAt) {
+        throw "Release harness case '$CaseName' did not immediately anchor the materialized CPU worker digest."
+    }
+    return [pscustomobject]@{
+        Precompile = @($phases | Where-Object Name -ceq 'precompile')[0]
+        Execution = @($phases | Where-Object Name -ceq 'execution')[0]
+    }
+}
+
+$releaseHarnessBlocks = Get-ScribeEvidenceReleaseHarnessBlocks $runner 'production'
+$releaseHarnessMutations = [ordered]@{
+    'release-removed' = $runner.Replace(", '--release'", '')
+    'digest-binding-removed' = $runner.Replace('$env:SCRIBE_BUNDLED_WORKER_SHA256 = $cpuWorkerDigest', '')
+    'rehash-bypassed' = $runner.Replace('$observedCpuWorkerDigest = (Get-FileHash -LiteralPath $cpuWorker -Algorithm SHA256).Hash.ToLowerInvariant()', '$observedCpuWorkerDigest = $cpuWorkerDigest')
+}
+foreach ($releaseHarnessMutation in $releaseHarnessMutations.GetEnumerator()) {
+    $mutationFailure = $null
+    try { $null = Get-ScribeEvidenceReleaseHarnessBlocks $releaseHarnessMutation.Value $releaseHarnessMutation.Key }
+    catch { $mutationFailure = $_.Exception }
+    if ($null -eq $mutationFailure) { throw "Release harness mutation was accepted: $($releaseHarnessMutation.Key)" }
+}
+
+$releaseHarnessMockedFunctions = @(
+    'Get-FileHash',
+    'Invoke-ScribeEvidenceWithPinnedMsvcEnvironment',
+    'Invoke-ScribeEvidenceCargoWithCmakeRetry',
+    'Invoke-ScribeEvidence'
+)
+$releaseHarnessOriginalFunctions = @{}
+foreach ($name in $releaseHarnessMockedFunctions) {
+    $existing = Get-Item -LiteralPath "Function:$name" -ErrorAction SilentlyContinue
+    $releaseHarnessOriginalFunctions[$name] = $existing
+}
+$previousReleaseHarnessDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
+$previousReleaseHarnessMode = $env:SCRIBE_BUILDING_WORKER
+$previousReleaseHarnessTarget = $env:CARGO_TARGET_DIR
+try {
+    $script:ReleaseHarnessHash = 'c' * 64 -join ''
+    $script:ReleaseHarnessHashCalls = [System.Collections.Generic.List[psobject]]::new()
+    $script:ReleaseHarnessPrecompileCalls = [System.Collections.Generic.List[psobject]]::new()
+    $script:ReleaseHarnessExecutionCalls = [System.Collections.Generic.List[psobject]]::new()
+    $script:ReleaseHarnessPinnedCalls = [System.Collections.Generic.List[psobject]]::new()
+    function Get-FileHash {
+        param([string]$LiteralPath, [string]$Algorithm)
+        $script:ReleaseHarnessHashCalls.Add([pscustomobject]@{
+                Path = $LiteralPath
+                Algorithm = $Algorithm
+            }) | Out-Null
+        return [pscustomobject]@{ Hash = $script:ReleaseHarnessHash }
+    }
+    function Invoke-ScribeEvidenceWithPinnedMsvcEnvironment {
+        param([System.Collections.IDictionary]$Environment, [scriptblock]$Operation)
+        $script:ReleaseHarnessPinnedCalls.Add([pscustomobject]@{ Environment = $Environment }) | Out-Null
+        & $Operation
+    }
+    function Invoke-ScribeEvidenceCargoWithCmakeRetry {
+        param([string[]]$Arguments, [string]$Failure, [string]$CargoTarget, [string]$BuildEnvironment)
+        $script:ReleaseHarnessPrecompileCalls.Add([pscustomobject]@{
+                Arguments = @($Arguments)
+                WorkerMode = $env:SCRIBE_BUILDING_WORKER
+                WorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
+                CargoTarget = $CargoTarget
+                BuildEnvironment = $BuildEnvironment
+            }) | Out-Null
+    }
+    function Invoke-ScribeEvidence {
+        param([string]$Exe, [string[]]$Arguments, [string]$Failure)
+        $script:ReleaseHarnessExecutionCalls.Add([pscustomobject]@{
+                Exe = $Exe
+                Arguments = @($Arguments)
+                WorkerMode = $env:SCRIBE_BUILDING_WORKER
+                WorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
+            }) | Out-Null
+    }
+
+    $cpuWorker = 'C:\scribe-evidence-test\cpu-worker.exe'
+    $cpuWorkerDigest = $script:ReleaseHarnessHash
+    $pinnedMsvcEnvironment = [ordered]@{ PATH = 'pinned' }
+    $env:CARGO_TARGET_DIR = 'C:\scribe-evidence-test\harness-target'
+    $harnessBuildEnvironment = 'C:\scribe-evidence-test\harness-environment'
+    $cargo = 'cargo.exe'
+    $expectedPrecompileArguments = @(
+        'test', '--locked', '--offline', '--release', '--features', 'inference-worker',
+        'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run'
+    )
+    $expectedExecutionArguments = @(
+        'test', '--locked', '--offline', '--release', '--features', 'inference-worker',
+        'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs',
+        '--', '--ignored', '--exact', '--test-threads=1'
+    )
+
+    $env:SCRIBE_BUILDING_WORKER = 'ambient-precompile'
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = 'a' * 64 -join ''
+    & ([scriptblock]::Create($releaseHarnessBlocks.Precompile.Invocation.Extent.Text))
+    $env:SCRIBE_BUILDING_WORKER = 'ambient-execution'
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = 'b' * 64 -join ''
+    & ([scriptblock]::Create($releaseHarnessBlocks.Execution.Invocation.Extent.Text))
+    if ($script:ReleaseHarnessHashCalls.Count -ne 2 -or
+        $script:ReleaseHarnessPrecompileCalls.Count -ne 1 -or
+        $script:ReleaseHarnessExecutionCalls.Count -ne 1 -or
+        $script:ReleaseHarnessPinnedCalls.Count -ne 2) {
+        throw 'Release harness did not rehash and invoke each pinned phase exactly once.'
+    }
+    foreach ($hashCall in $script:ReleaseHarnessHashCalls) {
+        if ($hashCall.Path -cne $cpuWorker -or $hashCall.Algorithm -cne 'SHA256') {
+            throw 'Release harness did not rehash the exact materialized CPU worker.'
+        }
+    }
+    $precompileCall = $script:ReleaseHarnessPrecompileCalls[0]
+    $executionCall = $script:ReleaseHarnessExecutionCalls[0]
+    foreach ($actualCall in @($precompileCall, $executionCall)) {
+        if ($null -ne $actualCall.WorkerMode -or $actualCall.WorkerDigest -cne $cpuWorkerDigest) {
+            throw 'Release harness did not bind the exact CPU digest outside worker-build mode.'
+        }
+    }
+    foreach ($expected in @(
+        [pscustomobject]@{ Actual = $precompileCall.Arguments; Expected = $expectedPrecompileArguments; Label = 'precompile' },
+        [pscustomobject]@{ Actual = $executionCall.Arguments; Expected = $expectedExecutionArguments; Label = 'execution' }
+    )) {
+        if ($expected.Actual.Count -ne $expected.Expected.Count) { throw "Release harness $($expected.Label) argument count changed." }
+        for ($index = 0; $index -lt $expected.Expected.Count; $index++) {
+            if ($expected.Actual[$index] -cne $expected.Expected[$index]) {
+                throw "Release harness $($expected.Label) argument changed at index $index."
+            }
+        }
+    }
+
+    $script:ReleaseHarnessHash = 'd' * 64 -join ''
+    $env:SCRIBE_BUILDING_WORKER = 'ambient-precompile-change'
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = 'e' * 64 -join ''
+    $precompileFailure = $null
+    try { & ([scriptblock]::Create($releaseHarnessBlocks.Precompile.Invocation.Extent.Text)) } catch { $precompileFailure = $_.Exception.Message }
+    if ($precompileFailure -cne 'Materialized CPU worker changed before Vulkan evidence test precompilation.' -or
+        $script:ReleaseHarnessPrecompileCalls.Count -ne 1) {
+        throw 'Release harness did not reject a changed CPU worker before precompile Cargo.'
+    }
+
+    $script:ReleaseHarnessHash = 'f' * 64 -join ''
+    $env:SCRIBE_BUILDING_WORKER = 'ambient-execution-change'
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = '0' * 64 -join ''
+    $executionFailure = $null
+    try { & ([scriptblock]::Create($releaseHarnessBlocks.Execution.Invocation.Extent.Text)) } catch { $executionFailure = $_.Exception.Message }
+    if ($executionFailure -cne 'Materialized CPU worker changed before exact Vulkan evidence execution.' -or
+        $script:ReleaseHarnessExecutionCalls.Count -ne 1) {
+        throw 'Release harness did not reject a changed CPU worker before exact evidence Cargo.'
+    }
+}
+finally {
+    foreach ($name in $releaseHarnessMockedFunctions) {
+        $original = $releaseHarnessOriginalFunctions[$name]
+        if ($null -eq $original) {
+            Remove-Item -LiteralPath "Function:$name" -ErrorAction SilentlyContinue
+        }
+        else {
+            Set-Item -LiteralPath "Function:$name" -Value $original.ScriptBlock
+        }
+    }
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousReleaseHarnessDigest
+    $env:SCRIBE_BUILDING_WORKER = $previousReleaseHarnessMode
+    $env:CARGO_TARGET_DIR = $previousReleaseHarnessTarget
+}
+if ($env:SCRIBE_BUNDLED_WORKER_SHA256 -cne $previousReleaseHarnessDigest -or
+    $env:SCRIBE_BUILDING_WORKER -cne $previousReleaseHarnessMode -or
+    $env:CARGO_TARGET_DIR -cne $previousReleaseHarnessTarget) {
+    throw 'Release harness test seam leaked its process environment.'
+}
+Write-Output 'Vulkan release-harness CPU digest tests passed (3 mutations).'
 $runnerRetryFunction = $runnerAst.Find({
     param($Ast)
     $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and

@@ -341,6 +341,8 @@ try {
     New-Item -ItemType Directory -Path $cpuBundle | Out-Null
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\scribe-inference-worker.exe') -Destination (Join-Path $cpuBundle 'scribe-inference-worker.exe')
     $cpuWorker = Assert-ScribeEvidenceSingleLinkFile (Join-Path $cpuBundle 'scribe-inference-worker.exe') 'Materialized CPU worker' (512MB) $trustedFsutil
+    $cpuWorkerDigest = (Get-FileHash -LiteralPath $cpuWorker -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($cpuWorkerDigest -cnotmatch '^[0-9a-f]{64}$') { throw 'Materialized CPU worker SHA-256 is not canonical.' }
     $packRoot = Join-Path $workRoot 'fixture-vulkan-pack'
     $packVersion = New-ScribeEvidenceFixturePackVersion $revision ([guid]::NewGuid().ToString('N').Substring(0, 12))
     & $packBuilder -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive -VulkanSourceArchiveDirectory $VulkanSourceArchiveDirectory -CargoTargetDirectory (New-ScribeEvidenceShortCargoTarget 'vulkan')
@@ -362,7 +364,11 @@ try {
     $env:LOCALAPPDATA = $harnessBuildEnvironment
     Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
         Set-ScribeEvidenceWorkerBuildMode $false
-        Invoke-ScribeEvidenceCargoWithCmakeRetry @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.' $env:CARGO_TARGET_DIR $harnessBuildEnvironment
+        $observedCpuWorkerDigest = (Get-FileHash -LiteralPath $cpuWorker -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($observedCpuWorkerDigest -cne $cpuWorkerDigest) { throw 'Materialized CPU worker changed before Vulkan evidence test precompilation.' }
+        if ($null -ne $env:SCRIBE_BUILDING_WORKER) { throw 'Vulkan evidence test precompilation must not use worker-build mode.' }
+        $env:SCRIBE_BUNDLED_WORKER_SHA256 = $cpuWorkerDigest
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('test', '--locked', '--offline', '--release', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.' $env:CARGO_TARGET_DIR $harnessBuildEnvironment
     }
     $baseline = Get-ScribeVulkanEvidenceNvidiaBaseline $ExpectedStableDevice $trustedNvidiaSmi
     $env:SCRIBE_VULKAN_EVIDENCE_PACK_ROOT = $packRoot
@@ -377,7 +383,11 @@ try {
     $env:SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON = $baseline | ConvertTo-Json -Compress
     Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
         Set-ScribeEvidenceWorkerBuildMode $false
-        Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
+        $observedCpuWorkerDigest = (Get-FileHash -LiteralPath $cpuWorker -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($observedCpuWorkerDigest -cne $cpuWorkerDigest) { throw 'Materialized CPU worker changed before exact Vulkan evidence execution.' }
+        if ($null -ne $env:SCRIBE_BUILDING_WORKER) { throw 'Exact Vulkan evidence execution must not use worker-build mode.' }
+        $env:SCRIBE_BUNDLED_WORKER_SHA256 = $cpuWorkerDigest
+        Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--release', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
     }
 }
 catch {
