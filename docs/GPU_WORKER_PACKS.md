@@ -750,6 +750,21 @@ comparison rejects changed, reordered, or removed predecessor rows. Before
 retirement can ship, the protected release path must enforce that comparison
 against authoritative released history. Repository CI is not that authority.
 
+The parser also enforces a per-pack-ID unsigned 64-bit security-epoch high-water
+mark across release rows. Equality and increases are allowed; a later release
+cannot go below a previously seen epoch, even after CPU-only releases or a
+backend's absence. The planner applies the same floor to the current staged
+catalog, including exact historical-root or release-row reuse. Replaying an
+older row is not an idempotent repair if a later row has raised that pack's floor.
+
+Multiple roots for one pack ID may share an epoch within a release, but mixed
+epochs for the same ID are rejected regardless of root ordering. Every listed
+root belongs to that release's selectable catalog; this schema has no separate
+inactive/retained role. Previous immutable rows still preserve older inventories
+without making those packs current again. CUDA and Vulkan floors are independent.
+These checks validate supplied history; they do not create a protected,
+persistent release authority or change runtime trust, rollback, or Auto policy.
+
 `scripts/assert-windows-gpu-pack-history-git-append-only.ps1` implements the
 unprivileged repository regression check. It requires exact base/candidate
 40-hex commit IDs and complete ancestry, then reads the fixed history path
@@ -805,6 +820,8 @@ All also run through the existing CI/local
 upgrades, empty pack sets, same-version repair, immutable-root reintroduction,
 zero-byte payloads, malformed/colliding paths, append-only history, exact limit
 boundaries, nonempty generated identities, and culture/input-order invariance.
+Epoch tests cover decreases across absent/CPU-only releases, same-ID mixed
+epochs, exact old-row replay, independent pack IDs, and the full UInt64 boundary.
 Staging fixtures exercise serialization after verification; they do not replace
 the signed-pack verifier's tamper tests.
 

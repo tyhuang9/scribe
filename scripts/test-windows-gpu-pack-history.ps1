@@ -41,7 +41,8 @@ function New-TestPack {
         [string]$Version,
         [char]$DigestCharacter,
         [char]$FileHashCharacter = $DigestCharacter,
-        [string[]]$AdditionalRelativeFiles = @()
+        [string[]]$AdditionalRelativeFiles = @(),
+        [uint64]$SecurityEpoch = 1
     )
     $packId = "scribe-$Backend-windows-x64"
     $digest = Get-TestDigest $DigestCharacter
@@ -72,7 +73,7 @@ function New-TestPack {
         pack_id = $packId
         pack_version = $Version
         pack_digest = $digest
-        security_epoch = 1
+        security_epoch = $SecurityEpoch
         root = $root
         files = [object[]]$files
     }
@@ -684,6 +685,144 @@ Invoke-TestCase 'append-only history accepts append and rejects modification rem
     } 'modified or reordered'
 }
 
+$epochPack1 = New-TestPack cuda 'epoch-1' '1' -SecurityEpoch 1
+$epochPack2 = New-TestPack cuda 'epoch-2' '2' -SecurityEpoch 2
+$epochPack3 = New-TestPack cuda 'epoch-3' '3' -SecurityEpoch 3
+$epochPackEqual = New-TestPack cuda 'epoch-2-equal' '4' -SecurityEpoch 2
+$epochRelease1 = New-TestRelease 'epoch-1' '1' '1' @($epochPack1)
+$epochRelease2 = New-TestRelease 'epoch-2' '2' '2' @($epochPack2)
+$epochRelease3 = New-TestRelease 'epoch-3' '3' '3' @($epochPack3)
+$epochReleaseEqual = New-TestRelease 'epoch-2-equal' '4' '4' @($epochPackEqual)
+$epochError = 'security epoch is below the historical high-water mark'
+
+Invoke-TestCase 'history epochs accept equality and increases but reject decreases' {
+    $valid = Convert-TestDocument (New-TestDocument @($epochRelease2, $epochReleaseEqual, $epochRelease3))
+    Assert-TestTrue ($valid.releases.Count -eq 3) 'Valid epoch progression lost rows.'
+    Assert-TestFailure {
+        Convert-TestDocument (New-TestDocument @($epochRelease2, $epochRelease1))
+    } $epochError
+    Assert-TestFailure {
+        Assert-WindowsGpuPackHistoryAppendOnly `
+            -PreviousDocument (New-TestDocument @($epochRelease2)) `
+            -NewDocument (New-TestDocument @($epochRelease2, $epochRelease1))
+    } $epochError
+}
+
+Invoke-TestCase 'same-ID roots require one epoch independent of lexical root assignment' {
+    foreach ($reverse in @($false, $true)) {
+        $left = New-TestPack cuda 'epoch-left' '5' -SecurityEpoch 2
+        $right = New-TestPack cuda 'epoch-right' '6' -SecurityEpoch 2
+        $inputPacks = if ($reverse) { @($right, $left) } else { @($left, $right) }
+        $equalRow = New-TestRelease 'equal-roots' '5' '5' $inputPacks
+        $equal = Convert-TestDocument (New-TestDocument @($equalRow))
+        Assert-TestTrue ($equal.releases[0].packs.Count -eq 2) 'Equal-epoch roots were rejected.'
+        if ($reverse) { $left.security_epoch = [uint64]3 }
+        else { $right.security_epoch = [uint64]3 }
+        $mixedRow = New-TestRelease 'mixed-roots' '6' '6' $inputPacks
+        Assert-TestFailure {
+            Convert-TestDocument (New-TestDocument @($mixedRow))
+        } 'mixes security epochs for one pack ID'
+    }
+}
+
+Invoke-TestCase 'CPU-only releases and backend absence never reset epoch floors' {
+    foreach ($intervening in @($emptyRelease, $releaseC)) {
+        Assert-TestFailure {
+            Convert-TestDocument (New-TestDocument @($epochRelease2, $intervening, $epochRelease1))
+        } $epochError
+        $valid = Convert-TestDocument (New-TestDocument @($epochRelease2, $intervening, $epochReleaseEqual))
+        Assert-TestTrue ($valid.releases.Count -eq 3) 'Reappearance at the floor was rejected.'
+    }
+}
+
+Invoke-TestCase 'current staging respects historical floors and accepts CPU-only current' {
+    $history = New-TestDocument @($epochRelease2, $emptyRelease)
+    Assert-TestFailure {
+        Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($epochRelease1))
+    } $epochError
+    foreach ($allowed in @($epochReleaseEqual, $epochRelease3)) {
+        $plan = Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($allowed))
+        Assert-TestTrue ($plan.CurrentPackRoots.Count -eq 1) 'Allowed current epoch lost its pack.'
+    }
+    $cpu = Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($emptyRelease))
+    Assert-TestTrue ($cpu.CurrentPackRoots.Count -eq 0) 'CPU-only current was not allowed.'
+}
+
+Invoke-TestCase 'exact latest-row repair passes but exact older-row replay cannot downgrade' {
+    $history = New-TestDocument @($epochRelease2, $epochRelease3)
+    $latest = Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($epochRelease3))
+    Assert-TestTrue ($latest.CurrentPackRoots[0] -ceq $epochPack3.root) 'Exact latest row could not be repaired.'
+    Assert-TestFailure {
+        Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($epochRelease2))
+    } $epochError
+    $changedEpoch = Copy-TestValue $epochPack3
+    $changedEpoch.security_epoch = [uint64]4
+    $changedRootRow = New-TestRelease 'changed-immutable-epoch' '7' '7' @($changedEpoch)
+    Assert-TestFailure {
+        Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($changedRootRow))
+    } 'different exact inventory'
+}
+
+Invoke-TestCase 'CUDA and Vulkan epoch floors are independent' {
+    $vulkan1 = New-TestPack vulkan 'epoch-1' '7' -SecurityEpoch 1
+    $vulkan2 = New-TestPack vulkan 'epoch-2' '8' -SecurityEpoch 2
+    $first = New-TestRelease 'both-first' '7' '7' @($epochPack3, $vulkan1)
+    $second = New-TestRelease 'both-second' '8' '8' @($epochPack3, $vulkan2)
+    $valid = Convert-TestDocument (New-TestDocument @($first, $second))
+    Assert-TestTrue ($valid.releases.Count -eq 2) 'One backend raised the other backend floor.'
+    $plan = Get-WindowsGpuPackRetirementPlan (New-TestDocument @($first)) (New-TestDocument @($second))
+    Assert-TestTrue ($plan.CurrentPackRoots.Count -eq 2) 'Independent current floors rejected.'
+}
+
+Invoke-TestCase 'security epochs preserve full UInt64 precision across signed and maximum boundaries' {
+    $values = @(
+        [uint64]::Parse('9223372036854775807'),
+        [uint64]::Parse('9223372036854775808'),
+        [uint64]::Parse('18446744073709551614'),
+        [uint64]::MaxValue
+    )
+    $rows = @()
+    for ($index = 0; $index -lt $values.Count; $index++) {
+        $digit = [char]([int][char]'1' + $index)
+        $pack = New-TestPack cuda "uint64-$index" $digit -SecurityEpoch $values[$index]
+        $rows += New-TestRelease "uint64-$index" $digit $digit @($pack)
+    }
+    $history = Convert-TestDocument (New-TestDocument $rows)
+    for ($index = 0; $index -lt $values.Count; $index++) {
+        $actual = $history.releases[$index].packs[0].security_epoch
+        Assert-TestTrue ($actual -is [uint64] -and $actual -eq $values[$index]) 'Epoch lost UInt64 precision.'
+    }
+    $latest = Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($rows[3]))
+    Assert-TestTrue ($latest.CurrentPackRoots.Count -eq 1) 'UInt64 maximum equality failed.'
+    Assert-TestFailure {
+        Get-WindowsGpuPackRetirementPlan $history (New-TestDocument @($rows[2]))
+    } $epochError
+    $regression = New-TestRelease 'uint64-regression' '5' '3' @($rows[2].packs[0])
+    Assert-TestFailure { Convert-TestDocument (New-TestDocument @($rows + $regression)) } $epochError
+}
+
+Invoke-TestCase 'failed rows and empty rows cannot partially advance shared epoch state' {
+    $floors = [System.Collections.Generic.Dictionary[string, uint64]]::new([StringComparer]::OrdinalIgnoreCase)
+    $floors.Add('scribe-cuda-windows-x64', [uint64]2)
+    $floors.Add('scribe-vulkan-windows-x64', [uint64]2)
+    $vulkanLow = New-TestPack vulkan 'low' '8' -SecurityEpoch 1
+    $normalizedLow = (Convert-TestDocument (New-TestDocument @(
+        (New-TestRelease 'atomic-low' '8' '8' @($epochPack3, $vulkanLow))
+    ))).releases[0].packs
+    Assert-TestFailure {
+        Update-WindowsGpuPackHistorySecurityEpochHighWater $normalizedLow $floors 'Test row'
+    } $epochError
+    Assert-TestTrue ($floors.Count -eq 2 -and $floors['scribe-cuda-windows-x64'] -eq [uint64]2 -and
+        $floors['scribe-vulkan-windows-x64'] -eq [uint64]2) 'Failed row partially advanced a floor.'
+    $normalized2 = (Convert-TestDocument (New-TestDocument @($epochRelease2))).releases[0].packs[0]
+    Assert-TestFailure {
+        Update-WindowsGpuPackHistorySecurityEpochHighWater @($normalizedLow[0], $normalized2) $floors 'Mixed row'
+    } 'mixes security epochs for one pack ID'
+    Update-WindowsGpuPackHistorySecurityEpochHighWater @() $floors 'Empty row'
+    Assert-TestTrue ($floors.Count -eq 2 -and $floors['scribe-cuda-windows-x64'] -eq [uint64]2 -and
+        $floors['scribe-vulkan-windows-x64'] -eq [uint64]2) 'Mixed or empty row changed an epoch floor.'
+}
+
 Invoke-TestCase 'bounded regular parser input rejects BOM oversize and reparse ancestors' {
     $testRoot = Join-Path `
         ([System.IO.Path]::GetTempPath()) `
@@ -765,7 +904,7 @@ Invoke-TestCase 'history helper remains parse validate and plan only' {
     }
 }
 
-if ($script:WindowsGpuPackHistoryTestCount -le 0) {
-    throw 'Windows GPU pack history tests did not execute any cases.'
+if ($script:WindowsGpuPackHistoryTestCount -ne 23) {
+    throw 'Expected Windows GPU pack history test cases were not all executed.'
 }
 Write-Output "Windows GPU pack history fail-closed tests passed ($script:WindowsGpuPackHistoryTestCount cases)."

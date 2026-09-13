@@ -168,6 +168,29 @@ try {
     $testCount++
     Write-Output 'PASS: previous identities are emitted separately without broadening current admission'
 
+    $higherEpochBundle = Join-Path $testRoot 'higher-epoch-history'
+    New-Item -ItemType Directory -Path $higherEpochBundle | Out-Null
+    $higherEpochPack = New-StagingFixturePack $higherEpochBundle 'cuda' 'higher-epoch' 'e'
+    $higherEpochPack.security_epoch = [uint64]2
+    $higherEpoch = Write-WorkerPackCatalog $higherEpochBundle @($higherEpochPack) ('5' * 40)
+    $cpuEpochBundle = Join-Path $testRoot 'cpu-after-higher-epoch'
+    New-Item -ItemType Directory -Path $cpuEpochBundle | Out-Null
+    $cpuEpoch = Write-WorkerPackCatalog $cpuEpochBundle @() ('6' * 40)
+    $epochHistory = [ordered]@{
+        schema_version = 1
+        history_epoch = 1
+        releases = [object[]]@($higherEpoch.History.releases[0], $cpuEpoch.History.releases[0])
+    }
+    $downgradeAllowlist = Join-Path $testRoot 'must-not-generate-downgrade.iss'
+    Assert-StagingFailure {
+        $downgradePlan = Get-WindowsGpuPackRetirementPlan $epochHistory $current.History
+        Write-InstallerAllowlist $downgradeAllowlist $downgradePlan.CurrentFiles.Path `
+            $downgradePlan $current.SizeBytes $current.Sha256
+    } 'security epoch is below the historical high-water mark'
+    Assert-StagingTrue (-not (Test-Path -LiteralPath $downgradeAllowlist)) 'A downgraded staged catalog generated installer admission.'
+    $testCount++
+    Write-Output 'PASS: staged epoch downgrade after a CPU-only release rejects before allowlist generation'
+
     $invalidBundle = Join-Path $testRoot 'invalid-revision'
     New-Item -ItemType Directory -Path $invalidBundle | Out-Null
     Assert-StagingFailure { Write-WorkerPackCatalog $invalidBundle @() 'main' } 'exact checked-out source revision'
@@ -223,5 +246,5 @@ finally {
         Remove-Item -LiteralPath $resolved -Recurse -Force
     }
 }
-if ($testCount -ne 6) { throw 'Expected staging test cases were not all executed.' }
+if ($testCount -ne 7) { throw 'Expected staging test cases were not all executed.' }
 Write-Output "Windows worker-pack staging tests passed ($testCount cases)."
