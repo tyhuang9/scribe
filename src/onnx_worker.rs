@@ -14238,6 +14238,526 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn validate_vulkan_evidence_acceleration_diagnostics(
+        resolved: &ResolvedAcceleration,
+        preference: AccelerationPreference,
+        expected_gpu_target: Option<&BackendTarget>,
+    ) -> Result<()> {
+        let selection = resolved
+            .selection
+            .as_ref()
+            .ok_or_else(|| anyhow!("Vulkan evidence execution omitted its typed selection"))?;
+        match expected_gpu_target {
+            Some(expected_gpu_target) => {
+                if expected_gpu_target.backend != BackendKind::Vulkan {
+                    bail!("Vulkan evidence expected target is not a Vulkan binding")
+                }
+                if preference != AccelerationPreference::Gpu
+                    || resolved.requested != AccelerationPreference::Gpu
+                    || selection.requested != AccelerationPreference::Gpu
+                {
+                    bail!("Vulkan evidence requires explicit GPU preference at every level")
+                }
+                if !matches!(&resolved.resolved, ComputeDevice::Gpu { .. }) {
+                    bail!("Vulkan evidence GPU request resolved to CPU")
+                }
+                if selection.reason != BackendSelectionReason::RequestedGpu {
+                    bail!("Vulkan evidence GPU selection was not explicitly requested")
+                }
+                if selection.target != *expected_gpu_target {
+                    bail!(
+                        "explicit Vulkan execution changed the internally verified device binding"
+                    )
+                }
+            }
+            None => {
+                if preference != AccelerationPreference::Cpu
+                    || resolved.requested != AccelerationPreference::Cpu
+                    || selection.requested != AccelerationPreference::Cpu
+                {
+                    bail!("CPU evidence requires explicit CPU preference at every level")
+                }
+                if resolved.resolved != ComputeDevice::Cpu {
+                    bail!("CPU comparator was not served by the explicit CPU worker")
+                }
+                if selection.reason != BackendSelectionReason::RequestedCpu {
+                    bail!("CPU evidence selection was not explicitly requested")
+                }
+                let canonical_cpu = BackendTarget::cpu();
+                if !selection.target.has_same_runtime_identity(&canonical_cpu) {
+                    bail!("CPU evidence target changed its stable runtime identity")
+                }
+                if selection.target.vendor != GpuVendor::Unknown
+                    || !matches!(
+                        selection.target.device_class,
+                        DeviceClass::Cpu | DeviceClass::Accelerator
+                    )
+                {
+                    bail!("CPU evidence target reported non-CPU metadata")
+                }
+            }
+        }
+        if !selection.fallback_targets.is_empty() || !selection.fallback_history.is_empty() {
+            bail!("Vulkan evidence selection must not use fallback targets or history")
+        }
+        if selection.power_policy != PowerPolicyDecision::NotApplied {
+            bail!("Vulkan evidence selection must not apply an Auto power policy")
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn vulkan_evidence_diagnostics_resolution(
+        requested: AccelerationPreference,
+        resolved: ComputeDevice,
+        target: BackendTarget,
+        reason: BackendSelectionReason,
+    ) -> ResolvedAcceleration {
+        ResolvedAcceleration {
+            requested,
+            resolved,
+            diagnostic: None,
+            selection: Some(BackendSelection {
+                requested,
+                target,
+                reason,
+                power_source: PowerSource::Ac,
+                power_policy: PowerPolicyDecision::NotApplied,
+                qualification_policy_version: 1,
+                fallback_targets: Vec::new(),
+                fallback_history: Vec::new(),
+                skipped_targets: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_vulkan_evidence_diagnostics_rejected(
+        case: &str,
+        diagnostics: &ResolvedAcceleration,
+        preference: AccelerationPreference,
+        expected_gpu_target: Option<&BackendTarget>,
+    ) {
+        assert!(
+            validate_vulkan_evidence_acceleration_diagnostics(
+                diagnostics,
+                preference,
+                expected_gpu_target,
+            )
+            .is_err(),
+            "Vulkan evidence diagnostics accepted {case}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_evidence_diagnostics_accepts_explicit_cpu_selection_with_live_cpu_fields() {
+        for device_class in [DeviceClass::Cpu, DeviceClass::Accelerator] {
+            let mut cpu = BackendTarget::cpu();
+            cpu.display_name = "Host CPU / NPU execution lane".to_owned();
+            cpu.memory_total_bytes = 96 * 1024 * 1024 * 1024;
+            cpu.memory_available_bytes = 57 * 1024 * 1024 * 1024;
+            cpu.process_index = Some(41);
+            cpu.device_class = device_class;
+            let diagnostics = vulkan_evidence_diagnostics_resolution(
+                AccelerationPreference::Cpu,
+                ComputeDevice::Cpu,
+                cpu,
+                BackendSelectionReason::RequestedCpu,
+            );
+            assert_eq!(
+                diagnostics.selection.as_ref().unwrap().target.process_index,
+                Some(41),
+                "raw diagnostics retain their differing process-local index"
+            );
+            validate_vulkan_evidence_acceleration_diagnostics(
+                &diagnostics,
+                AccelerationPreference::Cpu,
+                None,
+            )
+            .expect("raw explicit CPU evidence accepts its typed CPU selection");
+
+            let round_tripped: ResolvedAcceleration =
+                serde_json::from_slice(&serde_json::to_vec(&diagnostics).unwrap()).unwrap();
+            assert_eq!(
+                round_tripped
+                    .selection
+                    .as_ref()
+                    .expect("typed CPU selection survives worker diagnostics round trip")
+                    .target
+                    .process_index,
+                None,
+                "process-local indices are intentionally excluded from worker diagnostics"
+            );
+            validate_vulkan_evidence_acceleration_diagnostics(
+                &round_tripped,
+                AccelerationPreference::Cpu,
+                None,
+            )
+            .expect("round-tripped explicit CPU evidence accepts its typed CPU selection");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_evidence_diagnostics_rejects_cpu_mode_and_identity_spoofs() {
+        let valid_cpu = vulkan_evidence_diagnostics_resolution(
+            AccelerationPreference::Cpu,
+            ComputeDevice::Cpu,
+            BackendTarget::cpu(),
+            BackendSelectionReason::RequestedCpu,
+        );
+        let gpu_target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "vulkan-evidence-cpu-spoof-pack",
+            "vulkan:test:cpu-spoof-pack",
+            'a',
+        )
+        .target
+        .expect("verified GPU fixture target");
+
+        for (case, preference) in [
+            ("caller preference Auto", AccelerationPreference::Auto),
+            ("caller preference GPU", AccelerationPreference::Gpu),
+        ] {
+            assert_vulkan_evidence_diagnostics_rejected(case, &valid_cpu, preference, None);
+        }
+        for (case, requested) in [
+            ("diagnostic preference Auto", AccelerationPreference::Auto),
+            ("diagnostic preference GPU", AccelerationPreference::Gpu),
+        ] {
+            let mut diagnostics = valid_cpu.clone();
+            diagnostics.requested = requested;
+            assert_vulkan_evidence_diagnostics_rejected(
+                case,
+                &diagnostics,
+                AccelerationPreference::Cpu,
+                None,
+            );
+        }
+        let mut resolved_gpu = valid_cpu.clone();
+        resolved_gpu.resolved = ComputeDevice::Gpu {
+            name: "spoofed GPU".to_owned(),
+        };
+        assert_vulkan_evidence_diagnostics_rejected(
+            "GPU resolution",
+            &resolved_gpu,
+            AccelerationPreference::Cpu,
+            None,
+        );
+        for (case, requested) in [
+            ("selection preference Auto", AccelerationPreference::Auto),
+            ("selection preference GPU", AccelerationPreference::Gpu),
+        ] {
+            let mut diagnostics = valid_cpu.clone();
+            diagnostics.selection.as_mut().unwrap().requested = requested;
+            assert_vulkan_evidence_diagnostics_rejected(
+                case,
+                &diagnostics,
+                AccelerationPreference::Cpu,
+                None,
+            );
+        }
+        for (case, reason) in [
+            ("GPU selection reason", BackendSelectionReason::RequestedGpu),
+            ("Auto priority reason", BackendSelectionReason::AutoPriority),
+            (
+                "Auto CPU fallback reason",
+                BackendSelectionReason::AutoCpuFallback,
+            ),
+        ] {
+            let mut diagnostics = valid_cpu.clone();
+            diagnostics.selection.as_mut().unwrap().reason = reason;
+            assert_vulkan_evidence_diagnostics_rejected(
+                case,
+                &diagnostics,
+                AccelerationPreference::Cpu,
+                None,
+            );
+        }
+
+        let mut missing_selection = valid_cpu.clone();
+        missing_selection.selection = None;
+        assert_vulkan_evidence_diagnostics_rejected(
+            "missing typed selection",
+            &missing_selection,
+            AccelerationPreference::Cpu,
+            None,
+        );
+        type TargetSpoof = (&'static str, fn(&mut BackendTarget));
+        let target_spoofs: [TargetSpoof; 7] = [
+            ("GPU backend", |target| target.backend = BackendKind::Vulkan),
+            ("CPU provider", |target| {
+                target.provider_id = ProviderIdentity::new("transcribe-cpp:spoofed-cpu")
+            }),
+            ("CPU device", |target| {
+                target.device_id = DeviceIdentity::new("cpu:spoofed")
+            }),
+            ("CPU driver", |target| {
+                target.driver_version = Some("spoofed-driver".to_owned())
+            }),
+            ("CPU vendor", |target| target.vendor = GpuVendor::Nvidia),
+            ("GPU device class", |target| {
+                target.device_class = DeviceClass::DiscreteGpu
+            }),
+            ("unknown device class", |target| {
+                target.device_class = DeviceClass::Unknown
+            }),
+        ];
+        for (case, spoof) in target_spoofs {
+            let mut diagnostics = valid_cpu.clone();
+            spoof(&mut diagnostics.selection.as_mut().unwrap().target);
+            assert_vulkan_evidence_diagnostics_rejected(
+                case,
+                &diagnostics,
+                AccelerationPreference::Cpu,
+                None,
+            );
+        }
+        let mut pack = valid_cpu.clone();
+        pack.selection.as_mut().unwrap().target.pack = gpu_target.pack.clone();
+        assert_vulkan_evidence_diagnostics_rejected(
+            "GPU pack on CPU",
+            &pack,
+            AccelerationPreference::Cpu,
+            None,
+        );
+        let mut fallback_target = valid_cpu.clone();
+        fallback_target
+            .selection
+            .as_mut()
+            .unwrap()
+            .fallback_targets
+            .push(gpu_target.clone());
+        assert_vulkan_evidence_diagnostics_rejected(
+            "fallback target",
+            &fallback_target,
+            AccelerationPreference::Cpu,
+            None,
+        );
+        let mut fallback_history = valid_cpu.clone();
+        fallback_history
+            .selection
+            .as_mut()
+            .unwrap()
+            .fallback_history
+            .push(BackendFallback {
+                target: gpu_target,
+                category: BackendFailureCategory::WorkerFailed,
+            });
+        assert_vulkan_evidence_diagnostics_rejected(
+            "fallback history",
+            &fallback_history,
+            AccelerationPreference::Cpu,
+            None,
+        );
+        let mut auto_power_policy = valid_cpu.clone();
+        auto_power_policy.selection.as_mut().unwrap().power_policy =
+            PowerPolicyDecision::Unrestricted;
+        assert_vulkan_evidence_diagnostics_rejected(
+            "Auto power policy",
+            &auto_power_policy,
+            AccelerationPreference::Cpu,
+            None,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_evidence_diagnostics_requires_an_exact_explicit_vulkan_selection() {
+        let expected_target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "vulkan-evidence-gpu",
+            "vulkan:test:exact",
+            'b',
+        )
+        .target
+        .expect("verified Vulkan fixture target");
+        let valid_gpu = vulkan_evidence_diagnostics_resolution(
+            AccelerationPreference::Gpu,
+            ComputeDevice::Gpu {
+                name: "Vulkan evidence GPU".to_owned(),
+            },
+            expected_target.clone(),
+            BackendSelectionReason::RequestedGpu,
+        );
+        validate_vulkan_evidence_acceleration_diagnostics(
+            &valid_gpu,
+            AccelerationPreference::Gpu,
+            Some(&expected_target),
+        )
+        .expect("exact explicit Vulkan diagnostics");
+
+        let mut cases = Vec::new();
+        cases.push((
+            "caller preference Auto",
+            valid_gpu.clone(),
+            AccelerationPreference::Auto,
+        ));
+        cases.push((
+            "caller preference CPU",
+            valid_gpu.clone(),
+            AccelerationPreference::Cpu,
+        ));
+        let mut diagnostic_auto = valid_gpu.clone();
+        diagnostic_auto.requested = AccelerationPreference::Auto;
+        cases.push((
+            "diagnostic preference Auto",
+            diagnostic_auto,
+            AccelerationPreference::Gpu,
+        ));
+        let mut diagnostic_cpu = valid_gpu.clone();
+        diagnostic_cpu.requested = AccelerationPreference::Cpu;
+        cases.push((
+            "diagnostic preference CPU",
+            diagnostic_cpu,
+            AccelerationPreference::Gpu,
+        ));
+        let mut resolved_cpu = valid_gpu.clone();
+        resolved_cpu.resolved = ComputeDevice::Cpu;
+        cases.push(("CPU resolution", resolved_cpu, AccelerationPreference::Gpu));
+        let mut selection_auto = valid_gpu.clone();
+        selection_auto.selection.as_mut().unwrap().requested = AccelerationPreference::Auto;
+        cases.push((
+            "selection preference Auto",
+            selection_auto,
+            AccelerationPreference::Gpu,
+        ));
+        let mut selection_cpu = valid_gpu.clone();
+        selection_cpu.selection.as_mut().unwrap().requested = AccelerationPreference::Cpu;
+        cases.push((
+            "selection preference CPU",
+            selection_cpu,
+            AccelerationPreference::Gpu,
+        ));
+        let mut selection_cpu_reason = valid_gpu.clone();
+        selection_cpu_reason.selection.as_mut().unwrap().reason =
+            BackendSelectionReason::RequestedCpu;
+        cases.push((
+            "CPU selection reason",
+            selection_cpu_reason,
+            AccelerationPreference::Gpu,
+        ));
+        let mut selection_auto_reason = valid_gpu.clone();
+        selection_auto_reason.selection.as_mut().unwrap().reason =
+            BackendSelectionReason::AutoPriority;
+        cases.push((
+            "Auto selection reason",
+            selection_auto_reason,
+            AccelerationPreference::Gpu,
+        ));
+
+        let mut missing_selection = valid_gpu.clone();
+        missing_selection.selection = None;
+        cases.push((
+            "missing typed selection",
+            missing_selection,
+            AccelerationPreference::Gpu,
+        ));
+        let mut wrong_device = valid_gpu.clone();
+        wrong_device.selection.as_mut().unwrap().target.device_id =
+            DeviceIdentity::new("native:uuid:wrong-vulkan-device");
+        cases.push((
+            "wrong Vulkan device",
+            wrong_device,
+            AccelerationPreference::Gpu,
+        ));
+        let mut wrong_pack = valid_gpu.clone();
+        wrong_pack
+            .selection
+            .as_mut()
+            .unwrap()
+            .target
+            .pack
+            .as_mut()
+            .expect("verified target pack")
+            .pack_digest = "c".repeat(64);
+        cases.push(("wrong Vulkan pack", wrong_pack, AccelerationPreference::Gpu));
+        let mut fallback_target = valid_gpu.clone();
+        fallback_target
+            .selection
+            .as_mut()
+            .unwrap()
+            .fallback_targets
+            .push(BackendTarget::cpu());
+        cases.push((
+            "fallback target",
+            fallback_target,
+            AccelerationPreference::Gpu,
+        ));
+        let mut fallback_history = valid_gpu.clone();
+        fallback_history
+            .selection
+            .as_mut()
+            .unwrap()
+            .fallback_history
+            .push(BackendFallback {
+                target: BackendTarget::cpu(),
+                category: BackendFailureCategory::WorkerFailed,
+            });
+        cases.push((
+            "fallback history",
+            fallback_history,
+            AccelerationPreference::Gpu,
+        ));
+        let mut auto_power_policy = valid_gpu.clone();
+        auto_power_policy.selection.as_mut().unwrap().power_policy =
+            PowerPolicyDecision::Unrestricted;
+        cases.push((
+            "Auto power policy",
+            auto_power_policy,
+            AccelerationPreference::Gpu,
+        ));
+
+        for (case, diagnostics, preference) in cases {
+            assert!(
+                validate_vulkan_evidence_acceleration_diagnostics(
+                    &diagnostics,
+                    preference,
+                    Some(&expected_target),
+                )
+                .is_err(),
+                "Vulkan diagnostics accepted {case}"
+            );
+        }
+
+        assert!(
+            validate_vulkan_evidence_acceleration_diagnostics(
+                &valid_gpu,
+                AccelerationPreference::Gpu,
+                None,
+            )
+            .is_err(),
+            "Vulkan diagnostics accepted a missing expected target"
+        );
+        let cuda_target = verified_gpu_route(
+            BackendKind::Cuda,
+            "cuda-evidence-gpu",
+            "cuda:test:non-vulkan",
+            'd',
+        )
+        .target
+        .expect("verified CUDA fixture target");
+        let cuda_diagnostics = vulkan_evidence_diagnostics_resolution(
+            AccelerationPreference::Gpu,
+            ComputeDevice::Gpu {
+                name: "CUDA evidence GPU".to_owned(),
+            },
+            cuda_target.clone(),
+            BackendSelectionReason::RequestedGpu,
+        );
+        assert!(
+            validate_vulkan_evidence_acceleration_diagnostics(
+                &cuda_diagnostics,
+                AccelerationPreference::Gpu,
+                Some(&cuda_target),
+            )
+            .is_err(),
+            "Vulkan diagnostics accepted a non-Vulkan expected target"
+        );
+    }
+
+    #[cfg(windows)]
     fn run_vulkan_evidence_observation(
         registry: &InferenceWorkerRegistry,
         artifact: RuntimeArtifact,
@@ -14257,32 +14777,11 @@ mod tests {
                 &cancellation,
             )
             .map_err(anyhow::Error::from)?;
-        match expected_gpu_target {
-            Some(expected) => {
-                let observed = execution
-                    .diagnostics
-                    .resolved_acceleration
-                    .selection
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("explicit Vulkan execution omitted its selection"))?;
-                if observed.target != *expected || observed.target.backend != BackendKind::Vulkan {
-                    bail!(
-                        "explicit Vulkan execution changed the internally verified device binding"
-                    )
-                }
-            }
-            None => {
-                if execution.diagnostics.resolved_acceleration.resolved != ComputeDevice::Cpu
-                    || execution
-                        .diagnostics
-                        .resolved_acceleration
-                        .selection
-                        .is_some()
-                {
-                    bail!("CPU comparator was not served by the explicit CPU worker")
-                }
-            }
-        }
+        validate_vulkan_evidence_acceleration_diagnostics(
+            &execution.diagnostics.resolved_acceleration,
+            preference,
+            expected_gpu_target,
+        )?;
         Ok(VulkanEvidenceObservation {
             normalized_transcript: normalize_vulkan_evidence_transcript(&execution.transcript.text),
             end_to_end_ms: vulkan_evidence_millis(started.elapsed().as_millis(), "end-to-end")?,
