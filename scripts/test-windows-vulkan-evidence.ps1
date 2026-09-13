@@ -554,6 +554,117 @@ $runnerTokens = $null
 $runnerParseErrors = $null
 $runnerAst = [Management.Automation.Language.Parser]::ParseInput($runner, [ref]$runnerTokens, [ref]$runnerParseErrors)
 if ($runnerParseErrors.Count -ne 0) { throw 'Runner source could not be parsed for retry-path tests.' }
+function Assert-ScribeEvidenceVulkanPackBuildInvocation([string]$RunnerSource, [string]$CaseName) {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($RunnerSource, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw "Vulkan pack-build case '$CaseName' did not parse." }
+    $packInvocations = @($ast.FindAll({
+        param($Ast)
+        if ($Ast -isnot [Management.Automation.Language.CommandAst]) { return $false }
+        $elements = @($Ast.CommandElements)
+        return $elements.Count -ge 3 -and
+            $elements[0].Extent.Text -ceq '$packBuilder' -and
+            @($elements | Where-Object {
+                $_ -is [Management.Automation.Language.CommandParameterAst] -and
+                $_.ParameterName -ceq 'Backend'
+            }).Count -eq 1 -and
+            $Ast.Extent.Text -match '\$packBuilder\s+-Backend\s+Vulkan'
+    }, $true))
+    if ($packInvocations.Count -ne 1) { throw "Vulkan pack-build case '$CaseName' did not identify exactly one actual pack-builder invocation." }
+    $invocation = $packInvocations[0]
+    $elements = @($invocation.CommandElements)
+    $expectedPriorElements = @(
+        '$packBuilder', '-Backend', 'Vulkan', '-PackVersion', '$packVersion',
+        '-OutputDirectory', '$packRoot', '-SigningMode', 'Fixture',
+        '-NativeArchiveDirectory', '$nativeArchive',
+        '-VulkanSourceArchiveDirectory', '$VulkanSourceArchiveDirectory'
+    )
+    if ($elements.Count -ne ($expectedPriorElements.Count + 2)) {
+        throw "Vulkan pack-build case '$CaseName' changed the builder argument count."
+    }
+    for ($index = 0; $index -lt $expectedPriorElements.Count; $index++) {
+        if ($elements[$index].Extent.Text -cne $expectedPriorElements[$index]) {
+            throw "Vulkan pack-build case '$CaseName' changed a prior builder argument."
+        }
+    }
+    $targetParameters = @($elements | Where-Object {
+        $_ -is [Management.Automation.Language.CommandParameterAst] -and
+        $_.ParameterName -ceq 'CargoTargetDirectory'
+    })
+    if ($targetParameters.Count -ne 1 -or
+        $elements[$expectedPriorElements.Count].ParameterName -cne 'CargoTargetDirectory' -or
+        $elements[$expectedPriorElements.Count + 1].Extent.Text -cne "(New-ScribeEvidenceShortCargoTarget 'vulkan')") {
+        throw "Vulkan pack-build case '$CaseName' must pass exactly one fresh vulkan Cargo target explicitly."
+    }
+
+    # This seam checks forwarding only. The real helper and builder own
+    # filesystem freshness, canonical-path, and reparse validation.
+    $shortRoot = 'C:\scribe-evidence-test'
+    $expectedTarget = Join-Path $shortRoot 'evidence-vulkan-0123456789ab'
+    $script:VulkanPackBuilderCall = $null
+    $script:VulkanPackGeneratedTarget = $null
+    $script:VulkanPackTargetLabels = [System.Collections.Generic.List[string]]::new()
+    function New-ScribeEvidenceShortCargoTarget([string]$Label) {
+        $script:VulkanPackTargetLabels.Add($Label) | Out-Null
+        $script:VulkanPackGeneratedTarget = $expectedTarget
+        return $expectedTarget
+    }
+    function Invoke-ScribeEvidenceTestPackBuilder {
+        param(
+            [string]$Backend,
+            [string]$PackVersion,
+            [string]$OutputDirectory,
+            [string]$SigningMode,
+            [string]$NativeArchiveDirectory,
+            [string]$VulkanSourceArchiveDirectory,
+            [string]$CargoTargetDirectory
+        )
+        $script:VulkanPackBuilderCall = [ordered]@{
+            Backend = $Backend
+            PackVersion = $PackVersion
+            OutputDirectory = $OutputDirectory
+            SigningMode = $SigningMode
+            NativeArchiveDirectory = $NativeArchiveDirectory
+            VulkanSourceArchiveDirectory = $VulkanSourceArchiveDirectory
+            CargoTargetDirectory = $CargoTargetDirectory
+        }
+    }
+    $packBuilder = 'Invoke-ScribeEvidenceTestPackBuilder'
+    $packVersion = 'fixture-aaaaaaaaaaaa-bbbbbbbbbbbb'
+    $packRoot = Join-Path $shortRoot 'pack'
+    $nativeArchive = Join-Path $shortRoot 'native'
+    $VulkanSourceArchiveDirectory = Join-Path $shortRoot 'vulkan-source'
+    . ([scriptblock]::Create($invocation.Extent.Text))
+    if ($script:VulkanPackTargetLabels.Count -ne 1 -or
+        $script:VulkanPackTargetLabels[0] -cne 'vulkan' -or
+        $null -eq $script:VulkanPackGeneratedTarget -or
+        $null -eq $script:VulkanPackBuilderCall -or
+        $script:VulkanPackBuilderCall.Backend -cne 'Vulkan' -or
+        $script:VulkanPackBuilderCall.PackVersion -cne $packVersion -or
+        $script:VulkanPackBuilderCall.OutputDirectory -cne $packRoot -or
+        $script:VulkanPackBuilderCall.SigningMode -cne 'Fixture' -or
+        $script:VulkanPackBuilderCall.NativeArchiveDirectory -cne $nativeArchive -or
+        $script:VulkanPackBuilderCall.VulkanSourceArchiveDirectory -cne $VulkanSourceArchiveDirectory -or
+        $script:VulkanPackBuilderCall.CargoTargetDirectory -cne $script:VulkanPackGeneratedTarget) {
+        throw "Vulkan pack-build case '$CaseName' did not preserve or forward the exact builder arguments."
+    }
+}
+$packTargetArgument = " -CargoTargetDirectory (New-ScribeEvidenceShortCargoTarget 'vulkan')"
+Assert-ScribeEvidenceVulkanPackBuildInvocation $runner 'production'
+$packTargetMutations = [ordered]@{
+    'missing-default-target' = $runner.Replace($packTargetArgument, '')
+    'cpu-target-reuse' = $runner.Replace($packTargetArgument, " -CargoTargetDirectory (New-ScribeEvidenceShortCargoTarget 'cpu')")
+    'version-derived-target' = $runner.Replace($packTargetArgument, ' -CargoTargetDirectory (Join-Path $workRoot ("vulkan-$packVersion-cargo"))')
+    'duplicate-target-argument' = $runner.Replace($packTargetArgument, "$packTargetArgument$packTargetArgument")
+}
+foreach ($packTargetMutation in $packTargetMutations.GetEnumerator()) {
+    $mutationFailure = $null
+    try { Assert-ScribeEvidenceVulkanPackBuildInvocation $packTargetMutation.Value $packTargetMutation.Key }
+    catch { $mutationFailure = $_.Exception }
+    if ($null -eq $mutationFailure) { throw "Vulkan pack-build mutation was accepted: $($packTargetMutation.Key)" }
+}
+Write-Output 'Vulkan pack-build target forwarding tests passed (4 mutations).'
 $runnerRetryFunction = $runnerAst.Find({
     param($Ast)
     $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and

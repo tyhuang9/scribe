@@ -343,7 +343,7 @@ try {
     $cpuWorker = Assert-ScribeEvidenceSingleLinkFile (Join-Path $cpuBundle 'scribe-inference-worker.exe') 'Materialized CPU worker' (512MB) $trustedFsutil
     $packRoot = Join-Path $workRoot 'fixture-vulkan-pack'
     $packVersion = New-ScribeEvidenceFixturePackVersion $revision ([guid]::NewGuid().ToString('N').Substring(0, 12))
-    & $packBuilder -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive -VulkanSourceArchiveDirectory $VulkanSourceArchiveDirectory
+    & $packBuilder -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive -VulkanSourceArchiveDirectory $VulkanSourceArchiveDirectory -CargoTargetDirectory (New-ScribeEvidenceShortCargoTarget 'vulkan')
     if ($LASTEXITCODE -ne 0) { throw 'Fresh fixture-signed Vulkan pack build failed.' }
     $packManifest = Get-Content -LiteralPath (Join-Path $packRoot 'pack-manifest.json') -Raw | ConvertFrom-Json
     if ([string]$packManifest.app_build -cnotmatch ("#" + [regex]::Escape($revision) + '$') -or
