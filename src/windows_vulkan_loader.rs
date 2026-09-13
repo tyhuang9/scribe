@@ -5,6 +5,12 @@
 //! enforces the narrower worker invariant: the signed, retained pack sibling is
 //! the only mapped `vulkan-1.dll`, and its exact identity is admitted before any
 //! Vulkan/provider API is called.
+//!
+//! Admission runs during controlled startup, before Scribe starts inference
+//! threads. Two matching inventories reject observed loader churn, but are not
+//! an atomic loader-lock transaction and cannot rule out ABA changes or later
+//! mappings. The admitted module is pinned; global module uniqueness depends on
+//! no concurrent module loading during this startup boundary.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -15,21 +21,17 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_READ, GetFileInformationByHandle,
-};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
-    TH32CS_SNAPMODULE32,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameW,
     GetModuleHandleExW,
 };
+use windows_sys::Win32::System::ProcessStatus::K32EnumProcessModules;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::gpu_worker_pack::manifest::{
     PackBackend, VerifiedCopyEntry, VerifiedPackLease, hash_exact_length,
@@ -67,18 +69,6 @@ struct VerifiedVulkanLoader {
 }
 
 static VERIFIED_VULKAN_LOADER: OnceLock<VerifiedVulkanLoader> = OnceLock::new();
-
-struct Snapshot(HANDLE);
-
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        if self.0 != INVALID_HANDLE_VALUE {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
 
 /// Bind the desktop's launch decision to the exact policy-loader entry in the
 /// signed inventory. `VerifiedPackLease` keeps the already-verified payload
@@ -154,8 +144,7 @@ pub(crate) fn bootstrap_mapped_policy_loader() -> Result<()> {
         return Ok(());
     }
 
-    let module = unique_mapped_policy_loader()?;
-    let module = pin_module(module)?;
+    let module = pinned_mapped_policy_loader_with(module_inventory, module_path, pin_module)?;
     let mapped_path = module_path(module)?;
     let executable =
         std::env::current_exe().context("could not locate the Windows Vulkan worker executable")?;
@@ -257,32 +246,48 @@ pub(crate) fn ash_entry(require_policy_loader: bool) -> Result<ash::Entry> {
     unsafe { ash::Entry::load() }.context("could not load the Windows Vulkan loader")
 }
 
-fn unique_mapped_policy_loader() -> Result<HMODULE> {
-    let snapshot = module_snapshot()?;
-    let mut entry = unsafe { std::mem::zeroed::<MODULEENTRY32W>() };
-    entry.dwSize =
-        u32::try_from(size_of::<MODULEENTRY32W>()).expect("Windows module entry size fits in u32");
-    if unsafe { Module32FirstW(snapshot.0, &mut entry) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("could not enumerate mapped Windows worker modules");
+fn pinned_mapped_policy_loader_with(
+    mut inventory: impl FnMut() -> Result<Vec<HMODULE>>,
+    mut path_for: impl FnMut(HMODULE) -> Result<PathBuf>,
+    pin: impl FnOnce(HMODULE) -> Result<HMODULE>,
+) -> Result<HMODULE> {
+    let before = inventory()?;
+    let selected = unique_policy_loader_in(&before, &mut path_for)?;
+    let pinned = pin(selected)?;
+    if pinned != selected {
+        bail!("Windows pinned a different module than the enumerated Vulkan loader")
     }
+    let after = inventory()?;
+    if before != after {
+        bail!("Windows worker mapped-module inventory changed during Vulkan loader admission")
+    }
+    if unique_policy_loader_in(&after, path_for)? != pinned {
+        bail!("Windows Vulkan loader selection changed during admission")
+    }
+    Ok(pinned)
+}
 
-    let mut observed = 0_usize;
+fn unique_policy_loader_in(
+    modules: &[HMODULE],
+    mut path_for: impl FnMut(HMODULE) -> Result<PathBuf>,
+) -> Result<HMODULE> {
     let mut matches = Vec::new();
-    loop {
-        observed += 1;
-        if observed > MAX_MAPPED_MODULES {
-            bail!("Windows worker mapped-module list exceeded its safety bound")
+    for module in modules {
+        // Every mapped module must have a readable, complete path; skipping an
+        // unreadable entry could hide another Vulkan loader. No MAX_PATH field
+        // is involved in either handle enumeration or GetModuleFileNameW.
+        let path = path_for(*module)?;
+        if !path.is_absolute() || path.as_os_str().encode_wide().any(|value| value == 0) {
+            bail!("mapped Windows module path is not a complete absolute path")
         }
-        if wide_module_name_matches(&entry.szModule, PINNED_VULKAN_LOADER_FILENAME) {
-            matches.push(entry.hModule);
-        }
-        if unsafe { Module32NextW(snapshot.0, &mut entry) } == 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                break;
-            }
-            return Err(error).context("could not continue mapped Windows module enumeration");
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("mapped Windows module path has no filename"))?;
+        if wide_eq_ascii_case_insensitive_str(
+            &name.encode_wide().collect::<Vec<_>>(),
+            PINNED_VULKAN_LOADER_FILENAME,
+        ) {
+            matches.push(*module);
         }
     }
     if matches.len() != 1 {
@@ -295,28 +300,53 @@ fn unique_mapped_policy_loader() -> Result<HMODULE> {
     Ok(matches[0])
 }
 
-fn module_snapshot() -> Result<Snapshot> {
-    let mut last_error = None;
-    for _ in 0..3 {
-        let handle =
-            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
-        if handle != INVALID_HANDLE_VALUE {
-            return Ok(Snapshot(handle));
-        }
-        last_error = Some(std::io::Error::last_os_error());
+fn module_inventory() -> Result<Vec<HMODULE>> {
+    // Pass the extra slot to Windows too: 4097 modules must be observed and
+    // rejected, not mistaken for a complete inventory at the 4096 policy bound.
+    let mut modules = vec![std::ptr::null_mut(); MAX_MAPPED_MODULES + 1];
+    let capacity_bytes = modules
+        .len()
+        .checked_mul(size_of::<HMODULE>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| anyhow!("Windows module inventory byte capacity overflowed"))?;
+    let mut needed_bytes = 0_u32;
+    // SAFETY: the current-process pseudo-handle is valid and the writable
+    // buffer is exactly capacity_bytes long. Returned HMODULEs are borrowed
+    // snapshot values, not CloseHandle resources.
+    if unsafe {
+        K32EnumProcessModules(
+            GetCurrentProcess(),
+            modules.as_mut_ptr(),
+            capacity_bytes,
+            &mut needed_bytes,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("could not enumerate mapped Windows worker modules");
     }
-    Err(last_error.unwrap_or_else(std::io::Error::last_os_error))
-        .context("could not snapshot mapped Windows worker modules")
+    validated_module_inventory(&modules, needed_bytes)
 }
 
-fn wide_module_name_matches(value: &[u16], expected: &str) -> bool {
-    let end = value
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(value.len());
-    OsString::from_wide(&value[..end])
-        .to_string_lossy()
-        .eq_ignore_ascii_case(expected)
+fn validated_module_inventory(modules: &[HMODULE], needed_bytes: u32) -> Result<Vec<HMODULE>> {
+    let needed = usize::try_from(needed_bytes)
+        .context("Windows module inventory byte count is not representable")?;
+    if needed == 0 || !needed.is_multiple_of(size_of::<HMODULE>()) {
+        bail!("Windows worker mapped-module inventory has an invalid byte count")
+    }
+    let count = needed / size_of::<HMODULE>();
+    if count > MAX_MAPPED_MODULES || count > modules.len() {
+        bail!("Windows worker mapped-module inventory is truncated or exceeds its safety bound")
+    }
+    let mut inventory = modules[..count].to_vec();
+    if inventory.iter().any(|module| module.is_null()) {
+        bail!("Windows worker mapped-module inventory contains a null handle")
+    }
+    inventory.sort_unstable_by_key(|module| *module as usize);
+    if inventory.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("Windows worker mapped-module inventory contains a duplicate handle")
+    }
+    Ok(inventory)
 }
 
 fn strict_windows_absolute_path_eq(left: &Path, right: &Path) -> bool {
@@ -534,10 +564,10 @@ fn module_path(module: HMODULE) -> Result<PathBuf> {
     };
     if length == 0 {
         return Err(std::io::Error::last_os_error())
-            .context("could not obtain the mapped Vulkan loader path");
+            .context("could not obtain the mapped Windows module path");
     }
     if length as usize >= buffer.len() {
-        bail!("mapped Vulkan loader path exceeded its safety bound")
+        bail!("mapped Windows module path exceeded its safety bound")
     }
     buffer.truncate(length as usize);
     Ok(PathBuf::from(OsString::from_wide(&buffer)))
@@ -692,20 +722,224 @@ mod tests {
     }
 
     #[test]
-    fn module_name_matching_is_ascii_case_insensitive_and_nul_bounded() {
-        let mut exact = [0_u16; 32];
-        for (slot, value) in exact.iter_mut().zip("VULKAN-1.DLL".encode_utf16()) {
-            *slot = value;
+    fn module_inventory_validates_the_exact_returned_prefix_and_policy_bound() {
+        let handles = (1..=MAX_MAPPED_MODULES + 1)
+            .map(|value| value as HMODULE)
+            .collect::<Vec<_>>();
+        let bytes = |count| u32::try_from(count * size_of::<HMODULE>()).unwrap();
+        assert_eq!(
+            validated_module_inventory(&handles, bytes(MAX_MAPPED_MODULES)).unwrap(),
+            handles[..MAX_MAPPED_MODULES]
+        );
+        for count in [MAX_MAPPED_MODULES + 1, MAX_MAPPED_MODULES + 2] {
+            assert!(validated_module_inventory(&handles, bytes(count)).is_err());
         }
-        assert!(wide_module_name_matches(
-            &exact,
-            PINNED_VULKAN_LOADER_FILENAME
+        assert!(validated_module_inventory(&handles[..1], bytes(2)).is_err());
+        assert!(validated_module_inventory(&handles, 0).is_err());
+        assert!(validated_module_inventory(&handles, bytes(1) + 1).is_err());
+        assert!(validated_module_inventory(&handles, u32::MAX).is_err());
+        assert!(validated_module_inventory(&[std::ptr::null_mut()], bytes(1)).is_err());
+        assert!(validated_module_inventory(&[1 as HMODULE, 1 as HMODULE], bytes(2)).is_err());
+        assert_eq!(
+            validated_module_inventory(
+                &[2 as HMODULE, 1 as HMODULE, std::ptr::null_mut()],
+                bytes(2),
+            )
+            .unwrap(),
+            vec![1 as HMODULE, 2 as HMODULE]
+        );
+    }
+
+    #[test]
+    fn module_inventory_reads_the_real_current_process() {
+        let modules = module_inventory().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        assert!(modules.iter().any(|module| {
+            module_path(*module)
+                .is_ok_and(|path| strict_windows_absolute_path_eq(&path, &executable))
+        }));
+    }
+
+    #[test]
+    fn module_selection_accepts_long_absolute_paths_and_ascii_case_only() {
+        let long_path = PathBuf::from(format!(
+            r"C:\Scribe\{}\{}\VULKAN-1.DLL",
+            "a".repeat(150),
+            "b".repeat(150)
         ));
-        exact[0] = 'x' as u16;
-        assert!(!wide_module_name_matches(
-            &exact,
-            PINNED_VULKAN_LOADER_FILENAME
-        ));
+        assert!(long_path.as_os_str().encode_wide().count() > 260);
+        for path in [
+            PathBuf::from(r"C:\Scribe\vulkan-1.dll"),
+            PathBuf::from(r"\\?\C:\Scribe\VULKAN-1.DLL"),
+            PathBuf::from(r"C:\Users\黄 Name\vulkan-1.dll"),
+            long_path,
+        ] {
+            assert_eq!(
+                unique_policy_loader_in(&[1 as HMODULE], |_| Ok(path.clone())).unwrap(),
+                1 as HMODULE
+            );
+        }
+        for path in [
+            r"C:\vulkan-1.dll\other.dll",
+            r"C:\Scribe\vulkan-1.dll.extra",
+            r"C:\Scribe\vulKan-1.dll",
+            r"C:\Scribe\vulkan-1.dlℓ",
+        ] {
+            assert!(unique_policy_loader_in(&[1 as HMODULE], |_| Ok(PathBuf::from(path))).is_err());
+        }
+    }
+
+    #[test]
+    fn module_selection_rejects_missing_duplicate_and_unreadable_candidates() {
+        assert!(unique_policy_loader_in(&[], |_| unreachable!()).is_err());
+        assert!(
+            unique_policy_loader_in(&[1 as HMODULE, 2 as HMODULE], |_| {
+                Ok(PathBuf::from(r"C:\Scribe\vulkan-1.dll"))
+            })
+            .is_err()
+        );
+        for path in [r"vulkan-1.dll", r"C:\", "C:\\Scribe\\vulkan-1.dll\0hidden"] {
+            assert!(unique_policy_loader_in(&[1 as HMODULE], |_| Ok(PathBuf::from(path))).is_err());
+        }
+        // A valid candidate does not allow a later unreadable module to be skipped.
+        let error = unique_policy_loader_in(&[1 as HMODULE, 2 as HMODULE], |module| {
+            if module == 1 as HMODULE {
+                Ok(PathBuf::from(r"C:\Scribe\vulkan-1.dll"))
+            } else {
+                bail!("forced truncated or unreadable module path")
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("truncated or unreadable"));
+    }
+
+    fn fixture_module_path(module: HMODULE) -> Result<PathBuf> {
+        Ok(PathBuf::from(if module == 1 as HMODULE {
+            r"C:\Scribe\vulkan-1.dll"
+        } else {
+            r"C:\Windows\System32\kernel32.dll"
+        }))
+    }
+
+    #[test]
+    fn pinned_module_admission_brackets_pin_with_two_canonical_inventories() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let captures = std::cell::Cell::new(0);
+        let module = pinned_mapped_policy_loader_with(
+            || {
+                events.borrow_mut().push("inventory");
+                captures.set(captures.get() + 1);
+                let handles = if captures.get() == 1 {
+                    [2 as HMODULE, 1 as HMODULE]
+                } else {
+                    [1 as HMODULE, 2 as HMODULE]
+                };
+                validated_module_inventory(&handles, size_of_val(&handles) as u32)
+            },
+            |module| {
+                events.borrow_mut().push("path");
+                fixture_module_path(module)
+            },
+            |module| {
+                events.borrow_mut().push("pin");
+                Ok(module)
+            },
+        )
+        .unwrap();
+        assert_eq!(module, 1 as HMODULE);
+        assert_eq!(captures.get(), 2);
+        assert_eq!(
+            events.into_inner(),
+            [
+                "inventory",
+                "path",
+                "path",
+                "pin",
+                "inventory",
+                "path",
+                "path"
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_module_admission_rejects_changed_inventories_without_retry() {
+        for changed in [vec![1], vec![1, 2, 3], vec![1, 3]] {
+            let mut captures = 0;
+            let error = pinned_mapped_policy_loader_with(
+                || {
+                    captures += 1;
+                    Ok(if captures == 1 {
+                        vec![1 as HMODULE, 2 as HMODULE]
+                    } else {
+                        changed.iter().map(|handle| *handle as HMODULE).collect()
+                    })
+                },
+                fixture_module_path,
+                Ok,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("inventory changed"));
+            assert_eq!(captures, 2);
+        }
+    }
+
+    #[test]
+    fn pinned_module_admission_propagates_inventory_and_pin_failures() {
+        for failing_capture in [1, 2] {
+            let mut captures = 0;
+            let error = pinned_mapped_policy_loader_with(
+                || {
+                    captures += 1;
+                    if captures == failing_capture {
+                        bail!("forced inventory API failure")
+                    }
+                    Ok(vec![1 as HMODULE])
+                },
+                fixture_module_path,
+                Ok,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("inventory API failure"));
+            assert_eq!(captures, failing_capture);
+        }
+        for pin_result in [Err(anyhow!("forced pin failure")), Ok(2 as HMODULE)] {
+            let mut captures = 0;
+            assert!(
+                pinned_mapped_policy_loader_with(
+                    || {
+                        captures += 1;
+                        Ok(vec![1 as HMODULE])
+                    },
+                    fixture_module_path,
+                    |_| pin_result,
+                )
+                .is_err()
+            );
+            assert_eq!(captures, 1);
+        }
+    }
+
+    #[test]
+    fn pinned_module_admission_rechecks_names_after_pin() {
+        let mut paths = 0;
+        let error = pinned_mapped_policy_loader_with(
+            || Ok(vec![1 as HMODULE, 2 as HMODULE]),
+            |module| {
+                paths += 1;
+                fixture_module_path(if paths <= 2 {
+                    module
+                } else if module == 1 as HMODULE {
+                    2 as HMODULE
+                } else {
+                    1 as HMODULE
+                })
+            },
+            Ok,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("selection changed"));
+        assert_eq!(paths, 4);
     }
 
     #[test]
