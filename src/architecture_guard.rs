@@ -3491,7 +3491,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && file_probe_source.contains("if not ReleaseBeforeInnoReplacement then")
             && file_probe_source.contains("IdentityAccess := GenericRead")
             && file_probe_source
-                .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText",)
+                .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, False, ErrorText",)
             && file_probe_source
                 .contains("Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting")
             && file_probe_source
