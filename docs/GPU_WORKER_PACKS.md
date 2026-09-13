@@ -734,6 +734,141 @@ check can reject before Vulkan API use, but cannot retroactively prevent a DLL
 entry point from executing. Production trust and Auto qualification remain
 default-deny; no system-loader fallback is authorized for a verified Vulkan pack.
 
+## Windows installer pack-history foundation
+
+`runtime-manifests/gpu-worker-pack-history-windows-x64.json` records exact
+previously published Windows pack inventories and catalog byte identities.
+It is currently empty: fixture packs and unmerged builds are not published
+release history. The parser/planner in `scripts/windows-gpu-pack-history.ps1`
+does not inspect an installed catalog, delete files, activate packs, or access
+the private AppData store. Installed metadata is never retirement authority.
+
+Each history row binds a release ID, source revision, exact catalog size and
+SHA-256, canonical pack roots/security epochs, and every payload/control file's
+size and SHA-256. Reusing a root requires an identical inventory. The append-only
+comparison rejects changed, reordered, or removed predecessor rows. Before
+retirement can ship, CI and the protected release path must enforce that
+comparison against the authoritative previous history. The tested comparison
+API alone is not that release gate.
+
+The current build is different: its authority comes from freshly verified
+staging, not from a committed history row. Requiring the current pack digest in
+its own source commit would create a self-reference through the compiled app
+build identity. The stager serializes pack roots/files in ordinal order, hashes
+the actual catalog and complete staged inventory, and generates separate
+current-file identity/count, previous-file identity, and catalog predicates for
+the installer. History does not broaden the existing current-only admission
+predicates. The generated include is a build output and must not be committed.
+
+History is bounded to 128 releases, eight packs per release, 3–258 complete
+inventory files per pack, 512 KiB per catalog, and a merged union of 1,024 files
+and 900 ancestor directories. These leave headroom under the
+installer's independent 2,048-handle ceiling; they do not replace its runtime
+accounting. File/envelope limits mirror signed-pack validation. Zero-byte
+payload files are allowed; manifest/signature envelopes must be nonempty.
+Windows history uses an intentionally narrower literal-safe ASCII path grammar
+and depth bound than the generic signed-pack format. Reject an incompatible
+inventory during trusted staging rather than making the installer interpret
+additional path syntax. The build job and its checked-out history must be
+exclusive trusted inputs; pre/post path checks are not a mutable-directory
+race-proof signing boundary.
+
+Run the focused checks with:
+
+```powershell
+./scripts/test-windows-gpu-pack-history.ps1
+./scripts/test-windows-worker-pack-staging.ps1
+```
+
+Both also run through the existing CI/local
+`./scripts/test-windows-release-packaging.ps1` command. Coverage includes skipped
+upgrades, empty pack sets, same-version repair, immutable-root reintroduction,
+zero-byte payloads, malformed/colliding paths, append-only history, exact limit
+boundaries, nonempty generated identities, and culture/input-order invariance.
+Staging fixtures exercise serialization after verification; they do not replace
+the signed-pack verifier's tamper tests.
+
+This foundation does not enable obsolete GPU-payload deletion. Shipping that
+behavior still requires the catalog-publication fault matrix, byte-authenticated
+retained-handle retirement, bounded recovery, authoritative append-only release
+history (including any prior CPU-only catalog), and the private-store selection
+dependency. Keep normal production GPU trust and Auto default-deny until the
+separate release qualification gates pass.
+
+## Windows installer catalog publication
+
+The installer copies the new catalog to `worker-pack-catalog.next.json`, never
+directly over the live catalog. An existing next file is not overwritten.
+Preflight classifies live/next/previous catalogs by generated exact size/hash
+identities and rejects unknown, corrupt, linked, streamed, locked, or ambiguous
+states. It retains directory/file identities through the file-installation
+phase and verifies the full current payload identity table and file count before
+publication.
+
+Repeated tree validation reuses each already-retained directory lease after
+matching a temporary no-follow path probe to its volume/file identity and
+rechecking directory attributes/streams. The original lease remains open.
+Directory kind is recorded separately from file-replacement policy, so a file
+lease cannot be mistaken for a reusable directory lease. This avoids counting
+the same directory twice during a populated upgrade while preserving the
+2,048-handle ceiling and the 900-directory/1,024-file generated limits.
+
+After the file phase, publication uses two non-replacing, identity-bound Win32
+renames: live to `worker-pack-catalog.previous.json`, then next to live. Before
+each mutation it upgrades the source lease and rechecks the same volume/file
+identity and snapshot; afterward it reopens and verifies the result. A raced
+destination fails without replacement. The previous catalog remains available
+as recovery metadata. This is a recoverable two-step transition, not a claim of
+power-fail atomicity or whole-application rollback. If no live catalog remains,
+repair must restage the current application/payload; the installer does not
+restore an older catalog over potentially newer or mixed application files.
+When an authenticated current next catalog already exists, preflight still
+authenticates every present current worker file. Missing known current files may
+be restaged only in the four explicit next-catalog recovery states: fresh,
+before the first rename, before the second rename, and redundant next. The
+existing next catalog remains under its retained read lease throughout payload
+replay and is not restaged. Publication then reauthenticates that exact catalog
+and upgrades/reopens its lease only for the intended handle-bound mutation.
+Publication still requires the complete generated current size/hash table and
+file count after copying. Present corrupt, unknown, linked, streamed, or reparse
+payload paths continue to fail before payload or catalog mutation; historical
+payload admission and deletion remain disabled. Generated and observed counts
+must both remain within zero through 1,024, and observed files may never exceed
+the generated count.
+
+Post-file-phase failures set installer exit code 73 and suppress app launch.
+They are explicitly recorded because Inno post-install exceptions do not roll
+back file copies. Automatic app restart is disabled and its command-line
+override is rejected. Normal launch remains postinstall and requires successful
+catalog publication. Uninstall metadata cleanup is limited to the three exact
+app-local catalog filenames; there are no wildcard or install-time deletion
+directives, and private user data remains outside this cleanup.
+
+Run the compiled state-machine fixtures using the reviewed Inno 6.7.1 compiler:
+
+```powershell
+./scripts/test-windows-worker-catalog-publication.ps1 -InnoCompiler <verified-ISCC.exe-path>
+```
+
+CI runs the same command after acquiring/verifying the pinned compiler. The
+harness verifies its digest, builds production and test variants, bounds every
+owned process, and cleans only its exact temporary fixture roots after process
+shutdown. If a process cannot be reaped, it preserves those roots and reports
+them. Test-only fault and launch hooks are compiled out of the normal installer.
+
+These are synthetic catalog-state fixtures, not production signed A/B pack
+installers. Coverage includes fresh installation, update/repair, interrupted
+rename boundaries and restart, occupied destinations, altered catalogs,
+incompatible sharing, incomplete recovery payloads, launch suppression, and
+custom failure exits. A populated upgrade with 900 worker directories and
+1,024 byte-authenticated worker files also verifies that repeated directory
+validation stays within the retained-handle limit. Historical GPU payload admission/retirement remains
+disabled: a real differing-pack upgrade, authoritative history enforcement,
+handle-based obsolete-file removal, power-loss/hard-termination testing, and
+clean-machine signed installation still require their own verification before
+release. The private verified-pack store retains its separate activation and
+rollback guarantees.
+
 ## Stage 7 Linux GPU contract
 
 Linux GPU support remains default-deny. The only reviewed future worker target is

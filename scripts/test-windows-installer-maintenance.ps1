@@ -258,9 +258,24 @@ if ($installer -match 'ExitProcess@|TerminateProcess@|\bExitProcess\(') {
     throw 'Terminal remove must not abruptly terminate Setup and bypass its cleanup lifecycle.'
 }
 
-# No installer deletion directive may target Scribe data outside {app}.
-if ($installer -match '(?mi)^\[UninstallDelete\]' -or $installer -match '(?mi)^\[InstallDelete\]') {
-    throw 'Installer must not add delete directives that could remove user data.'
+# Renamed catalog metadata is not tracked under its final name by Inno's file
+# copy log. Permit only these three exact application-local uninstall entries.
+if ($installer -match '(?mi)^\[InstallDelete\]') {
+    throw 'Installer must not add install-time pathname deletion directives.'
+}
+$catalogDeleteSections = [regex]::Matches($installer, '(?ims)^\[UninstallDelete\]\s*\r?\n(.*?)(?=^\[|\z)')
+if ($catalogDeleteSections.Count -ne 1) {
+    throw 'Installer must have exactly one catalog-only uninstall cleanup section.'
+}
+$catalogDeleteLines = @($catalogDeleteSections[0].Groups[1].Value -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$expectedCatalogDeleteLines = @(
+    'Type: files; Name: "{app}\worker-pack-catalog.json"',
+    'Type: files; Name: "{app}\worker-pack-catalog.next.json"',
+    'Type: files; Name: "{app}\worker-pack-catalog.previous.json"'
+)
+if ($catalogDeleteLines.Count -ne 3 -or
+    ($catalogDeleteLines -join "`n") -cne ($expectedCatalogDeleteLines -join "`n")) {
+    throw 'Installer cleanup may target only the three exact application-local catalog files.'
 }
 Assert-Contains 'your Scribe settings, history, models, and runtimes stored outside the application folder are kept.' 'user-data preservation notice'
 

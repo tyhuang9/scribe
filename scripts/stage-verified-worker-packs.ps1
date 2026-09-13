@@ -11,6 +11,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'windows-gpu-pack-history.ps1')
+
 function Get-NormalizedFullPath([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)
     $root = [System.IO.Path]::GetPathRoot($full)
@@ -158,7 +160,106 @@ function Get-CompressedSize([string]$Root) {
     }
 }
 
-function Write-InstallerAllowlist([string]$Path, [string[]]$Files) {
+function Write-WorkerPackCatalog(
+    [string]$BundleRoot,
+    [object[]]$Packs,
+    [string]$SourceRevision
+) {
+    if ($SourceRevision -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'Worker-pack catalog history requires an exact checked-out source revision.'
+    }
+    # JSON and installer identities must not depend on caller order or host culture.
+    $orderedPacks = [System.Collections.Generic.List[object]]::new()
+    foreach ($pack in $Packs) {
+        $orderedFiles = [string[]]@($pack.files)
+        [Array]::Sort($orderedFiles, [System.StringComparer]::Ordinal)
+        $pack.files = $orderedFiles
+        $orderedPacks.Add($pack)
+    }
+    $orderedPacks.Sort([System.Comparison[object]]{
+        param($left, $right)
+        [System.StringComparer]::Ordinal.Compare([string]$left.root, [string]$right.root)
+    })
+    $catalog = [ordered]@{
+        schema_version = 1
+        packs = [object[]]$orderedPacks.ToArray()
+    }
+    $catalogJson = $catalog | ConvertTo-Json -Depth 8
+    if ([System.Text.Encoding]::UTF8.GetByteCount($catalogJson) -gt
+        $script:WindowsGpuPackHistoryMaximumCatalogSize) {
+        throw 'Generated worker-pack catalog exceeds the runtime catalog byte bound.'
+    }
+    $catalogPath = Join-Path $BundleRoot 'worker-pack-catalog.json'
+    [System.IO.File]::WriteAllText(
+        $catalogPath,
+        $catalogJson,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $catalogSize = [int64](Assert-RegularNonReparseFile $catalogPath).Length
+    $catalogSha256 = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $currentPackHistory = @($orderedPacks | ForEach-Object {
+        $pack = $_
+        [ordered]@{
+            pack_id = $pack.pack_id
+            pack_version = $pack.pack_version
+            pack_digest = $pack.pack_digest
+            security_epoch = $pack.security_epoch
+            root = $pack.root
+            files = @($pack.files | ForEach-Object {
+                $relative = $_
+                $filePath = Join-Path $BundleRoot ($relative -replace '/', '\')
+                [ordered]@{
+                    path = $relative
+                    size_bytes = [int64](Assert-RegularNonReparseFile $filePath).Length
+                    sha256 = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+            })
+        }
+    })
+    $currentHistoryJson = [ordered]@{
+        schema_version = 1
+        history_epoch = 1
+        releases = @([ordered]@{
+            release_id = "build-$SourceRevision"
+            source_revision = $SourceRevision
+            catalog_size_bytes = $catalogSize
+            catalog_sha256 = $catalogSha256
+            catalog_pack_roots = @($orderedPacks | ForEach-Object { $_.root })
+            packs = $currentPackHistory
+        })
+    } | ConvertTo-Json -Depth 12
+    $currentHistory = ConvertFrom-WindowsGpuPackHistoryJson `
+        -Json $currentHistoryJson -SourceLabel 'verified current staging inventory'
+    return [pscustomobject]@{
+        Path = $catalogPath
+        SizeBytes = $catalogSize
+        Sha256 = $catalogSha256
+        History = $currentHistory
+    }
+}
+
+function Get-InstallerFileIdentityClauses([object[]]$Files) {
+    return (@($Files | ForEach-Object {
+        $native = $_.Path.Replace('/', '\').Replace("'", "''")
+        @"
+  if SameStr(RelativePath, '$native') then
+  begin
+    FileSize := $($_.SizeBytes);
+    Sha256 := '$($_.Sha256)';
+    Result := True;
+    Exit;
+  end;
+"@
+    }) -join "`r`n")
+}
+
+function Write-InstallerAllowlist(
+    [string]$Path,
+    [string[]]$Files,
+    [object]$RetirementPlan,
+    [int64]$CatalogSize,
+    [string]$CatalogSha256
+) {
     $directories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($file in $Files) {
         $segments = $file.Split('/')
@@ -169,10 +270,12 @@ function Write-InstallerAllowlist([string]$Path, [string[]]$Files) {
     if ($directories.Count -gt 900) {
         throw 'Declared worker packs exceed the installer directory-handle bound.'
     }
-    $directoryClauses = @($directories | Sort-Object | ForEach-Object {
+    $orderedDirectories = Get-WindowsGpuPackHistoryOrdinalStrings $directories
+    $orderedFiles = Get-WindowsGpuPackHistoryOrdinalStrings $Files
+    $directoryClauses = @($orderedDirectories | ForEach-Object {
         "    SameStr(RelativePath, '$($_.Replace("'", "''"))')"
     })
-    $fileClauses = @($Files | Sort-Object | ForEach-Object {
+    $fileClauses = @($orderedFiles | ForEach-Object {
         $native = $_.Replace('/', '\').Replace("'", "''")
         "    SameStr(RelativePath, '$native')"
     })
@@ -182,8 +285,27 @@ function Write-InstallerAllowlist([string]$Path, [string[]]$Files) {
     $fileExpression = if ($fileClauses.Count -eq 0) { '  Result := False;' } else {
         "  Result :=`r`n" + ($fileClauses -join " or`r`n") + ';'
     }
+    $retiredDirectoryClauses = @($RetirementPlan.RetiredDirectories | ForEach-Object {
+        $native = $_.Replace('/', '\').Replace("'", "''")
+        "    SameStr(RelativePath, '$native')"
+    })
+    $retiredDirectoryExpression = if ($retiredDirectoryClauses.Count -eq 0) {
+        '  Result := False;'
+    } else {
+        "  Result :=`r`n" + ($retiredDirectoryClauses -join " or`r`n") + ';'
+    }
+    $currentFileClauses = Get-InstallerFileIdentityClauses $RetirementPlan.CurrentFiles
+    $retiredFileClauses = Get-InstallerFileIdentityClauses $RetirementPlan.RetiredFiles
+    $knownCatalogClauses = Get-WindowsGpuPackHistoryOrdinalStrings @(
+        "    ((FileSize = $CatalogSize) and SameStr(Sha256, '$CatalogSha256'))"
+        $RetirementPlan.HistoricalCatalogs | ForEach-Object {
+            "    ((FileSize = $($_.SizeBytes)) and SameStr(Sha256, '$($_.Sha256)'))"
+        }
+    )
+    $knownCatalogClauses = @($knownCatalogClauses | Select-Object -Unique)
+    $knownCatalogExpression = "  Result :=`r`n" + ($knownCatalogClauses -join " or`r`n") + ';'
     $text = @"
-// Generated from fully verified declared worker-pack roots. Do not commit.
+// Generated from verified current packs and checked-in release history. Do not commit.
 function IsGeneratedWorkerPackDirectory(RelativePath: String): Boolean;
 begin
 $directoryExpression
@@ -192,6 +314,46 @@ end;
 function IsGeneratedWorkerPackFile(RelativePath: String): Boolean;
 begin
 $fileExpression
+end;
+
+function IsGeneratedRetiredWorkerPackDirectory(RelativePath: String): Boolean;
+begin
+$retiredDirectoryExpression
+end;
+
+function GetGeneratedCurrentWorkerPackFileIdentity(
+  RelativePath: String; var FileSize: Int64; var Sha256: String
+): Boolean;
+begin
+  Result := False;
+  FileSize := -1;
+  Sha256 := '';
+$currentFileClauses
+end;
+
+function GetGeneratedCurrentWorkerPackFileCount(): Integer;
+begin
+  Result := $($RetirementPlan.CurrentFiles.Count);
+end;
+
+function GetGeneratedRetiredWorkerPackFileIdentity(
+  RelativePath: String; var FileSize: Int64; var Sha256: String
+): Boolean;
+begin
+  Result := False;
+  FileSize := -1;
+  Sha256 := '';
+$retiredFileClauses
+end;
+
+function IsGeneratedCurrentWorkerCatalog(FileSize: Int64; Sha256: String): Boolean;
+begin
+  Result := (FileSize = $CatalogSize) and SameStr(Sha256, '$CatalogSha256');
+end;
+
+function IsGeneratedKnownWorkerCatalog(FileSize: Int64; Sha256: String): Boolean;
+begin
+$knownCatalogExpression
 end;
 "@
     $parent = Split-Path -Parent $Path
@@ -284,20 +446,24 @@ if ($allPackFiles.Count -gt 1024) {
     throw 'Declared worker packs exceed the 1,024-file release bound.'
 }
 
-$catalog = [ordered]@{
-    schema_version = 1
-    packs = @($catalogPacks)
+$repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$sourceRevision = @(& git -C $repositoryRoot rev-parse --verify HEAD)
+if ($LASTEXITCODE -ne 0 -or $sourceRevision.Count -ne 1 -or
+    $sourceRevision[0] -cnotmatch '^[0-9a-f]{40}$') {
+    throw 'Worker-pack catalog history requires an exact checked-out source revision.'
 }
-$catalogPath = Join-Path $bundle 'worker-pack-catalog.json'
-[System.IO.File]::WriteAllText(
-    $catalogPath,
-    ($catalog | ConvertTo-Json -Depth 8),
-    [System.Text.UTF8Encoding]::new($false)
+$currentCatalog = Write-WorkerPackCatalog $bundle $catalogPacks.ToArray() $sourceRevision[0]
+$history = Read-WindowsGpuPackHistory -LiteralPath (
+    Join-Path $repositoryRoot 'runtime-manifests\gpu-worker-pack-history-windows-x64.json'
 )
-Write-InstallerAllowlist (Get-NormalizedFullPath $InstallerAllowlistPath) $allPackFiles.ToArray()
+$retirementPlan = Get-WindowsGpuPackRetirementPlan `
+    -HistoryDocument $history -CurrentDocument $currentCatalog.History
+Write-InstallerAllowlist `
+    (Get-NormalizedFullPath $InstallerAllowlistPath) `
+    $allPackFiles.ToArray() $retirementPlan $currentCatalog.SizeBytes $currentCatalog.Sha256
 
 [pscustomobject]@{
     PackFiles = $allPackFiles.ToArray()
     PackCount = $catalogPacks.Count
-    CatalogPath = $catalogPath
+    CatalogPath = $currentCatalog.Path
 }

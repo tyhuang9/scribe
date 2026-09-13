@@ -8,6 +8,62 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn installer_has_exact_catalog_uninstall_cleanup(source: &str) -> bool {
+    let lines: Vec<_> = source.lines().map(str::trim).collect();
+    if lines.iter().any(|line| {
+        ["[InstallDelete]", "[Registry]", "[INI]"]
+            .iter()
+            .any(|forbidden| line.eq_ignore_ascii_case(forbidden))
+    }) {
+        return false;
+    }
+    let sections: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.eq_ignore_ascii_case("[UninstallDelete]"))
+        .map(|(index, _)| index)
+        .collect();
+    let [start] = sections.as_slice() else {
+        return false;
+    };
+    let entries: Vec<_> = lines[start + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| !line.starts_with('['))
+        .filter(|line| !line.is_empty() && !line.starts_with(';'))
+        .collect();
+    entries
+        == [
+            r#"Type: files; Name: "{app}\worker-pack-catalog.json""#,
+            r#"Type: files; Name: "{app}\worker-pack-catalog.next.json""#,
+            r#"Type: files; Name: "{app}\worker-pack-catalog.previous.json""#,
+        ]
+}
+
+#[test]
+fn catalog_uninstall_guard_rejects_broad_extra_or_duplicate_cleanup() {
+    let valid = r#"[UninstallDelete]
+Type: files; Name: "{app}\worker-pack-catalog.json"
+Type: files; Name: "{app}\worker-pack-catalog.next.json"
+Type: files; Name: "{app}\worker-pack-catalog.previous.json"
+[Code]
+"#;
+    assert!(installer_has_exact_catalog_uninstall_cleanup(valid));
+    for invalid in [
+        valid.replace("Type: files;", "Type: filesandordirs;"),
+        valid.replace("worker-pack-catalog.json", "*"),
+        valid.replace("worker-pack-catalog.previous.json", "unrelated.json"),
+        valid.replace("[Code]", "Type: files; Name: \"{app}\\extra.json\"\n[Code]"),
+        valid.replace("[Code]", "[UNINSTALLDELETE]\n[Code]"),
+        valid.replace("[Code]", "[installdelete]\n[Code]"),
+        valid.replace("[Code]", "[REGISTRY]\n[Code]"),
+        valid.replace("[Code]", "[ini]\n[Code]"),
+        valid.replace("[UninstallDelete]", "[Tasks]"),
+    ] {
+        assert!(!installer_has_exact_catalog_uninstall_cleanup(&invalid));
+    }
+}
+
 fn rust_sources() -> Vec<(PathBuf, String)> {
     fn visit(root: &Path, files: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(root).expect("source directory must be readable") {
@@ -3491,7 +3547,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && file_probe_source.contains("if not ReleaseBeforeInnoReplacement then")
             && file_probe_source.contains("IdentityAccess := GenericRead")
             && file_probe_source
-                .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText",)
+                .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, False, ErrorText",)
             && file_probe_source
                 .contains("Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting")
             && file_probe_source
@@ -3608,11 +3664,8 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "installer must retain identity handles through installation and release them on every exit"
     );
     assert!(
-        !installer.contains("[InstallDelete]")
-            && !installer.contains("[UninstallDelete]")
-            && !installer.contains("[Registry]")
-            && !installer.contains("[INI]"),
-        "Windows installer must not broadly delete an existing program directory"
+        installer_has_exact_catalog_uninstall_cleanup(&installer),
+        "Windows installer cleanup must be limited to the three exact catalog files at uninstall"
     );
 
     let main = fs::read_to_string(repository.join("src").join("main.rs"))
