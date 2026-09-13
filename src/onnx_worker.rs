@@ -9716,17 +9716,50 @@ fn execute_worker_batch<R: WorkerRecognizer>(
                 processing_duration_ms,
             })
         }
-        WireRuntimeArtifact::Gguf(_) => runtime_router
-            .transcribe(
-                RuntimeArtifact::try_from(batch.artifact)?,
-                batch.preference,
-                &audio,
-                &batch.options,
-                runtime_router.cancellation_snapshot(),
-            )
-            .map(WireRuntimeExecution::from)
-            .map_err(anyhow::Error::new),
+        WireRuntimeArtifact::Gguf(_) => {
+            let native_execution = runtime_router
+                .transcribe(
+                    RuntimeArtifact::try_from(batch.artifact)?,
+                    batch.preference,
+                    &audio,
+                    &batch.options,
+                    runtime_router.cancellation_snapshot(),
+                )
+                .map_err(anyhow::Error::new)?;
+            complete_gguf_worker_batch(batch.load.diagnostics, native_execution)
+        }
     }
+}
+
+fn complete_gguf_worker_batch(
+    begin_diagnostics: WireRuntimeDiagnostics,
+    native_execution: RuntimeExecution,
+) -> Result<WireRuntimeExecution> {
+    // BeginBatch's load belongs to this request, and decode can trigger a
+    // further native reload. A request is warm only when both reuse their
+    // model, while its loading time is the sum of both phases.
+    // Check the native value before the general wire conversion, which
+    // deliberately saturates duration fields for protocol compatibility.
+    let decode_model_load_duration_ms =
+        u64::try_from(native_execution.diagnostics.model_load_duration_ms).map_err(|_| {
+            anyhow::Error::new(RuntimeError::Engine(
+                "GGUF decode model-load duration exceeds the worker wire range".to_owned(),
+            ))
+        })?;
+    let model_load_duration_ms = begin_diagnostics
+        .model_load_duration_ms
+        .checked_add(decode_model_load_duration_ms)
+        .ok_or_else(|| {
+            anyhow::Error::new(RuntimeError::Engine(
+                "GGUF batch model-load duration exceeds the worker wire range".to_owned(),
+            ))
+        })?;
+    let warm_reused = begin_diagnostics.warm_reused && native_execution.diagnostics.warm_reused;
+
+    let mut execution = WireRuntimeExecution::from(native_execution);
+    execution.diagnostics.warm_reused = warm_reused;
+    execution.diagnostics.model_load_duration_ms = model_load_duration_ms;
+    Ok(execution)
 }
 
 fn handle_audio_chunk<R: WorkerRecognizer>(
@@ -12884,6 +12917,169 @@ mod tests {
         assert!(validate_wire_diagnostics(&too_many_targets).is_err());
     }
 
+    fn gguf_native_execution(
+        diagnostics: WireRuntimeDiagnostics,
+        transcript: Transcript,
+        processing_duration_ms: u128,
+    ) -> RuntimeExecution {
+        RuntimeExecution {
+            transcript,
+            diagnostics: diagnostics.into(),
+            processing_duration_ms,
+        }
+    }
+
+    fn gguf_transcript_fixture() -> Transcript {
+        Transcript {
+            text: "decode transcript".to_owned(),
+            segments: vec![
+                TranscriptSegment {
+                    text: "decode".to_owned(),
+                    start_ms: Some(4),
+                    end_ms: Some(17),
+                    confidence: Some(0.75),
+                },
+                TranscriptSegment {
+                    text: "transcript".to_owned(),
+                    start_ms: Some(18),
+                    end_ms: Some(42),
+                    confidence: Some(0.5),
+                },
+            ],
+            detected_language: Some("fr".to_owned()),
+            duration_ms: Some(42),
+        }
+    }
+
+    #[test]
+    fn gguf_batch_completion_combines_warm_reuse_and_model_load_durations() {
+        for (begin_warm, decode_warm, begin_ms, decode_ms, expected_warm, expected_ms) in [
+            (false, false, 0, 0, false, 0),
+            (false, true, 12, 0, false, 12),
+            (true, true, 0, 0, true, 0),
+            (true, false, 0, 7, false, 7),
+            (false, false, 12, 7, false, 19),
+            (false, false, 0, u64::MAX, false, u64::MAX),
+            (false, false, u64::MAX, 0, false, u64::MAX),
+            (false, false, u64::MAX - 1, 1, false, u64::MAX),
+        ] {
+            let mut begin = diagnostics_with_typed_backend_selection();
+            begin.warm_reused = begin_warm;
+            begin.model_load_duration_ms = begin_ms;
+            let mut decode = diagnostics_with_typed_backend_selection();
+            decode.warm_reused = decode_warm;
+            decode.model_load_duration_ms = decode_ms;
+
+            let completed = complete_gguf_worker_batch(
+                begin,
+                gguf_native_execution(decode, gguf_transcript_fixture(), 13),
+            )
+            .unwrap();
+
+            assert_eq!(completed.diagnostics.warm_reused, expected_warm);
+            assert_eq!(
+                completed.diagnostics.model_load_duration_ms, expected_ms,
+                "begin={begin_ms}, decode={decode_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_batch_completion_preserves_decode_fields_through_scif() {
+        let mut begin = diagnostics_with_typed_backend_selection();
+        begin.warm_reused = true;
+        begin.model_load_duration_ms = 23;
+
+        let mut decode = diagnostics_with_typed_backend_selection();
+        decode.resolved_acceleration.diagnostic = Some("decode diagnostic".to_owned());
+        let decode_target = backend_target(BackendKind::Vulkan, "decode-vulkan", Some(77));
+        decode
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap()
+            .target = decode_target.clone();
+        decode.runtime_location = PathBuf::from("decode-native-runtime");
+        decode.warm_reused = true;
+        decode.model_load_duration_ms = 19;
+        let native = gguf_native_execution(decode.clone(), gguf_transcript_fixture(), 29);
+        let expected_decode = WireRuntimeExecution::from(native.clone());
+
+        let completed = complete_gguf_worker_batch(begin, native).unwrap();
+        assert_eq!(completed.transcript, expected_decode.transcript);
+        assert_eq!(
+            completed.processing_duration_ms,
+            expected_decode.processing_duration_ms
+        );
+        assert_eq!(
+            completed.diagnostics.resolved_acceleration,
+            decode.resolved_acceleration
+        );
+        assert_eq!(
+            completed.diagnostics.runtime_location,
+            decode.runtime_location
+        );
+        assert!(completed.diagnostics.warm_reused);
+        assert_eq!(completed.diagnostics.model_load_duration_ms, 42);
+        let expected_scif_execution: WireRuntimeExecution =
+            serde_json::from_slice(&serde_json::to_vec(&completed).unwrap()).unwrap();
+
+        let response = Control::RuntimeTranscript {
+            execution: completed,
+        };
+        validate_worker_response(&response).unwrap();
+        let (session_id, request_id, decoded) =
+            parse_worker_control(control_frame(41, 73, &response).unwrap()).unwrap();
+        assert_eq!((session_id, request_id), (41, 73));
+        let Control::RuntimeTranscript { execution } = decoded else {
+            panic!("expected a runtime transcript response");
+        };
+        assert_eq!(execution, expected_scif_execution);
+        let target = &execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .unwrap()
+            .target;
+        assert_eq!(target.backend, BackendKind::Vulkan);
+        assert_eq!(target.device_id, decode_target.device_id);
+        assert_eq!(target.process_index, None);
+    }
+
+    #[test]
+    fn gguf_batch_completion_rejects_unrepresentable_accounting_as_engine_decode_failure() {
+        for (begin_ms, decode_ms) in [(u64::MAX, u128::from(1_u8)), (0, u128::from(u64::MAX) + 1)] {
+            let mut begin = diagnostics_with_typed_backend_selection();
+            begin.model_load_duration_ms = begin_ms;
+            let mut decode = diagnostics_with_typed_backend_selection();
+            decode.model_load_duration_ms = 0;
+            let mut native = gguf_native_execution(decode, gguf_transcript_fixture(), 1);
+            native.diagnostics.model_load_duration_ms = decode_ms;
+            let error = complete_gguf_worker_batch(begin, native).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<RuntimeError>(),
+                Some(RuntimeError::Engine(_))
+            ));
+
+            let mut output = Vec::new();
+            write_runtime_result(&mut output, 7, 9, Err(error)).unwrap();
+            let mut output = Cursor::new(output);
+            let (session_id, request_id, response) =
+                parse_worker_control(read_frame(&mut output).unwrap()).unwrap();
+            assert_eq!((session_id, request_id), (7, 9));
+            assert_eq!(output.position(), output.get_ref().len() as u64);
+            match response {
+                Control::RuntimeFailed { error } => {
+                    assert_eq!(error.code, WireRuntimeErrorCode::Engine);
+                    assert_eq!(error.category, WireFailureCategory::Decode);
+                    assert_eq!(error.retry, WireRetryDisposition::Never);
+                    assert!(!error.fatal);
+                }
+                other => panic!("expected typed runtime failure, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn verified_pack_target_is_projected_into_typed_backend_diagnostics() {
         let mut diagnostics = diagnostics_with_typed_backend_selection();
@@ -12940,6 +13136,8 @@ mod tests {
         {
             Control::RuntimeFailed { error } => {
                 assert_eq!(error.code, WireRuntimeErrorCode::Inference);
+                assert_eq!(error.category, WireFailureCategory::Decode);
+                assert_eq!(error.retry, WireRetryDisposition::Never);
                 assert!(!error.fatal);
                 assert!(matches!(error.into_runtime(), RuntimeError::Inference(_)));
             }
@@ -12995,7 +13193,16 @@ mod tests {
         let content_failure = WireRuntimeError::from_runtime(&RuntimeError::Engine(
             "fixture content failure".to_owned(),
         ));
+        assert_eq!(content_failure.category, WireFailureCategory::Decode);
         assert_eq!(content_failure.retry, WireRetryDisposition::Never);
+
+        let cancellation = WireRuntimeError::from_runtime(&RuntimeError::Cancelled(
+            "fixture cancellation".to_owned(),
+        ));
+        assert_eq!(cancellation.code, WireRuntimeErrorCode::Cancelled);
+        assert_eq!(cancellation.category, WireFailureCategory::Cancellation);
+        assert_eq!(cancellation.retry, WireRetryDisposition::Never);
+        assert!(!cancellation.fatal);
 
         let artifact_path = PathBuf::from("models").join("fixture.gguf");
         let integrity = WireRuntimeError::from_runtime(&RuntimeError::ArtifactIntegrity {
