@@ -2480,6 +2480,52 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
 }
 
 #[test]
+fn windows_vulkan_path_compatibility_keeps_the_verified_launch_boundary() {
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let resolver = named_function_bodies(&worker, "resolve_verified_pack_executable");
+    assert_eq!(resolver.len(), 1, "there must be one shared pack resolver");
+    let resolver = &resolver[0];
+    let verified = resolver.find("verify_worker_executable(").unwrap();
+    let loader = resolver.find("validate_verified_pack_loader(").unwrap();
+    let compatibility = resolver
+        .find("validate_windows_vulkan_process_path(&executable.path)?")
+        .expect("verified Windows Vulkan paths need compatibility admission");
+    assert!(loader < verified && verified < compatibility);
+    assert!(
+        resolver[..compatibility]
+            .trim_end()
+            .ends_with("if pack.backend == PackBackend::Vulkan {"),
+        "the compatibility guard must not restrict CPU or CUDA workers"
+    );
+    assert!(resolver[verified..compatibility].contains("#[cfg(windows)]"));
+
+    let classifier = named_function_bodies(&worker, "windows_vulkan_process_path_is_compatible");
+    assert_eq!(classifier.len(), 1);
+    for forbidden in [
+        "Command::new",
+        "CreateProcess",
+        "GetShortPathName",
+        "canonicalize",
+        "fs::copy",
+        "std::fs::copy",
+        "symlink",
+        "junction",
+        "LoadLibrary",
+    ] {
+        assert!(
+            !classifier[0].contains(forbidden),
+            "path compatibility must inspect, not create another launch namespace: {forbidden}"
+        );
+    }
+    assert!(classifier[0].contains("encode_wide()"));
+    assert!(worker.contains("Command::new(&executable.path)"));
+    assert!(worker.contains("let _immediate_identity_check = executable.revalidate()?;"));
+    assert!(worker.contains("let mut child = command.spawn()?;"));
+    assert_eq!(worker.matches("command.spawn()?").count(), 1);
+    assert_eq!(resolver.matches("executable.path =").count(), 0);
+}
+
+#[test]
 fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
     let identity = include_str!("worker_identity.rs");

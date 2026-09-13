@@ -427,6 +427,7 @@ pub(crate) enum PackDiscoveryIssue {
     DeviceRollbackAuthorityRejected,
     ReleaseAuthorityRejected,
     NotAutoQualified,
+    VulkanProcessPathIncompatible,
     ProviderProbeRejected,
     DriverVersionUnavailable,
 }
@@ -498,6 +499,9 @@ impl PackDiscoveryDiagnostic {
             }
             PackDiscoveryIssue::NotAutoQualified => {
                 format!("{subject} is verified but not qualified for Auto")
+            }
+            PackDiscoveryIssue::VulkanProcessPathIncompatible => {
+                format!("{subject} requires a short, standard local Windows installation path")
             }
             PackDiscoveryIssue::ProviderProbeRejected => {
                 format!("{subject} provider probe was rejected")
@@ -2304,6 +2308,11 @@ mod tests {
                 PackBackend::Vulkan,
             ),
             PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::VulkanProcessPathIncompatible,
+                &pack_id,
+                PackBackend::Vulkan,
+            ),
+            PackDiscoveryDiagnostic::pack(
                 PackDiscoveryIssue::ProviderProbeRejected,
                 &pack_id,
                 PackBackend::Vulkan,
@@ -2313,6 +2322,7 @@ mod tests {
         assert!(summary.contains("catalog was rejected"));
         assert!(summary.contains("signature or installed inventory was rejected"));
         assert!(summary.contains("not qualified for Auto"));
+        assert!(summary.contains("requires a short, standard local Windows installation path"));
         assert!(summary.contains("provider probe was rejected"));
         assert!(!summary.contains(':'));
         assert!(summary.len() < 2_048);

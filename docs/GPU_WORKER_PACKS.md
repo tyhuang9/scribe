@@ -49,6 +49,57 @@ packs for publication.
 - GPU health uses the exact pack/runtime/OS/driver/device/model key described
   below.
 
+### Windows Vulkan process-path compatibility
+
+Verified Windows Vulkan packs have an additional pre-launch compatibility
+check. The shared probe/execution resolver first completes signed-pack,
+reviewed-loader, and worker-file verification, then admits only rooted local
+drive paths whose ordinary DOS representation fits within 255 UTF-16 code
+units, excluding the terminating NUL. Short canonical `\\?\C:\...` paths
+are accepted only when their components are DOS-normalization-stable; the
+original canonical path is never rewritten. UNC and device namespaces and
+normalization-sensitive names (such as trailing dots or spaces) are not admitted
+for this backend. CPU, CUDA, Metal, and non-Windows launch behavior is unchanged.
+
+This is a conservative backend-compatibility bound, not a general Windows path
+limit or long-path GPU support. In fixture-signed diagnostics on physical
+NVIDIA hardware with driver 616.92, the same verified Vulkan worker passed full
+GPU transcription twice at 255 ASCII path characters and failed before Hello
+twice at 256. These pre-guard captures are neither release qualification nor
+production-pack evidence. A debugger observed ordinary
+`C:\...` process-creation arguments in the passing case and `\\?\C:\...`
+arguments in the failing case. The native exception was
+`FAST_FAIL_INVALID_ARG` during NVIDIA initialization reached through the bundled
+loader's `vkCreateInstance`. Prefix handling, total path length, and inherited
+TEMP state were not independently isolated. Short-path Unicode or other
+driver/hardware compatibility still requires hardware qualification.
+
+The pinned Rust 1.96 process-path conversion corroborates the observed
+representation boundary: its 260-unit threshold includes the four-unit
+verbatim prefix and terminating NUL, and removal also requires an unchanged
+`GetFullPathNameW` result. This explains the conservative 255-unit DOS budget,
+but does not establish the driver's internal cause. Recheck this admission
+policy when updating the Rust toolchain.
+See [Rust 1.96 Windows argument conversion](https://github.com/rust-lang/rust/blob/1.96.0/library/std/src/sys/args/windows.rs).
+
+An incompatible path is reported as a categorical, path-free pack-discovery
+diagnostic before a worker can start; it creates no device binding or crash
+quarantine record. Explicit GPU remains strict and can use another eligible GPU
+pack; with none available it explains the short, standard local-path requirement. Auto keeps
+its qualified alternatives and CPU fallback. This check does not make a pack
+Auto-eligible or change signing authority.
+
+Release qualification must budget the complete installed path, including the
+per-user/retained installation root, immutable pack ID, version, full digest,
+and worker leaf. The normal installer uses
+`{localappdata}\Programs\Scribe`; updates preserve the validated registered
+location. A short release version normally leaves substantial headroom, but the
+general manifest permits 96-character versions, so manifest validity alone is
+not proof of path compatibility. A separately reviewed compact packaging or
+installer path-budget policy remains necessary for unusually long installations.
+Do not introduce short-name aliases, reparse indirection, runtime copying,
+prefix stripping, or a system-loader fallback to bypass this boundary.
+
 ## Stage 5 Windows Auto qualification
 
 `runtime-manifests/gpu-auto-qualification-windows-x64.json` is a compact,

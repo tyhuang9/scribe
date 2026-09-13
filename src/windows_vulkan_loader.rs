@@ -361,6 +361,18 @@ fn strict_windows_absolute_path_eq(left: &Path, right: &Path) -> bool {
     windows_prefix_eq(&left.prefix, &right.prefix) && left.components == right.components
 }
 
+/// Accept only the ordinary local-drive path shape that can safely represent
+/// a verified Vulkan worker without depending on Win32 normalization.
+pub(crate) fn is_strict_windows_local_disk_path(path: &Path) -> bool {
+    matches!(
+        parse_strict_windows_absolute_path(path.as_os_str()),
+        Some(WindowsAbsolutePath {
+            prefix: WindowsAbsolutePrefix::Disk(_),
+            ..
+        })
+    )
+}
+
 fn parse_strict_windows_absolute_path(path: &OsStr) -> Option<WindowsAbsolutePath> {
     const BACKSLASH: u16 = b'\\' as u16;
     const COLON: u16 = b':' as u16;
@@ -1049,6 +1061,35 @@ mod tests {
             assert!(
                 !strict_windows_absolute_path_eq(&normal, &verbatim),
                 "accepted normalization-sensitive component {component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_local_disk_path_accepts_only_standard_local_drive_paths() {
+        for path in [
+            Path::new(r"C:\Scribe\Pack\scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\Pack\scribe-inference-worker.exe"),
+        ] {
+            assert!(is_strict_windows_local_disk_path(path), "rejected {path:?}");
+        }
+        for path in [
+            Path::new(r"C:\Scribe\Pack.\scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\Pack \scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\.\scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\..\scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\\scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\CON\scribe-inference-worker.exe"),
+            Path::new(r"\\?\C:\Scribe\LPT²\scribe-inference-worker.exe"),
+            Path::new(r"C:\"),
+            Path::new(r"C:relative\scribe-inference-worker.exe"),
+            Path::new(r"\\server\share\scribe-inference-worker.exe"),
+            Path::new(r"\\?\UNC\server\share\scribe-inference-worker.exe"),
+            Path::new(r"\\.\COM1"),
+        ] {
+            assert!(
+                !is_strict_windows_local_disk_path(path),
+                "accepted nonstandard local path {path:?}"
             );
         }
     }
