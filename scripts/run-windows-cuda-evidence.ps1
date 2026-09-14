@@ -75,8 +75,31 @@ function New-ScribeEvidenceShortCargoTarget([string]$Label) {
 }
 
 function Invoke-ScribeEvidence([string]$Exe, [string[]]$Arguments, [string]$Failure) {
-    & $Exe @Arguments
-    if ($LASTEXITCODE -ne 0) { throw $Failure }
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Exe
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        try {
+            if (-not $process.Start()) {
+                throw 'Native process start returned false.'
+            }
+            $process.WaitForExit()
+        }
+        catch {
+            throw [InvalidOperationException]::new($Failure, $_.Exception)
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "$Failure Native process exit code: $($process.ExitCode)."
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 function Get-ScribeEvidencePinnedMsvcEnvironment([string]$Builder, [string]$NativeArchive, [string]$UnusedOutput) {
