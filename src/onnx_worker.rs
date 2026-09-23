@@ -3010,6 +3010,33 @@ fn verify_worker_executable(
     })
 }
 
+// Parent-only diagnostic: retains the same verified image handle, but exposes
+// no launcher and never executes the file. Absent from production builds.
+#[cfg(test)]
+pub(crate) struct ProfiledWorkerVerification {
+    pub(crate) elapsed: Duration,
+    _verified: VerifiedWorkerExecutable,
+}
+
+#[cfg(test)]
+pub(crate) fn profile_worker_executable(
+    candidate: &Path,
+    expected_sha256: &str,
+) -> Result<ProfiledWorkerVerification> {
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("profiling requires an explicit worker SHA-256");
+    }
+    let root = candidate.parent().context("worker parent is missing")?;
+    let name = candidate.file_name().context("worker name is missing")?;
+    let started = Instant::now();
+    let verified = verify_worker_executable(candidate, root, name, expected_sha256)?;
+    Ok(ProfiledWorkerVerification {
+        elapsed: started.elapsed(),
+        _verified: verified,
+    })
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 struct WindowsVulkanProcessPathIncompatible;

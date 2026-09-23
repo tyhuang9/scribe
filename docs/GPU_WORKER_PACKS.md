@@ -728,6 +728,40 @@ power-transition, reliability, production trust, or Auto qualification is
 established. Disposable compiler files and scratch directories were removed;
 original reports, logs, and matching build artifacts remain retained.
 
+### Parent-only retained-pack verification diagnostic
+
+The ignored test
+`gpu_worker_pack::manifest::verification_profile::windows_cuda_retained_fixture_parent_verification_profile`
+isolates verification of the retained `fixture-26df7731cd9c-4edf826e5bf3` pack.
+Set `SCRIBE_PROFILE_RETAINED_CUDA_PACK` to its source directory. The test pins
+the independently recorded manifest/signature hashes, artifact build identities,
+pack identity, and worker digest. It copies the verified inventory into fresh
+scratch storage and re-verifies it before measurement. The original artifacts
+are not modified. A newer CPU-only evaluator is allowed here because **no worker
+is executed**; its real compiled revision is reported separately from the
+artifact revision. Never override its build revision to impersonate the artifact.
+
+Use a clean evaluator revision, the pinned native toolchain, and a separate
+release build cache; do not overwrite the original evidence harness. Run:
+
+```powershell
+cargo test --release --locked --offline --bin local-transcriber --features inference-worker gpu_worker_pack::manifest::verification_profile::windows_cuda_retained_fixture_parent_verification_profile -- --ignored --exact --nocapture --test-threads=1
+```
+
+Require exactly one passed test. Only after all five samples and scratch cleanup
+succeed does `SCRIBE_PARENT_VERIFICATION_PROFILE` print a metadata-only JSON
+record. Any verification error or panic discards the collected timings. The
+collector is thread-local, rejects nesting, and is absent from production builds.
+The diagnostic reports full `launchable_worker` time, each payload's bounded
+read/hash time **nested within that interval**, and separate initial executable
+verification time while retaining the verified image handle. Do not add nested
+intervals together. These are logical verified-byte counts, not physical disk
+read measurements. Preparation warms filesystem caches; there is no cache purge,
+inference, GPU initialization, device validation, or Auto qualification here.
+The existing v2 transcription evidence schema and all production checks remain
+unchanged. Retain the exact evaluator revision, binary digest, command/output,
+and input identities alongside any measurements.
+
 ### Backend-specific fixture smoke tests
 
 The CPU-only test harness provides separate ignored CUDA and Vulkan smoke tests.
