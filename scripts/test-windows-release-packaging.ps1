@@ -1478,6 +1478,20 @@ Set-StrictMode -Version Latest
         -ExpectedModelManifestPath $fixtureManifestSource `
         -ExpectedLegalFiles @()
 
+    $savedInventoryPaths = @($script:expectedInventoryPaths)
+    $savedPortablePaths = @($script:expectedPortablePayloadPaths)
+    $savedPackExecutables = @($script:allowedPackExecutablePaths)
+    try {
+        & (Join-Path $PSScriptRoot 'test-windows-two-pack-packaging.ps1') `
+            -TestRoot $testRoot -BaseBundleRoot $verificationBundle `
+            -ModelManifest $fixtureModelManifest -ModelManifestPath $fixtureManifestSource
+    }
+    finally {
+        $script:expectedInventoryPaths = $savedInventoryPaths
+        $script:expectedPortablePayloadPaths = $savedPortablePaths
+        $script:allowedPackExecutablePaths = $savedPackExecutables
+    }
+
     $catalogFixturePath = Join-Path $verificationBundle 'worker-pack-catalog.json'
     $validEmptyCatalogBytes = [System.IO.File]::ReadAllBytes($catalogFixturePath)
     try {
