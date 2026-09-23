@@ -44,8 +44,8 @@ accepts future prebuilt, pre-signed roots through `-WorkerPackRoot`, but it runs
 the compiled production verifier before and after staging each root into
 `workers/packs/<pack-id>/<version>/<digest>/`. Because no production pack public
 key is provisioned yet, every non-empty declaration currently fails closed.
-Signing is not performed by repository release scripts. Future private signing
-material must remain inside a separately reviewed signer or HSM, must never be
+GPU-pack signing is not performed by repository release scripts. Future private
+signing material must remain inside a separately reviewed signer or HSM, must never be
 passed to source-checkout code, and must match a separately reviewed persistent
 public key.
 
@@ -329,9 +329,32 @@ same permanent download link.
 
 ## Signing
 
-The installer is currently unsigned. Windows may show a SmartScreen or unknown
-publisher warning. Do not claim it is signed or add certificate configuration
-until a real code-signing identity and secret-management process are approved.
+Unsigned Windows installers are an accepted release choice for Scribe's
+open-source GitHub distribution. Authenticode signing, a paid certificate, and
+a managed code-signing subscription are not prerequisites for continuing GPU
+development or publishing an otherwise verified Windows release. The existing
+release scripts already produce unsigned application and installer artifacts.
+
+Windows may show a SmartScreen or unknown-publisher warning, and some security
+policies can block unsigned software. Release notes must disclose the unsigned
+status and point to the official GitHub release assets. Do not instruct users
+to disable Windows security controls. Published hashes help check artifact
+consistency but do not independently authenticate the publisher if the release
+channel and its hashes are both compromised.
+
+This policy does not remove GPU-pack signatures, approved pack public keys,
+exact-inventory and hash checks, secure worker launching, rollback protection,
+or the separate hardware/performance qualification gate for Auto. A pack's
+project-controlled signature is distinct from Windows Authenticode and does
+not inherently require a commercial certificate or paid signing provider.
+Fixture signing keys must never become production trust. Production GPU packs
+still require an approved release-key custody and signing process; an unsigned
+installer does not make an unverified pack eligible.
+
+Authenticode can be added later as a separate release improvement. Do not claim
+artifacts are signed or add certificate configuration until a real code-signing
+identity and secret-management process are approved. This Windows decision does
+not change macOS signing/notarization requirements.
 
 ## Common release failures
 

@@ -17,6 +17,14 @@ provisioned it may be changed to `gpu_packs_required` only with a separate
 trusted workflow that signs fixed verified unsigned artifacts and returns both
 packs for publication.
 
+Windows Authenticode signing is separate from this pack-verification boundary.
+An unsigned Windows installer is an accepted release choice; no paid Windows
+certificate or code-signing subscription is required to continue GPU work.
+This does not waive pack signatures, approved release-key custody, inventory
+verification, rollback protection, or Auto qualification. See
+[`RELEASING.md` — Signing](../RELEASING.md#signing). Fixture keys remain
+test-only, and the empty production pack trust root described above is unchanged.
+
 ## Current Stage 4 behavior
 
 - Windows x64 discovers at most eight immutable packs and at most sixteen
