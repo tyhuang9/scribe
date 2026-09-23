@@ -13826,6 +13826,32 @@ mod tests {
         same_device_internally_verified: bool,
     }
 
+    /// CUDA evidence has a deliberately distinct schema and backend member so
+    /// it cannot be mistaken for, or consumed as, Vulkan evidence.
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct CudaEvidenceReport {
+        schema_version: u16,
+        evidence_kind: String,
+        fixture_only: bool,
+        untrusted: bool,
+        auto_eligible: bool,
+        source_revision: String,
+        cpu_worker_sha256: String,
+        pack: VulkanEvidencePack,
+        model_sha256: String,
+        wav_sha256: String,
+        gpu: VulkanEvidenceGpu,
+        nvidia_baseline: VulkanEvidenceNvidiaBaseline,
+        cold_runs_per_backend: usize,
+        warm_runs_per_backend: usize,
+        cpu: VulkanEvidenceBackendRuns,
+        cuda: VulkanEvidenceBackendRuns,
+        expected_phrase_present_every_run: bool,
+        normalized_transcript_parity: bool,
+        same_device_internally_verified: bool,
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct VulkanEvidenceObservation {
         normalized_transcript: String,
@@ -14166,6 +14192,107 @@ mod tests {
             || sha256_file(&inputs.wav)? != inputs.wav_sha256
         {
             bail!("fixture file digest mismatch")
+        }
+        Ok(inputs)
+    }
+
+    fn write_cuda_evidence_after_cleanup(
+        output: &Path,
+        report: &CudaEvidenceReport,
+        cleanup: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        cleanup().context("clean up CUDA fixture evidence resources before staging report")?;
+        write_vulkan_evidence_create_new_with(output, |file| {
+            serde_json::to_writer(file, report).context("serialize metadata-only CUDA evidence")
+        })
+    }
+
+    fn require_exactly_one_cuda_evidence_binding<T>(mut bindings: Vec<T>) -> Result<T> {
+        if bindings.len() != 1 {
+            bail!("fixture pack must advertise exactly one expected CUDA/NVIDIA/discrete target")
+        }
+        Ok(bindings.pop().expect("checked exact CUDA binding count"))
+    }
+
+    #[cfg(windows)]
+    fn cuda_evidence_inputs_from_environment() -> Result<VulkanEvidenceInputs> {
+        let path = |suffix: &str| {
+            std::env::var_os(format!("SCRIBE_CUDA_EVIDENCE_{suffix}"))
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("set SCRIBE_CUDA_EVIDENCE_{suffix}"))
+        };
+        let text = |suffix: &str| {
+            std::env::var(format!("SCRIBE_CUDA_EVIDENCE_{suffix}"))
+                .map_err(|_| anyhow!("set SCRIBE_CUDA_EVIDENCE_{suffix}"))
+        };
+        let pack_root = path("PACK_ROOT")?
+            .canonicalize()
+            .context("canonicalize CUDA fixture pack")?;
+        let output = path("OUTPUT")?;
+        let output_parent = output
+            .parent()
+            .ok_or_else(|| anyhow!("CUDA evidence output has no parent"))?
+            .canonicalize()
+            .context("canonicalize CUDA evidence output parent")?;
+        let output_name = output
+            .file_name()
+            .filter(|name| is_safe_vulkan_evidence_output_name(name))
+            .ok_or_else(|| anyhow!("CUDA evidence output must name a safe JSON file"))?;
+        let baseline_json = text("NVIDIA_BASELINE_JSON")?;
+        if baseline_json.len() > 1024 {
+            bail!("NVIDIA baseline metadata is too large")
+        }
+        let inputs = VulkanEvidenceInputs {
+            pack_root,
+            cpu_worker: path("CPU_WORKER")?,
+            model: path("MODEL")?,
+            model_sha256: canonical_vulkan_evidence_sha256(&text("MODEL_SHA256")?)?,
+            wav: path("WAV")?,
+            wav_sha256: canonical_vulkan_evidence_sha256(&text("WAV_SHA256")?)?,
+            expected_phrase: normalize_vulkan_evidence_transcript(&text("EXPECTED_PHRASE")?),
+            expected_stable_device: text("EXPECTED_STABLE_DEVICE")?,
+            nvidia_baseline: serde_json::from_str(&baseline_json)
+                .context("parse NVIDIA baseline")?,
+            output: output_parent.join(output_name),
+        };
+        if inputs.expected_phrase.is_empty()
+            || inputs.expected_phrase.len() > 256
+            || parse_native_pci_location(&inputs.expected_stable_device).is_none()
+        {
+            bail!("CUDA evidence phrase or stable device is noncanonical")
+        }
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).canonicalize()?;
+        if inputs.output.starts_with(&repository)
+            || inputs.output.starts_with(&inputs.pack_root)
+            || is_vulkan_evidence_activation_path(&inputs.output)
+            || inputs.pack_root.starts_with(&repository)
+        {
+            bail!("CUDA evidence inputs and output must remain outside source and activation roots")
+        }
+        assert_vulkan_evidence_regular_file(&inputs.cpu_worker, "CPU worker", 512 * 1024 * 1024)?;
+        assert_vulkan_evidence_regular_file(
+            &inputs.model,
+            "GGUF model",
+            VULKAN_EVIDENCE_MAX_MODEL_BYTES,
+        )?;
+        assert_vulkan_evidence_regular_file(
+            &inputs.wav,
+            "WAV fixture",
+            VULKAN_EVIDENCE_MAX_WAV_BYTES,
+        )?;
+        if sha256_file(&inputs.model)? != inputs.model_sha256
+            || sha256_file(&inputs.wav)? != inputs.wav_sha256
+        {
+            bail!("CUDA fixture file digest mismatch")
+        }
+        let baseline = &inputs.nvidia_baseline;
+        if !is_bounded_evidence_metadata(&baseline.product, 256)
+            || !is_bounded_evidence_metadata(&baseline.driver, 128)
+            || baseline.memory_total_bytes == 0
+            || baseline.memory_used_bytes > baseline.memory_total_bytes / 4
+            || baseline.gpu_utilization_percent > 10
+        {
+            bail!("NVIDIA baseline fails CUDA idle preflight")
         }
         Ok(inputs)
     }
@@ -14642,6 +14769,195 @@ mod tests {
                 skipped_targets: Vec::new(),
             }),
         }
+    }
+
+    #[cfg(windows)]
+    fn cuda_evidence_gpu_registry(binding: VerifiedPackLaunchBinding) -> InferenceWorkerRegistry {
+        let target = binding.backend_target();
+        assert_eq!(
+            target.backend,
+            BackendKind::Cuda,
+            "evidence accepts CUDA only"
+        );
+        assert_eq!(
+            target.vendor,
+            GpuVendor::Nvidia,
+            "CUDA evidence requires NVIDIA"
+        );
+        assert_eq!(
+            target.device_class,
+            DeviceClass::DiscreteGpu,
+            "CUDA evidence requires a discrete GPU"
+        );
+        let routes = Arc::new(vec![InferenceWorkerRoute {
+            provider: WorkerProvider::Cuda,
+            supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+            target: Some(target),
+            health_key: None,
+            consume_retry_bypass: false,
+            auto_evidence_id: None,
+        }]);
+        InferenceWorkerRegistry {
+            routes: Arc::new(Vec::new()),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
+                device_set_digest: verified_gpu_device_set_digest(&routes),
+                routes,
+                diagnostic: Some("fixture-only CUDA evidence capture".to_owned()),
+                discovery_fingerprint: "fixture-cuda-evidence".to_owned(),
+                provider_probe_incomplete: false,
+                skipped_targets: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(windows)]
+    fn validate_cuda_evidence_acceleration_diagnostics(
+        resolved: &ResolvedAcceleration,
+        preference: AccelerationPreference,
+        expected_gpu_target: Option<&BackendTarget>,
+    ) -> Result<()> {
+        if let Some(target) = expected_gpu_target
+            && (target.backend != BackendKind::Cuda
+                || target.provider_id.as_str() != "transcribe-cpp-ggml-cuda"
+                || target.vendor != GpuVendor::Nvidia
+                || target.device_class != DeviceClass::DiscreteGpu
+                || target.driver_version.as_deref().is_none_or(str::is_empty)
+                || target.memory_total_bytes == 0)
+        {
+            bail!("CUDA evidence requires an exact NVIDIA discrete CUDA binding")
+        }
+        let selection = resolved
+            .selection
+            .as_ref()
+            .ok_or_else(|| anyhow!("CUDA evidence execution omitted its typed selection"))?;
+        match expected_gpu_target {
+            Some(target)
+                if preference == AccelerationPreference::Gpu
+                    && resolved.requested == AccelerationPreference::Gpu
+                    && selection.requested == AccelerationPreference::Gpu
+                    && matches!(&resolved.resolved, ComputeDevice::Gpu { .. })
+                    && selection.reason == BackendSelectionReason::RequestedGpu
+                    && selection.target == *target => {}
+            None if preference == AccelerationPreference::Cpu
+                && resolved.requested == AccelerationPreference::Cpu
+                && selection.requested == AccelerationPreference::Cpu
+                && resolved.resolved == ComputeDevice::Cpu
+                && selection.reason == BackendSelectionReason::RequestedCpu
+                && selection
+                    .target
+                    .has_same_runtime_identity(&BackendTarget::cpu()) => {}
+            _ => bail!("CUDA evidence selection changed its explicit stable-device binding"),
+        }
+        if !selection.fallback_targets.is_empty()
+            || !selection.fallback_history.is_empty()
+            || selection.power_policy != PowerPolicyDecision::NotApplied
+        {
+            bail!("CUDA evidence must not use fallback or Auto policy")
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cuda_evidence_diagnostics_require_exact_explicit_cuda_and_cpu() {
+        let target = verified_gpu_route(
+            BackendKind::Cuda,
+            "cuda-evidence",
+            "native:pci:0000:01:00.0",
+            'c',
+        )
+        .target
+        .unwrap();
+        let mut target = target;
+        target.vendor = GpuVendor::Nvidia;
+        target.device_class = DeviceClass::DiscreteGpu;
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
+        target.driver_version = Some("fixture-driver".to_owned());
+        target.memory_total_bytes = 1;
+        let valid = vulkan_evidence_diagnostics_resolution(
+            AccelerationPreference::Gpu,
+            ComputeDevice::Gpu {
+                name: "CUDA".to_owned(),
+            },
+            target.clone(),
+            BackendSelectionReason::RequestedGpu,
+        );
+        validate_cuda_evidence_acceleration_diagnostics(
+            &valid,
+            AccelerationPreference::Gpu,
+            Some(&target),
+        )
+        .unwrap();
+        let cpu = vulkan_evidence_diagnostics_resolution(
+            AccelerationPreference::Cpu,
+            ComputeDevice::Cpu,
+            BackendTarget::cpu(),
+            BackendSelectionReason::RequestedCpu,
+        );
+        validate_cuda_evidence_acceleration_diagnostics(&cpu, AccelerationPreference::Cpu, None)
+            .unwrap();
+        let mut cases = Vec::new();
+        let mut wrong = target.clone();
+        wrong.backend = BackendKind::Vulkan;
+        cases.push((valid.clone(), Some(wrong)));
+        let mut wrong = target.clone();
+        wrong.provider_id = ProviderIdentity::new("wrong");
+        cases.push((valid.clone(), Some(wrong)));
+        let mut wrong = target.clone();
+        wrong.vendor = GpuVendor::Amd;
+        cases.push((valid.clone(), Some(wrong)));
+        let mut wrong = target.clone();
+        wrong.device_class = DeviceClass::IntegratedGpu;
+        cases.push((valid.clone(), Some(wrong)));
+        let mut changed = valid.clone();
+        changed.selection.as_mut().unwrap().target.device_id =
+            DeviceIdentity::new("native:pci:0000:02:00.0");
+        cases.push((changed, Some(target.clone())));
+        let mut changed = valid.clone();
+        changed
+            .selection
+            .as_mut()
+            .unwrap()
+            .fallback_targets
+            .push(BackendTarget::cpu());
+        cases.push((changed, Some(target.clone())));
+        let mut changed = valid.clone();
+        changed
+            .selection
+            .as_mut()
+            .unwrap()
+            .fallback_history
+            .push(BackendFallback {
+                target: BackendTarget::cpu(),
+                category: BackendFailureCategory::WorkerFailed,
+            });
+        cases.push((changed, Some(target.clone())));
+        let mut changed = valid.clone();
+        changed.selection.as_mut().unwrap().power_policy = PowerPolicyDecision::Unrestricted;
+        cases.push((changed, Some(target.clone())));
+        for (diagnostics, expected) in cases {
+            assert!(
+                validate_cuda_evidence_acceleration_diagnostics(
+                    &diagnostics,
+                    AccelerationPreference::Gpu,
+                    expected.as_ref()
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_cuda_evidence_acceleration_diagnostics(
+                &valid,
+                AccelerationPreference::Auto,
+                Some(&target)
+            )
+            .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -15296,6 +15612,108 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn run_cuda_evidence_observation(
+        registry: &InferenceWorkerRegistry,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        expected: Option<&BackendTarget>,
+    ) -> Result<VulkanEvidenceObservation> {
+        let cancellation = std::sync::atomic::AtomicU64::new(0);
+        let started = Instant::now();
+        let execution = registry
+            .transcribe(
+                artifact,
+                preference,
+                audio,
+                TranscriptionOptions::default(),
+                0,
+                &cancellation,
+            )
+            .map_err(anyhow::Error::from)?;
+        validate_cuda_evidence_acceleration_diagnostics(
+            &execution.diagnostics.resolved_acceleration,
+            preference,
+            expected,
+        )?;
+        Ok(VulkanEvidenceObservation {
+            normalized_transcript: normalize_vulkan_evidence_transcript(&execution.transcript.text),
+            end_to_end_ms: vulkan_evidence_millis(started.elapsed().as_millis(), "end-to-end")?,
+            backend_processing_ms: vulkan_evidence_millis(
+                execution.processing_duration_ms,
+                "backend processing",
+            )?,
+            model_load_ms: vulkan_evidence_millis(
+                execution.diagnostics.model_load_duration_ms,
+                "model load",
+            )?,
+            warm_reused: execution.diagnostics.warm_reused,
+        })
+    }
+
+    #[cfg(windows)]
+    fn collect_cuda_evidence_runs(
+        create_registry: impl Fn() -> InferenceWorkerRegistry,
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        expected: Option<&BackendTarget>,
+        cold: bool,
+    ) -> Result<Vec<VulkanEvidenceObservation>> {
+        let count = if cold {
+            VULKAN_EVIDENCE_COLD_RUNS
+        } else {
+            VULKAN_EVIDENCE_WARM_RUNS
+        };
+        if cold {
+            return (0..count)
+                .map(|_| {
+                    with_vulkan_evidence_registry(create_registry(), |registry| {
+                        let run = run_cuda_evidence_observation(
+                            registry,
+                            artifact.clone(),
+                            preference,
+                            audio,
+                            expected,
+                        )?;
+                        if run.warm_reused || run.model_load_ms == 0 {
+                            bail!("CUDA cold run reused a model generation")
+                        }
+                        Ok(run)
+                    })
+                })
+                .collect();
+        }
+        with_vulkan_evidence_registry(create_registry(), |registry| {
+            let priming = run_cuda_evidence_observation(
+                registry,
+                artifact.clone(),
+                preference,
+                audio,
+                expected,
+            )?;
+            if priming.warm_reused || priming.model_load_ms == 0 {
+                bail!("CUDA warm priming was not fresh")
+            }
+            (0..count)
+                .map(|_| {
+                    let run = run_cuda_evidence_observation(
+                        registry,
+                        artifact.clone(),
+                        preference,
+                        audio,
+                        expected,
+                    )?;
+                    if !run.warm_reused || run.model_load_ms != 0 {
+                        bail!("CUDA warm run did not reuse the primed model")
+                    }
+                    Ok(run)
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(windows)]
     #[test]
     #[ignore = "requires freshly built fixture-signed Vulkan and isolated CPU workers plus pinned GGUF/WAV; metadata-only evidence only"]
     fn windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs() {
@@ -15465,6 +15883,168 @@ mod tests {
             }
         })
         .expect("clean up the fixture lease and stage a bounded metadata-only evidence artifact");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires freshly built fixture-signed CUDA and isolated CPU workers plus pinned GGUF/WAV; metadata-only evidence only"]
+    fn windows_cuda_fixture_evidence_captures_five_cold_and_twenty_warm_runs() {
+        let inputs = cuda_evidence_inputs_from_environment().expect("CUDA evidence input contract");
+        let (lease_owner, lease) =
+            crate::gpu_worker_pack::manifest::test_support::lease_existing_fixture(
+                &inputs.pack_root,
+            )
+            .expect("fixture CUDA pack must verify");
+        let probe = InferenceWorkerSupervisor::for_pack_probe(Arc::new(lease));
+        let bindings = probe
+            .verified_pack_bindings()
+            .expect("challenge-bound CUDA discovery");
+        probe.shutdown().expect("CUDA fixture probe shutdown");
+        drop(probe);
+        let matching = bindings
+            .into_iter()
+            .filter(|candidate| {
+                let target = candidate.backend_target();
+                target.backend == BackendKind::Cuda
+                    && target.provider_id.as_str() == "transcribe-cpp-ggml-cuda"
+                    && target.vendor == GpuVendor::Nvidia
+                    && target.device_class == DeviceClass::DiscreteGpu
+                    && candidate.stable_device_identity() == inputs.expected_stable_device
+            })
+            .collect::<Vec<_>>();
+        let binding = require_exactly_one_cuda_evidence_binding(matching)
+            .expect("exactly one expected CUDA/NVIDIA/discrete binding");
+        let target = binding.backend_target();
+        validate_cuda_evidence_acceleration_diagnostics(
+            &vulkan_evidence_diagnostics_resolution(
+                AccelerationPreference::Gpu,
+                ComputeDevice::Gpu {
+                    name: "CUDA evidence GPU".to_owned(),
+                },
+                target.clone(),
+                BackendSelectionReason::RequestedGpu,
+            ),
+            AccelerationPreference::Gpu,
+            Some(&target),
+        )
+        .expect("exact CUDA binding metadata");
+        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("whisper_cpp_base_en"),
+            path: inputs.model.clone(),
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: assert_vulkan_evidence_regular_file(
+                &inputs.model,
+                "GGUF model",
+                VULKAN_EVIDENCE_MAX_MODEL_BYTES,
+            )
+            .unwrap(),
+            expected_sha256: inputs.model_sha256.clone(),
+        });
+        let audio = PreparedAudio::from_wav_path(&inputs.wav).expect("verified WAV fixture");
+        let cpu_cold = collect_cuda_evidence_runs(
+            || vulkan_evidence_cpu_registry(inputs.cpu_worker.clone()),
+            &artifact,
+            AccelerationPreference::Cpu,
+            &audio,
+            None,
+            true,
+        )
+        .expect("CPU cold evidence");
+        let cuda_cold = collect_cuda_evidence_runs(
+            || cuda_evidence_gpu_registry(binding.clone()),
+            &artifact,
+            AccelerationPreference::Gpu,
+            &audio,
+            Some(&target),
+            true,
+        )
+        .expect("CUDA cold evidence");
+        let cpu_warm = collect_cuda_evidence_runs(
+            || vulkan_evidence_cpu_registry(inputs.cpu_worker.clone()),
+            &artifact,
+            AccelerationPreference::Cpu,
+            &audio,
+            None,
+            false,
+        )
+        .expect("CPU warm evidence");
+        let cuda_warm = collect_cuda_evidence_runs(
+            || cuda_evidence_gpu_registry(binding.clone()),
+            &artifact,
+            AccelerationPreference::Gpu,
+            &audio,
+            Some(&target),
+            false,
+        )
+        .expect("CUDA warm evidence");
+        assert_vulkan_evidence_transcripts(&cpu_cold, &cuda_cold, &inputs.expected_phrase)
+            .expect("cold parity");
+        assert_vulkan_evidence_transcripts(&cpu_warm, &cuda_warm, &inputs.expected_phrase)
+            .expect("warm parity");
+        let pack = target.pack.as_ref().expect("CUDA pack identity");
+        let revision = env!("SCRIBE_BUILD_REVISION").to_ascii_lowercase();
+        assert!(revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()));
+        let report = CudaEvidenceReport {
+            schema_version: 1,
+            evidence_kind: "windows-cuda-fixture-performance".to_owned(),
+            fixture_only: true,
+            untrusted: true,
+            auto_eligible: false,
+            source_revision: revision,
+            cpu_worker_sha256: sha256_file(&inputs.cpu_worker).expect("CPU worker digest"),
+            pack: VulkanEvidencePack {
+                id: pack.pack_id.clone(),
+                version: pack.pack_version.clone(),
+                digest: canonical_vulkan_evidence_sha256(&pack.pack_digest).unwrap(),
+                security_epoch: pack.security_epoch,
+                runtime_abi: pack.runtime_abi,
+            },
+            model_sha256: inputs.model_sha256,
+            wav_sha256: inputs.wav_sha256,
+            gpu: VulkanEvidenceGpu {
+                backend: "cuda".to_owned(),
+                provider: target.provider_id.as_str().to_owned(),
+                vendor: "nvidia".to_owned(),
+                device_class: "discrete_gpu".to_owned(),
+                driver: target.driver_version.clone().expect("CUDA driver"),
+                memory_total_bytes: target.memory_total_bytes,
+            },
+            nvidia_baseline: inputs.nvidia_baseline,
+            cold_runs_per_backend: VULKAN_EVIDENCE_COLD_RUNS,
+            warm_runs_per_backend: VULKAN_EVIDENCE_WARM_RUNS,
+            cpu: VulkanEvidenceBackendRuns {
+                cold: vulkan_evidence_run_set(&cpu_cold, true).unwrap(),
+                warm: vulkan_evidence_run_set(&cpu_warm, false).unwrap(),
+            },
+            cuda: VulkanEvidenceBackendRuns {
+                cold: vulkan_evidence_run_set(&cuda_cold, true).unwrap(),
+                warm: vulkan_evidence_run_set(&cuda_warm, false).unwrap(),
+            },
+            expected_phrase_present_every_run: true,
+            normalized_transcript_parity: true,
+            same_device_internally_verified: true,
+        };
+        drop(binding);
+        write_cuda_evidence_after_cleanup(&inputs.output, &report, || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match std::fs::remove_dir_all(&lease_owner) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::PermissionDenied
+                            || error.raw_os_error() == Some(32))
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        return Err(error).context("remove reaped CUDA fixture-pack lease");
+                    }
+                }
+            }
+        })
+        .expect("clean up CUDA fixture lease and stage CUDA report");
     }
 
     #[test]
