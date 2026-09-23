@@ -157,6 +157,26 @@ retain the independently printed SHA-256 and use
 `Read-ScribeVerifiedCudaEvidenceReport`; the report remains fixture-only,
 untrusted, and ineligible for Auto, production trust, or promotion.
 
+CUDA report schema v2 adds per-request `worker_startup_ms` records for all five
+cold CPU and CUDA samples. Four disjoint parent-side intervals record pack/path
+resolution and initial verification (`resolve_ms`), the immediate executable
+recheck (`executable_revalidation_ms`), spawning and supervision setup
+(`spawn_ms`), and receipt and validation of the bound capability handshake
+(`hello_ms`). The handshake interval includes scheduling, pipe communication,
+and worker initialization; it is not a measurement of CUDA initialization alone.
+Each phase is truncated to integer milliseconds, and their sum cannot exceed
+the matching request's `end_to_end_ms`. These phases do not account for the
+whole request: model verification/loading and transcription happen separately.
+
+Startup observations are test-only and consumed once from the successful worker
+generation. Cold samples require a fresh observation inside the measured request;
+warm samples require reuse after unmeasured priming and emit
+`worker_startup_ms: null`, not invented zero durations. A restarted worker during
+a warm sample invalidates the capture. The strict reader still accepts the exact
+v1 contract for older independently digest-bound reports, but does not synthesize
+missing startup data. Vulkan reports, the worker protocol, production telemetry,
+and all pack/executable verification remain unchanged.
+
 The offline Windows qualification boundary is specified in
 [`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md). It digest-binds
 the evaluator, toolchain, Auto manifest, plan, lane identities, 50 paired run
