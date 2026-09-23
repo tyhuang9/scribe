@@ -762,6 +762,33 @@ The existing v2 transcription evidence schema and all production checks remain
 unchanged. Retain the exact evaluator revision, binary digest, command/output,
 and input identities alongside any measurements.
 
+The 2026-09-23 parent-only run from clean evaluator
+`4946f9543be488c143ba0c84a6d876a7171ed0ad` passed exactly one test (1,578
+filtered) in 6.65 seconds. Its independent transcript SHA-256 is
+`4e22aff0e493b629692697d3e24eb6ca46306f9353e67959ae7678bcfe0bc7ff`;
+the evaluator binary SHA-256 is
+`b390796771cd5a0977154841b4659d7273973c1331daa08f79d2dde487b1d61a`.
+The source fixture remained the digest-bound 26df pack above, not a rebuilt
+CUDA pack. The release evaluator's normal CPU-worker trust anchor came from a
+matching CPU build; neither worker was executed by this diagnostic.
+
+| Five cache-warmed samples, milliseconds | p50 | p95 |
+| --- | ---: | ---: |
+| Full signed-pack launch recheck | 772.28 | 799.18 |
+| Sum of nested payload read/hash intervals per sample | 768.61 | 794.86 |
+| Nested cuBLAS payload, 113,716,224 bytes | 87.53 | 91.10 |
+| Nested cuBLASLt payload, 674,667,520 bytes | 518.72 | 544.45 |
+| Nested worker payload, 214,058,496 bytes | 161.27 | 168.50 |
+| Separate initial executable verification | 162.09 | 171.64 |
+
+Independent transcript-hash, inventory/ordinal, bounded-integer and per-sample
+interval checks passed. Read/hash intervals accounted for 99.45–99.53% of the
+full recheck; the residual was 3.67–4.37 ms. This locates the dominant work but
+does **not** isolate pure CPU hashing from file I/O or establish actual SHA
+instruction dispatch. No inference speedup, comparison across capture conditions,
+or permission to omit a security check follows from these numbers. The temporary
+1,002,442,240-byte payload copy was removed before the result was published.
+
 ### Backend-specific fixture smoke tests
 
 The CPU-only test harness provides separate ignored CUDA and Vulkan smoke tests.
