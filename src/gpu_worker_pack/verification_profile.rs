@@ -213,6 +213,11 @@ fn artifact_compatibility() -> Compatibility<'static> {
     }
 }
 
+fn assert_profile_evaluator(debug_assertions: bool, evaluator_revision: &str) {
+    assert!(!debug_assertions, "profile with a release evaluator");
+    assert_ne!(evaluator_revision, ARTIFACT_REVISION);
+}
+
 #[test]
 fn profile_compatibility_distinguishes_evaluator_and_artifact_revisions() {
     let current = Compatibility::current(&[PackBackend::Cuda]);
@@ -230,6 +235,13 @@ fn profile_compatibility_distinguishes_evaluator_and_artifact_revisions() {
         verifier.validate_manifest(&manifest),
         Err(PackVerificationError::BuildMismatch)
     ));
+    assert_profile_evaluator(false, "different-evaluator");
+    assert!(
+        std::panic::catch_unwind(|| assert_profile_evaluator(true, "different-evaluator")).is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_profile_evaluator(false, ARTIFACT_REVISION)).is_err()
+    );
 }
 
 #[cfg(windows)]
@@ -241,8 +253,7 @@ fn windows_cuda_retained_fixture_parent_verification_profile() {
     const PACK_DIGEST: &str = "da02d2065768ff9b166d8d27fa35e5d7b0db58217a7af68874b7e05804b27821";
     const WORKER_SHA: &str = "ef61230f28f3ba332d0afa9f6d6dd5de9f7fa154b95d6634cde7e8202c11b39a";
 
-    assert!(!cfg!(debug_assertions), "profile with a release evaluator");
-    assert_ne!(env!("SCRIBE_BUILD_REVISION"), ARTIFACT_REVISION);
+    assert_profile_evaluator(cfg!(debug_assertions), env!("SCRIBE_BUILD_REVISION"));
     let source = PathBuf::from(std::env::var_os("SCRIBE_PROFILE_RETAINED_CUDA_PACK").expect(
         "set SCRIBE_PROFILE_RETAINED_CUDA_PACK to the retained fixture-26df7731cd9c-4edf826e5bf3 pack",
     ));
