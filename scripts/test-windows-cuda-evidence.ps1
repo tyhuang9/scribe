@@ -19,6 +19,88 @@ try {
  $index=0; foreach($mutation in $mutations){$copy=($report|ConvertTo-Json -Depth 12|ConvertFrom-Json);&$mutation $copy;$case=Write-Case $copy "bad-$index.json";$rejected=$false;try{Read-ScribeVerifiedCudaEvidenceReport $case[0] $case[1]|Out-Null}catch{$rejected=$true};if(-not$rejected){throw "CUDA reader accepted mutation $index"};$index++}
  $wrong=$false;try{Read-ScribeVerifiedCudaEvidenceReport $valid[0] ('0'*64)|Out-Null}catch{$wrong=$true};if(-not$wrong){throw 'CUDA reader accepted wrong digest.'}
  $duplicate=Join-Path $testRoot 'duplicate.json';[IO.File]::WriteAllText($duplicate,'{"schema_version":1,"schema_version":1}',[Text.UTF8Encoding]::new($false));$dd=(Get-FileHash $duplicate -Algorithm SHA256).Hash.ToLowerInvariant();$rejected=$false;try{Read-ScribeVerifiedCudaEvidenceReport $duplicate $dd|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'CUDA reader accepted duplicate JSON names.'}
+ # Keep the immutable v1 report contract while requiring all v2 startup records.
+ $v2 = $report | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+ $v2.schema_version = 2
+ foreach ($backend in @('cpu', 'cuda')) {
+     $records = @(1..5 | ForEach-Object {
+         [pscustomobject]@{resolve_ms=1;executable_revalidation_ms=0;spawn_ms=0;hello_ms=0}
+     })
+     $v2.$backend.cold | Add-Member worker_startup_ms $records
+     $v2.$backend.warm | Add-Member worker_startup_ms $null
+ }
+ $validV2 = Write-Case $v2 'valid-v2.json'
+ $null = Read-ScribeVerifiedCudaEvidenceReport $validV2[0] $validV2[1]
+ $pendingV2 = Write-Case $v2 'pending-v2.json'
+ $publishedV2 = Complete-ScribeCudaEvidencePendingReport $pendingV2[0] (Join-Path $testRoot 'published-v2.json') $testRoot 'pending-v2.json' 'published-v2.json' $null @()
+ if ($publishedV2.Digest -cne $pendingV2[1]) { throw 'CUDA v2 publication lost digest binding.' }
+ $null = Read-ScribeVerifiedCudaEvidenceReport $publishedV2.Path $publishedV2.Digest
+ $v2Mutations = @(
+     {param($r) $r.schema_version=1},
+     {param($r) $r.schema_version=3},
+     {param($r) $r.cpu.cold.PSObject.Properties.Remove('worker_startup_ms')},
+     {param($r) $r.cuda.warm.PSObject.Properties.Remove('worker_startup_ms')},
+     {param($r) $r.cpu.cold.worker_startup_ms=$null},
+     {param($r) $r.cuda.cold.worker_startup_ms=@()},
+     {param($r) $r.cpu.cold.worker_startup_ms=@($r.cpu.cold.worker_startup_ms[0]) * 4},
+     {param($r) $r.cuda.cold.worker_startup_ms=@($r.cuda.cold.worker_startup_ms[0]) * 6},
+     {param($r) $r.cpu.warm.worker_startup_ms=@()},
+     {param($r) $r.cuda.warm.worker_startup_ms=@($r.cuda.cold.worker_startup_ms[0]) * 20},
+     {param($r) $r.cpu.cold.worker_startup_ms[0]=$null},
+     {param($r) $r.cuda.cold.worker_startup_ms[0].PSObject.Properties.Remove('hello_ms')},
+     {param($r) $r.cpu.cold.worker_startup_ms[0] | Add-Member extra 0},
+     {param($r) $r.cpu.cold.worker_startup_ms[0].resolve_ms='1'},
+     {param($r) $r.cuda.cold.worker_startup_ms[0].executable_revalidation_ms=-1},
+     {param($r) $r.cpu.cold.worker_startup_ms[0].spawn_ms=0.5},
+     {param($r) $r.cuda.cold.worker_startup_ms[0].hello_ms=$false},
+     {param($r) $r.cpu.cold.worker_startup_ms[4].hello_ms=1},
+     {param($r) $r.cuda.cold.end_to_end_ms[4]=0},
+     {param($r) $r.cuda.cold.worker_startup_ms[0].resolve_ms=[uint64]::MaxValue}
+ )
+ $v2Index=0
+ foreach ($mutation in $v2Mutations) {
+     $copy=$v2 | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+     & $mutation $copy
+     $case=Write-Case $copy "bad-v2-$v2Index.json"
+     $rejected=$false
+     try { Read-ScribeVerifiedCudaEvidenceReport $case[0] $case[1] | Out-Null } catch { $rejected=$true }
+     if (-not $rejected) { throw "CUDA reader accepted v2 mutation $v2Index" }
+     $v2Index++
+ }
+ $v1MissingV2=$report | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+ $v1MissingV2.schema_version=2
+ $rejected=$false
+ try { Assert-ScribeCudaEvidenceReportJson ($v1MissingV2 | ConvertTo-Json -Depth 12 -Compress) } catch { $rejected=$true }
+ if (-not $rejected) { throw 'CUDA v2 accepted missing startup measurements.' }
+ $v2Json=$v2 | ConvertTo-Json -Depth 12 -Compress
+ $rawMutations=@(
+     '"resolve_ms":1,"resolve_ms":1',
+     '"resolve_ms":18446744073709551616',
+     '"resolve_ms":1.0',
+     '"resolve_ms":1e0'
+ )
+ foreach ($replacement in $rawMutations) {
+     $rejected=$false
+     try { Assert-ScribeCudaEvidenceReportJson ($v2Json.Replace('"resolve_ms":1', $replacement)) } catch { $rejected=$true }
+     if (-not $rejected) { throw "CUDA v2 accepted duplicate or noncanonical startup value: $replacement" }
+ }
+ # Exact u64 arithmetic: accept equality at the maximum, then reject a sum one above it.
+ $large=$v2 | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+ $large.cpu.cold.end_to_end_ms[0]=[uint64]::MaxValue
+ $large.cpu.cold.worker_startup_ms[0].resolve_ms=[uint64]::MaxValue-1
+ $large.cpu.cold.worker_startup_ms[0].hello_ms=1
+ Assert-ScribeCudaEvidenceReportJson ($large | ConvertTo-Json -Depth 12 -Compress)
+ $large.cpu.cold.worker_startup_ms[0].hello_ms=2
+ $rejected=$false
+ try { Assert-ScribeCudaEvidenceReportJson ($large | ConvertTo-Json -Depth 12 -Compress) } catch { $rejected=$true }
+ if (-not $rejected) { throw 'CUDA v2 startup sum overflow was accepted.' }
+ $invalidPending=Write-Case $large 'invalid-v2-pending.json'
+ $invalidFinal=Join-Path $testRoot 'invalid-v2-final.json'
+ $rejected=$false
+ try { Complete-ScribeCudaEvidencePendingReport $invalidPending[0] $invalidFinal $testRoot 'invalid-v2-pending.json' 'invalid-v2-final.json' $null @() | Out-Null } catch { $rejected=$true }
+ if (-not $rejected -or (Test-Path -LiteralPath $invalidPending[0]) -or (Test-Path -LiteralPath $invalidFinal)) {
+     throw 'CUDA v2 invalid startup report was published or not cleaned up.'
+ }
  $runner=Get-Content (Join-Path $PSScriptRoot 'run-windows-cuda-evidence.ps1') -Raw
  foreach($required in @('[string]$EvidenceDirectory','[string]$NativeArchiveDirectory','[string]$CudaToolkitDirectory','Production signing/release input is forbidden','Get-ScribeVulkanEvidenceActualSystem32','Assert-ScribeEvidenceSingleLinkFile','Get-ScribeEvidencePinnedMsvcEnvironment','Invoke-ScribeEvidenceCargoWithCmakeRetry','-Backend Cuda','-SigningMode Fixture','CUDA_PATH = $previousCudaPath','--no-run','local_transcriber-[0-9a-f]{16}',"Invoke-ScribeEvidence `$testExecutable",'[Diagnostics.ProcessStartInfo]::new()','UseShellExecute = $false','ArgumentList.Add($argument)','WaitForExit()','Native process exit code:','process.Dispose()','SCRIBE_BUNDLED_WORKER_SHA256 = $cpuWorkerDigest','changed before CUDA evidence test precompilation','changed before exact CUDA evidence execution','status --porcelain=v1 --untracked-files=all','Complete-ScribeCudaEvidencePendingReport','Windows Auto manifest changed')){if(-not$runner.Contains($required)){throw "CUDA runner missing hardened contract: $required"}}
  if($runner-match 'SigningMode Production|ProductionPrivateKeyPath'){throw 'CUDA runner references production signing.'}
@@ -27,6 +109,7 @@ try {
  $childScript=Join-Path $testRoot 'child process.ps1';[IO.File]::WriteAllText($childScript,'param([string]$Output,[string]$First,[string]$Second,[int]$Code)[IO.File]::WriteAllText($Output,$First+"`n"+$Second,[Text.UTF8Encoding]::new($false));exit $Code',[Text.UTF8Encoding]::new($false));$childOutput=Join-Path $testRoot 'waited child.txt';$pwsh=(Get-Command pwsh.exe -ErrorAction Stop).Source;Invoke-ScribeEvidence $pwsh @('-NoProfile','-File',$childScript,$childOutput,'first value with spaces',"second value's apostrophe",'0') 'waited child failed';if(-not(Test-Path -LiteralPath $childOutput)-or([IO.File]::ReadAllText($childOutput)-cne"first value with spaces`nsecond value's apostrophe")){throw 'CUDA native invocation helper returned before its child completed or changed argument boundaries.'}
  $nonzero=$null;try{Invoke-ScribeEvidence $pwsh @('-NoProfile','-File',$childScript,(Join-Path $testRoot 'failed child.txt'),'one','two','23') 'expected child failure'}catch{$nonzero=$_.Exception};if($null-eq$nonzero-or$nonzero.Message-cnotmatch'^expected child failure Native process exit code: 23\.$'){throw 'CUDA native invocation helper swallowed or misreported a child failure.'}
  Write-Output "Windows CUDA strict reader rejected $index semantic mutations plus duplicate/digest cases."
+ Write-Output "Windows CUDA v1/v2 contracts passed, including $v2Index v2 mutations, exact u64 accounting, and fail-closed publication."
  Write-Output 'Windows CUDA native invocation waits, preserves argument boundaries, and rejects child failures.'
  Write-Output 'Windows CUDA runner hardened static contracts passed.'
 } finally {Remove-Item -LiteralPath $testRoot -Recurse -Force}

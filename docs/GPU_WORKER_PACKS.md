@@ -157,6 +157,26 @@ retain the independently printed SHA-256 and use
 `Read-ScribeVerifiedCudaEvidenceReport`; the report remains fixture-only,
 untrusted, and ineligible for Auto, production trust, or promotion.
 
+CUDA report schema v2 adds per-request `worker_startup_ms` records for all five
+cold CPU and CUDA samples. Four disjoint parent-side intervals record pack/path
+resolution and initial verification (`resolve_ms`), the immediate executable
+recheck (`executable_revalidation_ms`), spawning and supervision setup
+(`spawn_ms`), and receipt and validation of the bound capability handshake
+(`hello_ms`). The handshake interval includes scheduling, pipe communication,
+and worker initialization; it is not a measurement of CUDA initialization alone.
+Each phase is truncated to integer milliseconds, and their sum cannot exceed
+the matching request's `end_to_end_ms`. These phases do not account for the
+whole request: model verification/loading and transcription happen separately.
+
+Startup observations are test-only and consumed once from the successful worker
+generation. Cold samples require a fresh observation inside the measured request;
+warm samples require reuse after unmeasured priming and emit
+`worker_startup_ms: null`, not invented zero durations. A restarted worker during
+a warm sample invalidates the capture. The strict reader still accepts the exact
+v1 contract for older independently digest-bound reports, but does not synthesize
+missing startup data. Vulkan reports, the worker protocol, production telemetry,
+and all pack/executable verification remain unchanged.
+
 The offline Windows qualification boundary is specified in
 [`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md). It digest-binds
 the evaluator, toolchain, Auto manifest, plan, lane identities, 50 paired run
@@ -612,8 +632,101 @@ that CUDA beats Vulkan. Auto remains default-deny.
 The runner now explicitly waits for the exact process and checks its exit code
 before restoring environment or publishing. Contract tests cover argument
 boundaries, child completion/failure, and suppression of publication after a
-failure. A fresh full canonical build/capture from this fix revision remains
-unrun; the operator capture must not be relabeled as a canonical-runner pass.
+failure. The separate canonical rerun below verifies this fix; it does not
+relabel the original failed attempt or its operator recovery as a runner pass.
+
+### Canonical CUDA capture checkpoint (2026-09-14)
+
+A fresh canonical build/capture from clean
+`92c93b66dd79bdb73fe380cfb2deaea68375ce93` completed with exit zero and the exact
+test passing. Five cold and twenty warm samples per backend passed transcript
+parity. The independently printed v1 report SHA-256 is
+`26262aaf6cd50ada4874864304df5707fe463dc982ff504d7bb36843ef28fee0`;
+consume only through `Read-ScribeVerifiedCudaEvidenceReport`. The CUDA pack was
+`fixture-92c93b66dd79-d1ddbe7adddc`, digest
+`11b9080479fe5b9972591017e04769b10673c1d05427929ce0f74d5e33c0ecb3`, and the
+CPU worker SHA-256 was
+`ea0b2ccbb96d1713a04353ef71e79476ca66d429b5bdbd2b3f0763e077882a38`.
+
+| Registry request timing, ms | CPU p50/p95 | CUDA p50/p95 |
+| --- | ---: | ---: |
+| Cold, five each | 651 / 968 | 1719 / 1781 |
+| Warm, twenty each | 330 / 355 | 76 / 128 |
+
+This is a canonical fixture-runner pass, not production qualification. Cold CUDA
+p95 still exceeded CPU by more than 10%; Auto remained default-deny. This v1
+report contains no worker-startup attribution. Do not infer improvements or
+backend rankings by comparing separate revisions or capture conditions.
+
+### CUDA startup attribution checkpoint (2026-09-23)
+
+Fresh CPU/CUDA workers and a CPU-only release test harness were built from clean
+`26df7731cd9c8e74758fe1e621cc4b4d73fad19c`. The canonical attempt stopped before
+the benchmark because the real NVIDIA utilization exceeded the unchanged 10%
+idle limit. It produced no performance report and remains a failed capture,
+not a worker crash. After the user paused GPU-heavy work, a separately labeled
+operator recovery reused the pinned artifacts and passed the exact waited test:
+one passed, zero failed, 1,570 filtered, 27.26 seconds for the whole test. This
+whole-test duration is not an inference timing. Fifty measured requests plus
+two unmeasured priming requests passed phrase, transcript-parity, stable-device,
+and strict backend assertions. The immediate-launch NVIDIA baseline was 4%
+utilization and 3,352 MiB used of 16,376 MiB.
+
+The independent v2 report SHA-256 is
+`a723f6bea3f3fe3c9a1bc690b2bcd3ab0a9cfffe3a9cc90cf0f691f92ea93ff1`;
+consume only through `Read-ScribeVerifiedCudaEvidenceReport`. Source, model,
+WAV, CPU worker, and pack identities were checked against the retained inputs,
+and all reported nearest-rank percentiles and same-request phase budgets were
+independently recalculated. The RTX 4080 SUPER binding remained
+`native:0000:01:00.0`, driver `windows-display:32.0.16.1692` / NVIDIA `616.92`.
+
+- CUDA pack: `fixture-26df7731cd9c-4edf826e5bf3`, digest
+  `da02d2065768ff9b166d8d27fa35e5d7b0db58217a7af68874b7e05804b27821`.
+- CPU worker SHA-256:
+  `5113c8f31005dbdbdc39bc17251eb12e035da5f754ca823a57f25eddbd2a5a8f`.
+- Harness SHA-256:
+  `967cf92fc73d6cd309d83f911b1e0d62fa4f932074973d6f95c0d209cfce559b`.
+- Operator wrapper / capture transcript SHA-256:
+  `fcc9c5113604ff5cb4576f59365700fa61e5aec83ca5d0239b18dd74aa41c7fd` /
+  `f654572625f8d024b4db4086ea3104289b718c32af094f88eeb198dc07447999`.
+
+| Measured interval, ms | CPU p50/p95 | CUDA p50/p95 |
+| --- | ---: | ---: |
+| Cold request, five each | 863 / 1016 | 1669 / 1701 |
+| Warm request, twenty each | 344 / 373 | 80 / 143 |
+| Cold resolution / initial verification | 19 / 30 | 800 / 808 |
+| Cold executable revalidation | 17 / 29 | 141 / 144 |
+| Cold spawn / supervision | 7 / 347 | 5 / 6 |
+| Cold parent Hello | 65 / 93 | 341 / 368 |
+| Cold same-request startup sum | 108 / 450 | 1290 / 1318 |
+
+CUDA's warm median was 4.3 times faster, but cold p95 was 1.674 times CPU and
+failed the <=10%-slower criterion. Resolution/initial verification is the
+largest measured CUDA startup interval; this directs further investigation,
+not removal of signature, inventory, payload, or executable checks. The phase
+does not isolate hashing, and parent Hello is not CUDA initialization alone.
+Compute a startup sum per request before taking percentiles; do not add the
+separately ranked phase percentiles. Warm startup and model-load fields are
+null because the worker/model was reused.
+
+Recovery retained all original failed-run artifacts and rechecked admission,
+hashes, source, Auto policy, and the fresh idle baseline. The existing exact test
+still performs complete signature/inventory verification. The execution-only
+wrapper used a fresh short TEMP and local-data directory, a system-only PATH,
+and explicit process waiting; it neither rebuilt binaries nor exported a new
+compiler environment. Its release harness is GUI-subsystem, while the worker
+is console-subsystem. The harness's exact import set (including the trusted
+Windows `userenv.dll`) was checked separately without changing the production
+import allowlist. Imports are not evidence of actual loaded module paths.
+
+This remains fixture-only, untrusted, and Auto-ineligible. The canonical attempt
+must not be relabeled as successful. Cold means a fresh worker generation, not
+a disk-cache purge; backend blocks are not interleaved. The request clock omits
+initial discovery/setup and final shutdown, and the CPU spawn interval contains
+an outlier. No full-app/installer latency, peak RAM/VRAM, broader hardware,
+power-transition, reliability, production trust, or Auto qualification is
+established. Disposable compiler files and scratch directories were removed;
+original reports, logs, and matching build artifacts remain retained.
 
 ### Backend-specific fixture smoke tests
 

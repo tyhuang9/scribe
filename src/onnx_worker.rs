@@ -753,6 +753,63 @@ struct SpawnedWorker {
     process: Arc<dyn WorkerProcess>,
     expectation: WorkerExpectation,
     pack_launch: Option<PackLaunchContext>,
+    #[cfg(test)]
+    launch_timings: Option<WorkerLaunchTimings>,
+}
+
+/// Parent-only evidence capture. These fields never enter the worker protocol
+/// or a production binary, and none of the measured checks are bypassed.
+#[cfg(test)]
+struct WorkerLaunchTimings {
+    started: Instant,
+    resolve: Duration,
+    executable_revalidation: Duration,
+    spawn: Duration,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerStartupTiming {
+    resolve_ms: u64,
+    executable_revalidation_ms: u64,
+    spawn_ms: u64,
+    hello_ms: u64,
+}
+
+#[cfg(test)]
+impl WorkerStartupTiming {
+    fn from_durations(launch: &WorkerLaunchTimings, hello: Duration) -> Result<Self> {
+        let millis = |duration: Duration| {
+            u64::try_from(duration.as_millis())
+                .context("worker startup timing exceeds evidence range")
+        };
+        Ok(Self {
+            resolve_ms: millis(launch.resolve)?,
+            executable_revalidation_ms: millis(launch.executable_revalidation)?,
+            spawn_ms: millis(launch.spawn)?,
+            hello_ms: millis(hello)?,
+        })
+    }
+
+    fn total_ms(&self) -> Result<u64> {
+        [
+            self.resolve_ms,
+            self.executable_revalidation_ms,
+            self.spawn_ms,
+            self.hello_ms,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, phase| total.checked_add(phase))
+        .ok_or_else(|| anyhow!("worker startup timing sum exceeds evidence range"))
+    }
+}
+
+#[cfg(test)]
+struct WorkerStartupObservation {
+    started: Instant,
+    completed: Instant,
+    timing: WorkerStartupTiming,
 }
 
 trait WorkerLauncher: Send + Sync {
@@ -3320,7 +3377,11 @@ impl OsWorkerLauncher {
 
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
+        #[cfg(test)]
+        let resolve_started = Instant::now();
         let executable = self.resolver.resolve(self.role)?;
+        #[cfg(test)]
+        let resolve_duration = resolve_started.elapsed();
         let mut expectation = expected_worker(self.role);
         if let Some(pack) = &executable.pack_launch {
             expectation.provider = pack.expectation.backend;
@@ -3350,6 +3411,8 @@ impl WorkerLauncher for OsWorkerLauncher {
                 process: Arc::new(launched.process),
                 expectation,
                 pack_launch: executable.pack_launch,
+                #[cfg(test)]
+                launch_timings: None,
             });
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
@@ -3369,6 +3432,8 @@ impl WorkerLauncher for OsWorkerLauncher {
                 process: Arc::new(launched.process),
                 expectation,
                 pack_launch: executable.pack_launch,
+                #[cfg(test)]
+                launch_timings: None,
             });
         }
         let mut command = Command::new(&executable.path);
@@ -3389,7 +3454,13 @@ impl WorkerLauncher for OsWorkerLauncher {
         }
         let mut parent_liveness = ParentLivenessChannel::attach(&mut command)?;
         configure_hidden_worker_command(&mut command);
+        #[cfg(test)]
+        let revalidation_started = Instant::now();
         let _immediate_identity_check = executable.revalidate()?;
+        #[cfg(test)]
+        let revalidation_duration = revalidation_started.elapsed();
+        #[cfg(test)]
+        let spawn_started = Instant::now();
         let mut child = command.spawn()?;
         parent_liveness.child_spawned();
         let process_guard =
@@ -3402,6 +3473,13 @@ impl WorkerLauncher for OsWorkerLauncher {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("process worker stdout unavailable"))?;
+        #[cfg(test)]
+        let launch_timings = Some(WorkerLaunchTimings {
+            started: resolve_started,
+            resolve: resolve_duration,
+            executable_revalidation: revalidation_duration,
+            spawn: spawn_started.elapsed(),
+        });
         Ok(SpawnedWorker {
             stdin: Box::new(stdin),
             stdout: Box::new(stdout),
@@ -3412,6 +3490,8 @@ impl WorkerLauncher for OsWorkerLauncher {
             }),
             expectation,
             pack_launch: executable.pack_launch,
+            #[cfg(test)]
+            launch_timings,
         })
     }
 }
@@ -4042,6 +4122,8 @@ struct CurrentGeneration {
     expectation: WorkerExpectation,
     pack_launch: Option<PackLaunchContext>,
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
+    #[cfg(test)]
+    startup_observation: Option<WorkerStartupObservation>,
 }
 
 struct WorkerGenerationContext {
@@ -4594,6 +4676,8 @@ impl ProcessWorkerSupervisor {
             process,
             expectation,
             pack_launch,
+            #[cfg(test)]
+            launch_timings,
         } = spawned;
         let generation = {
             let mut state = self
@@ -4609,6 +4693,8 @@ impl ProcessWorkerSupervisor {
                 expectation: expectation.clone(),
                 pack_launch,
                 pack_bindings: Vec::new(),
+                #[cfg(test)]
+                startup_observation: None,
             });
             state.active_stream = None;
             state.active_model = None;
@@ -4650,6 +4736,8 @@ impl ProcessWorkerSupervisor {
             }
         };
         let expected = expectation;
+        #[cfg(test)]
+        let hello_started = Instant::now();
         if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
@@ -4664,7 +4752,63 @@ impl ProcessWorkerSupervisor {
             self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
+        #[cfg(test)]
+        if let Some(launch) = launch_timings {
+            let completed = Instant::now();
+            let observation = WorkerStartupObservation {
+                started: launch.started,
+                completed,
+                timing: WorkerStartupTiming::from_durations(
+                    &launch,
+                    completed.duration_since(hello_started),
+                )?,
+            };
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let current = state
+                .current
+                .as_mut()
+                .filter(|current| current.generation == generation)
+                .ok_or_else(|| {
+                    anyhow!("worker generation retired before startup evidence capture")
+                })?;
+            // Failed Hello never publishes timings. Retirement removes this
+            // generation-owned observation together with its launch authority.
+            current.startup_observation = Some(observation);
+        }
         Ok(generation)
+    }
+
+    #[cfg(test)]
+    fn take_worker_startup_timing(
+        &self,
+        generation: u64,
+        request_started: Instant,
+        request_completed: Instant,
+    ) -> Result<Option<WorkerStartupTiming>> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        if state.retiring_generations.contains(&generation) {
+            bail!("worker startup evidence belongs to a retiring generation");
+        }
+        let current = state
+            .current
+            .as_mut()
+            .filter(|current| current.generation == generation)
+            .ok_or_else(|| anyhow!("worker startup evidence generation is no longer current"))?;
+        let Some(observation) = current.startup_observation.take() else {
+            return Ok(None);
+        };
+        if observation.started < request_started || observation.completed > request_completed {
+            bail!("worker startup evidence is outside the measured request");
+        }
+        Ok(Some(observation.timing))
     }
 
     fn launch_before(
@@ -10693,6 +10837,7 @@ mod tests {
 
     impl WorkerLauncher for TestLauncher {
         fn launch(&self) -> Result<SpawnedWorker> {
+            let started = Instant::now();
             let mode = self
                 .modes
                 .lock()
@@ -10742,6 +10887,12 @@ mod tests {
                 process,
                 expectation: expected_worker(WorkerRole::Inference),
                 pack_launch: None,
+                launch_timings: Some(WorkerLaunchTimings {
+                    started,
+                    resolve: Duration::ZERO,
+                    executable_revalidation: Duration::ZERO,
+                    spawn: Duration::ZERO,
+                }),
             })
         }
     }
@@ -11497,6 +11648,250 @@ mod tests {
                 "unexpected {mismatch:?} handshake error: {error}"
             );
             assert_eq!(supervisor.current_generation().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn worker_startup_timing_is_consumed_once_per_successful_generation() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        let started = Instant::now();
+        let generation = supervisor.ensure_generation().unwrap();
+        let completed = Instant::now();
+        assert!(
+            supervisor
+                .take_worker_startup_timing(generation, started, completed)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(supervisor.ensure_generation().unwrap(), generation);
+        assert!(
+            supervisor
+                .take_worker_startup_timing(generation, started, Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        supervisor
+            .invalidate_generation(generation, "startup evidence test completed", true)
+            .unwrap();
+    }
+
+    #[test]
+    fn worker_startup_timing_rejects_failed_and_retired_generations() {
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::CapabilityMismatch(CapabilityMismatch::Challenge),
+            TestMode::Normal,
+            TestMode::Normal,
+        ]));
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher,
+            short_deadlines(),
+        );
+        let started = Instant::now();
+        assert!(supervisor.ensure_generation().is_err());
+        assert!(
+            supervisor
+                .take_worker_startup_timing(1, started, Instant::now())
+                .is_err()
+        );
+        let retired = supervisor.ensure_generation().unwrap();
+        supervisor
+            .invalidate_generation(retired, "retire unconsumed startup evidence", true)
+            .unwrap();
+        let replacement_started = Instant::now();
+        let replacement = supervisor.ensure_generation().unwrap();
+        assert_ne!(retired, replacement);
+        assert!(
+            supervisor
+                .take_worker_startup_timing(retired, started, Instant::now())
+                .is_err()
+        );
+        assert!(
+            supervisor
+                .take_worker_startup_timing(replacement, replacement_started, Instant::now())
+                .unwrap()
+                .is_some()
+        );
+        supervisor
+            .invalidate_generation(replacement, "startup evidence test completed", true)
+            .unwrap();
+    }
+
+    #[test]
+    fn worker_startup_timing_cancelled_hello_does_not_survive_recovery() {
+        let (blocked_tx, blocked_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::BlockedHello {
+                started: blocked_tx,
+            },
+            TestMode::Normal,
+        ]));
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            SupervisorDeadlines::default(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let acquisition_supervisor = supervisor.clone();
+        let acquisition_cancelled = Arc::clone(&cancelled);
+        let started = Instant::now();
+        let acquisition = std::thread::spawn(move || {
+            acquisition_supervisor
+                .ensure_generation_before(None, Some(acquisition_cancelled.as_ref()))
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let failed_generation = supervisor.current_generation().unwrap().unwrap();
+        assert!(
+            supervisor
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .startup_observation
+                .is_none()
+        );
+        cancelled.store(true, Ordering::Release);
+        assert!(
+            acquisition
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert_eq!(supervisor.current_generation().unwrap(), None);
+        assert!(
+            supervisor
+                .take_worker_startup_timing(failed_generation, started, Instant::now())
+                .is_err()
+        );
+
+        cancelled.store(false, Ordering::Release);
+        let replacement_started = Instant::now();
+        let replacement = supervisor
+            .ensure_generation_before(None, Some(cancelled.as_ref()))
+            .unwrap();
+        assert_ne!(replacement, failed_generation);
+        assert!(
+            supervisor
+                .take_worker_startup_timing(failed_generation, started, Instant::now())
+                .is_err()
+        );
+        assert!(
+            supervisor
+                .take_worker_startup_timing(replacement, replacement_started, Instant::now())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            supervisor
+                .take_worker_startup_timing(replacement, replacement_started, Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        supervisor
+            .invalidate_generation(replacement, "startup cancellation test completed", true)
+            .unwrap();
+    }
+
+    #[test]
+    fn worker_startup_timing_retiring_generation_rejection_does_not_consume() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher,
+            short_deadlines(),
+        );
+        let started = Instant::now();
+        let generation = supervisor.ensure_generation().unwrap();
+        // Hold the same state marker used by invalidation while termination is
+        // in progress; no timing or scheduler threshold is needed.
+        supervisor
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .retiring_generations
+            .insert(generation);
+        let error = supervisor
+            .take_worker_startup_timing(generation, started, Instant::now())
+            .unwrap_err();
+        assert!(error.to_string().contains("retiring generation"));
+        assert!(
+            supervisor
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .remove(&generation)
+        );
+        assert!(
+            supervisor
+                .take_worker_startup_timing(generation, started, Instant::now())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            supervisor
+                .take_worker_startup_timing(generation, started, Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        supervisor
+            .invalidate_generation(generation, "startup retirement test completed", true)
+            .unwrap();
+    }
+
+    #[test]
+    fn worker_startup_timing_rejects_observations_outside_request_window() {
+        for starts_too_early in [true, false] {
+            let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+            let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                short_deadlines(),
+            );
+            let started = Instant::now();
+            let generation = supervisor.ensure_generation().unwrap();
+            let completed = Instant::now();
+            // Use explicit bounds, not a sleep or scheduler-dependent latency.
+            let (lower, upper) = if starts_too_early {
+                (
+                    completed + Duration::from_secs(1),
+                    completed + Duration::from_secs(2),
+                )
+            } else {
+                let mut state = supervisor.inner.state.lock().unwrap();
+                let observation = state
+                    .current
+                    .as_mut()
+                    .unwrap()
+                    .startup_observation
+                    .as_mut()
+                    .unwrap();
+                observation.completed = completed + Duration::from_secs(1);
+                (started, completed)
+            };
+            assert!(
+                supervisor
+                    .take_worker_startup_timing(generation, lower, upper)
+                    .is_err()
+            );
+            assert!(
+                supervisor
+                    .take_worker_startup_timing(generation, started, completed)
+                    .unwrap()
+                    .is_none()
+            );
+            supervisor
+                .invalidate_generation(generation, "startup evidence test completed", true)
+                .unwrap();
         }
     }
 
@@ -13773,6 +14168,25 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
+    struct CudaEvidenceRunSet {
+        end_to_end_ms: Vec<u64>,
+        end_to_end: VulkanEvidenceStatistics,
+        backend_processing_ms: Vec<u64>,
+        backend_processing: VulkanEvidenceStatistics,
+        model_load_ms: Option<Vec<u64>>,
+        model_load: Option<VulkanEvidenceStatistics>,
+        worker_startup_ms: Option<Vec<WorkerStartupTiming>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct CudaEvidenceBackendRuns {
+        cold: CudaEvidenceRunSet,
+        warm: CudaEvidenceRunSet,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
     struct VulkanEvidencePack {
         id: String,
         version: String,
@@ -13845,8 +14259,8 @@ mod tests {
         nvidia_baseline: VulkanEvidenceNvidiaBaseline,
         cold_runs_per_backend: usize,
         warm_runs_per_backend: usize,
-        cpu: VulkanEvidenceBackendRuns,
-        cuda: VulkanEvidenceBackendRuns,
+        cpu: CudaEvidenceBackendRuns,
+        cuda: CudaEvidenceBackendRuns,
         expected_phrase_present_every_run: bool,
         normalized_transcript_parity: bool,
         same_device_internally_verified: bool,
@@ -13859,6 +14273,12 @@ mod tests {
         backend_processing_ms: u64,
         model_load_ms: u64,
         warm_reused: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CudaEvidenceObservation {
+        execution: VulkanEvidenceObservation,
+        worker_startup: Option<WorkerStartupTiming>,
     }
 
     fn canonical_vulkan_evidence_sha256(value: &str) -> Result<String> {
@@ -14015,6 +14435,68 @@ mod tests {
                 .map(vulkan_evidence_statistics)
                 .transpose()?,
             model_load_ms,
+        })
+    }
+
+    fn validate_cuda_evidence_startup(
+        warm_reused: bool,
+        startup: Option<&WorkerStartupTiming>,
+        end_to_end_ms: u64,
+    ) -> Result<()> {
+        match (warm_reused, startup) {
+            (true, None) => Ok(()),
+            (true, Some(_)) => bail!("CUDA warm run unexpectedly started a worker generation"),
+            (false, None) => bail!("CUDA cold run has no measured worker startup"),
+            (false, Some(timing)) if timing.total_ms()? <= end_to_end_ms => Ok(()),
+            (false, Some(_)) => bail!("CUDA startup phases exceed the measured request duration"),
+        }
+    }
+
+    fn cuda_evidence_run_set(
+        observations: &[CudaEvidenceObservation],
+        cold: bool,
+    ) -> Result<CudaEvidenceRunSet> {
+        for run in observations {
+            validate_cuda_evidence_startup(
+                run.execution.warm_reused,
+                run.worker_startup.as_ref(),
+                run.execution.end_to_end_ms,
+            )?;
+        }
+        let executions = observations
+            .iter()
+            .map(|run| run.execution.clone())
+            .collect::<Vec<_>>();
+        let VulkanEvidenceRunSet {
+            end_to_end_ms,
+            end_to_end,
+            backend_processing_ms,
+            backend_processing,
+            model_load_ms,
+            model_load,
+        } = vulkan_evidence_run_set(&executions, cold)?;
+        let worker_startup_ms = if cold {
+            Some(
+                observations
+                    .iter()
+                    .map(|run| {
+                        run.worker_startup
+                            .clone()
+                            .ok_or_else(|| anyhow!("CUDA cold startup is missing"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        Ok(CudaEvidenceRunSet {
+            end_to_end_ms,
+            end_to_end,
+            backend_processing_ms,
+            backend_processing,
+            model_load_ms,
+            model_load,
+            worker_startup_ms,
         })
     }
 
@@ -14333,6 +14815,179 @@ mod tests {
             combined_error,
             "operation failed; evidence worker cleanup also failed: shutdown failed"
         );
+    }
+
+    fn cuda_evidence_observation_fixture(cold: bool) -> CudaEvidenceObservation {
+        CudaEvidenceObservation {
+            execution: VulkanEvidenceObservation {
+                normalized_transcript: "public fixture phrase".to_owned(),
+                end_to_end_ms: 20,
+                backend_processing_ms: 5,
+                model_load_ms: if cold { 5 } else { 0 },
+                warm_reused: !cold,
+            },
+            worker_startup: cold.then_some(WorkerStartupTiming {
+                resolve_ms: 1,
+                executable_revalidation_ms: 2,
+                spawn_ms: 3,
+                hello_ms: 4,
+            }),
+        }
+    }
+
+    #[test]
+    fn cuda_startup_timing_accounting_is_checked_and_truncates_each_phase() {
+        let launch = WorkerLaunchTimings {
+            started: Instant::now(),
+            resolve: Duration::from_micros(1_999),
+            executable_revalidation: Duration::from_micros(2_999),
+            spawn: Duration::from_micros(3_999),
+        };
+        let timing =
+            WorkerStartupTiming::from_durations(&launch, Duration::from_micros(4_999)).unwrap();
+        assert_eq!(timing.total_ms().unwrap(), 10);
+        assert!(validate_cuda_evidence_startup(false, Some(&timing), 10).is_ok());
+        assert!(validate_cuda_evidence_startup(false, Some(&timing), 9).is_err());
+        assert!(validate_cuda_evidence_startup(false, None, 20).is_err());
+        assert!(validate_cuda_evidence_startup(true, Some(&timing), 20).is_err());
+        assert!(validate_cuda_evidence_startup(true, None, 20).is_ok());
+        assert!(WorkerStartupTiming::from_durations(&launch, Duration::MAX).is_err());
+        let overflow = WorkerStartupTiming {
+            resolve_ms: u64::MAX,
+            ..timing
+        };
+        assert!(overflow.total_ms().is_err());
+        assert!(validate_cuda_evidence_startup(false, Some(&overflow), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn cuda_evidence_run_sets_require_cold_startup_and_forbid_warm_startup() {
+        let cold = vec![cuda_evidence_observation_fixture(true); VULKAN_EVIDENCE_COLD_RUNS];
+        let warm = vec![cuda_evidence_observation_fixture(false); VULKAN_EVIDENCE_WARM_RUNS];
+        assert_eq!(
+            cuda_evidence_run_set(&cold, true)
+                .unwrap()
+                .worker_startup_ms
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(
+            cuda_evidence_run_set(&warm, false)
+                .unwrap()
+                .worker_startup_ms
+                .is_none()
+        );
+        assert!(cuda_evidence_run_set(&cold[..4], true).is_err());
+        assert!(cuda_evidence_run_set(&warm[..19], false).is_err());
+        let mut missing = cold.clone();
+        missing[0].worker_startup = None;
+        assert!(cuda_evidence_run_set(&missing, true).is_err());
+        let mut unexpected = warm.clone();
+        unexpected[0].worker_startup = cold[0].worker_startup.clone();
+        assert!(cuda_evidence_run_set(&unexpected, false).is_err());
+        let mut overlong = cold;
+        overlong[0].execution.end_to_end_ms = 9;
+        assert!(cuda_evidence_run_set(&overlong, true).is_err());
+    }
+
+    #[test]
+    fn cuda_evidence_v2_serializes_exact_startup_fields_without_changing_vulkan() {
+        let cold = vec![cuda_evidence_observation_fixture(true); VULKAN_EVIDENCE_COLD_RUNS];
+        let warm = vec![cuda_evidence_observation_fixture(false); VULKAN_EVIDENCE_WARM_RUNS];
+        let runs = CudaEvidenceBackendRuns {
+            cold: cuda_evidence_run_set(&cold, true).unwrap(),
+            warm: cuda_evidence_run_set(&warm, false).unwrap(),
+        };
+        let report = CudaEvidenceReport {
+            schema_version: 2,
+            evidence_kind: "windows-cuda-fixture-performance".to_owned(),
+            fixture_only: true,
+            untrusted: true,
+            auto_eligible: false,
+            source_revision: "f".repeat(40),
+            cpu_worker_sha256: "e".repeat(64),
+            pack: VulkanEvidencePack {
+                id: "scribe-cuda-windows-x64".to_owned(),
+                version: "fixture-evidence".to_owned(),
+                digest: "a".repeat(64),
+                security_epoch: 1,
+                runtime_abi: 1,
+            },
+            model_sha256: "b".repeat(64),
+            wav_sha256: "c".repeat(64),
+            gpu: VulkanEvidenceGpu {
+                backend: "cuda".to_owned(),
+                provider: "transcribe-cpp-ggml-cuda".to_owned(),
+                vendor: "nvidia".to_owned(),
+                device_class: "discrete_gpu".to_owned(),
+                driver: "windows-display:fixture".to_owned(),
+                memory_total_bytes: 1,
+            },
+            nvidia_baseline: VulkanEvidenceNvidiaBaseline {
+                product: "NVIDIA fixture".to_owned(),
+                driver: "fixture".to_owned(),
+                memory_total_bytes: 1,
+                memory_used_bytes: 0,
+                gpu_utilization_percent: 0,
+            },
+            cold_runs_per_backend: VULKAN_EVIDENCE_COLD_RUNS,
+            warm_runs_per_backend: VULKAN_EVIDENCE_WARM_RUNS,
+            cpu: runs.clone(),
+            cuda: runs,
+            expected_phrase_present_every_run: true,
+            normalized_transcript_parity: true,
+            same_device_internally_verified: true,
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["fixture_only"], true);
+        assert_eq!(value["untrusted"], true);
+        assert_eq!(value["auto_eligible"], false);
+        for backend in ["cpu", "cuda"] {
+            for phase in ["cold", "warm"] {
+                let set = value[backend][phase].as_object().unwrap();
+                let mut keys = set.keys().map(String::as_str).collect::<Vec<_>>();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    [
+                        "backend_processing",
+                        "backend_processing_ms",
+                        "end_to_end",
+                        "end_to_end_ms",
+                        "model_load",
+                        "model_load_ms",
+                        "worker_startup_ms"
+                    ]
+                );
+            }
+            assert_eq!(
+                value[backend]["cold"]["worker_startup_ms"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            assert_eq!(
+                value[backend]["cold"]["worker_startup_ms"][0],
+                serde_json::json!({
+                    "resolve_ms": 1, "executable_revalidation_ms": 2, "spawn_ms": 3, "hello_ms": 4,
+                })
+            );
+            assert!(value[backend]["warm"]["worker_startup_ms"].is_null());
+        }
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("public fixture phrase"));
+        assert!(!serialized.contains("stable_device"));
+        let vulkan_runs = cold
+            .iter()
+            .map(|run| run.execution.clone())
+            .collect::<Vec<_>>();
+        let vulkan =
+            serde_json::to_value(vulkan_evidence_run_set(&vulkan_runs, true).unwrap()).unwrap();
+        assert_eq!(vulkan.as_object().unwrap().len(), 6);
+        assert!(vulkan.get("worker_startup_ms").is_none());
     }
 
     #[test]
@@ -15618,7 +16273,7 @@ mod tests {
         preference: AccelerationPreference,
         audio: &PreparedAudio,
         expected: Option<&BackendTarget>,
-    ) -> Result<VulkanEvidenceObservation> {
+    ) -> Result<CudaEvidenceObservation> {
         let cancellation = std::sync::atomic::AtomicU64::new(0);
         let started = Instant::now();
         let execution = registry
@@ -15636,9 +16291,27 @@ mod tests {
             preference,
             expected,
         )?;
-        Ok(VulkanEvidenceObservation {
+        let completed = Instant::now();
+        let supervisor = registry
+            .active_route
+            .lock()
+            .map_err(|_| anyhow!("CUDA evidence active route lock was poisoned"))?
+            .as_ref()
+            .map(|route| route.supervisor.clone())
+            .ok_or_else(|| anyhow!("CUDA evidence request did not retain its worker route"))?;
+        let generation = supervisor
+            .transport
+            .current_generation()?
+            .ok_or_else(|| anyhow!("CUDA evidence request did not retain its worker generation"))?;
+        let worker_startup = supervisor
+            .transport
+            .take_worker_startup_timing(generation, started, completed)?;
+        let observation = VulkanEvidenceObservation {
             normalized_transcript: normalize_vulkan_evidence_transcript(&execution.transcript.text),
-            end_to_end_ms: vulkan_evidence_millis(started.elapsed().as_millis(), "end-to-end")?,
+            end_to_end_ms: vulkan_evidence_millis(
+                completed.duration_since(started).as_millis(),
+                "end-to-end",
+            )?,
             backend_processing_ms: vulkan_evidence_millis(
                 execution.processing_duration_ms,
                 "backend processing",
@@ -15648,6 +16321,15 @@ mod tests {
                 "model load",
             )?,
             warm_reused: execution.diagnostics.warm_reused,
+        };
+        validate_cuda_evidence_startup(
+            observation.warm_reused,
+            worker_startup.as_ref(),
+            observation.end_to_end_ms,
+        )?;
+        Ok(CudaEvidenceObservation {
+            execution: observation,
+            worker_startup,
         })
     }
 
@@ -15659,7 +16341,7 @@ mod tests {
         audio: &PreparedAudio,
         expected: Option<&BackendTarget>,
         cold: bool,
-    ) -> Result<Vec<VulkanEvidenceObservation>> {
+    ) -> Result<Vec<CudaEvidenceObservation>> {
         let count = if cold {
             VULKAN_EVIDENCE_COLD_RUNS
         } else {
@@ -15676,7 +16358,7 @@ mod tests {
                             audio,
                             expected,
                         )?;
-                        if run.warm_reused || run.model_load_ms == 0 {
+                        if run.execution.warm_reused || run.execution.model_load_ms == 0 {
                             bail!("CUDA cold run reused a model generation")
                         }
                         Ok(run)
@@ -15692,7 +16374,7 @@ mod tests {
                 audio,
                 expected,
             )?;
-            if priming.warm_reused || priming.model_load_ms == 0 {
+            if priming.execution.warm_reused || priming.execution.model_load_ms == 0 {
                 bail!("CUDA warm priming was not fresh")
             }
             (0..count)
@@ -15704,13 +16386,27 @@ mod tests {
                         audio,
                         expected,
                     )?;
-                    if !run.warm_reused || run.model_load_ms != 0 {
+                    if !run.execution.warm_reused || run.execution.model_load_ms != 0 {
                         bail!("CUDA warm run did not reuse the primed model")
                     }
                     Ok(run)
                 })
                 .collect()
         })
+    }
+
+    #[cfg(windows)]
+    fn assert_cuda_evidence_transcripts(
+        cpu: &[CudaEvidenceObservation],
+        cuda: &[CudaEvidenceObservation],
+        expected_phrase: &str,
+    ) -> Result<()> {
+        let executions = |runs: &[CudaEvidenceObservation]| {
+            runs.iter()
+                .map(|run| run.execution.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_vulkan_evidence_transcripts(&executions(cpu), &executions(cuda), expected_phrase)
     }
 
     #[cfg(windows)]
@@ -15977,15 +16673,15 @@ mod tests {
             false,
         )
         .expect("CUDA warm evidence");
-        assert_vulkan_evidence_transcripts(&cpu_cold, &cuda_cold, &inputs.expected_phrase)
+        assert_cuda_evidence_transcripts(&cpu_cold, &cuda_cold, &inputs.expected_phrase)
             .expect("cold parity");
-        assert_vulkan_evidence_transcripts(&cpu_warm, &cuda_warm, &inputs.expected_phrase)
+        assert_cuda_evidence_transcripts(&cpu_warm, &cuda_warm, &inputs.expected_phrase)
             .expect("warm parity");
         let pack = target.pack.as_ref().expect("CUDA pack identity");
         let revision = env!("SCRIBE_BUILD_REVISION").to_ascii_lowercase();
         assert!(revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()));
         let report = CudaEvidenceReport {
-            schema_version: 1,
+            schema_version: 2,
             evidence_kind: "windows-cuda-fixture-performance".to_owned(),
             fixture_only: true,
             untrusted: true,
@@ -16012,13 +16708,13 @@ mod tests {
             nvidia_baseline: inputs.nvidia_baseline,
             cold_runs_per_backend: VULKAN_EVIDENCE_COLD_RUNS,
             warm_runs_per_backend: VULKAN_EVIDENCE_WARM_RUNS,
-            cpu: VulkanEvidenceBackendRuns {
-                cold: vulkan_evidence_run_set(&cpu_cold, true).unwrap(),
-                warm: vulkan_evidence_run_set(&cpu_warm, false).unwrap(),
+            cpu: CudaEvidenceBackendRuns {
+                cold: cuda_evidence_run_set(&cpu_cold, true).unwrap(),
+                warm: cuda_evidence_run_set(&cpu_warm, false).unwrap(),
             },
-            cuda: VulkanEvidenceBackendRuns {
-                cold: vulkan_evidence_run_set(&cuda_cold, true).unwrap(),
-                warm: vulkan_evidence_run_set(&cuda_warm, false).unwrap(),
+            cuda: CudaEvidenceBackendRuns {
+                cold: cuda_evidence_run_set(&cuda_cold, true).unwrap(),
+                warm: cuda_evidence_run_set(&cuda_warm, false).unwrap(),
             },
             expected_phrase_present_every_run: true,
             normalized_transcript_parity: true,
@@ -17468,13 +18164,31 @@ mod tests {
             launcher,
             SupervisorDeadlines::default(),
         );
-        transport.ensure_generation().unwrap();
+        let started = Instant::now();
+        let generation = transport.ensure_generation().unwrap();
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .startup_observation
+                .is_some()
+        );
         let supervisor = InferenceWorkerSupervisor {
             transport: transport.clone(),
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         supervisor.cancel_active();
         assert_eq!(transport.current_generation().unwrap(), None);
+        assert!(
+            transport
+                .take_worker_startup_timing(generation, started, Instant::now())
+                .is_err()
+        );
     }
 
     fn cooperative_cancel_fixture(
@@ -17513,6 +18227,7 @@ mod tests {
             expectation: expected_worker(WorkerRole::Inference),
             pack_launch: None,
             pack_bindings: Vec::new(),
+            startup_observation: None,
         });
         state.active_request = Some(correlation);
         drop(state);
