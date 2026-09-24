@@ -31,7 +31,7 @@ const PACK_DIGEST_DOMAIN: &[u8] = b"scribe-gpu-worker-pack-digest-v1\0";
 
 #[cfg(test)]
 #[path = "verification_profile.rs"]
-mod verification_profile;
+pub(crate) mod verification_profile;
 
 #[cfg(test)]
 type PackReadHook = Box<dyn FnMut(&Path)>;

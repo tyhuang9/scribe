@@ -5,14 +5,16 @@ use super::*;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
+#[cfg(windows)]
+use std::time::Duration;
 use std::time::Instant;
 
 #[derive(Debug, Serialize)]
-struct PayloadObservation {
-    ordinal: usize,
-    relative_path: String,
-    verified_bytes: u64,
-    read_hash_ns: u128,
+pub(crate) struct PayloadObservation {
+    pub(crate) ordinal: usize,
+    pub(crate) relative_path: String,
+    pub(crate) verified_bytes: u64,
+    pub(crate) read_hash_ns: u128,
 }
 
 thread_local! {
@@ -69,19 +71,29 @@ fn collector_is_clear() -> bool {
     OBSERVATIONS.with(|slot| slot.borrow().is_none())
 }
 
+// The application-only executable verifier uses this narrow test hook to
+// prove that a failed executable check cannot publish partial payload samples.
+// Keep the collector implementation independent of the application runtime so
+// the standalone worker-pack author tool can test the shared verifier.
+pub(crate) fn capture_for_test<T, E>(
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, Vec<PayloadObservation>), E> {
+    capture(operation)
+}
+
+pub(crate) fn collector_is_clear_for_test() -> bool {
+    collector_is_clear()
+}
+
 #[test]
 fn payload_profile_records_exact_successful_inventory() {
     let root = test_support::temp_root("profile-success");
     let (verifier, lease) = test_support::leased_fixture(&root);
-    let ((full_elapsed, executable), observations) = capture(|| -> anyhow::Result<_> {
+    let ((full_elapsed, worker_path), observations) = capture(|| -> anyhow::Result<_> {
         let start = Instant::now();
         let launchable = verifier.launchable_worker(&lease)?;
         let full_elapsed = start.elapsed();
-        let executable = crate::onnx_worker::profile_worker_executable(
-            launchable.path(),
-            &test_support::base_manifest().payload[0].sha256,
-        )?;
-        Ok((full_elapsed, executable))
+        Ok((full_elapsed, launchable.path().to_owned()))
     })
     .unwrap();
     assert_eq!(observations.len(), 1);
@@ -89,10 +101,8 @@ fn payload_profile_records_exact_successful_inventory() {
     assert_eq!(observations[0].relative_path, "bin/worker.exe");
     assert_eq!(observations[0].verified_bytes, 13);
     assert!(observations[0].read_hash_ns <= full_elapsed.as_nanos());
-    // Read the field on all platforms; do not set noisy timing thresholds.
-    let _ = executable.elapsed;
+    assert_eq!(worker_path, lease.worker_path());
     assert!(collector_is_clear());
-    drop(executable);
     drop(lease);
     fs::remove_dir_all(root).unwrap();
 }
@@ -120,22 +130,6 @@ fn payload_profile_discards_records_after_later_payload_failure() {
     assert_eq!(observations[1].ordinal, 1);
     assert_eq!(observations[1].relative_path, "bin/z.dll");
     assert_eq!(observations[1].verified_bytes, 3);
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn payload_profile_discards_records_after_executable_failure() {
-    let root = test_support::temp_root("profile-bad-executable");
-    let (verifier, lease) = test_support::leased_fixture(&root);
-    let result = capture(|| -> anyhow::Result<_> {
-        let launchable = verifier.launchable_worker(&lease)?;
-        crate::onnx_worker::profile_worker_executable(launchable.path(), &"0".repeat(64))
-    });
-    assert!(result.is_err());
-    assert!(collector_is_clear());
-    assert!(crate::onnx_worker::profile_worker_executable(&lease.worker_path(), "").is_err());
-    drop(result);
-    drop(lease);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -245,15 +239,17 @@ fn profile_compatibility_distinguishes_evaluator_and_artifact_revisions() {
 }
 
 #[cfg(windows)]
-#[test]
-#[ignore = "local retained fixture only; parent verification, not GPU qualification"]
-fn windows_cuda_retained_fixture_parent_verification_profile() {
+pub(crate) fn windows_cuda_retained_fixture_parent_verification_profile<T>(
+    evaluator_revision: &str,
+    evaluator_debug_assertions: bool,
+    mut measure_executable: impl FnMut(&Path, &str) -> anyhow::Result<(Duration, T)>,
+) -> anyhow::Result<serde_json::Value> {
     const MANIFEST_SHA: &str = "682cc1bf43f170d5fecd03a981b9e114c550ab46488022f33b8779d43c2a70dc";
     const SIGNATURE_SHA: &str = "671de157521e73af656cd8185eed8811ad929b663ceefc866e3b5e0515680f0e";
     const PACK_DIGEST: &str = "da02d2065768ff9b166d8d27fa35e5d7b0db58217a7af68874b7e05804b27821";
     const WORKER_SHA: &str = "ef61230f28f3ba332d0afa9f6d6dd5de9f7fa154b95d6634cde7e8202c11b39a";
 
-    assert_profile_evaluator(cfg!(debug_assertions), env!("SCRIBE_BUILD_REVISION"));
+    assert_profile_evaluator(evaluator_debug_assertions, evaluator_revision);
     let source = PathBuf::from(std::env::var_os("SCRIBE_PROFILE_RETAINED_CUDA_PACK").expect(
         "set SCRIBE_PROFILE_RETAINED_CUDA_PACK to the retained fixture-26df7731cd9c-4edf826e5bf3 pack",
     ));
@@ -294,7 +290,7 @@ fn windows_cuda_retained_fixture_parent_verification_profile() {
     let owner = test_support::temp_root("parent-verification-profile");
     // Catch panics solely to drop all leased handles and remove this owned
     // scratch tree before propagating failure. No partial timing output.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<_> {
         let store = owner.join("workers/packs");
         let destination = store
             .join(descriptor.pack_id.as_str())
@@ -316,16 +312,19 @@ fn windows_cuda_retained_fixture_parent_verification_profile() {
         assert_eq!(lease.verified_pack().pack_digest, PACK_DIGEST);
         // Preparation above is deliberately unmeasured and warms file caches.
         let mut samples = Vec::new();
+        // Retain every verified image through the complete measurement series.
+        // The callback owns the app-specific image guard, while this generic
+        // collector remains usable by the standalone pack-author tool.
+        let mut verified_images = Vec::new();
         for ordinal in 0..5 {
-            let ((launchable_ns, executable), payloads) = capture(|| -> anyhow::Result<_> {
-                let started = Instant::now();
-                let launchable = verifier.launchable_worker(&lease)?;
-                let elapsed = started.elapsed();
-                let executable =
-                    crate::onnx_worker::profile_worker_executable(launchable.path(), WORKER_SHA)?;
-                Ok((elapsed.as_nanos(), executable))
-            })
-            .unwrap();
+            let ((launchable_ns, (executable_elapsed, verified_image)), payloads) =
+                capture(|| -> anyhow::Result<_> {
+                    let started = Instant::now();
+                    let launchable = verifier.launchable_worker(&lease)?;
+                    let elapsed = started.elapsed();
+                    let executable = measure_executable(launchable.path(), WORKER_SHA)?;
+                    Ok((elapsed.as_nanos(), executable))
+                })?;
             assert_eq!(payloads.len(), 3);
             assert_eq!(
                 payloads.iter().map(|p| p.verified_bytes).sum::<u64>(),
@@ -335,34 +334,48 @@ fn windows_cuda_retained_fixture_parent_verification_profile() {
             samples.push(serde_json::json!({
                 "ordinal": ordinal,
                 "launchable_worker_ns": launchable_ns,
-                "initial_executable_verification_ns": executable.elapsed.as_nanos(),
+                "initial_executable_verification_ns": executable_elapsed.as_nanos(),
                 "payload_read_hash_nested_in_launchable_worker": payloads,
             }));
+            verified_images.push(verified_image);
         }
-        samples
+        Ok(samples)
     }));
     drop((manifest_handle, signature_handle, source_handles));
-    fs::remove_dir_all(&owner)
-        .expect("owned profiling scratch cleanup failed; no result published");
+    let cleanup = fs::remove_dir_all(&owner);
     let samples = match result {
-        Ok(samples) => samples,
-        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(Ok(samples)) => {
+            cleanup.map_err(|error| {
+                anyhow::anyhow!(
+                    "owned profiling scratch cleanup failed; no result published: {error}"
+                )
+            })?;
+            samples
+        }
+        Ok(Err(error)) => {
+            if let Err(cleanup_error) = cleanup {
+                return Err(anyhow::anyhow!(
+                    "parent verification diagnostic failed: {error:#}; additionally failed to remove owned profiling scratch: {cleanup_error}"
+                ));
+            }
+            return Err(error);
+        }
+        Err(panic) => {
+            cleanup.expect("owned profiling scratch cleanup failed; no result published");
+            std::panic::resume_unwind(panic);
+        }
     };
-    let report = serde_json::json!({
+    Ok(serde_json::json!({
         "diagnostic": "parent-verification-profile-v1",
         "fixture_only": true,
         "auto_eligible": false,
         "worker_executed": false,
-        "evaluator_revision": env!("SCRIBE_BUILD_REVISION"),
+        "evaluator_revision": evaluator_revision,
         "artifact_revision": ARTIFACT_REVISION,
         "artifact_manifest_sha256": MANIFEST_SHA,
         "artifact_signature_sha256": SIGNATURE_SHA,
         "artifact_pack_digest": PACK_DIGEST,
         "preparation_warms_filesystem_cache": true,
         "samples": samples,
-    });
-    println!(
-        "SCRIBE_PARENT_VERIFICATION_PROFILE={}",
-        serde_json::to_string(&report).unwrap()
-    );
+    }))
 }

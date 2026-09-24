@@ -730,8 +730,8 @@ original reports, logs, and matching build artifacts remain retained.
 
 ### Parent-only retained-pack verification diagnostic
 
-The ignored test
-`gpu_worker_pack::manifest::verification_profile::windows_cuda_retained_fixture_parent_verification_profile`
+The ignored application test
+`onnx_worker::tests::windows_cuda_retained_fixture_parent_verification_profile`
 isolates verification of the retained `fixture-26df7731cd9c-4edf826e5bf3` pack.
 Set `SCRIBE_PROFILE_RETAINED_CUDA_PACK` to its source directory. The test pins
 the independently recorded manifest/signature hashes, artifact build identities,
@@ -745,7 +745,7 @@ Use a clean evaluator revision, the pinned native toolchain, and a separate
 release build cache; do not overwrite the original evidence harness. Run:
 
 ```powershell
-cargo test --release --locked --offline --bin local-transcriber --features inference-worker gpu_worker_pack::manifest::verification_profile::windows_cuda_retained_fixture_parent_verification_profile -- --ignored --exact --nocapture --test-threads=1
+cargo test --release --locked --offline --bin local-transcriber --features inference-worker onnx_worker::tests::windows_cuda_retained_fixture_parent_verification_profile -- --ignored --exact --nocapture --test-threads=1
 ```
 
 Require exactly one passed test. Only after all five samples and scratch cleanup
@@ -768,6 +768,9 @@ filtered) in 6.65 seconds. Its independent transcript SHA-256 is
 `4e22aff0e493b629692697d3e24eb6ca46306f9353e67959ae7678bcfe0bc7ff`;
 the evaluator binary SHA-256 is
 `b390796771cd5a0977154841b4659d7273973c1331daa08f79d2dde487b1d61a`.
+That historical capture used the former shared-test path before this boundary
+refactor; the application-test command above is for future captures and does
+not recapture or reinterpret the 4946 evidence.
 The source fixture remained the digest-bound 26df pack above, not a rebuilt
 CUDA pack. The release evaluator's normal CPU-worker trust anchor came from a
 matching CPU build; neither worker was executed by this diagnostic.
