@@ -139,12 +139,16 @@ $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
 $cmakeBootstrapScript = Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1'
 $prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
 $cudaInventoryScript = Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1'
+$cudaPackInputsTestScript = Join-Path $PSScriptRoot 'test-windows-cuda-pack-inputs.ps1'
+$vulkanPackHelperScript = Join-Path $PSScriptRoot 'windows-vulkan-policy-pack.ps1'
 $autoQualificationReportScript = Join-Path $PSScriptRoot 'report-windows-gpu-auto-qualification.ps1'
 foreach ($script in @(
     $buildScript,
     $cmakeBootstrapScript,
     $prepareScript,
     $cudaInventoryScript,
+    $cudaPackInputsTestScript,
+    $vulkanPackHelperScript,
     (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1'),
     $autoQualificationReportScript
 )) {
@@ -1102,7 +1106,45 @@ $inventoryGuardAt = $buildSource.IndexOf('$currentEntries = @(Get-ChildItem -Lit
 $deletionAt = $buildSource.IndexOf('Remove-Item -LiteralPath $buildDirectory -Recurse -Force')
 Assert-True ($deletionGuardAt -ge 0 -and $deletionGuardAt -lt $deletionAt) 'Builder deletion is not guarded by descendant reparse validation.'
 Assert-True ($inventoryGuardAt -ge 0 -and $inventoryGuardAt -lt $deletionAt) 'Builder deletion is not guarded by current OUT_DIR inventory validation.'
+. $vulkanPackHelperScript
 . $cudaInventoryScript
+& $cudaPackInputsTestScript | Out-Null
+$checkedInToolchainContract = Get-Content -LiteralPath `
+    (Join-Path $repositoryRoot 'runtime-manifests\gpu-worker-toolchain-windows-x64.json') `
+    -Raw | ConvertFrom-Json
+$checkedInCudaInventory = @($checkedInToolchainContract.cuda.production_inventory)
+Assert-True ($checkedInCudaInventory.Count -eq 1727) 'Checked-in CUDA production inventory must contain the supplier-bound 1,727 files.'
+$checkedInRequiredCudaInputs = @(
+    @($checkedInToolchainContract.cuda.required_files) +
+    @($checkedInToolchainContract.cuda.packaged_runtime_imports | ForEach-Object { "bin/$_" }) +
+    @(Get-ScribeCudaPackNoticeContract | ForEach-Object { $_.SourceRelativePath })
+)
+$null = ConvertTo-AuthenticatedCudaInventory `
+    $checkedInCudaInventory `
+    $checkedInRequiredCudaInputs
+for ($cudaInventoryIndex = 1; $cudaInventoryIndex -lt $checkedInCudaInventory.Count; $cudaInventoryIndex++) {
+    $previousCudaInventoryPath = [string]$checkedInCudaInventory[$cudaInventoryIndex - 1].path
+    $currentCudaInventoryPath = [string]$checkedInCudaInventory[$cudaInventoryIndex].path
+    Assert-True `
+        ([System.StringComparer]::Ordinal.Compare($previousCudaInventoryPath, $currentCudaInventoryPath) -lt 0) `
+        'Checked-in CUDA production inventory is not in strict ordinal path order.'
+}
+$checkedInCudaPins = @{
+    'bin/cublas64_12.dll' = '9513540e4ec4c51ee9e7304138c2cc255c29a8c181f9e80c38efa25738becd99'
+    'bin/cublasLt64_12.dll' = 'b199d1ff892a81b7fd3d57ba1781549609b41500b36008fef326038393ad46c7'
+    'bin/cudart64_12.dll' = 'c2c9a9c22a9bcba90e261825968836787b331038047a26770cffb7a583c28344'
+    'licenses/cuda_cudart/LICENSE' = 'e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07'
+    'licenses/libcublas/LICENSE' = 'e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07'
+}
+foreach ($checkedInCudaPin in $checkedInCudaPins.GetEnumerator()) {
+    $matchingCheckedInCudaPin = @($checkedInCudaInventory | Where-Object {
+        [string]$_.path -ceq [string]$checkedInCudaPin.Key -and
+        [string]$_.sha256 -ceq [string]$checkedInCudaPin.Value
+    })
+    Assert-True `
+        ($matchingCheckedInCudaPin.Count -eq 1) `
+        "Checked-in CUDA production inventory lost exact pin $($checkedInCudaPin.Key)."
+}
 $autoQualificationReport = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-gpu-auto-qualification-$([guid]::NewGuid().ToString('N')).txt"
 try {
     & $autoQualificationReportScript -OutputPath $autoQualificationReport | Out-Null
@@ -1365,7 +1407,19 @@ Assert-True $longTargetRejected 'Native GPU pack build accepted a repository-loc
 Assert-True (-not (Test-Path -LiteralPath $toolchainOutput)) 'Rejected native build target created a pack output.'
 
 $previousCudaPath = $env:CUDA_PATH
+$emptyCudaContractRoot = Join-Path `
+    ([System.IO.Path]::GetTempPath()) `
+    "scribe-empty-cuda-contract-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $emptyCudaContractRoot | Out-Null
 try {
+    $emptyCudaContract = Get-Content -LiteralPath $toolchainManifest -Raw | ConvertFrom-Json
+    $emptyCudaContract.cuda.production_inventory = @()
+    $emptyCudaContractPath = Join-Path $emptyCudaContractRoot 'gpu-worker-toolchain-windows-x64.json'
+    [System.IO.File]::WriteAllText(
+        $emptyCudaContractPath,
+        ($emptyCudaContract | ConvertTo-Json -Depth 16),
+        [System.Text.UTF8Encoding]::new($false)
+    )
     $productionCudaFailedClosed = $false
     try {
         & $buildScript `
@@ -1373,6 +1427,7 @@ try {
             -PackVersion '0.1.0-production-contract' `
             -OutputDirectory $toolchainOutput `
             -SigningMode Production `
+            -ToolchainManifestPath $emptyCudaContractPath `
             -ToolchainCheckOnly | Out-Null
     }
     catch {
@@ -1400,6 +1455,17 @@ try {
 }
 finally {
     $env:CUDA_PATH = $previousCudaPath
+    $canonicalEmptyCudaContractRoot = [System.IO.Path]::GetFullPath($emptyCudaContractRoot)
+    $expectedEmptyCudaContractPrefix = [System.IO.Path]::GetFullPath(
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-empty-cuda-contract-')
+    )
+    if (-not $canonicalEmptyCudaContractRoot.StartsWith(
+        $expectedEmptyCudaContractPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Refusing to clean an empty CUDA contract fixture outside the dedicated temp prefix.'
+    }
+    Remove-Item -LiteralPath $canonicalEmptyCudaContractRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $cudaInventoryTestRoot = Join-Path `
@@ -1774,6 +1840,60 @@ try {
     ) 'Deterministic fixture signatures differ.'
     $verified = Invoke-NativeProcess $tool @('verify-fixture', '--pack-root', $first)
     Assert-True (($verified.Stdout | ConvertFrom-Json).pack_digest -ceq $firstDescriptor.pack_digest) 'Fixture verifier returned a mismatched digest.'
+
+    $cudaNoticeRoot = Join-Path $testRoot 'cuda-notices'
+    New-FixturePayload $cudaNoticeRoot
+    $cudaNoticeSourceRoot = Join-Path $testRoot 'cuda-notice-sources'
+    New-Item -ItemType Directory -Path $cudaNoticeSourceRoot | Out-Null
+    $cudaNoticeFixtures = @(
+        [pscustomobject]@{
+            Source = Join-Path $cudaNoticeSourceRoot 'cudart-LICENSE'
+            Destination = Join-Path $cudaNoticeRoot 'licenses\cuda-cudart\LICENSE'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes('fixture cudart notice bytes')
+            ManifestPath = 'licenses/cuda-cudart/LICENSE'
+        },
+        [pscustomobject]@{
+            Source = Join-Path $cudaNoticeSourceRoot 'cublas-LICENSE'
+            Destination = Join-Path $cudaNoticeRoot 'licenses\cuda-cublas\LICENSE'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes('fixture cublas notice bytes')
+            ManifestPath = 'licenses/cuda-cublas/LICENSE'
+        }
+    )
+    foreach ($cudaNoticeFixture in $cudaNoticeFixtures) {
+        [System.IO.File]::WriteAllBytes($cudaNoticeFixture.Source, $cudaNoticeFixture.Bytes)
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $cudaNoticeFixture.Destination)
+        $cudaNoticeFixture | Add-Member `
+            -NotePropertyName Sha256 `
+            -NotePropertyValue ((Get-FileHash -LiteralPath $cudaNoticeFixture.Source -Algorithm SHA256).Hash.ToLowerInvariant())
+        Copy-AuthenticatedCudaPackFile `
+            $cudaNoticeFixture.Source `
+            $cudaNoticeFixture.Destination `
+            $cudaNoticeFixture.Sha256
+    }
+    $cudaNoticeAuthor = Invoke-NativeProcess $tool @(
+        'author',
+        '--backend', 'cuda',
+        '--pack-id', 'scribe-cuda-windows-x64',
+        '--pack-root', $cudaNoticeRoot,
+        '--pack-version', '0.1.0-fixture',
+        '--provider', 'transcribe-cpp-ggml-cuda',
+        '--security-epoch', '1',
+        '--worker-path', 'bin/scribe-inference-worker.exe',
+        '--fixture-signing'
+    )
+    $cudaNoticeDescriptor = $cudaNoticeAuthor.Stdout | ConvertFrom-Json
+    Assert-True ($cudaNoticeDescriptor.payload_files -eq 3) 'CUDA fixture notice payload file count changed.'
+    $cudaNoticeManifest = Get-Content -LiteralPath (Join-Path $cudaNoticeRoot 'pack-manifest.json') -Raw | ConvertFrom-Json
+    foreach ($cudaNoticeFixture in $cudaNoticeFixtures) {
+        $manifestNotice = @($cudaNoticeManifest.payload | Where-Object {
+            $_.path -ceq $cudaNoticeFixture.ManifestPath
+        })
+        Assert-True `
+            ($manifestNotice.Count -eq 1 -and
+            [int64]$manifestNotice[0].size_bytes -eq $cudaNoticeFixture.Bytes.Length -and
+            [string]$manifestNotice[0].sha256 -ceq [string]$cudaNoticeFixture.Sha256) `
+            "CUDA authored manifest omitted exact notice bytes: $($cudaNoticeFixture.ManifestPath)"
+    }
 
     [System.IO.File]::AppendAllText(
         (Join-Path $second 'bin\scribe-inference-worker.exe'),
