@@ -35,7 +35,9 @@ mod worker_pack_authoring;
 
 use manifest::{Compatibility, PackBackend, PackVerifier, ProductionTrustRoot};
 use store::PackStore;
-use windows_gpu_approved_signing::{inspect_approved_windows_set, sign_approved_windows_set};
+use windows_gpu_approved_signing::{
+    inspect_approved_windows_set, sign_approved_windows_set, verify_signed_windows_set,
+};
 use worker_pack_authoring::{
     AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, PrepareRequest, SigningMode,
     author_pack, check_production_signing_key, inspect_prepared_pack, prepare_pack,
@@ -50,6 +52,7 @@ commands:\n\
   sign-prepared-pack --pack-root <path> --expected-manifest-sha256 <sha256> --expected-pack-digest <sha256> (--fixture-signing | --key-id <id> --private-key <path>)\n\
   inspect-approved-windows-set --handoff-root <path> --approval <path> --policy <path>\n\
   sign-approved-windows-set --handoff-root <path> --approval <path> --policy <path> --output-root <path> (PKCS#8 v2 DER key on stdin)\n\
+  verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path>\n\
   verify-fixture --pack-root <path>\n\
   verify-production-linux --pack-root <path>\n\
   install-production-linux --pack-root <path> --packs-root <path> --state-root <path>\n\
@@ -111,6 +114,19 @@ fn run() -> Result<()> {
                 &PathBuf::from(required(&options, "--policy")?),
                 &PathBuf::from(required(&options, "--output-root")?),
                 &mut input,
+            )?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
+        }
+        Some("verify-signed-windows-set") => {
+            require_exact_options(
+                &options,
+                &["--policy", "--signed-root", "--toolchain-manifest"],
+            )?;
+            let receipt = verify_signed_windows_set(
+                &PathBuf::from(required(&options, "--signed-root")?),
+                &PathBuf::from(required(&options, "--policy")?),
+                &PathBuf::from(required(&options, "--toolchain-manifest")?),
             )?;
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
@@ -532,6 +548,9 @@ mod tests {
         assert!(HELP_TEXT.contains("defaults to windows/x86_64"));
         assert!(HELP_TEXT.contains("verify-production-linux"));
         assert!(HELP_TEXT.contains("install-production-linux"));
+        assert!(HELP_TEXT.contains(
+            "verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path>"
+        ));
     }
 
     #[test]
