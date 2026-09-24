@@ -227,7 +227,17 @@ function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
         'SCRIBE_GPU_PACK_RELEASE_POLICY',
         'resolve-windows-gpu-release-policy.ps1',
         'gpu_pack_release_policy: ${{ steps.gpu-release-policy.outputs.release_policy }}',
-        'gpu_worker_packs_included: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}',
+        'gpu_worker_packs_included: ${{ steps.gpu-catalog.outputs.included }}',
+        'signed_gpu_inputs_requested',
+        'gpu_signing_run_id:',
+        'gpu_signing_run_attempt:',
+        'gpu_signed_artifact_id:',
+        'resolve-windows-signed-gpu-inputs.ps1',
+        'digest-mismatch: error',
+        '$releaseArguments.WorkerPackRoot = $verified.PackRoots',
+        'Verify actual staged GPU catalog before claiming inclusion',
+        'Recheck signed GPU provenance before asset upload',
+        'Recheck signed GPU provenance before release publication',
         'temporary_cpu_only_stage4',
         'gpu_packs_required',
         'Official GPU-capable publication omitted required CUDA or Vulkan worker packs.',
@@ -248,12 +258,47 @@ function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
         '-WorkerPackRoot'
     )) {
         if ($Workflow.Contains($forbidden)) {
-            throw "Candidate-ref Windows release workflow must never receive signing authority or package production GPU packs: $forbidden"
+            throw "Candidate-ref Windows release workflow must never receive signing authority or unguarded pack roots: $forbidden"
         }
     }
 }
 
 function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
+    $gpuInputs = @{
+        EventName = 'workflow_dispatch'; Ref = 'refs/heads/main'
+        Repository = 'tyhuang9/scribe'; Policy = 'gpu_packs_required'
+        SigningRunId = '101'; SigningRunAttempt = '2'; SignedArtifactId = '303'
+    }
+    foreach ($publish in @($false, $true)) {
+        $requested = & $Script @gpuInputs -PublishRelease:$publish
+        if (-not $requested.signed_gpu_inputs_requested -or $requested.include_gpu_worker_packs -or
+            $requested.official_release -ne $publish) {
+            throw 'Valid exact GPU inputs must request verification without claiming unverified pack inclusion.'
+        }
+    }
+    foreach ($mutation in @(
+        @{ Field = 'SigningRunId'; Value = '' },
+        @{ Field = 'SigningRunAttempt'; Value = '' },
+        @{ Field = 'SignedArtifactId'; Value = '' },
+        @{ Field = 'SigningRunId'; Value = '01' },
+        @{ Field = 'SigningRunAttempt'; Value = '2 ' },
+        @{ Field = 'SignedArtifactId'; Value = '0' }
+    )) {
+        $invalid = $gpuInputs.Clone(); $invalid[$mutation.Field] = $mutation.Value
+        Invoke-ExpectedFailure { & $Script @invalid } 'all three canonical'
+    }
+    foreach ($mutation in @(
+        @{ Field = 'EventName'; Value = 'pull_request' },
+        @{ Field = 'EventName'; Value = 'push' },
+        @{ Field = 'Ref'; Value = 'refs/heads/feature' },
+        @{ Field = 'Ref'; Value = 'refs/tags/v0.1.0' },
+        @{ Field = 'Repository'; Value = 'attacker/scribe' },
+        @{ Field = 'Policy'; Value = 'temporary_cpu_only_stage4' },
+        @{ Field = 'Policy'; Value = '' }
+    )) {
+        $invalid = $gpuInputs.Clone(); $invalid[$mutation.Field] = $mutation.Value
+        Invoke-ExpectedFailure { & $Script @invalid } 'fixed repository default-branch manual workflow'
+    }
     $nonRelease = & $Script `
         -EventName 'push' `
         -Ref 'refs/heads/main' `
@@ -1610,6 +1655,8 @@ Set-StrictMode -Version Latest
         Assert-PayloadParity $verificationBundle $installedVerificationBundle "Installed fixture"
     } "payload parity mismatch"
 
+    & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-inputs.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
     Write-Output "Windows release packaging fail-closed tests passed."
 }
 finally {

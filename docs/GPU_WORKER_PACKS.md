@@ -246,12 +246,17 @@ portable payload and the installer copies that exact tree; CI emits a separate
 per-pack installed and compressed size report from the verified catalog.
 
 Repository tooling contains no production private key. The candidate-ref
-workflow contains no production-key secret reference, accepts no GPU-pack
-dispatch request, and always creates the CPU-only portable/installer payload.
+workflow contains no production-key secret reference and keeps candidate-ref
+builds CPU-only. A default-branch manual run can consume an exact completed
+protected signing artifact through the keyless signed-pair adapter; it cannot
+build or sign GPU packs in the installer job.
 Official publication fails when the reviewed repository policy is absent or
 unknown; the temporary Stage 4 policy is explicitly CPU-only, while
-`gpu_packs_required` remains unavailable until a separate protected trusted
-workflow can sign fixed verified unsigned artifacts. That signer must verify the
+`gpu_packs_required` requires all three immutable signing-run/attempt/artifact
+inputs on the fixed default-branch manual workflow. Whole-pair native verification,
+independent signing and unsigned-producer provenance checks, current policy and
+signer pins, and exact post-staging catalog verification precede successful
+installer inclusion. That separate protected signer must verify the
 approved source/revision and complete unsigned-artifact digests before receiving
 authority; candidate-ref scripts must not run with the key. The authoring tool
 still verifies that a supplied key's public half exactly matches the separately

@@ -114,6 +114,59 @@ Unsigned and signed pair artifacts expire after seven days; the trusted-tool
 artifact expires after 90 days. Do not use the download of an expired/missing
 artifact as authorization to substitute another build.
 
+## Including an approved pair in the Windows installer
+
+After the setup and a real protected signing run have succeeded, the existing
+Windows installer workflow can consume the signed pair without receiving the
+private key. Ordinary pull requests, pushes, tags, and manual runs without GPU
+inputs remain CPU-only (or fail when an official GPU-required release has no
+eligible inputs). Nothing in this adapter provisions trust or changes Auto.
+
+1. Keep the installer checkout at the exact source revision recorded in the
+   signed receipt. If `main` has advanced beyond that candidate, prepare and
+   sign a new candidate; the workflow will not silently select an older source.
+2. Through maintainer-controlled repository configuration, select
+   `SCRIBE_GPU_PACK_RELEASE_POLICY=gpu_packs_required`. Keep the independently
+   reviewed public signer pins configured as described above. This document and
+   its PR do not change that repository setting or authorize publication.
+3. Dispatch `release.yml` on `main` with all three string inputs:
+   `gpu_signing_run_id`, `gpu_signing_run_attempt`, and
+   `gpu_signed_artifact_id`. These identify the **completed signing run** and its
+   `windows-gpu-signed-<run ID>-<attempt>` artifact, not the unsigned producer.
+   Start with `publish_release=false` to validate an installer without creating
+   a GitHub Release. Partial inputs, candidate branches, and other repositories
+   are rejected. GPU-required tag releases do not infer an artifact automatically.
+4. Require the entire workflow to pass, including native verification of the
+   complete signed pair, both staged pack identities, per-pack size reporting,
+   installer maintenance checks, and portable/installer payload parity. The job
+   reports GPU inclusion only after the generated catalog contains the exact
+   verified CUDA/Vulkan pair. A failed second backend cannot produce a successful
+   GPU installer or silently change the request to CPU-only packaging.
+5. Perform the clean-machine and real-hardware acceptance checks before an
+   explicitly authorized publishing run. Build/test success does not establish
+   CUDA/Vulkan performance qualification or grant Auto eligibility.
+
+The controller validates both the chosen signing run/artifact and, independently,
+the original unsigned producer identities inside the receipt. These run IDs and
+artifact IDs are deliberately different. It rejects rerun/stale attempts,
+expired or mismatched artifacts, changed policy or signer pins, and incompatible
+source/toolchain identities. Only fixed `cuda` and `vulkan` roots returned after
+whole-pair native verification reach the existing pack staging path. No downloaded
+worker/provider is executed during input verification. Staging still invokes
+the compiled desktop verifier before and after copying each pack. Fresh current
+policy/provenance checks also precede asset upload and release publication.
+
+The keyless native command is `verify-signed-windows-set --signed-root <path>
+--policy <path> --toolchain-manifest <path>`. Its production entry point has no
+fixture-key override. Offline tests inject private test trust only inside the
+Rust test module; mocked workflow/process tests are not production-signing or
+clean-machine hardware evidence.
+
+Rollback: return the repository policy to the explicit
+`temporary_cpu_only_stage4` setting and omit all GPU artifact inputs, or revert
+the focused adapter PR. Do not revoke pack signatures, lower security epochs,
+or enable Auto as part of disabling new installer inclusion.
+
 ## Epochs, retries, and stale approval
 
 Each candidate's security epoch must **equal** the currently reviewed policy
@@ -156,8 +209,9 @@ artifact. In-memory handling limits exposure; it is not an HSM and does not
 protect against a compromised approved runner or trusted signer.
 
 PowerShell bootstrap path checks and retained leaf handles do not provide
-atomic no-follow opens or pin path ancestors. Both preflight and signing rely
-on fresh trusted hosted jobs, no candidate code execution, and no untrusted
+atomic no-follow opens or pin path ancestors. Preflight, signing, and the
+installer input controller rely on fresh trusted hosted jobs, no candidate
+code execution during input verification, and no untrusted
 concurrent writers. Do not move these steps onto a persistent/shared builder.
 The native signer's bounded physical inventory verification remains mandatory;
 the PowerShell checks are not a substitute for it.
@@ -173,7 +227,7 @@ The previous `tools/windows-gpu-promotion-broker` proof and fixture-only
 fixtures. They are not the selected production path and must not be provisioned
 to use this workflow. No background service or paid signing product is needed.
 
-Hardware qualification, installer integration, Auto enablement, Linux/macOS
-rollout, and Authenticode signing remain outside this change. Keep temporary
+Hardware qualification, production installer execution, Auto enablement, Linux/macOS
+rollout, and Authenticode signing remain separately gated. Keep temporary
 fixture output short-lived and remove only owned scratch directories; retain
 the actual source-bound candidate packs until their acceptance work is complete.
