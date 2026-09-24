@@ -217,38 +217,57 @@ try {
 
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\windows-gpu-pack-promotion.yml') -Raw
     $protected = $workflow.Split('  protected-promote:', 2)[1]
-    Assert-True ($workflow.Contains('environment: windows-gpu-pack-signing')) 'Protected environment gate is missing.'
-    Assert-True ($workflow.Contains('steps.upload.outputs.artifact-digest')) 'Unsigned artifact digest is not bound across jobs.'
-    Assert-True ($workflow.Contains('steps.upload.outputs.artifact-id')) 'Unsigned artifact ID is not bound across jobs.'
-    Assert-True ($workflow.Contains('cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml')) 'Clean hosted runners do not fetch the locked worker-pack tool dependencies before offline testing.'
-    Assert-True ($workflow.Contains('cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml')) 'Clean hosted runners do not fetch the independently locked broker-contract dependencies.'
-    Assert-True ($workflow.Contains('cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml')) 'Hosted contract validation does not exercise the locked offline broker state-machine proof.'
-    Assert-True ($workflow.Contains('test-windows-gpu-broker-transport.ps1 -RequireScmIntegration')) 'Hosted contract validation does not exercise the exact restricted-service transport.'
-    Assert-True ($workflow.Contains("- 'scripts/provision-windows-gpu-broker-client-policy.ps1'")) 'Client policy provisioner changes do not trigger hosted broker verification.'
-    Assert-True ($workflow.Contains('github.event.repository.default_branch')) 'Production dispatch is not restricted to the default branch.'
-    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256')) 'Protected broker-client digest is not independently configured.'
-    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED')) 'Separately privileged broker provisioning gate is missing.'
-    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID')) 'Protected workflow client SID variable is missing.'
-    Assert-True ($protected.Contains('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value')) 'Protected runner does not inspect its exact TokenUser SID.'
-    Assert-True ($protected.Contains('$currentClientSid -cne $configuredClientSid.Value')) 'Protected runner does not compare exact configured and current client SIDs.'
-    $identityCheck = $protected.IndexOf('$currentClientSid -cne $configuredClientSid.Value', [StringComparison]::Ordinal)
-    $brokerGate = $protected.IndexOf('$env:PRODUCTION_BROKER_PROVISIONED -cne', [StringComparison]::Ordinal)
-    Assert-True ($identityCheck -ge 0 -and $identityCheck -lt $brokerGate) 'Protected runner identity preflight does not precede the closed broker gate.'
-    Assert-True ($protected.Contains('actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c')) 'Protected artifact download is not pinned to the reviewed v8.0.1 action.'
-    Assert-True ($protected.Contains('digest-mismatch: error')) 'Protected artifact download does not fail closed on a digest mismatch.'
-    Assert-True ($protected.Contains('--require-unused-release-set')) 'Trusted signer interface does not require replay rejection.'
-    Assert-True ($protected.Contains('no filesystem, ledger, or signing authority was accessed')) 'Unprovisioned production path does not fail before client invocation.'
-    Assert-True ($protected.Contains('[IO.FileShare]::Read')) 'Protected workflow does not retain a no-write/delete client handle.'
-    Assert-True ($protected.Contains('provide no-follow open semantics or pin path ancestors')) 'Protected workflow overstates its leaf handle authority.'
-    Assert-True ($protected.Contains('$processInfo.ArgumentList.Add')) 'Protected workflow does not use the structured child-process argument API.'
-    Assert-True ($protected.Contains('scribe-gpu-pack-signer-ephemeral')) 'Protected signer runner is not required to be ephemeral.'
-    Assert-True (-not $protected.Contains('actions/checkout@')) 'Protected signing job checks out candidate source.'
-    Assert-True (-not $protected.Contains('cargo ')) 'Protected signing job compiles candidate source.'
-    Assert-True (-not $protected.Contains('promote-windows-gpu-worker-packs.ps1')) 'Protected job runs a repository-owned promotion script.'
-    Assert-True (-not $workflow.Contains('secrets.')) 'Promotion workflow exposes raw private-key secrets to repository jobs.'
-    Assert-True (-not $protected.Contains('--private-key')) 'Protected broker client accepts a raw key path.'
-    Assert-True (-not $protected.Contains('--ledger-root')) 'Ephemeral runner configures durable broker state.'
-    Assert-True (-not $protected.Contains('--broker-endpoint')) 'Ephemeral runner can redirect broker authority.'
+    $preProtected = $workflow.Split('  protected-promote:', 2)[0]
+    $approvedWrapper = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'invoke-windows-gpu-approved-signing.ps1') -Raw
+    $toolWorkflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\windows-gpu-signer-tool.yml') -Raw
+    foreach ($required in @(
+        'environment: windows-gpu-pack-signing', 'steps.upload.outputs.artifact-digest',
+        'steps.upload.outputs.artifact-id', 'github.event.repository.default_branch',
+        'cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml',
+        'cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml',
+        'cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml',
+        'cargo test --locked --offline --manifest-path tools/worker-pack-author/Cargo.toml',
+        'test-windows-gpu-broker-transport.ps1 -RequireScmIntegration',
+        'test-windows-gpu-approved-signing.ps1', 'test-windows-gpu-signing-policy.ps1',
+        "- 'scripts/provision-windows-gpu-broker-client-policy.ps1'",
+        "inputs.operation == 'prepare'", "inputs.operation == 'sign'",
+        '-SecurityEpoch $cudaEpoch', '-SecurityEpoch $vulkanEpoch'
+    )) { Assert-True ($workflow.Contains($required)) "Promotion workflow lost $required." }
+    foreach ($required in @(
+        'runs-on: windows-2022', 'actions: read', 'contents: read',
+        'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
+        'digest-mismatch: error', 'needs.preflight-signing.outputs.approval_artifact_id',
+        'needs.preflight-signing.outputs.approval_sha256',
+        'needs.preflight-signing.outputs.signer_pins_sha256',
+        'SCRIBE_GPU_SIGNER_SOURCE_SHA', 'SCRIBE_GPU_SIGNER_ARTIFACT_SHA256',
+        'SCRIBE_GPU_SIGNER_BINARY_SHA256', 'SCRIBE_GPU_SIGNER_WRAPPER_SHA256',
+        'vars.SCRIBE_GPU_APPROVED_SIGNER_SOURCE_SHA', 'vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ID',
+        'vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ATTEMPT', 'vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_ID',
+        'vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_SHA256',
+        'vars.SCRIBE_GPU_APPROVED_SIGNER_BINARY_SHA256', 'vars.SCRIBE_GPU_APPROVED_SIGNER_WRAPPER_SHA256',
+        '-Mode Sign', '-Mode PublicationCheck', '-ExpectedSignerPinsSha256',
+        'secrets.SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64'
+    )) { Assert-True ($protected.Contains($required)) "Protected signing boundary lost $required." }
+    foreach ($forbidden in @(
+        'actions/checkout@', 'cargo ', 'self-hosted',
+        'promote-windows-gpu-worker-packs.ps1', '--private-key',
+        '--ledger-root', '--broker-endpoint', '--require-unused-release-set',
+        'PRODUCTION_BROKER_PROVISIONED', 'id-token: write'
+        'vars.SCRIBE_GPU_SIGNER_'
+    )) { Assert-True (-not $protected.Contains($forbidden)) "Protected job regained $forbidden." }
+    Assert-True (-not $preProtected.Contains('secrets.')) 'A secret escaped the protected signing job.'
+    Assert-True (($workflow.Split('secrets.SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64').Count - 1) -eq 1) 'Private key must be scoped to exactly one signing step.'
+    foreach ($required in @(
+        'inspect-approved-windows-set', 'sign-approved-windows-set',
+        'Get-CurrentSigningPolicy', 'Assert-SigningPinsUnchanged',
+        'Assert-SigningRunMetadata', 'Assert-SigningArtifactMetadata',
+        '[IO.FileShare]::Read', '$info.ArgumentList.Add',
+        '$process.StandardInput.BaseStream.Write', 'CryptographicOperations]::ZeroMemory',
+        'Approved source differs from the authenticated producer source.'
+    )) { Assert-True ($approvedWrapper.Contains($required)) "Trusted signing wrapper lost $required." }
+    Assert-True ($toolWorkflow.Contains("github.ref == 'refs/heads/main'")) 'Signer source is not restricted to the protected branch.'
+    Assert-True ($toolWorkflow.Contains('ref: ${{ github.sha }}')) 'Signer bundle does not build its exact workflow source.'
+    Assert-True (-not $toolWorkflow.Contains('secrets.') -and -not $toolWorkflow.Contains('inputs.')) 'Signer bundle build accepts authority or arbitrary source inputs.'
     $brokerContract = Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\lib.rs') -Raw
     Assert-True ($brokerContract.Contains('pub struct PromotionIntent')) 'Broker contract lost its path-free promotion intent.'
     Assert-True ($brokerContract.Contains('pub struct ClientInvocation')) 'Broker contract lost its process-local invocation wrapper.'

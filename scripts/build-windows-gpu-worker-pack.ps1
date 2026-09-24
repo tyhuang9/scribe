@@ -9,6 +9,8 @@ param(
     [string]$OutputDirectory,
     [ValidateSet('Production', 'Prepared', 'Fixture')]
     [string]$SigningMode = 'Production',
+    [ValidateRange(1, [uint64]::MaxValue)]
+    [uint64]$SecurityEpoch = 1,
     [string]$ProductionPrivateKeyPath,
     [string]$ProductionKeyId,
     [string]$ToolchainManifestPath,
@@ -1427,7 +1429,7 @@ try {
         '--pack-root', $stagingRoot,
         '--pack-version', $PackVersion,
         '--provider', ([string]$providerContract.provider),
-        '--security-epoch', '1',
+        '--security-epoch', $SecurityEpoch.ToString([Globalization.CultureInfo]::InvariantCulture),
         '--worker-path', 'bin/scribe-inference-worker.exe'
     )
     if ($SigningMode -eq 'Fixture') {
@@ -1464,7 +1466,7 @@ try {
         PackId = [string]$descriptor.pack_id
         PackVersion = [string]$descriptor.pack_version
         PackDigest = [string]$descriptor.pack_digest
-        SecurityEpoch = if ($SigningMode -eq 'Prepared') { [uint64]$descriptor.security_epoch } else { [uint64]1 }
+        SecurityEpoch = if ($SigningMode -eq 'Prepared') { [uint64]$descriptor.security_epoch } else { $SecurityEpoch }
         Provider = if ($SigningMode -eq 'Prepared') { [string]$descriptor.provider } else { [string]$providerContract.provider }
         SigningKeyId = if ($SigningMode -eq 'Prepared') { $null } else { [string]$descriptor.key_id }
         ManifestSha256 = if ($SigningMode -eq 'Prepared') { [string]$descriptor.manifest_sha256 } else { $null }

@@ -1044,11 +1044,15 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
         .expect("production registry function remains structurally visible");
     assert!(production_manifest.contains("struct ProductionTrustRoot"));
     assert!(production_manifest.contains("fn public_key(&self, _key_id: &str) -> Option<&[u8]>"));
-    let trust_root_is_empty = production_manifest
-        .split("impl TrustRoot for ProductionTrustRoot")
-        .nth(1)
-        .and_then(|source| source.split('}').next())
-        .is_some_and(|body| body.contains("None"));
+    assert!(
+        production_manifest.contains("../../runtime-manifests/worker-pack-production-trust.json")
+    );
+    let production_trust: serde_json::Value = serde_json::from_str(include_str!(
+        "../runtime-manifests/worker-pack-production-trust.json"
+    ))
+    .expect("compiled production trust manifest must be valid JSON");
+    assert_eq!(production_trust["schema_version"], 1);
+    let trust_root_is_empty = production_trust["keys"] == serde_json::json!([]);
     for module_lint_reason in [
         "the desktop retains the target-aware Stage 5 Auto policy types used by its private worker protocol",
         "the desktop embeds Stage 5 qualification evidence for private worker routing without exposing a public settings surface",
@@ -1477,26 +1481,32 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     }
     for required in [
         "environment: windows-gpu-pack-signing",
-        "scribe-gpu-pack-signer-ephemeral",
+        "runs-on: windows-2022",
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         "digest-mismatch: error",
         "cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml",
         "cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml",
         "test-windows-gpu-broker-transport.ps1 -RequireScmIntegration",
+        "test-windows-gpu-approved-signing.ps1",
+        "test-windows-gpu-signing-policy.ps1",
         "scripts/provision-windows-gpu-broker-client-policy.ps1",
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
-        "SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256",
-        "SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID",
-        "SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED",
-        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-        "$currentClientSid -cne $configuredClientSid.Value",
-        "--require-unused-release-set",
-        "--workflow-source-sha",
-        "no filesystem, ledger, or signing authority was accessed",
-        "[IO.FileShare]::Read",
-        "$processInfo.ArgumentList.Add",
+        "SCRIBE_GPU_SIGNER_SOURCE_SHA",
+        "SCRIBE_GPU_SIGNER_BINARY_SHA256",
+        "SCRIBE_GPU_SIGNER_WRAPPER_SHA256",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_SOURCE_SHA",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ID",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ATTEMPT",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_ID",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_SHA256",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_BINARY_SHA256",
+        "vars.SCRIBE_GPU_APPROVED_SIGNER_WRAPPER_SHA256",
+        "needs.preflight-signing.outputs.approval_sha256",
+        "needs.preflight-signing.outputs.signer_pins_sha256",
+        "-Mode PublicationCheck",
+        "secrets.SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64",
     ] {
         assert!(
             workflow.contains(required),
@@ -1506,15 +1516,40 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     for forbidden in [
         "actions/checkout@",
         "cargo ",
+        "self-hosted",
         "promote-windows-gpu-worker-packs.ps1",
-        "secrets.",
-        "private-key",
+        "--private-key",
         "--ledger-root",
         "--broker-endpoint",
+        "--require-unused-release-set",
+        "PRODUCTION_BROKER_PROVISIONED",
+        "vars.SCRIBE_GPU_SIGNER_",
+        "id-token: write",
     ] {
         assert!(
             !protected.contains(forbidden),
             "protected job regained candidate code or raw signing authority {forbidden:?}"
+        );
+    }
+    assert_eq!(
+        workflow
+            .matches("secrets.SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64")
+            .count(),
+        1,
+        "raw signing authority must be scoped to one protected step"
+    );
+    let approved_wrapper = include_str!("../scripts/invoke-windows-gpu-approved-signing.ps1");
+    for required in [
+        "inspect-approved-windows-set",
+        "sign-approved-windows-set",
+        "Assert-SigningPinsUnchanged",
+        "Get-CurrentSigningPolicy",
+        "$process.StandardInput.BaseStream.Write",
+        "CryptographicOperations]::ZeroMemory",
+    ] {
+        assert!(
+            approved_wrapper.contains(required),
+            "approved wrapper lost {required:?}"
         );
     }
     assert!(broker_manifest.contains("[workspace]"));
