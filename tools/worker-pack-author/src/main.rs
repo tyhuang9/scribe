@@ -26,6 +26,8 @@ mod onnx_worker {
 #[cfg(test)]
 #[path = "../../../build_support/windows_cuda_link.rs"]
 mod windows_cuda_link;
+#[path = "../../../src/windows_gpu_approved_signing.rs"]
+mod windows_gpu_approved_signing;
 #[path = "../../../src/worker_identity.rs"]
 mod worker_identity;
 #[path = "../../../src/worker_pack_authoring.rs"]
@@ -33,6 +35,7 @@ mod worker_pack_authoring;
 
 use manifest::{Compatibility, PackBackend, PackVerifier, ProductionTrustRoot};
 use store::PackStore;
+use windows_gpu_approved_signing::{inspect_approved_windows_set, sign_approved_windows_set};
 use worker_pack_authoring::{
     AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, PrepareRequest, SigningMode,
     author_pack, check_production_signing_key, inspect_prepared_pack, prepare_pack,
@@ -45,6 +48,8 @@ commands:\n\
   prepare-pack --backend <cuda|vulkan|metal> --pack-root <path> ...\n\
   inspect-prepared-pack --pack-root <path>\n\
   sign-prepared-pack --pack-root <path> --expected-manifest-sha256 <sha256> --expected-pack-digest <sha256> (--fixture-signing | --key-id <id> --private-key <path>)\n\
+  inspect-approved-windows-set --handoff-root <path> --approval <path> --policy <path>\n\
+  sign-approved-windows-set --handoff-root <path> --approval <path> --policy <path> --output-root <path> (PKCS#8 v2 DER key on stdin)\n\
   verify-fixture --pack-root <path>\n\
   verify-production-linux --pack-root <path>\n\
   install-production-linux --pack-root <path> --packs-root <path> --state-root <path>\n\
@@ -84,6 +89,32 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("sign-prepared-pack") => run_sign_prepared_pack(&options),
+        Some("inspect-approved-windows-set") => {
+            require_exact_options(&options, &["--approval", "--handoff-root", "--policy"])?;
+            let descriptor = inspect_approved_windows_set(
+                &PathBuf::from(required(&options, "--handoff-root")?),
+                &PathBuf::from(required(&options, "--approval")?),
+                &PathBuf::from(required(&options, "--policy")?),
+            )?;
+            println!("{}", serde_json::to_string(&descriptor)?);
+            Ok(())
+        }
+        Some("sign-approved-windows-set") => {
+            require_exact_options(
+                &options,
+                &["--approval", "--handoff-root", "--output-root", "--policy"],
+            )?;
+            let mut input = std::io::stdin().lock();
+            let receipt = sign_approved_windows_set(
+                &PathBuf::from(required(&options, "--handoff-root")?),
+                &PathBuf::from(required(&options, "--approval")?),
+                &PathBuf::from(required(&options, "--policy")?),
+                &PathBuf::from(required(&options, "--output-root")?),
+                &mut input,
+            )?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
+        }
         Some("verify-fixture") => {
             require_exact_options(&options, &["--pack-root"])?;
             let descriptor =

@@ -4,6 +4,13 @@ on:
   pull_request:
     paths:
       - '.github/workflows/windows-gpu-pack-promotion.yml'
+      - '.github/workflows/windows-gpu-signer-tool.yml'
+      - 'scripts/invoke-windows-gpu-approved-signing.ps1'
+      - 'scripts/test-windows-gpu-approved-signing.ps1'
+      - 'scripts/test-windows-gpu-signing-policy.ps1'
+      - 'runtime-manifests/windows-gpu-signing-policy.json'
+      - 'runtime-manifests/worker-pack-production-trust.json'
+      - 'src/windows_gpu_approved_signing.rs'
       - 'scripts/promote-windows-gpu-worker-packs.ps1'
       - 'scripts/test-windows-gpu-pack-promotion.ps1'
       - 'scripts/test-windows-gpu-broker-transport.ps1'
@@ -20,6 +27,13 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/windows-gpu-pack-promotion.yml'
+      - '.github/workflows/windows-gpu-signer-tool.yml'
+      - 'scripts/invoke-windows-gpu-approved-signing.ps1'
+      - 'scripts/test-windows-gpu-approved-signing.ps1'
+      - 'scripts/test-windows-gpu-signing-policy.ps1'
+      - 'runtime-manifests/windows-gpu-signing-policy.json'
+      - 'runtime-manifests/worker-pack-production-trust.json'
+      - 'src/windows_gpu_approved_signing.rs'
       - 'scripts/promote-windows-gpu-worker-packs.ps1'
       - 'scripts/test-windows-gpu-pack-promotion.ps1'
       - 'scripts/test-windows-gpu-broker-transport.ps1'
@@ -34,14 +48,24 @@ on:
       - 'tools/windows-gpu-promotion-broker/**'
   workflow_dispatch:
     inputs:
-      promote:
-        description: Prepare an unsigned CUDA+Vulkan set and request protected promotion.
+      operation:
+        description: Prepare a pair, or approve/sign a separately completed prepare run.
         required: true
-        type: boolean
-        default: false
+        type: choice
+        options: [prepare, sign]
+        default: prepare
+      producer_run_id:
+        description: Completed prepare workflow run ID (sign only).
+        type: string
+      producer_run_attempt:
+        description: Completed prepare run attempt (sign only).
+        type: string
+      unsigned_artifact_id:
+        description: Exact unsigned artifact ID from that prepare run (sign only).
+        type: string
       pack_version:
         description: Canonical immutable worker-pack version.
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -56,6 +80,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
       - name: Fetch locked worker-pack tool dependencies
         shell: pwsh
@@ -65,15 +90,35 @@ jobs:
       - name: Test unsigned handoff and fixture-only atomic promotion
         shell: pwsh
         run: |
+          $revision = (git rev-parse --verify HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $revision -cnotmatch '\A[0-9a-f]{40}\z' -or $revision -cne $env:GITHUB_SHA) { throw 'Contract checkout does not match the workflow source revision.' }
+          $env:SCRIBE_BUILD_REVISION = $revision
           pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Promotion contract failed.' }
+          pwsh -NoProfile -File .\scripts\test-windows-gpu-approved-signing.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Approved signing orchestration failed.' }
+          cargo test --locked --offline --manifest-path tools/worker-pack-author/Cargo.toml -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Approved signing core tests failed.' }
           cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
+      - name: Check monotonic reviewed signing epochs
+        shell: pwsh
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          $base = $env:BASE_REVISION
+          if ($base -cnotmatch '^[0-9a-f]{40}$' -or $base -eq ('0' * 40)) {
+            $base = (git rev-parse --verify HEAD^).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve immutable signing policy base.' }
+          }
+          pwsh -NoProfile -File .\scripts\test-windows-gpu-signing-policy.ps1 -BaseRevision $base
+          if ($LASTEXITCODE -ne 0) { throw 'Signing epoch policy rejected.' }
       - name: Test fixed authenticated no-authority broker transport
         shell: pwsh
         run: pwsh -NoProfile -File .\scripts\test-windows-gpu-broker-transport.ps1 -RequireScmIntegration
 
   prepare-unsigned:
     name: Prepare unsigned CUDA and Vulkan handoff
-    if: github.event_name == 'workflow_dispatch' && inputs.promote == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: contract
     runs-on: [self-hosted, Windows, X64, scribe-gpu-pack-builder]
     timeout-minutes: 180
@@ -109,8 +154,11 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-unsigned'
           if (Test-Path -LiteralPath $root) { throw 'Unsigned handoff root must be fresh.' }
           New-Item -ItemType Directory -Path $root | Out-Null
-          $cuda = & .\scripts\build-windows-gpu-worker-pack.ps1 -Backend Cuda -PackVersion $env:PACK_VERSION -OutputDirectory (Join-Path $root 'cuda') -SigningMode Prepared
-          $vulkan = & .\scripts\build-windows-gpu-worker-pack.ps1 -Backend Vulkan -PackVersion $env:PACK_VERSION -OutputDirectory (Join-Path $root 'vulkan') -SigningMode Prepared
+          $policy = Get-Content -LiteralPath 'runtime-manifests/windows-gpu-signing-policy.json' -Raw | ConvertFrom-Json
+          $cudaEpoch = @($policy.packs | Where-Object backend -CEQ 'cuda')[0].security_epoch
+          $vulkanEpoch = @($policy.packs | Where-Object backend -CEQ 'vulkan')[0].security_epoch
+          $cuda = & .\scripts\build-windows-gpu-worker-pack.ps1 -Backend Cuda -SecurityEpoch $cudaEpoch -PackVersion $env:PACK_VERSION -OutputDirectory (Join-Path $root 'cuda') -SigningMode Prepared
+          $vulkan = & .\scripts\build-windows-gpu-worker-pack.ps1 -Backend Vulkan -SecurityEpoch $vulkanEpoch -PackVersion $env:PACK_VERSION -OutputDirectory (Join-Path $root 'vulkan') -SigningMode Prepared
           $cuda | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'cuda-descriptor.json') -Encoding utf8NoBOM
           $vulkan | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'vulkan-descriptor.json') -Encoding utf8NoBOM
           "handoff_root=$root" >> $env:GITHUB_OUTPUT
@@ -149,90 +197,204 @@ jobs:
           name: windows-gpu-unsigned-${{ github.run_id }}
           path: ${{ steps.build.outputs.handoff_root }}
           if-no-files-found: error
-          retention-days: 1
-
-  protected-promote:
-    name: Independently sign and atomically promote pack set
-    if: github.event_name == 'workflow_dispatch' && inputs.promote == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    needs: prepare-unsigned
-    runs-on: [self-hosted, Windows, X64, scribe-gpu-pack-signer-ephemeral]
-    environment: windows-gpu-pack-signing
-    timeout-minutes: 30
+          retention-days: 7
+  preflight-signing:
+    name: Inspect exact pair and current policy without secrets
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'sign' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: contract
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 15
+    outputs:
+      approval_artifact_id: ${{ steps.approval-upload.outputs.artifact-id }}
+      approval_sha256: ${{ steps.inspect.outputs.approval_sha256 }}
+      signer_pins_sha256: ${{ steps.inspect.outputs.signer_pins_sha256 }}
+    env:
+      SCRIBE_GPU_SIGNER_SOURCE_SHA: ${{ vars.SCRIBE_GPU_SIGNER_SOURCE_SHA }}
+      SCRIBE_GPU_SIGNER_RUN_ID: ${{ vars.SCRIBE_GPU_SIGNER_RUN_ID }}
+      SCRIBE_GPU_SIGNER_RUN_ATTEMPT: ${{ vars.SCRIBE_GPU_SIGNER_RUN_ATTEMPT }}
+      SCRIBE_GPU_SIGNER_ARTIFACT_ID: ${{ vars.SCRIBE_GPU_SIGNER_ARTIFACT_ID }}
+      SCRIBE_GPU_SIGNER_ARTIFACT_SHA256: ${{ vars.SCRIBE_GPU_SIGNER_ARTIFACT_SHA256 }}
+      SCRIBE_GPU_SIGNER_BINARY_SHA256: ${{ vars.SCRIBE_GPU_SIGNER_BINARY_SHA256 }}
+      SCRIBE_GPU_SIGNER_WRAPPER_SHA256: ${{ vars.SCRIBE_GPU_SIGNER_WRAPPER_SHA256 }}
     steps:
-      - name: Download the exact uploaded handoff
+      - name: Download independently reviewed signer bundle by immutable ID
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          artifact-ids: ${{ needs.prepare-unsigned.outputs.artifact_id }}
+          github-token: ${{ github.token }}
+          repository: tyhuang9/scribe
+          run-id: ${{ vars.SCRIBE_GPU_SIGNER_RUN_ID }}
+          artifact-ids: ${{ vars.SCRIBE_GPU_SIGNER_ARTIFACT_ID }}
           digest-mismatch: error
-          path: ${{ runner.temp }}/scribe-windows-gpu-handoff
-      - name: Invoke independently installed unprivileged broker client
+          path: ${{ runner.temp }}/scribe-approved-signer
+      - name: Authenticate wrapper before its first execution
         shell: pwsh
-        env:
-          TRUSTED_CLIENT_PATH: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_PATH }}
-          TRUSTED_CLIENT_SHA256: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256 }}
-          SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID: ${{ vars.SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID }}
-          PRODUCTION_BROKER_PROVISIONED: ${{ vars.SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED }}
-          ARTIFACT_ID: ${{ needs.prepare-unsigned.outputs.artifact_id }}
-          ARTIFACT_DIGEST: ${{ needs.prepare-unsigned.outputs.artifact_digest }}
-          HANDOFF_SHA256: ${{ needs.prepare-unsigned.outputs.handoff_sha256 }}
-          RELEASE_SET_DIGEST: ${{ needs.prepare-unsigned.outputs.release_set_digest }}
-          SOURCE_REVISION: ${{ needs.prepare-unsigned.outputs.source_revision }}
-          TOOLCHAIN_MANIFEST_SHA256: ${{ needs.prepare-unsigned.outputs.toolchain_manifest_sha256 }}
-          PACK_VERSION: ${{ needs.prepare-unsigned.outputs.pack_version }}
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-          if ([string]::IsNullOrWhiteSpace($env:SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID)) { throw 'Protected broker client SID is not provisioned.' }
-          try { $configuredClientSid = [Security.Principal.SecurityIdentifier]::new($env:SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID) }
-          catch { throw 'Protected broker client SID is not canonical.' }
-          if ($configuredClientSid.Value -cne $env:SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID) { throw 'Protected broker client SID is not canonical.' }
-          $currentClientSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          if ($currentClientSid -cne $configuredClientSid.Value) { throw 'Protected runner TokenUser SID does not match protected broker client configuration.' }
-          if ($env:PRODUCTION_BROKER_PROVISIONED -cne 'true') { throw 'Separately privileged production broker and trust root are not provisioned; no filesystem, ledger, or signing authority was accessed.' }
-          if ([string]::IsNullOrWhiteSpace($env:TRUSTED_CLIENT_PATH) -or $env:TRUSTED_CLIENT_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Protected broker client identity is not provisioned.' }
-          $client = [IO.Path]::GetFullPath($env:TRUSTED_CLIENT_PATH)
-          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
-          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
-          if ($client.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase) -or $client.StartsWith("$runnerTemp\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Trusted broker client must not come from the checkout, handoff, or runner temporary directory.' }
-          $item = Get-Item -LiteralPath $client -Force
-          if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Trusted broker client is not a regular non-reparse file.' }
-          # This retained leaf handle denies direct writes/deletion after hashing. It does not
-          # provide no-follow open semantics or pin path ancestors; the broker gate stays closed
-          # until installation DACL, ancestor, loader, and service/HSM controls are reviewed.
-          $clientLock = [IO.FileStream]::new($client, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-          try {
-            $sha256 = [Security.Cryptography.SHA256]::Create()
-            try { $actualClientSha256 = ([BitConverter]::ToString($sha256.ComputeHash($clientLock))).Replace('-', '').ToLowerInvariant() }
-            finally { $sha256.Dispose() }
-            if ($actualClientSha256 -cne $env:TRUSTED_CLIENT_SHA256) { throw 'Trusted broker client digest does not match protected configuration.' }
-            $clientLock.Position = 0
-            $output = Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-promoted'
-            $arguments = @(
-              'promote-windows-pack-set', '--handoff-root', (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-handoff'), '--output-root', $output,
-              '--source-repository', $env:GITHUB_REPOSITORY, '--source-ref', $env:GITHUB_REF, '--source-revision', $env:SOURCE_REVISION,
-              '--workflow-ref', $env:GITHUB_WORKFLOW_REF, '--workflow-source-sha', $env:GITHUB_SHA, '--run-id', $env:GITHUB_RUN_ID,
-              '--run-attempt', $env:GITHUB_RUN_ATTEMPT, '--artifact-id', $env:ARTIFACT_ID, '--artifact-digest', $env:ARTIFACT_DIGEST,
-              '--handoff-sha256', $env:HANDOFF_SHA256, '--release-set-digest', $env:RELEASE_SET_DIGEST,
-              '--toolchain-manifest-sha256', $env:TOOLCHAIN_MANIFEST_SHA256, '--pack-version', $env:PACK_VERSION,
-              '--minimum-security-epoch', '1', '--require-unused-release-set'
-            )
-            $processInfo = [Diagnostics.ProcessStartInfo]::new()
-            $processInfo.FileName = $client
-            $processInfo.UseShellExecute = $false
-            $processInfo.WorkingDirectory = [IO.Path]::GetDirectoryName($client)
-            foreach ($argument in $arguments) { $processInfo.ArgumentList.Add([string]$argument) }
-            $process = [Diagnostics.Process]::Start($processInfo)
-            if ($null -eq $process) { throw 'Protected broker client process did not start.' }
-            try { $process.WaitForExit(); $clientExitCode = $process.ExitCode }
-            finally { $process.Dispose() }
-            if ($clientExitCode -ne 0) { throw 'Protected broker rejected the unsigned handoff.' }
+          $root = Join-Path $env:RUNNER_TEMP 'scribe-approved-signer'
+          $expected = @{
+            'invoke-windows-gpu-approved-signing.ps1' = $env:SCRIBE_GPU_SIGNER_WRAPPER_SHA256
+            'scribe-worker-pack-tool.exe' = $env:SCRIBE_GPU_SIGNER_BINARY_SHA256
           }
-          finally { $clientLock.Dispose() }
-          if (-not (Test-Path -LiteralPath (Join-Path $output 'protected-promotion-receipt.json') -PathType Leaf)) { throw 'Protected signer did not produce its signed promotion receipt.' }
-      - name: Upload non-activated protected signed set
+          $entries = @(Get-ChildItem -LiteralPath $root -Force)
+          if ($entries.Count -ne 2) { throw 'Signer bundle inventory differs from the reviewed two-file contract.' }
+          foreach ($entry in $entries) {
+            if (-not $expected.ContainsKey($entry.Name) -or $expected[$entry.Name] -cnotmatch '^[0-9a-f]{64}$') { throw 'Signer file or independent pin is missing.' }
+            if ($entry.PSIsContainer -or $entry.Length -le 0 -or $entry.Length -gt 67108864 -or $entry.LinkType) { throw 'Signer payload is not a bounded unlinked regular file.' }
+            $cursor = $entry.FullName
+            while ($cursor) {
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Signer bundle traverses a reparse point.' }
+              $parent = Split-Path -Parent $cursor
+              if ($parent -eq $cursor) { break }
+              $cursor = $parent
+            }
+            $streams = @(Get-Item -LiteralPath $entry.FullName -Stream *)
+            if ($streams.Count -ne 1 -or $streams[0].Stream -cne ':$DATA') { throw 'Signer file has alternate streams.' }
+            if ((Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected[$entry.Name]) { throw 'Signer bundle digest differs from its independent pin.' }
+          }
+      - name: Download exact unsigned candidate as data only
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          repository: tyhuang9/scribe
+          run-id: ${{ inputs.producer_run_id }}
+          artifact-ids: ${{ inputs.unsigned_artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/scribe-windows-gpu-handoff
+      - name: Resolve authenticated provenance and exact approval
+        id: inspect
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ inputs.producer_run_attempt }}
+          UNSIGNED_ARTIFACT_ID: ${{ inputs.unsigned_artifact_id }}
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'scribe-approved-signer/invoke-windows-gpu-approved-signing.ps1') -Mode Preflight -HandoffRoot (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-handoff') -ApprovalRoot (Join-Path $env:RUNNER_TEMP 'scribe-gpu-approval') -ProducerRunId $env:PRODUCER_RUN_ID -ProducerRunAttempt $env:PRODUCER_RUN_ATTEMPT -ArtifactId $env:UNSIGNED_ARTIFACT_ID
+      - name: Upload the exact non-secret approval and policy
+        id: approval-upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-gpu-approval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scribe-gpu-approval
+          if-no-files-found: error
+          retention-days: 7
+
+  protected-promote:
+    name: Sign only the maintainer-approved exact pack pair
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'sign' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: preflight-signing
+    # A fresh GitHub-hosted VM, never a persistent candidate-builder or broker.
+    # PowerShell path probes and retained leaf handles do not
+    # provide no-follow open semantics or pin path ancestors. This assumes a
+    # fresh trusted job without candidate execution or untrusted concurrent writers.
+    runs-on: windows-2022
+    environment: windows-gpu-pack-signing
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: windows-gpu-pack-signing
+      cancel-in-progress: false
+    timeout-minutes: 15
+    env:
+      EXPECTED_APPROVAL_SHA256: ${{ needs.preflight-signing.outputs.approval_sha256 }}
+      EXPECTED_SIGNER_PINS_SHA256: ${{ needs.preflight-signing.outputs.signer_pins_sha256 }}
+    steps:
+      - name: Download independently reviewed signer bundle by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          repository: tyhuang9/scribe
+          run-id: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ID }}
+          artifact-ids: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_ID }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/scribe-approved-signer
+      - name: Authenticate wrapper before its first execution
+        shell: pwsh
+        env:
+          SCRIBE_GPU_SIGNER_SOURCE_SHA: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_SOURCE_SHA }}
+          SCRIBE_GPU_SIGNER_RUN_ID: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ID }}
+          SCRIBE_GPU_SIGNER_RUN_ATTEMPT: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ATTEMPT }}
+          SCRIBE_GPU_SIGNER_ARTIFACT_ID: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_ID }}
+          SCRIBE_GPU_SIGNER_ARTIFACT_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_SHA256 }}
+          SCRIBE_GPU_SIGNER_BINARY_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_BINARY_SHA256 }}
+          SCRIBE_GPU_SIGNER_WRAPPER_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_WRAPPER_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $root = Join-Path $env:RUNNER_TEMP 'scribe-approved-signer'
+          $expected = @{
+            'invoke-windows-gpu-approved-signing.ps1' = $env:SCRIBE_GPU_SIGNER_WRAPPER_SHA256
+            'scribe-worker-pack-tool.exe' = $env:SCRIBE_GPU_SIGNER_BINARY_SHA256
+          }
+          $entries = @(Get-ChildItem -LiteralPath $root -Force)
+          if ($entries.Count -ne 2) { throw 'Signer bundle inventory differs from the reviewed two-file contract.' }
+          foreach ($entry in $entries) {
+            if (-not $expected.ContainsKey($entry.Name) -or $expected[$entry.Name] -cnotmatch '^[0-9a-f]{64}$') { throw 'Signer file or independent pin is missing.' }
+            if ($entry.PSIsContainer -or $entry.Length -le 0 -or $entry.Length -gt 67108864 -or $entry.LinkType) { throw 'Signer payload is not a bounded unlinked regular file.' }
+            $cursor = $entry.FullName
+            while ($cursor) {
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Signer bundle traverses a reparse point.' }
+              $parent = Split-Path -Parent $cursor
+              if ($parent -eq $cursor) { break }
+              $cursor = $parent
+            }
+            $streams = @(Get-Item -LiteralPath $entry.FullName -Stream *)
+            if ($streams.Count -ne 1 -or $streams[0].Stream -cne ':$DATA') { throw 'Signer file has alternate streams.' }
+            if ((Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected[$entry.Name]) { throw 'Signer bundle digest differs from its independent pin.' }
+          }
+      - name: Download exact unsigned candidate as data only
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          repository: tyhuang9/scribe
+          run-id: ${{ inputs.producer_run_id }}
+          artifact-ids: ${{ inputs.unsigned_artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/scribe-windows-gpu-handoff
+      - name: Download exact preflight approval
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.preflight-signing.outputs.approval_artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/scribe-gpu-approval
+      - name: Revalidate policy and sign with memory-only protected authority
+        shell: pwsh
+        env:
+          SCRIBE_GPU_SIGNER_SOURCE_SHA: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_SOURCE_SHA }}
+          SCRIBE_GPU_SIGNER_RUN_ID: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ID }}
+          SCRIBE_GPU_SIGNER_RUN_ATTEMPT: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ATTEMPT }}
+          SCRIBE_GPU_SIGNER_ARTIFACT_ID: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_ID }}
+          SCRIBE_GPU_SIGNER_ARTIFACT_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_SHA256 }}
+          SCRIBE_GPU_SIGNER_BINARY_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_BINARY_SHA256 }}
+          SCRIBE_GPU_SIGNER_WRAPPER_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_WRAPPER_SHA256 }}
+          GH_TOKEN: ${{ github.token }}
+          SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64: ${{ secrets.SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64 }}
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'scribe-approved-signer/invoke-windows-gpu-approved-signing.ps1') -Mode Sign -HandoffRoot (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-handoff') -ApprovalRoot (Join-Path $env:RUNNER_TEMP 'scribe-gpu-approval') -OutputRoot (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-promoted') -ExpectedApprovalSha256 $env:EXPECTED_APPROVAL_SHA256 -ExpectedSignerPinsSha256 $env:EXPECTED_SIGNER_PINS_SHA256
+      - name: Recheck current policy immediately before artifact publication
+        shell: pwsh
+        env:
+          SCRIBE_GPU_SIGNER_SOURCE_SHA: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_SOURCE_SHA }}
+          SCRIBE_GPU_SIGNER_RUN_ID: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ID }}
+          SCRIBE_GPU_SIGNER_RUN_ATTEMPT: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_RUN_ATTEMPT }}
+          SCRIBE_GPU_SIGNER_ARTIFACT_ID: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_ID }}
+          SCRIBE_GPU_SIGNER_ARTIFACT_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_ARTIFACT_SHA256 }}
+          SCRIBE_GPU_SIGNER_BINARY_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_BINARY_SHA256 }}
+          SCRIBE_GPU_SIGNER_WRAPPER_SHA256: ${{ vars.SCRIBE_GPU_APPROVED_SIGNER_WRAPPER_SHA256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'scribe-approved-signer/invoke-windows-gpu-approved-signing.ps1') -Mode PublicationCheck -ApprovalRoot (Join-Path $env:RUNNER_TEMP 'scribe-gpu-approval') -OutputRoot (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-promoted') -ExpectedApprovalSha256 $env:EXPECTED_APPROVAL_SHA256 -ExpectedSignerPinsSha256 $env:EXPECTED_SIGNER_PINS_SHA256
+      - name: Upload signed pair without activation or Auto enablement
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-gpu-signed-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/scribe-windows-gpu-promoted
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7

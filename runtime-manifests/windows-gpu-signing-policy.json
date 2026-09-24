@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "policy_id": "scribe-windows-gpu-github-signing-v1",
+  "key_id": "",
+  "public_key_sha256": "",
+  "source_repository": "tyhuang9/scribe",
+  "source_ref": "refs/heads/main",
+  "app_version": "0.1.0",
+  "protocol_version": 5,
+  "worker_abi_version": 1,
+  "minimum_security_epoch": 1,
+  "packs": [
+    {
+      "backend": "cuda",
+      "pack_id": "scribe-cuda-windows-x64",
+      "provider": "transcribe-cpp-ggml-cuda",
+      "worker_path": "bin/scribe-inference-worker.exe",
+      "security_epoch": 1
+    },
+    {
+      "backend": "vulkan",
+      "pack_id": "scribe-vulkan-windows-x64",
+      "provider": "transcribe-cpp-ggml-vulkan",
+      "worker_path": "bin/scribe-inference-worker.exe",
+      "security_epoch": 1
+    }
+  ]
+}

@@ -256,20 +256,28 @@ approved source/revision and complete unsigned-artifact digests before receiving
 authority; candidate-ref scripts must not run with the key. The authoring tool
 still verifies that a supplied key's public half exactly matches the separately
 reviewed key embedded in `ProductionTrustRoot`. Because no production public key
-or trusted signer exists today, every nonempty production release fails closed.
+has been provisioned today, every nonempty production release fails closed.
 The deterministic seed and key ID used by tooling tests and local hardware smoke
 are fixture-only and cannot verify under production trust.
 
-The separate `windows-gpu-pack-promotion.yml` contract divides this future
-authority into three boundaries. An unprivileged, manually dispatched
-default-branch job builds one unsigned CUDA pack and one unsigned Vulkan pack,
-then uploads a one-day handoff artifact. Its canonical metadata binds the exact
-repository, ref, source SHA, workflow ref, run ID and attempt, pack version,
-toolchain-manifest SHA-256, ordered CUDA/Vulkan manifest and pack digests, and a
-domain-separated release-set digest. `actions/upload-artifact` exposes the
-artifact ID and digest; the digest-pinned `download-artifact` action validates
-that artifact in the protected job, and both values are also passed through the
-unprivileged client as approval inputs for the future privileged broker.
+The selected `windows-gpu-pack-promotion.yml` path now uses maintainer-approved
+GitHub environment signing, not a separately privileged broker. It separates
+unsigned preparation, secret-free preflight of a completed producer run, and
+protected signing on a fresh hosted runner. A separately pinned GPU-free tool
+verifies the complete pair before reading the key; no candidate worker or
+candidate source executes with signing authority. Exact-input retries are
+idempotent, and a reviewed, nondecreasing per-pack security-epoch policy replaces
+the previously proposed durable one-time broker ledger. The installer may
+remain Authenticode-unsigned; GPU pack signatures remain required. See
+[`WINDOWS_GPU_PACK_SIGNING.md`](WINDOWS_GPU_PACK_SIGNING.md) for setup, trust
+boundaries, failure behavior, and the remaining unprovisioned prerequisites.
+
+### Historical broker proof (not the selected deployment path)
+
+The following describes retained unprivileged transport and fixture regression
+coverage. It is not a prerequisite for the selected GitHub signing path. Do not
+provision the service or registry policy for that path, and do not enable its
+test-only signing code in production.
 
 The serializable broker input is the canonical path-free `PromotionIntent`.
 It carries the fixed `scribe-windows-gpu-production-v1` policy namespace and
