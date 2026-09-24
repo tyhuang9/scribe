@@ -363,15 +363,75 @@ pub(crate) trait TrustRoot: Send + Sync {
     fn public_key(&self, key_id: &str) -> Option<&[u8]>;
 }
 
-/// Intentionally empty until a production public key and key ID complete a
-/// separate release-security review. The build-time author rejects every
-/// external private key that does not match an entry exposed here.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProductionTrustManifest {
+    schema_version: u16,
+    keys: Vec<ProductionTrustKey>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProductionTrustKey {
+    key_id: String,
+    public_key_hex: String,
+}
+
+struct ParsedProductionTrustKey {
+    key_id: String,
+    public_key: Vec<u8>,
+}
+
+/// The reviewed production trust root is compiled into every verifier. It is
+/// intentionally empty until a public key completes a separate release-
+/// security review. Private keys are never stored in this manifest.
 pub(crate) struct ProductionTrustRoot;
 
 impl TrustRoot for ProductionTrustRoot {
     fn public_key(&self, _key_id: &str) -> Option<&[u8]> {
-        None
+        // Invalid reviewed trust bytes fail closed to None.
+        static KEYS: std::sync::OnceLock<Option<Vec<ParsedProductionTrustKey>>> =
+            std::sync::OnceLock::new();
+        let keys = KEYS.get_or_init(parse_production_trust_manifest).as_ref()?;
+        keys.iter()
+            .find(|key| key.key_id == _key_id)
+            .map(|key| key.public_key.as_slice())
     }
+}
+
+fn parse_production_trust_manifest() -> Option<Vec<ParsedProductionTrustKey>> {
+    let bytes = include_bytes!("../../runtime-manifests/worker-pack-production-trust.json");
+    parse_production_trust_manifest_bytes(bytes)
+}
+
+fn parse_production_trust_manifest_bytes(bytes: &[u8]) -> Option<Vec<ParsedProductionTrustKey>> {
+    let manifest = serde_json::from_slice::<ProductionTrustManifest>(bytes).ok()?;
+    let canonical = serde_json::to_vec(&manifest).ok()?;
+    let canonical_with_newline = canonical
+        .iter()
+        .copied()
+        .chain(std::iter::once(b'\n'))
+        .collect::<Vec<_>>();
+    if manifest.schema_version != 1
+        || (bytes != canonical.as_slice() && bytes != canonical_with_newline.as_slice())
+    {
+        return None;
+    }
+    let mut key_ids = BTreeSet::new();
+    let mut parsed = Vec::with_capacity(manifest.keys.len());
+    for key in manifest.keys {
+        if validate_identifier(&key.key_id, "production trust key ID").is_err()
+            || !key_ids.insert(key.key_id.clone())
+        {
+            return None;
+        }
+        let public_key = decode_hex_exact(&key.public_key_hex, 32)?;
+        parsed.push(ParsedProductionTrustKey {
+            key_id: key.key_id,
+            public_key,
+        });
+    }
+    Some(parsed)
 }
 
 #[derive(Clone, Debug)]
@@ -1657,6 +1717,25 @@ pub(crate) enum PackVerificationError {
 pub(crate) mod test_support {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    #[test]
+    fn production_trust_manifest_rejects_malformed_duplicate_and_fixture_entries() {
+        assert!(
+            parse_production_trust_manifest_bytes(br#"{"schema_version":1,"keys":[]}"#).is_some()
+        );
+        assert!(
+            parse_production_trust_manifest_bytes(br#"{"schema_version":2,"keys":[]}"#).is_none()
+        );
+        assert!(
+            parse_production_trust_manifest_bytes(
+                br#"{"schema_version":1,"keys":[],"extra":true}"#
+            )
+            .is_none()
+        );
+        let duplicate = br#"{"schema_version":1,"keys":[{"key_id":"release-v1","public_key_hex":"0000000000000000000000000000000000000000000000000000000000000000"},{"key_id":"release-v1","public_key_hex":"1111111111111111111111111111111111111111111111111111111111111111"}]}"#;
+        assert!(parse_production_trust_manifest_bytes(duplicate).is_none());
+        assert!(TrustRoot::public_key(&ProductionTrustRoot, "fixture-ed25519-v1").is_none());
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_SEED: [u8; 32] = [7; 32];

@@ -25,7 +25,7 @@ use crate::manifest::{
 
 pub(crate) const FIXTURE_KEY_ID: &str = "fixture-ed25519-v1";
 const FIXTURE_SEED: [u8; 32] = [7; 32];
-const MAX_PRIVATE_KEY_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_PRIVATE_KEY_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuthoringBackend {
@@ -44,7 +44,7 @@ impl AuthoringBackend {
         }
     }
 
-    fn manifest_backend(self) -> PackBackend {
+    pub(crate) fn manifest_backend(self) -> PackBackend {
         match self {
             Self::Cuda => PackBackend::Cuda,
             Self::Vulkan => PackBackend::Vulkan,
@@ -52,7 +52,7 @@ impl AuthoringBackend {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Cuda => "cuda",
             Self::Vulkan => "vulkan",
@@ -113,6 +113,24 @@ pub(crate) struct PreparedPack {
     pub(crate) manifest_sha256: String,
     pub(crate) payload_files: usize,
     pub(crate) installed_payload_bytes: u64,
+}
+
+/// A reviewed target identity for signing a prepared pack built from a source
+/// revision other than the revision used to compile the isolated signer.
+/// Every field is compared exactly before the private key is requested.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ApprovedPackTarget<'a> {
+    pub(crate) pack_id: &'a str,
+    pub(crate) security_epoch: u64,
+    pub(crate) backend: AuthoringBackend,
+    pub(crate) provider: &'a str,
+    pub(crate) target_os: &'a str,
+    pub(crate) target_arch: &'a str,
+    pub(crate) worker_path: &'a str,
+    pub(crate) app_protocol_version: u16,
+    pub(crate) runtime_abi_version: u16,
+    pub(crate) app_build: &'a str,
+    pub(crate) worker_build: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -194,16 +212,34 @@ pub(crate) fn prepare_pack(request: &PrepareRequest) -> Result<PreparedPack> {
 }
 
 pub(crate) fn inspect_prepared_pack(root: &Path) -> Result<PreparedPack> {
+    inspect_prepared_pack_inner(root, None)
+}
+
+pub(crate) fn inspect_approved_prepared_pack(
+    root: &Path,
+    target: &ApprovedPackTarget<'_>,
+) -> Result<PreparedPack> {
+    inspect_prepared_pack_inner(root, Some(target))
+}
+
+fn inspect_prepared_pack_inner(
+    root: &Path,
+    target: Option<&ApprovedPackTarget<'_>>,
+) -> Result<PreparedPack> {
     validate_root(root)?;
     if root.join(SIGNATURE_NAME).exists() {
         bail!("prepared pack must not contain a signature envelope");
     }
     let (manifest, manifest_bytes) = manifest_from_root(root, "prepared")?;
-    validate_prepared_manifest(&manifest)?;
+    match target {
+        Some(target) => validate_approved_prepared_manifest(&manifest, target)?,
+        None => validate_prepared_manifest(&manifest)?,
+    }
     let payload = inventory_payload(root, true)?;
     if payload != manifest.payload {
         bail!("prepared pack payload does not match its canonical manifest");
     }
+    validate_prepared_directories(root, &payload)?;
     if !payload
         .iter()
         .any(|entry| entry.path == manifest.worker_path)
@@ -225,6 +261,46 @@ pub(crate) fn inspect_prepared_pack(root: &Path) -> Result<PreparedPack> {
         payload_files: payload.len(),
         installed_payload_bytes,
     })
+}
+
+pub(crate) fn sign_approved_prepared_pack(
+    root: &Path,
+    target: &ApprovedPackTarget<'_>,
+    trust: &dyn TrustRoot,
+    key_id: &str,
+    private_key: &[u8],
+    expected_manifest_sha256: &str,
+    expected_pack_digest: &str,
+) -> Result<AuthoredPack> {
+    if !is_canonical_sha256(expected_manifest_sha256) || !is_canonical_sha256(expected_pack_digest)
+    {
+        bail!("caller-approved prepared-pack digests must be canonical SHA-256 values");
+    }
+    let prepared = inspect_approved_prepared_pack(root, target)?;
+    if prepared.manifest_sha256 != expected_manifest_sha256
+        || prepared.pack_digest != expected_pack_digest
+    {
+        bail!("prepared pack does not match the caller-approved manifest and pack digests");
+    }
+    let (manifest, manifest_bytes) = manifest_from_root(root, "approved prepared")?;
+    validate_approved_prepared_manifest(&manifest, target)?;
+    if encode_hex(&Sha256::digest(&manifest_bytes)) != expected_manifest_sha256
+        || manifest.pack_digest != expected_pack_digest
+    {
+        bail!("prepared pack changed after validation and before signing");
+    }
+    let key_pair = production_key_pair_from_bytes(key_id, private_key, trust)?;
+    write_and_verify_signature(
+        root,
+        prepared,
+        manifest,
+        manifest_bytes,
+        key_id.to_owned(),
+        key_pair,
+        target.app_build,
+        target.worker_build,
+        trust,
+    )
 }
 
 pub(crate) fn sign_prepared_pack(
@@ -250,6 +326,35 @@ pub(crate) fn sign_prepared_pack(
         bail!("prepared pack changed after validation and before signing");
     }
     let (key_id, key_pair) = signing_key_pair(signing)?;
+    let trust = ExactTrustRoot {
+        key_id: key_id.clone(),
+        public_key: key_pair.public_key().as_ref().to_vec(),
+    };
+    write_and_verify_signature(
+        root,
+        prepared,
+        manifest,
+        manifest_bytes,
+        key_id,
+        key_pair,
+        crate::worker_identity::DESKTOP_BUILD_ID,
+        crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
+        &trust,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_and_verify_signature(
+    root: &Path,
+    prepared: PreparedPack,
+    manifest: PackManifest,
+    manifest_bytes: Vec<u8>,
+    key_id: String,
+    key_pair: Ed25519KeyPair,
+    app_build: &str,
+    worker_build: &str,
+    trust: &dyn TrustRoot,
+) -> Result<AuthoredPack> {
     let signature = DetachedSignature {
         schema_version: PACK_SCHEMA_VERSION,
         key_id: key_id.clone(),
@@ -259,16 +364,12 @@ pub(crate) fn sign_prepared_pack(
     write_new_envelope(&signature_path, &serde_json::to_vec(&signature)?)
         .context("could not create canonical worker-pack signature")?;
 
-    let trust = ExactTrustRoot {
-        key_id: key_id.clone(),
-        public_key: key_pair.public_key().as_ref().to_vec(),
-    };
     let allowed_backends = [manifest.backend];
     let verifier = PackVerifier::new(
-        &trust,
+        trust,
         Compatibility {
-            app_build: crate::worker_identity::DESKTOP_BUILD_ID,
-            worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
+            app_build,
+            worker_build,
             target_os: &manifest.target_os,
             target_arch: &manifest.target_arch,
             allowed_backends: &allowed_backends,
@@ -448,6 +549,54 @@ fn validate_prepared_manifest(manifest: &PackManifest) -> Result<()> {
     Ok(())
 }
 
+fn validate_approved_prepared_manifest(
+    manifest: &PackManifest,
+    target: &ApprovedPackTarget<'_>,
+) -> Result<()> {
+    validate_authoring_target(target.backend, target.target_os, target.target_arch)?;
+    if manifest.schema_version != PACK_SCHEMA_VERSION
+        || manifest.app_protocol_version != target.app_protocol_version
+        || manifest.worker_protocol_version != target.app_protocol_version
+        || manifest.runtime_abi_version != target.runtime_abi_version
+    {
+        bail!("approved prepared pack has an incompatible schema, protocol, or runtime ABI");
+    }
+    if manifest.security_epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH
+        || manifest.security_epoch != target.security_epoch
+    {
+        bail!("approved prepared pack security epoch does not match reviewed policy");
+    }
+    if !manifest.pack_id.is_canonical() || !manifest.pack_version.is_canonical() {
+        bail!("approved prepared pack has a noncanonical store identity");
+    }
+    validate_identifier(target.pack_id, "approved pack ID")?;
+    validate_identifier(target.provider, "approved provider")?;
+    validate_relative_path(target.worker_path)?;
+    validate_build_identity(target.app_build, "approved app build")?;
+    validate_build_identity(target.worker_build, "approved worker build")?;
+    if manifest.pack_id.as_str() != target.pack_id
+        || manifest.backend != target.backend.manifest_backend()
+        || manifest.provider != target.provider
+        || manifest.target_os != target.target_os
+        || manifest.target_arch != target.target_arch
+        || manifest.worker_path != target.worker_path
+        || manifest.app_build != target.app_build
+        || manifest.worker_build != target.worker_build
+    {
+        bail!("approved prepared pack identity does not match reviewed policy and source");
+    }
+    validate_inventory(&manifest.payload)?;
+    if !manifest.worker_path.is_ascii()
+        || manifest.payload.iter().any(|entry| !entry.path.is_ascii())
+    {
+        bail!("approved prepared pack paths must be ASCII for Windows ordinal case safety");
+    }
+    if compute_pack_digest(manifest)? != manifest.pack_digest {
+        bail!("approved prepared pack digest does not match its canonical manifest");
+    }
+    Ok(())
+}
+
 fn backend_from_manifest(backend: PackBackend) -> AuthoringBackend {
     match backend {
         PackBackend::Cuda => AuthoringBackend::Cuda,
@@ -483,13 +632,30 @@ fn installed_payload_bytes(payload: &[PayloadEntry]) -> Result<u64> {
 
 fn production_key_pair(key_id: &str, private_key_path: &Path) -> Result<Ed25519KeyPair> {
     validate_identifier(key_id, "signature key ID")?;
-    let embedded = TrustRoot::public_key(&ProductionTrustRoot, key_id).ok_or_else(|| {
+    if TrustRoot::public_key(&ProductionTrustRoot, key_id).is_none() {
+        bail!(
+            "production signing key ID {key_id:?} has no separately reviewed public key embedded in this build"
+        );
+    }
+    let private_key = read_bounded_private_key(private_key_path)?;
+    production_key_pair_from_bytes(key_id, &private_key, &ProductionTrustRoot)
+}
+
+pub(crate) fn production_key_pair_from_bytes(
+    key_id: &str,
+    private_key: &[u8],
+    trust: &dyn TrustRoot,
+) -> Result<Ed25519KeyPair> {
+    validate_identifier(key_id, "signature key ID")?;
+    let embedded = TrustRoot::public_key(trust, key_id).ok_or_else(|| {
         anyhow!(
             "production signing key ID {key_id:?} has no separately reviewed public key embedded in this build"
         )
     })?;
-    let private_key = read_bounded_private_key(private_key_path)?;
-    let key_pair = Ed25519KeyPair::from_pkcs8(&private_key)
+    if private_key.is_empty() || private_key.len() as u64 > MAX_PRIVATE_KEY_BYTES {
+        bail!("production signing key size is outside the accepted bound");
+    }
+    let key_pair = Ed25519KeyPair::from_pkcs8(private_key)
         .map_err(|_| anyhow!("production signing key is not Ed25519 PKCS#8 v2 DER"))?;
     if key_pair.public_key().as_ref() != embedded {
         bail!(
@@ -605,6 +771,44 @@ fn inventory_payload(root: &Path, prepared_manifest_allowed: bool) -> Result<Vec
     payload.sort_by(|left, right| left.path.cmp(&right.path));
     validate_inventory(&payload)?;
     Ok(payload)
+}
+
+fn validate_prepared_directories(root: &Path, payload: &[PayloadEntry]) -> Result<()> {
+    let mut expected = BTreeSet::new();
+    for entry in payload {
+        let mut parent = Path::new(&entry.path).parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            expected.insert(path.to_string_lossy().replace('\\', "/"));
+            parent = path.parent();
+        }
+    }
+    let mut observed = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| anyhow!("prepared pack directory escaped its root"))?
+                .to_str()
+                .ok_or_else(|| anyhow!("prepared pack directory is not UTF-8"))?
+                .replace('\\', "/");
+            observed.insert(relative);
+            pending.push(path);
+        }
+    }
+    if observed != expected {
+        bail!("prepared pack contains a directory outside its canonical inventory");
+    }
+    Ok(())
 }
 
 fn manifest_from_root(root: &Path, label: &str) -> Result<(PackManifest, Vec<u8>)> {
