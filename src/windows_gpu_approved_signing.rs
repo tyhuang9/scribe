@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::{
-    EMBEDDED_MINIMUM_SECURITY_EPOCH, MANIFEST_NAME, ProductionTrustRoot, SIGNATURE_NAME, TrustRoot,
-    is_link_or_reparse, open_regular_no_follow, reject_hardlink, reject_named_streams,
-    validate_build_identity, validate_identifier, validate_relative_path, validate_root,
+    Compatibility, EMBEDDED_MINIMUM_SECURITY_EPOCH, MANIFEST_NAME, PackBackend, PackManifest,
+    PackVerifier, ProductionTrustRoot, SIGNATURE_NAME, TrustRoot, is_link_or_reparse,
+    open_regular_no_follow, reject_hardlink, reject_named_streams, validate_build_identity,
+    validate_identifier, validate_relative_path, validate_root,
 };
 use crate::worker_pack_authoring::{
     ApprovedPackTarget, AuthoringBackend, MAX_PRIVATE_KEY_BYTES, PreparedPack,
@@ -26,6 +27,7 @@ pub(crate) const HANDOFF_NAME: &str = "windows-gpu-pack-handoff.json";
 pub(crate) const RECEIPT_NAME: &str = "windows-gpu-pack-signing-receipt.json";
 const CONTROL_SCHEMA_VERSION: u16 = 1;
 const MAX_CONTROL_BYTES: u64 = 256 * 1024;
+const MAX_TOOLCHAIN_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const RELEASE_SET_DOMAIN: &[u8] = b"scribe-windows-gpu-release-set-v1\0";
 const WINDOWS_TARGET_OS: &str = "windows";
 const WINDOWS_TARGET_ARCH: &str = "x86_64";
@@ -136,7 +138,7 @@ pub(crate) struct InspectedWindowsPackSet {
     pub(crate) packs: Vec<InspectedPack>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InspectedPack {
     pub(crate) backend: String,
@@ -151,7 +153,7 @@ pub(crate) struct InspectedPack {
     pub(crate) installed_payload_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WindowsPackSigningReceipt {
     pub(crate) schema_version: u16,
@@ -173,6 +175,24 @@ pub(crate) struct WindowsPackSigningReceipt {
     pub(crate) toolchain_manifest_sha256: String,
     pub(crate) pack_version: String,
     pub(crate) packs: Vec<InspectedPack>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPackSignature {
+    schema_version: u16,
+    key_id: String,
+    signature_hex: String,
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseIdentity<'a> {
+    app_version: &'a str,
+    source_revision: &'a str,
+    app_build: &'a str,
+    worker_build: &'a str,
+    protocol_version: u16,
+    worker_abi_version: u16,
 }
 
 struct ValidatedSet {
@@ -212,6 +232,88 @@ pub(crate) fn sign_approved_windows_set(
         private_key_input,
         &ProductionTrustRoot,
     )
+}
+
+pub(crate) fn verify_signed_windows_set(
+    signed_root: &Path,
+    policy_path: &Path,
+    toolchain_manifest_path: &Path,
+) -> Result<WindowsPackSigningReceipt> {
+    verify_signed_windows_set_with_trust(
+        signed_root,
+        policy_path,
+        toolchain_manifest_path,
+        &ProductionTrustRoot,
+        ReleaseIdentity {
+            app_version: env!("CARGO_PKG_VERSION"),
+            source_revision: env!("SCRIBE_BUILD_REVISION"),
+            app_build: crate::worker_identity::DESKTOP_BUILD_ID,
+            worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
+            protocol_version: crate::worker_identity::PROTOCOL_VERSION as u16,
+            worker_abi_version: crate::worker_identity::WORKER_ABI_VERSION,
+        },
+    )
+}
+
+fn verify_signed_windows_set_with_trust(
+    signed_root: &Path,
+    policy_path: &Path,
+    toolchain_manifest_path: &Path,
+    trust: &dyn TrustRoot,
+    identity: ReleaseIdentity<'_>,
+) -> Result<WindowsPackSigningReceipt> {
+    validate_signed_root(signed_root)?;
+
+    let receipt_bytes = read_bounded_control(&signed_root.join(RECEIPT_NAME), "signing receipt")?;
+    let receipt: WindowsPackSigningReceipt = serde_json::from_slice(&receipt_bytes)
+        .context("Windows pack signing receipt JSON is invalid")?;
+    if serde_json::to_vec(&receipt)? != receipt_bytes {
+        bail!("Windows pack signing receipt is not canonical JSON");
+    }
+
+    let policy_bytes = read_bounded_control(policy_path, "signing policy")?;
+    let policy: WindowsSigningPolicy =
+        serde_json::from_slice(&policy_bytes).context("Windows signing policy JSON is invalid")?;
+    validate_policy(&policy, trust)?;
+    let policy_sha256 = sha256_hex(&policy_bytes);
+    if receipt.schema_version != CONTROL_SCHEMA_VERSION
+        || receipt.policy_id != policy.policy_id
+        || receipt.policy_sha256 != policy_sha256
+        || receipt.key_id != policy.key_id
+    {
+        bail!("signing receipt does not match the authoritative signing policy");
+    }
+
+    validate_release_identity(&receipt, &policy, identity)?;
+    let toolchain_bytes = read_bounded_regular(
+        toolchain_manifest_path,
+        "toolchain manifest",
+        MAX_TOOLCHAIN_MANIFEST_BYTES,
+    )?;
+    if sha256_hex(&toolchain_bytes) != receipt.toolchain_manifest_sha256 {
+        bail!("signing receipt does not bind the exact checked-out toolchain manifest bytes");
+    }
+
+    let approval = approval_from_receipt(&receipt);
+    validate_approval(&approval, &policy, &policy_sha256)?;
+    let handoff = handoff_from_approval(&approval);
+    let handoff_bytes = serde_json::to_vec(&handoff)?;
+    validate_handoff(&handoff, &approval, &handoff_bytes)?;
+
+    for ((inspected, approved), rule) in
+        receipt.packs.iter().zip(&approval.packs).zip(&policy.packs)
+    {
+        verify_signed_pack(
+            signed_root,
+            inspected,
+            approved,
+            rule,
+            &policy,
+            trust,
+            identity,
+        )?;
+    }
+    Ok(receipt)
 }
 
 fn inspect_with_trust(
@@ -386,6 +488,84 @@ fn validate_policy(policy: &WindowsSigningPolicy, trust: &dyn TrustRoot) -> Resu
         }
     }
     Ok(())
+}
+
+fn validate_release_identity(
+    receipt: &WindowsPackSigningReceipt,
+    policy: &WindowsSigningPolicy,
+    identity: ReleaseIdentity<'_>,
+) -> Result<()> {
+    validate_revision(identity.source_revision, "compiled release source revision")?;
+    let expected_app_build = format!(
+        "local-transcriber@{}#{}",
+        identity.app_version, identity.source_revision
+    );
+    let expected_worker_build = format!(
+        "scribe-inference-worker@{}#{}",
+        identity.app_version, identity.source_revision
+    );
+    if identity.app_build != expected_app_build || identity.worker_build != expected_worker_build {
+        bail!("compiled worker identity is inconsistent with its release source and version");
+    }
+    if receipt.source_revision != identity.source_revision
+        || policy.app_version != identity.app_version
+        || policy.protocol_version != identity.protocol_version
+        || policy.worker_abi_version != identity.worker_abi_version
+    {
+        bail!("signed pack set is not bound to this verifier's compiled release identity");
+    }
+    Ok(())
+}
+
+fn approval_from_receipt(receipt: &WindowsPackSigningReceipt) -> ApprovedWindowsPackSet {
+    ApprovedWindowsPackSet {
+        schema_version: receipt.schema_version,
+        policy_sha256: receipt.policy_sha256.clone(),
+        signer_source_revision: receipt.signer_source_revision.clone(),
+        signer_sha256: receipt.signer_sha256.clone(),
+        source_repository: receipt.source_repository.clone(),
+        source_ref: receipt.source_ref.clone(),
+        source_revision: receipt.source_revision.clone(),
+        workflow_ref: receipt.workflow_ref.clone(),
+        run_id: receipt.run_id.clone(),
+        run_attempt: receipt.run_attempt.clone(),
+        artifact_id: receipt.artifact_id.clone(),
+        artifact_digest: receipt.artifact_digest.clone(),
+        handoff_sha256: receipt.handoff_sha256.clone(),
+        release_set_digest: receipt.release_set_digest.clone(),
+        toolchain_manifest_sha256: receipt.toolchain_manifest_sha256.clone(),
+        pack_version: receipt.pack_version.clone(),
+        packs: receipt
+            .packs
+            .iter()
+            .map(|pack| ApprovedPack {
+                backend: pack.backend.clone(),
+                pack_root: pack.pack_root.clone(),
+                pack_id: pack.pack_id.clone(),
+                pack_version: pack.pack_version.clone(),
+                pack_digest: pack.pack_digest.clone(),
+                security_epoch: pack.security_epoch,
+                provider: pack.provider.clone(),
+                manifest_sha256: pack.manifest_sha256.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn handoff_from_approval(approval: &ApprovedWindowsPackSet) -> WindowsPackHandoff {
+    WindowsPackHandoff {
+        schema_version: approval.schema_version,
+        source_repository: approval.source_repository.clone(),
+        source_ref: approval.source_ref.clone(),
+        source_revision: approval.source_revision.clone(),
+        workflow_ref: approval.workflow_ref.clone(),
+        run_id: approval.run_id.clone(),
+        run_attempt: approval.run_attempt.clone(),
+        pack_version: approval.pack_version.clone(),
+        toolchain_manifest_sha256: approval.toolchain_manifest_sha256.clone(),
+        packs: approval.packs.clone(),
+        release_set_digest: approval.release_set_digest.clone(),
+    }
 }
 
 fn validate_approval(
@@ -565,6 +745,115 @@ fn validate_handoff_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_signed_root(root: &Path) -> Result<()> {
+    validate_root(root).context("signed pack-set root is unsafe")?;
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(root).context("could not enumerate signed pack-set root")? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| anyhow!("signed pack-set root entry is not UTF-8"))?
+            .to_owned();
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if is_link_or_reparse(&metadata) {
+            bail!("signed pack-set root contains a link or reparse point");
+        }
+        match name.as_str() {
+            "cuda" | "vulkan" if metadata.is_dir() => validate_root(&path)?,
+            RECEIPT_NAME if metadata.is_file() => reject_named_streams(&path)?,
+            _ => bail!("signed pack-set root contains an unexpected entry"),
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            bail!("signed pack-set root contains a case-colliding entry");
+        }
+    }
+    let expected = ["cuda", "vulkan", RECEIPT_NAME]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if names != expected {
+        bail!("signed pack-set root is incomplete");
+    }
+    Ok(())
+}
+
+fn verify_signed_pack(
+    signed_root: &Path,
+    inspected: &InspectedPack,
+    approved: &ApprovedPack,
+    rule: &PolicyPack,
+    policy: &WindowsSigningPolicy,
+    trust: &dyn TrustRoot,
+    identity: ReleaseIdentity<'_>,
+) -> Result<()> {
+    let expected_backend = match rule.backend.as_str() {
+        "cuda" => PackBackend::Cuda,
+        "vulkan" => PackBackend::Vulkan,
+        _ => bail!("policy backend is unsupported"),
+    };
+    let allowed_backends = [expected_backend];
+    let verifier = PackVerifier::new(
+        trust,
+        Compatibility {
+            app_build: identity.app_build,
+            worker_build: identity.worker_build,
+            target_os: WINDOWS_TARGET_OS,
+            target_arch: WINDOWS_TARGET_ARCH,
+            allowed_backends: &allowed_backends,
+        },
+    );
+    let pack_root = signed_root.join(&approved.pack_root);
+    let verified = verifier
+        .verify(&pack_root)
+        .with_context(|| format!("{} signed pack failed full verification", approved.backend))?;
+
+    let signature_bytes = read_bounded_control(&pack_root.join(SIGNATURE_NAME), "pack signature")?;
+    let signature: SignedPackSignature = serde_json::from_slice(&signature_bytes)
+        .context("signed pack signature JSON is invalid")?;
+    if serde_json::to_vec(&signature)? != signature_bytes {
+        bail!("signed pack signature is not canonical JSON");
+    }
+    if signature.schema_version != CONTROL_SCHEMA_VERSION || signature.key_id != policy.key_id {
+        bail!("signed pack was not signed by the exact policy key");
+    }
+
+    let manifest_bytes = read_bounded_control(&pack_root.join(MANIFEST_NAME), "pack manifest")?;
+    let manifest: PackManifest =
+        serde_json::from_slice(&manifest_bytes).context("signed pack manifest JSON is invalid")?;
+    let installed_payload_bytes = manifest.payload.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.size_bytes)
+            .ok_or_else(|| anyhow!("signed pack payload byte count overflowed"))
+    })?;
+    let actual_backend = match verified.backend {
+        PackBackend::Cuda => "cuda",
+        PackBackend::Vulkan => "vulkan",
+        PackBackend::Metal => "metal",
+    };
+    if actual_backend != inspected.backend
+        || verified.pack_id.as_str() != inspected.pack_id
+        || verified.pack_version.as_str() != inspected.pack_version
+        || verified.pack_digest != inspected.pack_digest
+        || verified.security_epoch != inspected.security_epoch
+        || verified.provider != inspected.provider
+        || verified.runtime_abi_version != policy.worker_abi_version
+        || manifest.app_protocol_version != policy.protocol_version
+        || manifest.worker_protocol_version != policy.protocol_version
+        || manifest.runtime_abi_version != policy.worker_abi_version
+        || manifest.app_build != identity.app_build
+        || manifest.worker_build != identity.worker_build
+        || manifest.worker_path != rule.worker_path
+        || sha256_hex(&manifest_bytes) != inspected.manifest_sha256
+        || manifest.payload.len() != inspected.payload_files
+        || installed_payload_bytes != inspected.installed_payload_bytes
+    {
+        bail!("signed pack facts do not match the signing receipt and policy");
+    }
+    Ok(())
+}
+
 fn validate_exact_pack_order(packs: &[(&str, &str)]) -> Result<()> {
     let expected = [
         ("cuda", "scribe-cuda-windows-x64"),
@@ -681,6 +970,10 @@ fn inspected_pack(approved: &ApprovedPack, prepared: &PreparedPack) -> Inspected
 }
 
 fn read_bounded_control(path: &Path, label: &str) -> Result<Vec<u8>> {
+    read_bounded_regular(path, label, MAX_CONTROL_BYTES)
+}
+
+fn read_bounded_regular(path: &Path, label: &str, maximum_bytes: u64) -> Result<Vec<u8>> {
     let mut file =
         open_regular_no_follow(path).with_context(|| format!("could not open {label}"))?;
     let metadata = file
@@ -688,12 +981,12 @@ fn read_bounded_control(path: &Path, label: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("could not inspect {label}"))?;
     reject_hardlink(&file, &metadata, path)?;
     reject_named_streams(path)?;
-    if metadata.len() == 0 || metadata.len() > MAX_CONTROL_BYTES {
+    if metadata.len() == 0 || metadata.len() > maximum_bytes {
         bail!("{label} size is outside the accepted bound");
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     Read::by_ref(&mut file)
-        .take(MAX_CONTROL_BYTES + 1)
+        .take(maximum_bytes + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("could not read {label}"))?;
     if bytes.len() as u64 != metadata.len() {
@@ -909,6 +1202,7 @@ mod tests {
         handoff: PathBuf,
         approval: PathBuf,
         policy: PathBuf,
+        toolchain: PathBuf,
         output: PathBuf,
         private_key: Vec<u8>,
         trust: TestTrust,
@@ -969,6 +1263,9 @@ mod tests {
         let policy_path = owner.join("policy.json");
         let policy_bytes = serde_json::to_vec_pretty(&policy).unwrap();
         fs::write(&policy_path, &policy_bytes).unwrap();
+        let toolchain = owner.join("toolchain.json");
+        let toolchain_bytes = br#"{"schema_version":1,"target":"windows-x86_64"}"#;
+        fs::write(&toolchain, toolchain_bytes).unwrap();
 
         let app_build = format!("local-transcriber@9.8.7#{CANDIDATE_REVISION}");
         let worker_build = format!("scribe-inference-worker@9.8.7#{CANDIDATE_REVISION}");
@@ -997,7 +1294,7 @@ mod tests {
             run_id: "12345".to_owned(),
             run_attempt: "1".to_owned(),
             pack_version: "candidate-1".to_owned(),
-            toolchain_manifest_sha256: "c".repeat(64),
+            toolchain_manifest_sha256: sha256_hex(toolchain_bytes),
             packs,
             release_set_digest: String::new(),
         };
@@ -1036,6 +1333,7 @@ mod tests {
             handoff,
             approval,
             policy: policy_path,
+            toolchain,
             private_key,
             trust,
         }
@@ -1107,6 +1405,112 @@ mod tests {
         hasher.update(RELEASE_SET_DOMAIN);
         hasher.update(serde_json::to_vec(&material).unwrap());
         encode_hex(&hasher.finalize())
+    }
+
+    fn sign_fixture(fixture: &Fixture) -> WindowsPackSigningReceipt {
+        let mut key = Cursor::new(&fixture.private_key);
+        sign_with_trust(
+            &fixture.handoff,
+            &fixture.approval,
+            &fixture.policy,
+            &fixture.output,
+            &mut key,
+            &fixture.trust,
+        )
+        .unwrap()
+    }
+
+    fn verify_fixture_with_trust(
+        fixture: &Fixture,
+        trust: &dyn TrustRoot,
+    ) -> Result<WindowsPackSigningReceipt> {
+        let app_build = format!("local-transcriber@9.8.7#{CANDIDATE_REVISION}");
+        let worker_build = format!("scribe-inference-worker@9.8.7#{CANDIDATE_REVISION}");
+        verify_signed_windows_set_with_trust(
+            &fixture.output,
+            &fixture.policy,
+            &fixture.toolchain,
+            trust,
+            ReleaseIdentity {
+                app_version: "9.8.7",
+                source_revision: CANDIDATE_REVISION,
+                app_build: &app_build,
+                worker_build: &worker_build,
+                protocol_version: 5,
+                worker_abi_version: 1,
+            },
+        )
+    }
+
+    fn verify_fixture(fixture: &Fixture) -> Result<WindowsPackSigningReceipt> {
+        verify_fixture_with_trust(fixture, &fixture.trust)
+    }
+
+    fn read_receipt(fixture: &Fixture) -> WindowsPackSigningReceipt {
+        serde_json::from_slice(&fs::read(fixture.output.join(RECEIPT_NAME)).unwrap()).unwrap()
+    }
+
+    fn write_receipt(fixture: &Fixture, receipt: &WindowsPackSigningReceipt) {
+        fs::write(
+            fixture.output.join(RECEIPT_NAME),
+            serde_json::to_vec(receipt).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn mutate_receipt(fixture: &Fixture, mutate: impl FnOnce(&mut WindowsPackSigningReceipt)) {
+        let mut receipt = read_receipt(fixture);
+        mutate(&mut receipt);
+        write_receipt(fixture, &receipt);
+    }
+
+    fn rewrite_manifest_and_signature(
+        fixture: &Fixture,
+        pack_root: &str,
+        key_id: &str,
+        private_key: &[u8],
+        mutate: impl FnOnce(&mut PackManifest),
+    ) {
+        let root = fixture.output.join(pack_root);
+        let mut manifest: PackManifest =
+            serde_json::from_slice(&fs::read(root.join(MANIFEST_NAME)).unwrap()).unwrap();
+        mutate(&mut manifest);
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(root.join(MANIFEST_NAME), &manifest_bytes).unwrap();
+        let key_pair = Ed25519KeyPair::from_pkcs8(private_key).unwrap();
+        let signature = SignedPackSignature {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            key_id: key_id.to_owned(),
+            signature_hex: encode_hex(key_pair.sign(&manifest_bytes).as_ref()),
+        };
+        fs::write(
+            root.join(SIGNATURE_NAME),
+            serde_json::to_vec(&signature).unwrap(),
+        )
+        .unwrap();
+    }
+
+    struct MultiTrust {
+        keys: Vec<(String, Vec<u8>)>,
+    }
+
+    impl TrustRoot for MultiTrust {
+        fn public_key(&self, key_id: &str) -> Option<&[u8]> {
+            self.keys
+                .iter()
+                .find(|(candidate, _)| candidate == key_id)
+                .map(|(_, key)| key.as_slice())
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_symlink_directory(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_directory(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
     }
 
     #[test]
@@ -1308,5 +1712,358 @@ mod tests {
         .to_string();
         assert!(!error.contains(std::str::from_utf8(sentinel).unwrap()));
         assert!(!fixture.output.exists());
+    }
+
+    #[test]
+    fn signed_pair_verifies_as_one_release_bound_set() {
+        let fixture = fixture("verify-valid-pair");
+        let signed = sign_fixture(&fixture);
+        let verified = verify_fixture(&fixture).unwrap();
+        assert_eq!(verified, signed);
+        assert_eq!(verified.packs.len(), 2);
+        assert_eq!(verified.packs[0].backend, "cuda");
+        assert_eq!(verified.packs[1].backend, "vulkan");
+        assert_ne!(verified.signer_source_revision, verified.source_revision);
+    }
+
+    #[test]
+    fn production_wrapper_never_accepts_test_trust() {
+        let fixture = fixture("verify-production-trust");
+        sign_fixture(&fixture);
+        let error = verify_signed_windows_set(&fixture.output, &fixture.policy, &fixture.toolchain)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("separately reviewed production trust entry"));
+    }
+
+    #[test]
+    fn verifier_binds_source_build_protocol_and_abi_to_release_identity() {
+        let source = fixture("verify-wrong-source");
+        sign_fixture(&source);
+        mutate_receipt(&source, |receipt| {
+            receipt.source_revision = "f".repeat(40);
+        });
+        assert!(
+            verify_fixture(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("compiled release identity")
+        );
+
+        let app_build = fixture("verify-wrong-app-build");
+        sign_fixture(&app_build);
+        rewrite_manifest_and_signature(
+            &app_build,
+            "cuda",
+            KEY_ID,
+            &app_build.private_key,
+            |manifest| manifest.app_build = format!("local-transcriber@9.8.7#{}", "f".repeat(40)),
+        );
+        assert!(verify_fixture(&app_build).is_err());
+
+        let worker_build = fixture("verify-wrong-worker-build");
+        sign_fixture(&worker_build);
+        rewrite_manifest_and_signature(
+            &worker_build,
+            "cuda",
+            KEY_ID,
+            &worker_build.private_key,
+            |manifest| {
+                manifest.worker_build = format!("scribe-inference-worker@9.8.7#{}", "f".repeat(40));
+            },
+        );
+        assert!(verify_fixture(&worker_build).is_err());
+
+        let protocol = fixture("verify-wrong-protocol");
+        sign_fixture(&protocol);
+        rewrite_manifest_and_signature(
+            &protocol,
+            "cuda",
+            KEY_ID,
+            &protocol.private_key,
+            |manifest| manifest.worker_protocol_version += 1,
+        );
+        assert!(verify_fixture(&protocol).is_err());
+
+        let abi = fixture("verify-wrong-abi");
+        sign_fixture(&abi);
+        rewrite_manifest_and_signature(&abi, "cuda", KEY_ID, &abi.private_key, |manifest| {
+            manifest.runtime_abi_version += 1;
+        });
+        assert!(verify_fixture(&abi).is_err());
+
+        let worker_path = fixture("verify-wrong-worker-path");
+        sign_fixture(&worker_path);
+        fs::rename(
+            worker_path
+                .output
+                .join("cuda/bin/scribe-inference-worker.exe"),
+            worker_path.output.join("cuda/bin/alternate-worker.exe"),
+        )
+        .unwrap();
+        rewrite_manifest_and_signature(
+            &worker_path,
+            "cuda",
+            KEY_ID,
+            &worker_path.private_key,
+            |manifest| {
+                manifest.worker_path = "bin/alternate-worker.exe".to_owned();
+                manifest.payload[0].path = manifest.worker_path.clone();
+                manifest.pack_digest = compute_pack_digest(manifest).unwrap();
+            },
+        );
+        assert!(
+            verify_fixture(&worker_path)
+                .unwrap_err()
+                .to_string()
+                .contains("facts do not match")
+        );
+    }
+
+    #[test]
+    fn verifier_requires_exact_toolchain_policy_epoch_and_policy_key() {
+        let toolchain = fixture("verify-wrong-toolchain");
+        sign_fixture(&toolchain);
+        fs::write(&toolchain.toolchain, br#"{"schema_version":2}"#).unwrap();
+        assert!(
+            verify_fixture(&toolchain)
+                .unwrap_err()
+                .to_string()
+                .contains("exact checked-out toolchain")
+        );
+
+        let policy = fixture("verify-wrong-policy");
+        sign_fixture(&policy);
+        let mut policy_bytes = fs::read(&policy.policy).unwrap();
+        policy_bytes.push(b'\n');
+        fs::write(&policy.policy, policy_bytes).unwrap();
+        assert!(
+            verify_fixture(&policy)
+                .unwrap_err()
+                .to_string()
+                .contains("authoritative signing policy")
+        );
+
+        let epoch = fixture("verify-wrong-epoch");
+        sign_fixture(&epoch);
+        mutate_receipt(&epoch, |receipt| receipt.packs[0].security_epoch += 1);
+        assert!(
+            verify_fixture(&epoch)
+                .unwrap_err()
+                .to_string()
+                .contains("approval pack identity")
+        );
+
+        let key = fixture("verify-wrong-policy-key");
+        sign_fixture(&key);
+        let alternate_key_id = "scribe-test-production-alternate-v1";
+        let alternate_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let alternate_pair = Ed25519KeyPair::from_pkcs8(alternate_document.as_ref()).unwrap();
+        rewrite_manifest_and_signature(
+            &key,
+            "cuda",
+            alternate_key_id,
+            alternate_document.as_ref(),
+            |_| {},
+        );
+        let trust = MultiTrust {
+            keys: vec![
+                (KEY_ID.to_owned(), key.trust.public_key.clone()),
+                (
+                    alternate_key_id.to_owned(),
+                    alternate_pair.public_key().as_ref().to_vec(),
+                ),
+            ],
+        };
+        assert!(
+            verify_fixture_with_trust(&key, &trust)
+                .unwrap_err()
+                .to_string()
+                .contains("exact policy key")
+        );
+    }
+
+    #[test]
+    fn receipt_json_is_bounded_canonical_and_strict() {
+        let malformed = fixture("verify-malformed-receipt");
+        sign_fixture(&malformed);
+        fs::write(malformed.output.join(RECEIPT_NAME), b"{").unwrap();
+        assert!(
+            verify_fixture(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("receipt JSON is invalid")
+        );
+
+        let noncanonical = fixture("verify-noncanonical-receipt");
+        sign_fixture(&noncanonical);
+        let mut bytes = fs::read(noncanonical.output.join(RECEIPT_NAME)).unwrap();
+        bytes.push(b'\n');
+        fs::write(noncanonical.output.join(RECEIPT_NAME), bytes).unwrap();
+        assert!(
+            verify_fixture(&noncanonical)
+                .unwrap_err()
+                .to_string()
+                .contains("not canonical JSON")
+        );
+
+        let duplicate = fixture("verify-duplicate-receipt-field");
+        sign_fixture(&duplicate);
+        let original =
+            String::from_utf8(fs::read(duplicate.output.join(RECEIPT_NAME)).unwrap()).unwrap();
+        let duplicated = format!("{{\"schema_version\":1,{}", &original[1..]);
+        fs::write(duplicate.output.join(RECEIPT_NAME), duplicated).unwrap();
+        assert!(verify_fixture(&duplicate).is_err());
+
+        let unknown = fixture("verify-unknown-receipt-field");
+        sign_fixture(&unknown);
+        let mut original =
+            String::from_utf8(fs::read(unknown.output.join(RECEIPT_NAME)).unwrap()).unwrap();
+        assert_eq!(original.pop(), Some('}'));
+        original.push_str(",\"unexpected\":true}");
+        fs::write(unknown.output.join(RECEIPT_NAME), original).unwrap();
+        assert!(verify_fixture(&unknown).is_err());
+    }
+
+    #[test]
+    fn forged_receipt_counts_and_digests_are_rejected() {
+        let counts = fixture("verify-forged-counts");
+        sign_fixture(&counts);
+        mutate_receipt(&counts, |receipt| {
+            receipt.packs[0].payload_files += 1;
+            receipt.packs[0].installed_payload_bytes += 1;
+        });
+        assert!(
+            verify_fixture(&counts)
+                .unwrap_err()
+                .to_string()
+                .contains("facts do not match")
+        );
+
+        let pack_digest = fixture("verify-forged-pack-digest");
+        sign_fixture(&pack_digest);
+        mutate_receipt(&pack_digest, |receipt| {
+            receipt.packs[0].pack_digest = "f".repeat(64);
+        });
+        assert!(verify_fixture(&pack_digest).is_err());
+
+        let release_digest = fixture("verify-forged-release-digest");
+        sign_fixture(&release_digest);
+        mutate_receipt(&release_digest, |receipt| {
+            receipt.release_set_digest = "f".repeat(64);
+            let approval = approval_from_receipt(receipt);
+            receipt.handoff_sha256 =
+                sha256_hex(&serde_json::to_vec(&handoff_from_approval(&approval)).unwrap());
+        });
+        assert!(
+            verify_fixture(&release_digest)
+                .unwrap_err()
+                .to_string()
+                .contains("release-set digest")
+        );
+
+        let handoff_digest = fixture("verify-forged-handoff-digest");
+        sign_fixture(&handoff_digest);
+        mutate_receipt(&handoff_digest, |receipt| {
+            receipt.handoff_sha256 = "f".repeat(64);
+        });
+        assert!(
+            verify_fixture(&handoff_digest)
+                .unwrap_err()
+                .to_string()
+                .contains("approved digest")
+        );
+    }
+
+    #[test]
+    fn verifier_requires_exact_pair_shape_and_top_level_inventory() {
+        let missing = fixture("verify-missing-backend");
+        sign_fixture(&missing);
+        mutate_receipt(&missing, |receipt| {
+            receipt.packs.pop();
+        });
+        assert!(verify_fixture(&missing).is_err());
+
+        let duplicate = fixture("verify-duplicate-backend");
+        sign_fixture(&duplicate);
+        mutate_receipt(&duplicate, |receipt| {
+            receipt.packs.push(receipt.packs[0].clone());
+        });
+        assert!(verify_fixture(&duplicate).is_err());
+
+        let swapped = fixture("verify-swapped-backends");
+        sign_fixture(&swapped);
+        mutate_receipt(&swapped, |receipt| receipt.packs.swap(0, 1));
+        assert!(verify_fixture(&swapped).is_err());
+
+        let extra = fixture("verify-extra-root-entry");
+        sign_fixture(&extra);
+        fs::write(extra.output.join("unexpected.txt"), b"unexpected").unwrap();
+        assert!(
+            verify_fixture(&extra)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected entry")
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_tampering_hardlinks_links_and_traversal() {
+        let tampered = fixture("verify-payload-tampering");
+        sign_fixture(&tampered);
+        fs::write(
+            tampered.output.join("cuda/bin/scribe-inference-worker.exe"),
+            b"tampered worker",
+        )
+        .unwrap();
+        assert!(verify_fixture(&tampered).is_err());
+
+        let hardlinked = fixture("verify-hardlinked-payload");
+        sign_fixture(&hardlinked);
+        let worker = hardlinked
+            .output
+            .join("cuda/bin/scribe-inference-worker.exe");
+        let outside = hardlinked.owner.join("hardlink-source.exe");
+        let worker_bytes = fs::read(&worker).unwrap();
+        fs::write(&outside, worker_bytes).unwrap();
+        fs::remove_file(&worker).unwrap();
+        fs::hard_link(&outside, &worker).unwrap();
+        assert!(verify_fixture(&hardlinked).is_err());
+
+        let traversal = fixture("verify-traversal-root");
+        sign_fixture(&traversal);
+        mutate_receipt(&traversal, |receipt| {
+            receipt.packs[0].pack_root = "../cuda".to_owned();
+        });
+        assert!(verify_fixture(&traversal).is_err());
+
+        let linked = fixture("verify-linked-backend");
+        sign_fixture(&linked);
+        fs::remove_dir_all(linked.output.join("vulkan")).unwrap();
+        if try_symlink_directory(&linked.output.join("cuda"), &linked.output.join("vulkan")).is_ok()
+        {
+            assert!(
+                verify_fixture(&linked)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("link or reparse point")
+            );
+        }
+    }
+
+    #[test]
+    fn partner_pack_failure_returns_no_validated_receipt() {
+        let fixture = fixture("verify-partner-failure");
+        let expected = sign_fixture(&fixture);
+        fs::write(
+            fixture
+                .output
+                .join("vulkan/bin/scribe-inference-worker.exe"),
+            b"partner failed",
+        )
+        .unwrap();
+        assert_eq!(read_receipt(&fixture), expected);
+        let error = verify_fixture(&fixture).unwrap_err().to_string();
+        assert!(error.contains("vulkan signed pack failed full verification"));
     }
 }
