@@ -7,6 +7,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+& (Join-Path $PSScriptRoot 'test-windows-msvc-payload-profiles.ps1')
+
 function Invoke-NativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
