@@ -105,6 +105,12 @@ download NVIDIA archives, execute CUDA, depend on a local SDK, or require keys.
 The production empty-inventory rejection remains covered with an explicitly
 empty test contract, even though the real manifest is now populated.
 
+The checked-in Windows qualification plan binds the complete toolchain file by
+SHA-256. After changing the inventory, update that plan's toolchain binding and
+run `scripts/test-windows-gpu-qualification.ps1` as well. Rebinding the plan is
+not approval: the protected authority must remain empty and Auto default-denied
+until separately qualified and authorized.
+
 The fast synthetic check is
 `pwsh -NoProfile -File scripts/test-windows-cuda-pack-inputs.ps1`. The existing
 `scripts/test-windows-gpu-worker-pack-tools.ps1` suite invokes it and additionally
