@@ -3010,6 +3010,33 @@ fn verify_worker_executable(
     })
 }
 
+// Parent-only diagnostic: retains the same verified image handle, but exposes
+// no launcher and never executes the file. Absent from production builds.
+#[cfg(test)]
+pub(crate) struct ProfiledWorkerVerification {
+    pub(crate) elapsed: Duration,
+    _verified: VerifiedWorkerExecutable,
+}
+
+#[cfg(test)]
+pub(crate) fn profile_worker_executable(
+    candidate: &Path,
+    expected_sha256: &str,
+) -> Result<ProfiledWorkerVerification> {
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("profiling requires an explicit worker SHA-256");
+    }
+    let root = candidate.parent().context("worker parent is missing")?;
+    let name = candidate.file_name().context("worker name is missing")?;
+    let started = Instant::now();
+    let verified = verify_worker_executable(candidate, root, name, expected_sha256)?;
+    Ok(ProfiledWorkerVerification {
+        elapsed: started.elapsed(),
+        _verified: verified,
+    })
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 struct WindowsVulkanProcessPathIncompatible;
@@ -10368,6 +10395,73 @@ mod tests {
     use std::sync::mpsc::{Receiver as TestReceiver, Sender as TestSender, channel};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn profile_worker_executable_requires_exact_digest_and_discards_payload_samples() {
+        let root =
+            crate::gpu_worker_pack::manifest::test_support::temp_root("profile-worker-executable");
+        let (verifier, lease) =
+            crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let expected_sha256 = crate::gpu_worker_pack::manifest::test_support::base_manifest()
+            .payload[0]
+            .sha256
+            .clone();
+
+        let ((launchable_elapsed, executable_elapsed, verified), observations) =
+            crate::gpu_worker_pack::manifest::verification_profile::capture_for_test(
+                || -> anyhow::Result<_> {
+                    let started = Instant::now();
+                    let launchable = verifier.launchable_worker(&lease)?;
+                    let launchable_elapsed = started.elapsed();
+                    let verified = profile_worker_executable(launchable.path(), &expected_sha256)?;
+                    Ok((launchable_elapsed, verified.elapsed, verified))
+                },
+            )
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].read_hash_ns <= launchable_elapsed.as_nanos());
+        // Read the separate executable interval without setting a noisy threshold.
+        let _ = executable_elapsed;
+        assert!(
+            crate::gpu_worker_pack::manifest::verification_profile::collector_is_clear_for_test()
+        );
+        drop(verified);
+
+        let failure = crate::gpu_worker_pack::manifest::verification_profile::capture_for_test(
+            || -> anyhow::Result<_> {
+                let launchable = verifier.launchable_worker(&lease)?;
+                profile_worker_executable(launchable.path(), &"0".repeat(64))
+            },
+        );
+        assert!(failure.is_err());
+        assert!(
+            crate::gpu_worker_pack::manifest::verification_profile::collector_is_clear_for_test()
+        );
+        assert!(profile_worker_executable(&lease.worker_path(), "").is_err());
+        drop(failure);
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "local retained fixture only; parent verification, not GPU qualification"]
+    fn windows_cuda_retained_fixture_parent_verification_profile() {
+        let report = crate::gpu_worker_pack::manifest::verification_profile::
+            windows_cuda_retained_fixture_parent_verification_profile(
+                env!("SCRIBE_BUILD_REVISION"),
+                cfg!(debug_assertions),
+                |candidate, expected_sha256| {
+                    let verified = profile_worker_executable(candidate, expected_sha256)?;
+                    Ok((verified.elapsed, verified))
+                },
+            )
+            .unwrap();
+        println!(
+            "SCRIBE_PARENT_VERIFICATION_PROFILE={}",
+            serde_json::to_string(&report).unwrap()
+        );
+    }
 
     enum PipeChunk {
         Bytes(Vec<u8>),

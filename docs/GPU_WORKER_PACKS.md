@@ -728,6 +728,70 @@ power-transition, reliability, production trust, or Auto qualification is
 established. Disposable compiler files and scratch directories were removed;
 original reports, logs, and matching build artifacts remain retained.
 
+### Parent-only retained-pack verification diagnostic
+
+The ignored application test
+`onnx_worker::tests::windows_cuda_retained_fixture_parent_verification_profile`
+isolates verification of the retained `fixture-26df7731cd9c-4edf826e5bf3` pack.
+Set `SCRIBE_PROFILE_RETAINED_CUDA_PACK` to its source directory. The test pins
+the independently recorded manifest/signature hashes, artifact build identities,
+pack identity, and worker digest. It copies the verified inventory into fresh
+scratch storage and re-verifies it before measurement. The original artifacts
+are not modified. A newer CPU-only evaluator is allowed here because **no worker
+is executed**; its real compiled revision is reported separately from the
+artifact revision. Never override its build revision to impersonate the artifact.
+
+Use a clean evaluator revision, the pinned native toolchain, and a separate
+release build cache; do not overwrite the original evidence harness. Run:
+
+```powershell
+cargo test --release --locked --offline --bin local-transcriber --features inference-worker onnx_worker::tests::windows_cuda_retained_fixture_parent_verification_profile -- --ignored --exact --nocapture --test-threads=1
+```
+
+Require exactly one passed test. Only after all five samples and scratch cleanup
+succeed does `SCRIBE_PARENT_VERIFICATION_PROFILE` print a metadata-only JSON
+record. Any verification error or panic discards the collected timings. The
+collector is thread-local, rejects nesting, and is absent from production builds.
+The diagnostic reports full `launchable_worker` time, each payload's bounded
+read/hash time **nested within that interval**, and separate initial executable
+verification time while retaining the verified image handle. Do not add nested
+intervals together. These are logical verified-byte counts, not physical disk
+read measurements. Preparation warms filesystem caches; there is no cache purge,
+inference, GPU initialization, device validation, or Auto qualification here.
+The existing v2 transcription evidence schema and all production checks remain
+unchanged. Retain the exact evaluator revision, binary digest, command/output,
+and input identities alongside any measurements.
+
+The 2026-09-23 parent-only run from clean evaluator
+`4946f9543be488c143ba0c84a6d876a7171ed0ad` passed exactly one test (1,578
+filtered) in 6.65 seconds. Its independent transcript SHA-256 is
+`4e22aff0e493b629692697d3e24eb6ca46306f9353e67959ae7678bcfe0bc7ff`;
+the evaluator binary SHA-256 is
+`b390796771cd5a0977154841b4659d7273973c1331daa08f79d2dde487b1d61a`.
+That historical capture used the former shared-test path before this boundary
+refactor; the application-test command above is for future captures and does
+not recapture or reinterpret the 4946 evidence.
+The source fixture remained the digest-bound 26df pack above, not a rebuilt
+CUDA pack. The release evaluator's normal CPU-worker trust anchor came from a
+matching CPU build; neither worker was executed by this diagnostic.
+
+| Five cache-warmed samples, milliseconds | p50 | p95 |
+| --- | ---: | ---: |
+| Full signed-pack launch recheck | 772.28 | 799.18 |
+| Sum of nested payload read/hash intervals per sample | 768.61 | 794.86 |
+| Nested cuBLAS payload, 113,716,224 bytes | 87.53 | 91.10 |
+| Nested cuBLASLt payload, 674,667,520 bytes | 518.72 | 544.45 |
+| Nested worker payload, 214,058,496 bytes | 161.27 | 168.50 |
+| Separate initial executable verification | 162.09 | 171.64 |
+
+Independent transcript-hash, inventory/ordinal, bounded-integer and per-sample
+interval checks passed. Read/hash intervals accounted for 99.45–99.53% of the
+full recheck; the residual was 3.67–4.37 ms. This locates the dominant work but
+does **not** isolate pure CPU hashing from file I/O or establish actual SHA
+instruction dispatch. No inference speedup, comparison across capture conditions,
+or permission to omit a security check follows from these numbers. The temporary
+1,002,442,240-byte payload copy was removed before the result was published.
+
 ### Backend-specific fixture smoke tests
 
 The CPU-only test harness provides separate ignored CUDA and Vulkan smoke tests.

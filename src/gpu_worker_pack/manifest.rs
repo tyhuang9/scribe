@@ -30,6 +30,10 @@ pub(crate) const MAX_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PACK_DIGEST_DOMAIN: &[u8] = b"scribe-gpu-worker-pack-digest-v1\0";
 
 #[cfg(test)]
+#[path = "verification_profile.rs"]
+pub(crate) mod verification_profile;
+
+#[cfg(test)]
 type PackReadHook = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
@@ -1125,11 +1129,15 @@ fn verify_payload(
         reject_hardlink(&file, &metadata, &path)?;
         #[cfg(test)]
         run_pack_read_hook(&path);
+        #[cfg(test)]
+        let profile_start = verification_profile::payload_start();
         if hash_exact_length(&mut file, entry.size_bytes, &entry.path)? != entry.sha256 {
             return Err(PackVerificationError::PayloadDigestMismatch(
                 entry.path.clone(),
             ));
         }
+        #[cfg(test)]
+        verification_profile::payload_verified(entry, profile_start);
         retained.push(file);
     }
     Ok(retained)
@@ -1663,6 +1671,13 @@ pub(crate) mod test_support {
 
     pub(crate) struct FixtureTrustRoot {
         public_key: Vec<u8>,
+    }
+
+    pub(super) fn fixture_trust_root() -> FixtureTrustRoot {
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
+        FixtureTrustRoot {
+            public_key: key_pair.public_key().as_ref().to_vec(),
+        }
     }
 
     impl TrustRoot for FixtureTrustRoot {
