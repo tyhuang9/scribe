@@ -151,6 +151,7 @@ Assert-Rejected 'negative builder epoch' { & $probe -SecurityEpoch -1 }
 
 # Parse every multiline PowerShell run block as code, not only source substrings.
 # GitHub still provides the authoritative workflow YAML/schema validation in CI.
+$contractBlocks = [Collections.Generic.List[scriptblock]]::new()
 foreach ($workflowName in @('windows-gpu-pack-promotion.yml', 'windows-gpu-signer-tool.yml')) {
     $workflowPath = Join-Path (Split-Path -Parent $PSScriptRoot) ".github/workflows/$workflowName"
     $lines = [IO.File]::ReadAllLines($workflowPath)
@@ -166,10 +167,82 @@ foreach ($workflowName in @('windows-gpu-pack-promotion.yml', 'windows-gpu-signe
         $workflowTokens = $null; $workflowErrors = $null
         $null = [Management.Automation.Language.Parser]::ParseInput(($block -join "`n"), [ref]$workflowTokens, [ref]$workflowErrors)
         Assert-Test ($workflowErrors.Count -eq 0) "$workflowName contains an invalid PowerShell run block near line $($index + 1)."
+        if ($workflowName -ceq 'windows-gpu-pack-promotion.yml' -and
+            ($block -join "`n").Contains('cargo test --locked --offline --manifest-path tools/worker-pack-author/Cargo.toml')) {
+            $contractBlocks.Add([scriptblock]::Create($block -join "`n"))
+        }
         $blockCount++
     }
     $minimumBlocks = if ($workflowName -ceq 'windows-gpu-pack-promotion.yml') { 8 } else { 2 }
     Assert-Test ($blockCount -ge $minimumBlocks) "Expected $workflowName run blocks were not discovered."
+}
+
+# Execute the actual contract step with process seams replaced. In particular,
+# the fixture script's child-process environment cannot configure later cargo calls.
+Assert-Test ($contractBlocks.Count -eq 1) 'Expected exactly one author-tool contract test step.'
+function Invoke-ContractRevisionProbe(
+    [string]$GitRevision,
+    [string]$WorkflowRevision,
+    [int]$GitExitCode = 0
+) {
+    $previousBuildRevision = $env:SCRIBE_BUILD_REVISION
+    $previousWorkflowRevision = $env:GITHUB_SHA
+    $exitCodeVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $previousExitCode = if ($null -ne $exitCodeVariable) { $exitCodeVariable.Value } else { $null }
+    $calls = [Collections.Generic.List[object]]::new()
+    function git {
+        if (($args -join ' ') -cne 'rev-parse --verify HEAD') { throw 'Unexpected fixture git command.' }
+        $global:LASTEXITCODE = $GitExitCode
+        return $GitRevision
+    }
+    function pwsh {
+        $calls.Add([pscustomobject]@{ Tool = 'pwsh'; Arguments = ($args -join ' '); Revision = $env:SCRIBE_BUILD_REVISION })
+        $global:LASTEXITCODE = 0
+    }
+    function cargo {
+        $calls.Add([pscustomobject]@{ Tool = 'cargo'; Arguments = ($args -join ' '); Revision = $env:SCRIBE_BUILD_REVISION })
+        $global:LASTEXITCODE = 0
+    }
+    try {
+        $env:SCRIBE_BUILD_REVISION = 'stale-inherited-build-revision'
+        $env:GITHUB_SHA = $WorkflowRevision
+        $succeeded = $false
+        try { & $contractBlocks[0]; $succeeded = $true } catch { }
+        return [pscustomobject]@{ Succeeded = $succeeded; Calls = $calls.ToArray(); Revision = $env:SCRIBE_BUILD_REVISION }
+    } finally {
+        $env:SCRIBE_BUILD_REVISION = $previousBuildRevision
+        $env:GITHUB_SHA = $previousWorkflowRevision
+        if ($null -eq $exitCodeVariable) {
+            Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+        } else {
+            $global:LASTEXITCODE = $previousExitCode
+        }
+    }
+}
+
+$bound = Invoke-ContractRevisionProbe $revision $revision
+Assert-Test $bound.Succeeded 'Matching workflow checkout must run contract tests.'
+Assert-Test ($bound.Calls.Count -eq 4) 'Expected both fixture scripts and both Rust test suites.'
+Assert-Test ($bound.Revision -ceq $revision) 'Contract did not replace the inherited build identity.'
+Assert-Test (@($bound.Calls | Where-Object Revision -CNE $revision).Count -eq 0) 'A contract child ran without the exact checkout identity.'
+$authorCalls = @($bound.Calls | Where-Object { $_.Tool -ceq 'cargo' -and $_.Arguments.Contains('tools/worker-pack-author/Cargo.toml') })
+# PowerShell consumes the standalone -- when calling a function seam, unlike a
+# native process. Check both the received arguments and the original separator.
+Assert-Test ($authorCalls.Count -eq 1 -and $authorCalls[0].Arguments -ceq 'test --locked --offline --manifest-path tools/worker-pack-author/Cargo.toml --test-threads=1' -and
+    $contractBlocks[0].ToString().Contains('cargo test --locked --offline --manifest-path tools/worker-pack-author/Cargo.toml -- --test-threads=1')) 'Author-tool tests must use locked offline dependencies and serial Windows store fixtures.'
+foreach ($case in @(
+    @{ Git = $revision; Workflow = ''; Exit = 0 },
+    @{ Git = $revision; Workflow = $headRevision; Exit = 0 },
+    @{ Git = ('A' * 40); Workflow = ('A' * 40); Exit = 0 },
+    @{ Git = ('a' * 39); Workflow = ('a' * 39); Exit = 0 },
+    @{ Git = ('g' * 40); Workflow = ('g' * 40); Exit = 0 },
+    @{ Git = ''; Workflow = $revision; Exit = 128 },
+    @{ Git = $revision; Workflow = $revision; Exit = 128 }
+)) {
+    $rejected = Invoke-ContractRevisionProbe $case.Git $case.Workflow $case.Exit
+    Assert-Test (-not $rejected.Succeeded) 'Invalid workflow checkout identity was accepted.'
+    Assert-Test ($rejected.Calls.Count -eq 0) 'Invalid checkout started a fixture or compiler process.'
+    Assert-Test ($rejected.Revision -ceq 'stale-inherited-build-revision') 'Rejected checkout changed the build identity.'
 }
 
 Assert-Test ($script:SigningTestCount -ge 50) 'Expected approved-signing cases were not discovered.'
