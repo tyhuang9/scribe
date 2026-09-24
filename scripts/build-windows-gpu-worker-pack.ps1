@@ -1016,9 +1016,13 @@ function Resolve-VulkanSdk($Contract) {
 }
 
 function Resolve-CudaSdk($Contract, [string]$BuildSigningMode) {
+    $noticePaths = @(Get-ScribeCudaPackNoticeContract | ForEach-Object {
+        $_.SourceRelativePath
+    })
     $requiredAuthenticatedPaths = @(
         @($Contract.cuda.required_files) +
-        @($Contract.cuda.packaged_runtime_imports | ForEach-Object { "bin/$_" })
+        @($Contract.cuda.packaged_runtime_imports | ForEach-Object { "bin/$_" }) +
+        $noticePaths
     )
     if ($BuildSigningMode -cne 'Fixture') {
         $null = ConvertTo-AuthenticatedCudaInventory `
@@ -1061,7 +1065,8 @@ function Copy-ReviewedGpuWorkerDependencyClosure(
     [string]$PackBin,
     [string[]]$SystemDriverImports,
     [string[]]$PackagedRuntimeImports,
-    [Collections.IDictionary]$PinnedRuntimeSources = @{}
+    [Collections.IDictionary]$PinnedRuntimeSources = @{},
+    [bool]$RequirePinnedRuntimeSources = $false
 ) {
     $system = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $systemDrivers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1080,6 +1085,16 @@ function Copy-ReviewedGpuWorkerDependencyClosure(
             $system.Contains([string]$name) -or
             -not $packaged.Add([string]$name)) {
             throw "Packaged dependency allowlist contains an unsafe or duplicate DLL name: $name"
+        }
+    }
+    if ($RequirePinnedRuntimeSources) {
+        if ($PinnedRuntimeSources.Count -ne $packaged.Count) {
+            throw 'Authenticated provider runtime source set does not match the packaged dependency allowlist.'
+        }
+        foreach ($name in $PackagedRuntimeImports) {
+            if (-not $PinnedRuntimeSources.Contains($name)) {
+                throw "Authenticated provider runtime source is missing: $name"
+            }
         }
     }
 
@@ -1279,6 +1294,12 @@ if ($Backend -eq 'Vulkan') {
         Path = $builtVulkanLoader.DllPath; Sha256 = $vulkanPolicy.artifact.sha256
     }
 }
+elseif ($SigningMode -cne 'Fixture') {
+    $pinnedRuntimeSources = Get-AuthenticatedCudaRuntimeSources `
+        $sdkRoot `
+        @($contract.cuda.production_inventory) `
+        @($contract.cuda.packaged_runtime_imports)
+}
 
 try {
     $previousPinnedMsvcEnvironment = Set-PinnedMsvcBuildEnvironment $msvcToolchain
@@ -1368,6 +1389,16 @@ try {
     $worker = Join-Path $cargoTarget 'release\scribe-inference-worker.exe'
     $null = Assert-RegularNonReparseFile $worker "$Backend inference worker"
 
+    # Resolve and authenticate every CUDA notice before creating any notice
+    # destination. The subsequent copy reauthenticates each source while its
+    # handle is retained, so mutable SDK inputs cannot be silently substituted.
+    $cudaPackNoticeSources = if ($Backend -eq 'Cuda') {
+        @(Get-AuthenticatedCudaPackNoticeSources `
+            $sdkRoot `
+            @($contract.cuda.production_inventory))
+    }
+    else { @() }
+
     New-Item -ItemType Directory -Path (Join-Path $stagingRoot 'bin') | Out-Null
     $stagingCreated = $true
     $stagedWorker = Join-Path $stagingRoot 'bin\scribe-inference-worker.exe'
@@ -1379,9 +1410,13 @@ try {
         (Join-Path $stagingRoot 'bin') `
         @($providerContract.system_driver_imports) `
         @($providerContract.packaged_runtime_imports) `
-        $pinnedRuntimeSources
+        $pinnedRuntimeSources `
+        ($Backend -eq 'Vulkan' -or $SigningMode -cne 'Fixture')
     if ($Backend -eq 'Vulkan') {
         Copy-ScribeVulkanPolicyLicenses $builtVulkanLoader $stagingRoot
+    }
+    else {
+        Copy-AuthenticatedCudaPackNotices $cudaPackNoticeSources $stagingRoot
     }
 
     $packId = "scribe-$backendName-windows-x64"

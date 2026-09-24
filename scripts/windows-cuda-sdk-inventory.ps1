@@ -116,3 +116,327 @@ function Assert-AuthenticatedCudaSdkInventory(
         throw "Production CUDA Toolkit omitted authenticated inventory entries: $($missing -join ', ')"
     }
 }
+
+function Assert-CudaInventoryNoReparseAncestorsAllowMissing([string]$Path) {
+    $current = [System.IO.Path]::GetFullPath($Path)
+    while (-not (Test-Path -LiteralPath $current)) {
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) {
+            throw "Could not resolve an existing CUDA pack-input ancestor: $Path"
+        }
+        $current = $parent
+    }
+    Assert-CudaInventoryNoReparseAncestors $current
+}
+
+function Assert-CudaInventoryCanonicalPhysicalPath(
+    [string]$Root,
+    [string]$RelativePath
+) {
+    $current = [System.IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/'))
+    foreach ($segment in @($RelativePath -split '/')) {
+        $matches = @(Get-ChildItem -LiteralPath $current -Force | Where-Object {
+            [string]::Equals($_.Name, $segment, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($matches.Count -ne 1 -or $matches[0].Name -cne $segment) {
+            throw "Authenticated CUDA input has noncanonical physical case: $RelativePath"
+        }
+        $current = $matches[0].FullName
+    }
+}
+
+function Get-ScribeCudaPackNoticeContract {
+    $noticeDigest = 'e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07'
+    return @(
+        [pscustomobject]@{
+            SourceRelativePath = 'licenses/cuda_cudart/LICENSE'
+            DestinationRelativePath = 'licenses/cuda-cudart/LICENSE'
+            Sha256 = $noticeDigest
+            SizeBytes = [int64]63021
+        },
+        [pscustomobject]@{
+            SourceRelativePath = 'licenses/libcublas/LICENSE'
+            DestinationRelativePath = 'licenses/cuda-cublas/LICENSE'
+            Sha256 = $noticeDigest
+            SizeBytes = [int64]63021
+        }
+    )
+}
+
+function Get-AuthenticatedCudaSdkFile(
+    [string]$Root,
+    [object[]]$Inventory,
+    [string]$RequestedRelativePath,
+    [string]$ExpectedSha256 = '',
+    [int64]$ExpectedSizeBytes = -1
+) {
+    if ($RequestedRelativePath -cnotmatch '\A[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\z') {
+        throw "Authenticated CUDA input path is noncanonical: $RequestedRelativePath"
+    }
+    if ($ExpectedSha256 -and $ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Authenticated CUDA input expected digest is noncanonical.'
+    }
+    if ($ExpectedSizeBytes -lt -1) {
+        throw 'Authenticated CUDA input expected size is invalid.'
+    }
+
+    $null = ConvertTo-AuthenticatedCudaInventory $Inventory @($RequestedRelativePath)
+    $matchingRecords = @($Inventory | Where-Object {
+        [string]::Equals(
+            ([string]$_.path).Replace('\', '/'),
+            $RequestedRelativePath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    })
+    if ($matchingRecords.Count -ne 1) {
+        throw "Authenticated CUDA inventory did not resolve one exact input: $RequestedRelativePath"
+    }
+    $record = $matchingRecords[0]
+    $canonicalRelativePath = ([string]$record.path).Replace('\', '/')
+    $expectedDigest = [string]$record.sha256
+    if ($ExpectedSha256 -and $expectedDigest -cne $ExpectedSha256) {
+        throw "Authenticated CUDA input pin mismatch: $canonicalRelativePath"
+    }
+
+    $canonicalRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/'))
+    if (-not (Test-Path -LiteralPath $canonicalRoot -PathType Container)) {
+        throw "Production CUDA Toolkit root is missing: $canonicalRoot"
+    }
+    Assert-CudaInventoryNoReparseAncestors $canonicalRoot
+    $sourcePath = Join-Path $canonicalRoot $canonicalRelativePath.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Authenticated CUDA input is missing: $canonicalRelativePath"
+    }
+    Assert-CudaInventoryNoReparseAncestors $sourcePath
+    Assert-CudaInventoryCanonicalPhysicalPath $canonicalRoot $canonicalRelativePath
+    $sourceItem = Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop
+    if ($sourceItem.PSIsContainer -or
+        ($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Authenticated CUDA input must be a regular non-reparse file: $canonicalRelativePath"
+    }
+    $observedRelativePath = [System.IO.Path]::GetRelativePath(
+        $canonicalRoot,
+        $sourceItem.FullName
+    ).Replace('\', '/')
+    if ($observedRelativePath -cne $canonicalRelativePath) {
+        throw "Authenticated CUDA input has noncanonical physical case: $canonicalRelativePath"
+    }
+    if ($ExpectedSizeBytes -ge 0 -and $sourceItem.Length -ne $ExpectedSizeBytes) {
+        throw "Authenticated CUDA input $canonicalRelativePath size mismatch: expected $ExpectedSizeBytes, got $($sourceItem.Length)"
+    }
+    $streams = @(Get-Item -LiteralPath $sourceItem.FullName -Stream * -ErrorAction Stop)
+    if ($streams.Count -ne 1 -or ([string]$streams[0].Stream) -cne ':$DATA') {
+        throw "Authenticated CUDA input contains an alternate data stream: $canonicalRelativePath"
+    }
+
+    $input = [System.IO.File]::Open(
+        $sourceItem.FullName,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $observedDigest = [System.Convert]::ToHexString(
+                $sha.ComputeHash($input)
+            ).ToLowerInvariant()
+        }
+        finally {
+            $sha.Dispose()
+        }
+    }
+    finally {
+        $input.Dispose()
+    }
+    if ($observedDigest -cne $expectedDigest) {
+        throw "Authenticated CUDA input $canonicalRelativePath SHA-256 mismatch: expected $expectedDigest, got $observedDigest"
+    }
+
+    return [pscustomobject]@{
+        SourcePath = $sourceItem.FullName
+        SourceRelativePath = $canonicalRelativePath
+        Sha256 = $expectedDigest
+    }
+}
+
+function Get-AuthenticatedCudaRuntimeSources(
+    [string]$Root,
+    [object[]]$Inventory,
+    [string[]]$RuntimeImports
+) {
+    $sources = @{}
+    foreach ($runtimeImport in @($RuntimeImports)) {
+        if ($runtimeImport -cnotmatch '^[a-z0-9._-]+\.dll$' -or
+            $sources.ContainsKey($runtimeImport)) {
+            throw "CUDA packaged-runtime import is unsafe or duplicated: $runtimeImport"
+        }
+        $source = Get-AuthenticatedCudaSdkFile `
+            $Root `
+            $Inventory `
+            "bin/$runtimeImport"
+        $sources[$runtimeImport] = [pscustomobject]@{
+            Path = $source.SourcePath
+            Sha256 = $source.Sha256
+        }
+    }
+    return $sources
+}
+
+function Get-AuthenticatedCudaPackNoticeSources(
+    [string]$Root,
+    [object[]]$Inventory
+) {
+    $contracts = @(Get-ScribeCudaPackNoticeContract)
+    $requiredPaths = @($contracts | ForEach-Object { $_.SourceRelativePath })
+    $null = ConvertTo-AuthenticatedCudaInventory $Inventory $requiredPaths
+    $sources = [System.Collections.Generic.List[object]]::new()
+    foreach ($contract in $contracts) {
+        $sourceDirectoryRelative = Split-Path -Parent $contract.SourceRelativePath
+        $sourceDirectoryPrefix = "$($sourceDirectoryRelative.Replace('\', '/'))/"
+        $groupInventory = @($Inventory | Where-Object {
+            ([string]$_.path).Replace('\', '/').StartsWith(
+                $sourceDirectoryPrefix,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        })
+        if ($groupInventory.Count -ne 1 -or
+            ([string]$groupInventory[0].path).Replace('\', '/') -cne $contract.SourceRelativePath) {
+            throw "Authenticated CUDA notice inventory has unexpected inputs beneath $sourceDirectoryRelative."
+        }
+
+        $source = Get-AuthenticatedCudaSdkFile `
+            $Root `
+            $Inventory `
+            $contract.SourceRelativePath `
+            $contract.Sha256 `
+            $contract.SizeBytes
+        $sourceDirectory = Split-Path -Parent $source.SourcePath
+        Assert-CudaInventoryNoReparseAncestors $sourceDirectory
+        $sourceDirectoryEntries = @(Get-ChildItem -LiteralPath $sourceDirectory -Force)
+        if ($sourceDirectoryEntries.Count -ne 1 -or
+            $sourceDirectoryEntries[0].PSIsContainer -or
+            ($sourceDirectoryEntries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $sourceDirectoryEntries[0].Name -cne 'LICENSE') {
+            throw "Authenticated CUDA notice directory has unexpected inputs: $sourceDirectoryRelative"
+        }
+        $sources.Add([pscustomobject]@{
+            SourcePath = $source.SourcePath
+            SourceRelativePath = $source.SourceRelativePath
+            DestinationRelativePath = $contract.DestinationRelativePath
+            Sha256 = $source.Sha256
+            SizeBytes = [int64]$contract.SizeBytes
+        })
+    }
+    return $sources.ToArray()
+}
+
+function Copy-AuthenticatedCudaPackFile(
+    [string]$Source,
+    [string]$Destination,
+    [string]$ExpectedSha256,
+    [int64]$ExpectedSizeBytes = -1
+) {
+    if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Authenticated CUDA pack-file digest is noncanonical.'
+    }
+    if ($ExpectedSizeBytes -lt -1) {
+        throw 'Authenticated CUDA pack-file size is invalid.'
+    }
+    Assert-CudaInventoryNoReparseAncestors $Source
+    $sourceItem = Get-Item -LiteralPath $Source -Force -ErrorAction Stop
+    if ($sourceItem.PSIsContainer -or
+        ($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Authenticated CUDA pack-file source must be a regular non-reparse file.'
+    }
+    if ($ExpectedSizeBytes -ge 0 -and $sourceItem.Length -ne $ExpectedSizeBytes) {
+        throw 'Authenticated CUDA pack-file source size mismatch.'
+    }
+    $sourceStreams = @(Get-Item -LiteralPath $sourceItem.FullName -Stream * -ErrorAction Stop)
+    if ($sourceStreams.Count -ne 1 -or ([string]$sourceStreams[0].Stream) -cne ':$DATA') {
+        throw 'Authenticated CUDA pack-file source contains an alternate data stream.'
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        throw 'Authenticated CUDA pack-file destination must be fresh.'
+    }
+    Assert-CudaInventoryNoReparseAncestorsAllowMissing $Destination
+
+    # Copy-ScribePackRuntimeFile holds the source handle while hashing and
+    # copying, uses create-new output semantics, and verifies the materialized
+    # bytes. The CUDA wrapper additionally rejects ADS and all preexisting
+    # destinations instead of accepting an identical retained destination.
+    Copy-ScribePackRuntimeFile $sourceItem.FullName $Destination $ExpectedSha256
+    Assert-CudaInventoryNoReparseAncestors $Destination
+    $destinationItem = Get-Item -LiteralPath $Destination -Force -ErrorAction Stop
+    $destinationStreams = @(Get-Item -LiteralPath $destinationItem.FullName -Stream * -ErrorAction Stop)
+    if ($destinationItem.PSIsContainer -or
+        ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $destinationStreams.Count -ne 1 -or
+        ([string]$destinationStreams[0].Stream) -cne ':$DATA' -or
+        ($ExpectedSizeBytes -ge 0 -and $destinationItem.Length -ne $ExpectedSizeBytes) -or
+        (Get-FileHash -LiteralPath $destinationItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedSha256) {
+        throw 'Materialized authenticated CUDA pack file failed validation.'
+    }
+}
+
+function Copy-AuthenticatedCudaPackNotices(
+    [object[]]$Sources,
+    [string]$PackRoot
+) {
+    $contracts = @(Get-ScribeCudaPackNoticeContract)
+    if (@($Sources).Count -ne $contracts.Count) {
+        throw 'Authenticated CUDA notice source set is incomplete.'
+    }
+    $canonicalPackRoot = [System.IO.Path]::GetFullPath($PackRoot).TrimEnd([char[]]@('\', '/'))
+    Assert-CudaInventoryNoReparseAncestors $canonicalPackRoot
+    $packRootItem = Get-Item -LiteralPath $canonicalPackRoot -Force -ErrorAction Stop
+    if (-not $packRootItem.PSIsContainer -or
+        ($packRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'CUDA pack root must be a physical directory.'
+    }
+
+    $copyPlan = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $contracts.Count; $index++) {
+        $contract = $contracts[$index]
+        $source = @($Sources)[$index]
+        $actualProperties = @($source.PSObject.Properties.Name | Sort-Object)
+        $expectedProperties = @('SourcePath', 'SourceRelativePath', 'DestinationRelativePath', 'Sha256', 'SizeBytes' | Sort-Object)
+        if ($actualProperties.Count -ne $expectedProperties.Count -or
+            (Compare-Object -ReferenceObject $expectedProperties -DifferenceObject $actualProperties -CaseSensitive) -or
+            $source.SourceRelativePath -cne $contract.SourceRelativePath -or
+            $source.DestinationRelativePath -cne $contract.DestinationRelativePath -or
+            $source.Sha256 -cne $contract.Sha256 -or
+            [int64]$source.SizeBytes -ne [int64]$contract.SizeBytes) {
+            throw 'Authenticated CUDA notice source set does not match the fixed pack policy.'
+        }
+        $destination = Join-Path $canonicalPackRoot $contract.DestinationRelativePath.Replace('/', '\')
+        Assert-CudaInventoryNoReparseAncestorsAllowMissing $destination
+        if (Test-Path -LiteralPath $destination) {
+            throw 'Authenticated CUDA notice destination must be fresh.'
+        }
+        $destinationDirectory = Split-Path -Parent $destination
+        Assert-CudaInventoryNoReparseAncestorsAllowMissing $destinationDirectory
+        if (Test-Path -LiteralPath $destinationDirectory) {
+            throw 'Authenticated CUDA notice destination directory must be fresh.'
+        }
+        $copyPlan.Add([pscustomobject]@{
+            Source = [string]$source.SourcePath
+            Destination = $destination
+            DestinationDirectory = $destinationDirectory
+            Sha256 = [string]$source.Sha256
+            SizeBytes = [int64]$source.SizeBytes
+        })
+    }
+
+    foreach ($copy in $copyPlan) {
+        if (Test-Path -LiteralPath $copy.DestinationDirectory) {
+            throw 'Authenticated CUDA notice destination directory must be fresh.'
+        }
+        [System.IO.Directory]::CreateDirectory($copy.DestinationDirectory) | Out-Null
+        Copy-AuthenticatedCudaPackFile `
+            $copy.Source `
+            $copy.Destination `
+            $copy.Sha256 `
+            $copy.SizeBytes
+    }
+}

@@ -445,9 +445,11 @@ replace remote CI, CUDA, production-signing, installer, or Auto qualification.
 At that earlier Vulkan checkpoint, CUDA was not built or run locally because
 CUDA Toolkit/nvcc 12.8.93 was absent.
 Fixture mode checks that exact developer-toolkit version. Production mode also
-requires a complete canonical CUDA Toolkit inventory with exact SHA-256 values;
-the checked-in inventory is intentionally empty, so same-version modified inputs
-cannot become production-trusted packs. Production signing and packaging remain
+requires a complete canonical CUDA Toolkit inventory with exact SHA-256 values.
+The checked-in inventory now authenticates the exact 1,727-file CUDA 12.8.1
+component assembly documented in [Windows CUDA input provenance](CUDA_WINDOWS_INPUT_PROVENANCE.md);
+same-version modified, incomplete or expanded SDK trees are rejected.
+Production signing and packaging remain
 intentionally unverified and fail closed because no reviewed production public
 key or protected trusted signer exists.
 Auto enablement, five-cold/twenty-warm performance qualification, driver/device
