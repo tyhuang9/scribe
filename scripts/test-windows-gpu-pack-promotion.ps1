@@ -216,6 +216,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $productionOutput)) 'Production fail-closed gate created output.'
 
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\windows-gpu-pack-promotion.yml') -Raw
+    Assert-True ($workflow.Contains('provide no-follow open semantics or pin path ancestors')) 'Signing workflow lost the retained architecture guard warning about its PowerShell path-check boundary.'
     $protected = $workflow.Split('  protected-promote:', 2)[1]
     $preProtected = $workflow.Split('  protected-promote:', 2)[0]
     $approvedWrapper = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'invoke-windows-gpu-approved-signing.ps1') -Raw

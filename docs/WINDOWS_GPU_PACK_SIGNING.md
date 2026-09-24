@@ -155,6 +155,13 @@ private key is never a process argument, file in the pack tree, or uploaded
 artifact. In-memory handling limits exposure; it is not an HSM and does not
 protect against a compromised approved runner or trusted signer.
 
+PowerShell bootstrap path checks and retained leaf handles do not provide
+atomic no-follow opens or pin path ancestors. Both preflight and signing rely
+on fresh trusted hosted jobs, no candidate code execution, and no untrusted
+concurrent writers. Do not move these steps onto a persistent/shared builder.
+The native signer's bounded physical inventory verification remains mandatory;
+the PowerShell checks are not a substitute for it.
+
 ## Verification and scope
 
 Run the locked GPU-free Rust tests, existing promotion contract tests, policy
