@@ -4,7 +4,10 @@ param(
     [Parameter(Mandatory = $true)][string]$EvidencePath,
     [string]$ArtifactRoot,
     [switch]$AllowFixture,
-    [switch]$RequireEligible
+    [switch]$RequireEligible,
+    [string]$ExpectedAuthorizationSha256,
+    [string]$ExpectedCampaignNonce,
+    [Nullable[Int64]]$FixtureNowUnixSeconds
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,7 +40,10 @@ $ContractPaths = [ordered]@{
     toolchain_contract_sha256 = 'runtime-manifests\gpu-worker-toolchain-windows-x64.json'
 }
 $ProductionAuthorityPath = 'runtime-manifests\windows-gpu-qualification-production-authority.json'
+$PerformanceAuthorityPath = 'runtime-manifests\windows-gpu-performance-authority.json'
 $AttestationDomain = [Text.Encoding]::ASCII.GetBytes("SCRIBE-WINDOWS-GPU-QUALIFICATION-LANE-ATTESTATION-V1`0")
+$PerformanceAuthorizationDomain = [Text.Encoding]::ASCII.GetBytes("SCRIBE-WINDOWS-GPU-PERFORMANCE-AUTHORIZATION-V1`0")
+$PerformanceAttestationDomain = [Text.Encoding]::ASCII.GetBytes("SCRIBE-WINDOWS-GPU-PERFORMANCE-LANE-ATTESTATION-V1`0")
 
 if ($null -eq ('ScribeWindowsQualification.NativeFile' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -574,15 +580,17 @@ function Get-CaptureContractProjection($Plan, $Identity) {
     }
 }
 
-function Get-AttestationPreimage([byte[]]$CanonicalRecord) {
+function Get-DomainPreimage([byte[]]$Domain, [byte[]]$CanonicalRecord) {
     [byte[]]$length = [BitConverter]::GetBytes([UInt64]$CanonicalRecord.Length)
     if (-not [BitConverter]::IsLittleEndian) { [Array]::Reverse($length) }
-    [byte[]]$preimage = [byte[]]::new($AttestationDomain.Length + 8 + $CanonicalRecord.Length)
-    [Array]::Copy($AttestationDomain, 0, $preimage, 0, $AttestationDomain.Length)
-    [Array]::Copy($length, 0, $preimage, $AttestationDomain.Length, 8)
-    [Array]::Copy($CanonicalRecord, 0, $preimage, $AttestationDomain.Length + 8, $CanonicalRecord.Length)
+    [byte[]]$preimage = [byte[]]::new($Domain.Length + 8 + $CanonicalRecord.Length)
+    [Array]::Copy($Domain, 0, $preimage, 0, $Domain.Length)
+    [Array]::Copy($length, 0, $preimage, $Domain.Length, 8)
+    [Array]::Copy($CanonicalRecord, 0, $preimage, $Domain.Length + 8, $CanonicalRecord.Length)
     return ,$preimage
 }
+
+function Get-AttestationPreimage([byte[]]$CanonicalRecord) { return ,(Get-DomainPreimage $AttestationDomain $CanonicalRecord) }
 
 function Import-P256PublicKey($Value, [string]$ExpectedKeyId, [string]$Label) {
     [byte[]]$spki = Get-CanonicalBase64 $Value "$Label SPKI" 256
@@ -860,6 +868,76 @@ function Assert-Identity($Identity, [string]$Label, [string]$ExpectedAppVersion 
     Assert-Condition ($Identity.cpu_baseline.worker_sha256 -cne $Identity.gpu_worker.worker_sha256) "$Label CPU and GPU workers must be distinct."
 }
 
+function Assert-PerformanceIdentity($Identity, [string]$Label, $Source) {
+    Assert-ExactKeys $Identity @(
+        'lane_id', 'app_build_id', 'windows_version', 'target_arch', 'backend', 'provider_id',
+        'cpu_baseline', 'gpu_worker', 'acquisition', 'battery_acquisition', 'pack', 'model',
+        'workload', 'device', 'driver'
+    ) $Label
+    $null = Get-Identifier $Identity.lane_id "$Label.lane_id"
+    $appBuild = Get-JsonString $Identity.app_build_id "$Label.app_build_id" 160
+    Assert-Condition ($appBuild -cmatch '^local-transcriber@((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)#([0-9a-f]{40})$') "$Label.app_build_id is not a concrete SemVer desktop build identity."
+    $buildVersion = $Matches[1]; $buildRevision = $Matches[2]
+    Assert-Condition ($buildVersion -ceq $Source.app_version -and $buildRevision -ceq $Source.revision) "$Label app build does not match the authorized fixed source."
+    $windowsVersion = Get-JsonString $Identity.windows_version "$Label.windows_version" 32
+    Assert-Condition ($windowsVersion -cmatch '^10\.0\.[0-9]{4,6}$') "$Label.windows_version is not a reviewed Windows build identity."
+    Assert-Condition ((Get-JsonString $Identity.target_arch "$Label.target_arch" 16) -ceq 'x86_64') "$Label.target_arch must be x86_64."
+    $backend = Get-JsonString $Identity.backend "$Label.backend" 16
+    $provider = Get-Identifier $Identity.provider_id "$Label.provider_id"
+    Assert-Worker $Identity.cpu_baseline "$Label.cpu_baseline" $true
+    Assert-Worker $Identity.gpu_worker "$Label.gpu_worker" $false
+    foreach ($worker in @($Identity.cpu_baseline, $Identity.gpu_worker)) { Assert-Condition ($worker.worker_build_id -ceq "scribe-inference-worker@$buildVersion#$buildRevision") "$Label worker build does not match the authorized fixed source." }
+    Assert-Pack $Identity.pack "$Label.pack"
+    Assert-ExactKeys $Identity.model @('model_id', 'model_digest') "$Label.model"
+    $null = Get-Identifier $Identity.model.model_id "$Label.model.model_id"; $null = Get-Sha256Value $Identity.model.model_digest "$Label.model.model_digest"
+    Assert-ExactKeys $Identity.workload @('workload_id', 'audio_sha256', 'expected_transcript_sha256') "$Label.workload"
+    $null = Get-Identifier $Identity.workload.workload_id "$Label.workload.workload_id"; $null = Get-Sha256Value $Identity.workload.audio_sha256 "$Label.workload.audio_sha256"; $null = Get-Sha256Value $Identity.workload.expected_transcript_sha256 "$Label.workload.expected_transcript_sha256"
+    Assert-ExactKeys $Identity.device @('stable_device_id', 'vendor', 'device_class', 'memory_model', 'total_memory_bytes') "$Label.device"
+    $stable = Get-JsonString $Identity.device.stable_device_id "$Label.device.stable_device_id" 64
+    Assert-Condition (Test-StableDeviceId $stable) "$Label.device.stable_device_id is not canonical."
+    $vendor = Get-JsonString $Identity.device.vendor "$Label.device.vendor" 16
+    Assert-Condition (@('nvidia', 'amd', 'intel') -ccontains $vendor) "$Label.device.vendor is unsupported."
+    $class = Get-JsonString $Identity.device.device_class "$Label.device.device_class" 32
+    Assert-Condition (@('discrete_gpu', 'integrated_gpu', 'unified_gpu') -ccontains $class) "$Label.device.device_class is unsupported."
+    $memoryModel = Get-JsonString $Identity.device.memory_model "$Label.device.memory_model" 32
+    Assert-Condition ($memoryModel -ceq $(if ($class -ceq 'discrete_gpu') { 'dedicated_vram' } else { 'shared_host_memory' })) "$Label.device.memory_model does not match its class."
+    $total = Get-JsonInteger $Identity.device.total_memory_bytes "$Label.device.total_memory_bytes" $MinimumGpuMemoryBytes
+    Assert-ExactKeys $Identity.driver @('kind', 'value') "$Label.driver"
+    Assert-Condition ((Get-JsonString $Identity.driver.kind "$Label.driver.kind" 16) -ceq 'exact') "$Label.driver.kind must be exact."
+    $driver = Get-JsonString $Identity.driver.value "$Label.driver.value" 128
+    Assert-Condition (Test-DriverVendorBinding $backend $driver $vendor) "$Label.driver.value is not canonical for the selected Windows backend and vendor."
+    Assert-Acquisition $Identity.acquisition "$Label.acquisition" $stable $vendor $class $driver $total $backend 3 'ac'
+    if ($class -ceq 'discrete_gpu') { Assert-Condition ($null -eq $Identity.battery_acquisition) "$Label.battery_acquisition must be null for a discrete GPU." }
+    else {
+        Assert-Condition ($null -ne $Identity.battery_acquisition) "$Label.battery_acquisition is required for an integrated or unified GPU."
+        Assert-Acquisition $Identity.battery_acquisition "$Label.battery_acquisition" $stable $vendor $class $driver $total $backend 3 'battery'
+        Assert-PairedAcquisition $Identity.acquisition $Identity.battery_acquisition $Label
+    }
+    $validBinding = ($backend -ceq 'cuda' -and $provider -ceq 'transcribe-cpp-ggml-cuda' -and $vendor -ceq 'nvidia') -or ($backend -ceq 'vulkan' -and $provider -ceq 'transcribe-cpp-ggml-vulkan' -and @('nvidia', 'amd', 'intel') -ccontains $vendor)
+    Assert-Condition $validBinding "$Label has an invalid backend, provider, and vendor binding."
+    Assert-Condition ($Identity.gpu_worker.backend -ceq $backend -and $Identity.gpu_worker.provider_id -ceq $backend -and $Identity.gpu_worker.runtime_abi -eq $Identity.pack.runtime_abi) "$Label GPU worker does not match the compiled pack candidate."
+    Assert-Condition ($Identity.pack.pack_id -ceq "scribe-$backend-windows-x64" -and $Identity.cpu_baseline.worker_sha256 -cne $Identity.gpu_worker.worker_sha256) "$Label worker/pack binding is invalid."
+}
+
+function Get-PerformanceContractProjection($Plan) {
+    return [ordered]@{
+        approval_key_id = $Plan.authorization.key_id
+        capture_authority = $Plan.capture_authority
+        capture_contract = $Plan.capture_contract
+        cold_runs = $Plan.cold_runs
+        contract_bindings = $Plan.contract_bindings
+        fixture_only = $Plan.fixture_only
+        kind = 'windows_gpu_performance_capture_contract'
+        maximum_gpu_p95_cpu_percent = $Plan.maximum_gpu_p95_cpu_percent
+        required_lane_identities = @($Plan.required_lanes | ForEach-Object { $_.identity })
+        schema_version = 1
+        source = $Plan.source
+        target_arch = $Plan.target_arch
+        target_os = $Plan.target_os
+        warm_runs = $Plan.warm_runs
+    }
+}
+
 function Import-ProductionAuthority([string]$RepositoryRoot) {
     $loaded = Import-CanonicalJson (Join-Path $RepositoryRoot $ProductionAuthorityPath) 'Windows GPU qualification production authority'
     $authority = $loaded.Document
@@ -881,6 +959,92 @@ function Import-ProductionAuthority([string]$RepositoryRoot) {
         $approved.Add($digest, $entry)
     }
     return [pscustomobject]@{ Approved = $approved; Digest = Get-Sha256Bytes $loaded.Raw }
+}
+
+function Import-PerformanceApprovalKey($Value, [string]$ExpectedKeyId, [string]$Label) {
+    [byte[]]$spki = Get-CanonicalBase64 $Value "$Label SPKI" 256
+    $digest = Get-Sha256Bytes $spki
+    Assert-Condition ($ExpectedKeyId -ceq "performance-approval-p256:$digest") "$Label SPKI does not match its performance approval key ID."
+    return Import-P256PublicKey $Value "p256:$digest" $Label
+}
+
+function Import-PerformanceAuthority([string]$RepositoryRoot) {
+    $loaded = Import-CanonicalJson (Join-Path $RepositoryRoot $PerformanceAuthorityPath) 'Windows GPU performance campaign authority'
+    $authority = $loaded.Document
+    Assert-ExactKeys $authority @('schema_version', 'kind', 'minimum_policy_epoch', 'keys') 'Windows GPU performance campaign authority'
+    Assert-Condition ((Get-JsonInteger $authority.schema_version 'performance authority.schema_version' 1 1) -eq 1 -and (Get-JsonString $authority.kind 'performance authority.kind') -ceq 'windows_gpu_performance_campaign_authority') 'Windows GPU performance authority contract is unsupported.'
+    $minimumEpoch = Get-JsonInteger $authority.minimum_policy_epoch 'performance authority.minimum_policy_epoch' 1 ([uint32]::MaxValue)
+    Assert-Array $authority.keys 'performance authority.keys'
+    $keys = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $materials = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $previous = ''
+    foreach ($entry in @($authority.keys)) {
+        Assert-ExactKeys $entry @('key_id', 'public_key_spki_base64') 'performance authority key'
+        $keyId = Get-JsonString $entry.key_id 'performance authority key.key_id' 100
+        Assert-Condition ($keyId -cmatch '^performance-approval-p256:[0-9a-f]{64}$' -and [StringComparer]::Ordinal.Compare($keyId, $previous) -gt 0) 'Performance authority keys must be strictly ID-sorted and unique.'
+        $previous = $keyId
+        $key = Import-PerformanceApprovalKey $entry.public_key_spki_base64 $keyId 'performance authority key'
+        try { $material = [Convert]::ToBase64String($key.ExportSubjectPublicKeyInfo()) } finally { $key.Dispose() }
+        Assert-Condition ($materials.Add($material)) 'Performance authority reuses approval key material.'
+        $keys.Add($keyId, $entry)
+    }
+    return [pscustomobject]@{ Digest = Get-Sha256Bytes $loaded.Raw; Keys = $keys; MinimumEpoch = $minimumEpoch }
+}
+
+function Assert-PerformanceAuthorization($Plan, $Authority, [bool]$FixtureAllowed, [bool]$FixtureClockProvided, [Nullable[Int64]]$FixtureClock, [string]$ExpectedAuthorization, [string]$ExpectedNonce) {
+    $fixture = [bool]$Plan.fixture_only
+    $authorizationKeys = @('key_id', 'record', 'signature_base64', 'signature_scheme')
+    if ($fixture) { $authorizationKeys += 'fixture_approval_public_key_spki_base64' }
+    Assert-ExactKeys $Plan.authorization $authorizationKeys 'performance plan.authorization'
+    $keyId = Get-JsonString $Plan.authorization.key_id 'performance plan.authorization.key_id' 100
+    Assert-Condition ($keyId -cmatch '^performance-approval-p256:[0-9a-f]{64}$') 'Performance approval key ID is invalid.'
+    Assert-Condition ((Get-JsonString $Plan.authorization.signature_scheme 'performance plan.authorization.signature_scheme' 64) -ceq 'ecdsa-p256-sha256-ieee-p1363') 'Performance authorization signature scheme is unsupported.'
+    [byte[]]$signature = Get-CanonicalBase64 $Plan.authorization.signature_base64 'performance plan.authorization.signature_base64' 64
+    Assert-Condition ($signature.Length -eq 64) 'Performance authorization must contain a 64-byte IEEE-P1363 signature.'
+    $record = $Plan.authorization.record
+    Assert-ExactKeys $record @('schema_version', 'kind', 'source_revision', 'performance_contract_sha256', 'campaign_nonce', 'policy_epoch', 'issued_at_unix_seconds', 'expires_at_unix_seconds') 'performance authorization record'
+    Assert-Condition ((Get-JsonInteger $record.schema_version 'performance authorization record.schema_version' 1 1) -eq 1 -and (Get-JsonString $record.kind 'performance authorization record.kind') -ceq 'windows_gpu_performance_campaign_authorization') 'Performance authorization record contract is unsupported.'
+    Assert-Condition ((Get-JsonString $record.source_revision 'performance authorization record.source_revision' 40) -ceq $Plan.source.revision) 'Performance authorization source revision differs from the plan.'
+    $contractDigest = Get-CanonicalDigest (Get-PerformanceContractProjection $Plan)
+    Assert-Condition ((Get-Sha256Value $record.performance_contract_sha256 'performance authorization record.performance_contract_sha256') -ceq $contractDigest) 'Performance authorization does not bind the exact capture contract.'
+    Assert-Condition ((Get-Sha256Value $record.campaign_nonce 'performance authorization record.campaign_nonce') -ceq $Plan.capture_authority.campaign_nonce) 'Performance authorization campaign nonce differs from the plan.'
+    $epoch = Get-JsonInteger $record.policy_epoch 'performance authorization record.policy_epoch' 1 ([uint32]::MaxValue)
+    Assert-Condition ($epoch -ge $Authority.MinimumEpoch) 'Performance authorization policy epoch is below the protected minimum.'
+    $issued = Get-JsonInteger $record.issued_at_unix_seconds 'performance authorization record.issued_at_unix_seconds' 1 253402300799
+    $expires = Get-JsonInteger $record.expires_at_unix_seconds 'performance authorization record.expires_at_unix_seconds' 1 253402300799
+    Assert-Condition ($expires -gt $issued -and ([Numerics.BigInteger]$expires - [Numerics.BigInteger]$issued) -le 604800) 'Performance authorization validity window is invalid or exceeds seven days.'
+    if ($FixtureClockProvided) {
+        Assert-Condition ($fixture -and $FixtureAllowed) '-FixtureNowUnixSeconds is allowed only for an admitted performance fixture.'
+        Assert-Condition ($null -ne $FixtureClock -and [Int64]$FixtureClock -gt 0 -and [Int64]$FixtureClock -le 253402300799) 'Fixture authorization clock must be a positive bounded Unix timestamp.'
+        $now = [Int64]$FixtureClock
+    }
+    else { $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+    Assert-Condition ($issued -le $now -and $now -lt $expires) 'Performance authorization is not currently valid.'
+    $authorizationDigest = Get-CanonicalDigest $Plan.authorization
+    $pinsProvided = -not [string]::IsNullOrEmpty($ExpectedAuthorization) -or -not [string]::IsNullOrEmpty($ExpectedNonce)
+    if ($fixture) { Assert-Condition (-not $pinsProvided -or (-not [string]::IsNullOrEmpty($ExpectedAuthorization) -and -not [string]::IsNullOrEmpty($ExpectedNonce))) 'Performance fixture integrity pins must be supplied together.' }
+    else { Assert-Condition (-not [string]::IsNullOrEmpty($ExpectedAuthorization) -and -not [string]::IsNullOrEmpty($ExpectedNonce)) 'Production performance evaluation requires expected authorization and campaign nonce pins.' }
+    if (-not [string]::IsNullOrEmpty($ExpectedAuthorization)) { Assert-Condition ((Get-Sha256Value $ExpectedAuthorization 'ExpectedAuthorizationSha256') -ceq $authorizationDigest) 'Performance authorization digest differs from the caller pin.' }
+    if (-not [string]::IsNullOrEmpty($ExpectedNonce)) { Assert-Condition ((Get-Sha256Value $ExpectedNonce 'ExpectedCampaignNonce') -ceq $Plan.capture_authority.campaign_nonce) 'Performance campaign nonce differs from the caller pin.' }
+    if ($fixture) {
+        Assert-Condition $FixtureAllowed 'Fixture-only performance evidence requires -AllowFixture.'
+        $approvalKey = Import-PerformanceApprovalKey $Plan.authorization.fixture_approval_public_key_spki_base64 $keyId 'fixture performance approval key'
+    }
+    else {
+        Assert-Condition ($Authority.Keys.ContainsKey($keyId)) 'Performance authorization key is not approved by the protected campaign authority.'
+        $approvalKey = Import-PerformanceApprovalKey $Authority.Keys[$keyId].public_key_spki_base64 $keyId 'production performance approval key'
+    }
+    try {
+        $captureSpki = Get-CanonicalBase64 $Plan.capture_authority.capture_public_key_spki_base64 'performance capture key SPKI' 256
+        $approvalSpki = $approvalKey.ExportSubjectPublicKeyInfo()
+        Assert-Condition (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($captureSpki, $approvalSpki)) 'Performance capture and approval keys must be distinct.'
+        [byte[]]$recordBytes = Get-CanonicalBytesFromObject $record
+        [byte[]]$preimage = Get-DomainPreimage $PerformanceAuthorizationDomain $recordBytes
+        $verified = $approvalKey.VerifyData($preimage, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+    }
+    finally { $approvalKey.Dispose() }
+    Assert-Condition $verified 'Performance campaign authorization signature is invalid.'
+    return [pscustomobject]@{ AuthorizationDigest = $authorizationDigest; ContractDigest = $contractDigest }
 }
 
 function Assert-AutoEntry($Entry, [string]$Label) {
@@ -1021,6 +1185,76 @@ function Assert-Plan($Plan, [string]$RepositoryRoot) {
     return [pscustomobject]@{ Required = $required; Contracts = $contracts; CaptureKeyId = $captureKeyId }
 }
 
+function Assert-PerformanceCaptureContract($CaptureContract, [string]$Label) {
+    Assert-ExactKeys $CaptureContract @('artifact_targets', 'cold_captures_per_target', 'control_kind', 'header_bytes', 'launch_scopes', 'max_control_body_bytes', 'power_policy', 'protocol_magic', 'protocol_version', 'request_id', 'session_id', 'warm_captures_per_target') $Label
+    [byte[]]$actualTargets = Get-CanonicalBytesFromObject $CaptureContract.artifact_targets
+    [byte[]]$expectedTargets = Get-CanonicalBytesFromObject @([ordered]@{ artifact = 'gguf'; target = 'windows-x86_64' }, [ordered]@{ artifact = 'onnx_asr'; target = 'windows-x86_64' })
+    Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal($actualTargets, $expectedTargets)) "$Label artifact targets must be exact and ordered."
+    Assert-Array $CaptureContract.launch_scopes "$Label.launch_scopes"
+    [byte[]]$actualScopes = Get-CanonicalBytesFromObject $CaptureContract.launch_scopes
+    [byte[]]$expectedScopes = Get-CanonicalBytesFromObject @('cpu', 'provider_discovery', 'selected_device')
+    Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal($actualScopes, $expectedScopes)) "$Label launch scopes are not canonical."
+    Assert-Condition ((Get-JsonInteger $CaptureContract.cold_captures_per_target "$Label.cold_captures_per_target") -eq 5 -and (Get-JsonInteger $CaptureContract.warm_captures_per_target "$Label.warm_captures_per_target") -eq 1) "$Label capture generation counts are unsupported."
+    Assert-Condition ((Get-JsonInteger $CaptureContract.header_bytes "$Label.header_bytes") -eq 26 -and (Get-JsonInteger $CaptureContract.max_control_body_bytes "$Label.max_control_body_bytes") -eq 262144 -and (Get-JsonInteger $CaptureContract.protocol_version "$Label.protocol_version") -eq 5 -and (Get-JsonInteger $CaptureContract.control_kind "$Label.control_kind") -eq 1 -and (Get-JsonInteger $CaptureContract.session_id "$Label.session_id") -eq 0 -and (Get-JsonInteger $CaptureContract.request_id "$Label.request_id") -eq 0 -and (Get-JsonString $CaptureContract.protocol_magic "$Label.protocol_magic" 4) -ceq 'SCIF') "$Label wire contract is unsupported."
+    Assert-Condition ((Get-JsonString $CaptureContract.power_policy "$Label.power_policy" 80) -ceq $V3PowerPolicy) "$Label power policy is unsupported."
+}
+
+function Assert-PerformancePlan($Plan, [string]$RepositoryRoot) {
+    Assert-ExactKeys $Plan @('schema_version', 'kind', 'fixture_only', 'source', 'target_os', 'target_arch', 'cold_runs', 'warm_runs', 'maximum_gpu_p95_cpu_percent', 'contract_bindings', 'capture_contract', 'capture_authority', 'authorization', 'required_lanes') 'performance plan'
+    Assert-Condition ((Get-JsonInteger $Plan.schema_version 'performance plan.schema_version' 1 1) -eq 1 -and (Get-JsonString $Plan.kind 'performance plan.kind') -ceq 'windows_gpu_performance_candidate_plan') 'Performance plan contract is unsupported.'
+    $fixture = Get-JsonBoolean $Plan.fixture_only 'performance plan.fixture_only'
+    Assert-ExactKeys $Plan.source @('repository', 'ref', 'revision', 'app_version') 'performance plan.source'
+    Assert-Condition ((Get-JsonString $Plan.source.repository 'performance plan.source.repository' 64) -ceq 'tyhuang9/scribe' -and (Get-JsonString $Plan.source.ref 'performance plan.source.ref' 64) -ceq 'refs/heads/main') 'Performance plan source repository/ref is unsupported.'
+    $revision = Get-JsonString $Plan.source.revision 'performance plan.source.revision' 40
+    Assert-Condition ($revision -cmatch '^[0-9a-f]{40}$' -and $revision -cne ('0' * 40)) 'Performance plan source revision is invalid.'
+    $appVersion = Get-JsonString $Plan.source.app_version 'performance plan.source.app_version' 64
+    Assert-Condition ($appVersion -cmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') 'Performance plan app_version is not canonical SemVer.'
+    Assert-Condition ((Get-JsonString $Plan.target_os 'performance plan.target_os') -ceq 'windows' -and (Get-JsonString $Plan.target_arch 'performance plan.target_arch') -ceq 'x86_64') 'Performance plan target is unsupported.'
+    Assert-Condition ((Get-JsonInteger $Plan.cold_runs 'performance plan.cold_runs') -eq 5 -and (Get-JsonInteger $Plan.warm_runs 'performance plan.warm_runs') -eq 20 -and (Get-JsonInteger $Plan.maximum_gpu_p95_cpu_percent 'performance plan.maximum_gpu_p95_cpu_percent') -eq 110) 'Performance plan run policy is unsupported.'
+    Assert-PerformanceCaptureContract $Plan.capture_contract 'performance plan.capture_contract'
+    Assert-ExactKeys $Plan.capture_authority @('campaign_nonce', 'capture_key_id', 'capture_public_key_spki_base64') 'performance plan.capture_authority'
+    $nonce = Get-Sha256Value $Plan.capture_authority.campaign_nonce 'performance plan.capture_authority.campaign_nonce'
+    $captureKeyId = Get-JsonString $Plan.capture_authority.capture_key_id 'performance plan.capture_authority.capture_key_id' 69
+    Assert-Condition ($captureKeyId -cmatch '^p256:[0-9a-f]{64}$') 'Performance capture key ID is invalid.'
+    $captureKey = Import-P256PublicKey $Plan.capture_authority.capture_public_key_spki_base64 $captureKeyId 'performance capture key'
+    $captureKey.Dispose()
+    $performanceContractPaths = [ordered]@{
+        base_auto_manifest_sha256 = 'runtime-manifests\gpu-auto-qualification-windows-x64.json'
+        evaluator_sha256 = 'scripts\qualify-windows-gpu-evidence.ps1'
+        toolchain_contract_sha256 = 'runtime-manifests\gpu-worker-toolchain-windows-x64.json'
+    }
+    Assert-ExactKeys $Plan.contract_bindings @($performanceContractPaths.Keys) 'performance plan.contract_bindings'
+    $contracts = [ordered]@{}
+    foreach ($field in $performanceContractPaths.Keys) {
+        $expected = Get-Sha256Value $Plan.contract_bindings[$field] "performance plan.contract_bindings.$field"
+        [byte[]]$raw = Get-BoundBytes (Join-Path $RepositoryRoot $performanceContractPaths[$field]) "checked-in performance $field"
+        Assert-Condition ((Get-Sha256Bytes $raw) -ceq $expected) "Performance plan $field does not bind the checked-in contract."
+        $contracts[$field] = $raw
+    }
+    [object[]]$baseEntries = Import-AutoManifest $contracts.base_auto_manifest_sha256
+    Assert-Condition ($baseEntries.Count -eq 0) 'Performance candidate requires the checked-in base Auto manifest to remain empty default-deny.'
+    try { $toolchain = [Text.UTF8Encoding]::new($false, $true).GetString($contracts.toolchain_contract_sha256) | ConvertFrom-Json -AsHashtable -Depth 64 } catch { Fail "Bound performance toolchain contract is invalid: $($_.Exception.Message)" }
+    Assert-Condition ((Get-JsonString $toolchain.app_version 'bound performance toolchain app_version' 64) -ceq $appVersion) 'Performance source app version differs from the bound toolchain.'
+    Assert-Array $Plan.required_lanes 'performance plan.required_lanes'
+    [object[]]$required = @($Plan.required_lanes)
+    Assert-Condition ($required.Count -le $MaxLanes) 'Performance plan exceeds the representative-lane bound.'
+    $previous = ''; $digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $cpuIdentity = $null
+    $backendIdentities = [Collections.Generic.Dictionary[string, byte[]]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $required) {
+        Assert-ExactKeys $entry @('identity', 'evidence_sha256') 'performance required lane'
+        Assert-PerformanceIdentity $entry.identity 'performance required lane identity' $Plan.source
+        Assert-Condition ([StringComparer]::Ordinal.Compare([string]$entry.identity.lane_id, $previous) -gt 0) 'Performance required lanes must be strictly sorted and unique.'
+        $previous = $entry.identity.lane_id
+        Assert-Condition ($digests.Add((Get-Sha256Value $entry.evidence_sha256 'performance required lane evidence_sha256'))) 'Performance plan reuses an evidence digest.'
+        [byte[]]$cpu = Get-CanonicalBytesFromObject $entry.identity.cpu_baseline
+        if ($null -eq $cpuIdentity) { $cpuIdentity = $cpu } else { Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal($cpuIdentity, $cpu)) 'Performance lanes do not share one exact CPU baseline.' }
+        [byte[]]$backendIdentity = Get-CanonicalBytesFromObject ([ordered]@{ gpu_worker = $entry.identity.gpu_worker; pack = $entry.identity.pack })
+        if ($backendIdentities.ContainsKey($entry.identity.backend)) { Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal($backendIdentities[$entry.identity.backend], $backendIdentity)) 'Performance lanes mix pack/worker release identities for one backend.' }
+        else { $backendIdentities.Add($entry.identity.backend, $backendIdentity) }
+    }
+    return [pscustomobject]@{ Contracts = $contracts; Fixture = $fixture; Required = $required }
+}
+
 function Get-ArtifactRelativePath($Value, [string]$Label) {
     $raw = Get-JsonString $Value $Label 240
     Assert-Condition (-not $raw.StartsWith('/') -and -not $raw.Contains('\') -and -not $raw.Contains(':')) "$Label must be a relative canonical artifact path."
@@ -1098,6 +1332,47 @@ function Assert-LaneAttestation($Lane, $Plan, $ExpectedLane, [string]$PlanDigest
     }
     finally { $key.Dispose() }
     Assert-Condition $verified "$Label attestation signature is invalid."
+    return ,$inventory
+}
+
+function Assert-PerformanceLaneAttestation($Lane, $Plan, $ExpectedLane, [string]$AuthorizationDigest, [string]$ContractDigest, [string]$Label) {
+    Assert-ExactKeys $Lane @('identity', 'acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'captures', 'battery', 'artifact_inventory', 'attestation') $Label
+    Assert-ExactKeys $Lane.attestation @('key_id', 'record', 'signature_base64', 'signature_scheme') "$Label.attestation"
+    Assert-Condition ((Get-JsonString $Lane.attestation.key_id "$Label.attestation.key_id" 69) -ceq $Plan.capture_authority.capture_key_id) "$Label attestation key does not match the authorized capture key."
+    Assert-Condition ((Get-JsonString $Lane.attestation.signature_scheme "$Label.attestation.signature_scheme" 64) -ceq 'ecdsa-p256-sha256-ieee-p1363') "$Label attestation signature scheme is unsupported."
+    [byte[]]$signature = Get-CanonicalBase64 $Lane.attestation.signature_base64 "$Label.attestation.signature_base64" 64
+    Assert-Condition ($signature.Length -eq 64) "$Label attestation must contain a 64-byte IEEE-P1363 signature."
+    Assert-Array $Lane.artifact_inventory "$Label.artifact_inventory"
+    [object[]]$inventory = @($Lane.artifact_inventory)
+    Assert-Condition ($inventory.Count -gt 0 -and $inventory.Count -le $MaxArtifacts) "$Label artifact inventory is empty or oversized."
+    $priorPath = ''; $inventoryDigests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $inventory) {
+        Assert-ExactKeys $entry @('artifact_path', 'artifact_sha256') "$Label artifact inventory entry"
+        $path = Get-ArtifactRelativePath $entry.artifact_path "$Label artifact inventory entry.artifact_path"
+        Assert-Condition ([StringComparer]::Ordinal.Compare($path, $priorPath) -gt 0) "$Label artifact inventory must be strictly stable-path-sorted and unique."
+        $priorPath = $path
+        Assert-Condition ($inventoryDigests.Add((Get-Sha256Value $entry.artifact_sha256 "$Label artifact inventory entry.artifact_sha256"))) "$Label artifact inventory reuses a digest."
+    }
+    $record = $Lane.attestation.record
+    Assert-ExactKeys $record @('schema_version', 'kind', 'performance_contract_sha256', 'authorization_sha256', 'campaign_nonce', 'lane_id', 'acquisition_batch_id', 'lane_payload_sha256', 'artifact_inventory_sha256') "$Label.attestation.record"
+    Assert-Condition ((Get-JsonInteger $record.schema_version "$Label.attestation.record.schema_version" 1 1) -eq 1 -and (Get-JsonString $record.kind "$Label.attestation.record.kind") -ceq 'windows_gpu_performance_lane_attestation') "$Label attestation record contract is unsupported."
+    $expectedRecord = [ordered]@{
+        acquisition_batch_id = $ExpectedLane.identity.acquisition.batch_id
+        artifact_inventory_sha256 = Get-CanonicalDigest $inventory
+        authorization_sha256 = $AuthorizationDigest
+        campaign_nonce = $Plan.capture_authority.campaign_nonce
+        kind = 'windows_gpu_performance_lane_attestation'
+        lane_id = $ExpectedLane.identity.lane_id
+        lane_payload_sha256 = Get-CanonicalDigest (Get-UnsignedLane $Lane)
+        performance_contract_sha256 = $ContractDigest
+        schema_version = 1
+    }
+    [byte[]]$recordBytes = Get-CanonicalBytesFromObject $record
+    Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal($recordBytes, (Get-CanonicalBytesFromObject $expectedRecord))) "$Label attestation record does not bind the authorized performance lane and inventory."
+    $key = Import-P256PublicKey $Plan.capture_authority.capture_public_key_spki_base64 $Plan.capture_authority.capture_key_id 'authorized performance capture key'
+    [byte[]]$preimage = Get-DomainPreimage $PerformanceAttestationDomain $recordBytes
+    try { $verified = $key.VerifyData($preimage, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation) } finally { $key.Dispose() }
+    Assert-Condition $verified "$Label performance attestation signature is invalid."
     return ,$inventory
 }
 
@@ -1195,7 +1470,7 @@ function Assert-WireWorkerIdentity($Value, [string]$Label, $Identity, [bool]$Cpu
     }
 }
 
-function Assert-Capture($Capture, [string]$Label, $Identity, $Acquisition, [string]$PowerSource, [int]$SchemaVersion, $Context, $RunGenerationCaptures, $AllowedExtraGenerations, $ChallengeSet, $ValidatedCaptures) {
+function Assert-Capture($Capture, [string]$Label, $Identity, $Acquisition, [string]$PowerSource, [int]$SchemaVersion, $Context, $RunGenerationCaptures, $AllowedExtraGenerations, $ChallengeSet, $ValidatedCaptures, [string]$ArtifactKind = 'windows_gpu_qualification_raw_scif_capture') {
     $captureKeys = @('artifact_path', 'artifact_sha256', 'generation', 'launch_scope', 'request_frame_base64', 'response_frame_base64')
     if ($SchemaVersion -eq 3) { $captureKeys += @('acquisition_sha256', 'power_source_before', 'power_source_after') }
     Assert-ExactKeys $Capture $captureKeys $Label
@@ -1262,7 +1537,7 @@ function Assert-Capture($Capture, [string]$Label, $Identity, $Acquisition, [stri
     $captureDigest = Get-CanonicalDigest $record
     if ($RunGenerationCaptures.ContainsKey($generation)) { Assert-Condition ($RunGenerationCaptures[$generation] -ceq $captureDigest) "$Label content does not match the run's signed raw capture digest." }
     Assert-Condition (-not $ValidatedCaptures.ContainsKey($captureDigest)) 'Qualification evidence reuses one raw capture for multiple generations.'
-    Assert-ArtifactEnvelope $Context $Capture.artifact_path $artifactDigest 'windows_gpu_qualification_raw_scif_capture' $record $Label
+    Assert-ArtifactEnvelope $Context $Capture.artifact_path $artifactDigest $ArtifactKind $record $Label
     $summary = [pscustomobject]@{ AcquisitionDigest = $acquisitionDigest; Digest = $captureDigest; Generation = $generation; PowerSource = $PowerSource; Scope = $scope; StableId = $stable; CurrentIndex = $currentIndex; Challenge = $challenge }
     $ValidatedCaptures[$captureDigest] = $summary
     return $summary
@@ -1306,7 +1581,7 @@ function Assert-Execution($Execution, [string]$Label, [string]$Target, $Identity
     }
 }
 
-function Assert-Run($Run, [string]$Label, [int]$Sequence, [string]$Target, [string]$Mode, $Identity, $Acquisition, [string]$PowerSource, [int]$SchemaVersion, $Context, $GenerationCaptures, $CaptureGenerations) {
+function Assert-Run($Run, [string]$Label, [int]$Sequence, [string]$Target, [string]$Mode, $Identity, $Acquisition, [string]$PowerSource, [int]$SchemaVersion, $Context, $GenerationCaptures, $CaptureGenerations, [string]$ArtifactKind = 'windows_gpu_qualification_run_artifact') {
     $runKeys = @('sequence', 'artifact_path', 'artifact_sha256', 'acquisition_batch_id', 'machine_id_sha256', 'session_id', 'pair_id', 'pair_order', 'reset_state', 'priming_runs', 'device_set_sha256', 'execution', 'outcome', 'failure_category', 'end_to_end_ms', 'backend_ms', 'peak_process_memory_bytes', 'peak_vram_bytes', 'peak_shared_device_memory_bytes', 'available_device_memory_bytes_before', 'available_device_memory_bytes_after', 'transcript_sha256')
     if ($SchemaVersion -eq 3) { $runKeys += @('acquisition_sha256', 'power_source_before', 'power_source_after') }
     Assert-ExactKeys $Run $runKeys $Label
@@ -1360,7 +1635,7 @@ function Assert-Run($Run, [string]$Label, [int]$Sequence, [string]$Target, [stri
     }
     $record = [ordered]@{}
     foreach ($key in $Run.Keys) { if (@('artifact_path', 'artifact_sha256') -cnotcontains $key) { $record[$key] = $Run[$key] } }
-    Assert-ArtifactEnvelope $Context $Run.artifact_path $artifactDigest 'windows_gpu_qualification_run_artifact' $record $Label
+    Assert-ArtifactEnvelope $Context $Run.artifact_path $artifactDigest $ArtifactKind $record $Label
     return $Run
 }
 
@@ -1531,10 +1806,10 @@ function Get-AutoProjection($Identity, $PowerRunSets, $PowerParsed, [Int64]$Mini
     }
 }
 
-function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSource, $Plan, [string]$Label, $Context, $GenerationCaptures, $CaptureGenerations, $Challenges, $ValidatedCaptures) {
-    $schemaVersion = [int]$Plan.schema_version
+function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSource, $Plan, [string]$Label, $Context, $GenerationCaptures, $CaptureGenerations, $Challenges, $ValidatedCaptures, [bool]$IncludeMixed = $true, [int]$PowerSchemaVersion = 0, [string]$ArtifactNamespace = 'windows_gpu_qualification') {
+    $schemaVersion = if ($PowerSchemaVersion -gt 0) { $PowerSchemaVersion } else { [int]$Plan.schema_version }
     $acquisitionArtifactDigest = Get-Sha256Value $Block.acquisition_artifact_sha256 "$Label.acquisition_artifact_sha256"
-    Assert-ArtifactEnvelope $Context $Block.acquisition_artifact_path $acquisitionArtifactDigest 'windows_gpu_qualification_acquisition_artifact' $Acquisition "$Label acquisition"
+    Assert-ArtifactEnvelope $Context $Block.acquisition_artifact_path $acquisitionArtifactDigest "${ArtifactNamespace}_acquisition_artifact" $Acquisition "$Label acquisition"
     Assert-ExactKeys $Block.run_sets @('cold', 'warm') "$Label.run_sets"
     $parsed = [ordered]@{}
     foreach ($mode in @('cold', 'warm')) {
@@ -1546,7 +1821,7 @@ function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSou
             [object[]]$runs = @($Block.run_sets[$mode][$target])
             Assert-Condition ($runs.Count -eq $expectedCount) "$Label.$mode.$target has the wrong run count."
             $parsedRuns = [Collections.Generic.List[object]]::new()
-            for ($offset = 0; $offset -lt $runs.Count; $offset++) { $parsedRuns.Add((Assert-Run $runs[$offset] "$Label.$mode.$target[$offset]" ($offset + 1) $target $mode $Identity $Acquisition $PowerSource $schemaVersion $Context $GenerationCaptures $CaptureGenerations)) }
+            for ($offset = 0; $offset -lt $runs.Count; $offset++) { $parsedRuns.Add((Assert-Run $runs[$offset] "$Label.$mode.$target[$offset]" ($offset + 1) $target $mode $Identity $Acquisition $PowerSource $schemaVersion $Context $GenerationCaptures $CaptureGenerations "${ArtifactNamespace}_run_artifact")) }
             $parsed[$mode][$target] = $parsedRuns.ToArray()
         }
     }
@@ -1555,21 +1830,21 @@ function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSou
     $afterGeneration = "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:scenario:mixed_gpu:after"
     $discoveryGeneration = "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:provider_discovery"
     $extraGenerations = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    if ($PowerSource -ceq 'ac') { $null = $extraGenerations.Add($beforeGeneration); $null = $extraGenerations.Add($afterGeneration) }
+    if ($IncludeMixed -and $PowerSource -ceq 'ac') { $null = $extraGenerations.Add($beforeGeneration); $null = $extraGenerations.Add($afterGeneration) }
     $null = $extraGenerations.Add($discoveryGeneration)
     $requiredGenerations = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $expectedScopes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($parsed[$mode][$target])) { $generation = [string]$run.execution.worker_generation; $null = $requiredGenerations.Add($generation); $expectedScopes[$generation] = if ($target -ceq 'cpu') { 'cpu' } else { 'selected_device' } } } }
-    if ($PowerSource -ceq 'ac') { $null = $requiredGenerations.Add($beforeGeneration); $null = $requiredGenerations.Add($afterGeneration) }
+    if ($IncludeMixed -and $PowerSource -ceq 'ac') { $null = $requiredGenerations.Add($beforeGeneration); $null = $requiredGenerations.Add($afterGeneration) }
     $null = $requiredGenerations.Add($discoveryGeneration)
-    if ($PowerSource -ceq 'ac') { $expectedScopes[$beforeGeneration] = 'selected_device'; $expectedScopes[$afterGeneration] = 'selected_device' }
+    if ($IncludeMixed -and $PowerSource -ceq 'ac') { $expectedScopes[$beforeGeneration] = 'selected_device'; $expectedScopes[$afterGeneration] = 'selected_device' }
     $expectedScopes[$discoveryGeneration] = 'provider_discovery'
     Assert-Array $Block.captures "$Label.captures"
     [object[]]$captures = @($Block.captures)
     Assert-Condition ($captures.Count -eq $requiredGenerations.Count) "$Label must contain exactly one raw SCIF capture per required worker generation and discovery launch."
     $laneCaptureGenerations = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($capture in $captures) {
-        $summary = Assert-Capture $capture "$Label capture" $Identity $Acquisition $PowerSource $schemaVersion $Context $GenerationCaptures $extraGenerations $Challenges $ValidatedCaptures
+        $summary = Assert-Capture $capture "$Label capture" $Identity $Acquisition $PowerSource $schemaVersion $Context $GenerationCaptures $extraGenerations $Challenges $ValidatedCaptures "${ArtifactNamespace}_raw_scif_capture"
         Assert-Condition ($requiredGenerations.Contains($summary.Generation) -and $laneCaptureGenerations.Add($summary.Generation)) "$Label contains an unexpected or duplicate capture generation."
         Assert-Condition ($summary.Scope -ceq $expectedScopes[$summary.Generation]) "$Label capture launch scope does not match its measured/discovery purpose."
     }
@@ -1704,6 +1979,141 @@ function Assert-LaneEvidence($Lane, $Expected, $Plan, [int]$Index, $Context, $Ge
     return $summary
 }
 
+function Assert-PerformanceLaneEvidence($Lane, $Expected, $Plan, [int]$Index, $Context, $GenerationCaptures, $CaptureGenerations, $Challenges, $ValidatedCaptures) {
+    $label = "performance evidence lane $Index"
+    Assert-PerformanceIdentity $Lane.identity "$label.identity" $Plan.source
+    Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal((Get-CanonicalBytesFromObject $Lane.identity), (Get-CanonicalBytesFromObject $Expected.identity))) "$label identity does not match its reviewed plan."
+    Assert-Condition ((Get-CanonicalDigest $Lane) -ceq $Expected.evidence_sha256) "$label does not match its reviewed evidence digest."
+    $powerBlocks = [ordered]@{ ac = $Lane; battery = $null }; $powerParsed = [ordered]@{ ac = $null; battery = $null }
+    $powerBlocks.battery = $Lane.battery
+    if ($Lane.identity.device.device_class -ceq 'discrete_gpu') { Assert-Condition ($null -eq $Lane.battery) "$label.battery must be null for a discrete GPU." }
+    else { Assert-Condition ($null -ne $Lane.battery) "$label.battery is required for an integrated or unified GPU."; Assert-ExactKeys $Lane.battery @('acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'captures') "$label.battery" }
+    $ac = Assert-PowerEvidence $Lane $Lane.identity $Lane.identity.acquisition 'ac' $Plan "$label.ac" $Context $GenerationCaptures $CaptureGenerations $Challenges $ValidatedCaptures $false 3 'windows_gpu_performance'
+    $powerParsed.ac = $ac.Parsed
+    if ($null -ne $Lane.battery) { $battery = Assert-PowerEvidence $Lane.battery $Lane.identity $Lane.identity.battery_acquisition 'battery' $Plan "$label.battery" $Context $GenerationCaptures $CaptureGenerations $Challenges $ValidatedCaptures $false 3 'windows_gpu_performance'; $powerParsed.battery = $battery.Parsed }
+    $powerEvaluation = [ordered]@{ ac = $null; battery = $null }; $reasons = [Collections.Generic.List[string]]::new()
+    foreach ($power in @('ac', 'battery')) {
+        $parsed = $powerParsed[$power]; if ($null -eq $parsed) { continue }
+        [object[]]$allRuns = @($parsed.cold.cpu) + @($parsed.cold.gpu) + @($parsed.warm.cpu) + @($parsed.warm.gpu)
+        $allSuccessful = @($allRuns | Where-Object { $_.outcome -cne 'success' }).Count -eq 0
+        $correctness = $allSuccessful -and @($allRuns | Where-Object { $_.transcript_sha256 -cne $Lane.identity.workload.expected_transcript_sha256 }).Count -eq 0
+        $performance = $allSuccessful
+        if ($performance) { foreach ($mode in @('cold', 'warm')) { $gpu = Get-NearestRank @($parsed[$mode].gpu | ForEach-Object { [Int64]$_.end_to_end_ms }) 95; $cpu = Get-NearestRank @($parsed[$mode].cpu | ForEach-Object { [Int64]$_.end_to_end_ms }) 95; if (([Numerics.BigInteger]$gpu * 100) -gt ([Numerics.BigInteger]$cpu * 110)) { $performance = $false } } }
+        [object[]]$successfulGpuRuns = @(@($parsed.cold.gpu) + @($parsed.warm.gpu) | Where-Object { $_.outcome -ceq 'success' })
+        $minimum = if ($successfulGpuRuns.Count -eq 0) { $null } else { [Int64](@($successfulGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before }) | Measure-Object -Minimum).Minimum }
+        $powerEvaluation[$power] = [ordered]@{
+            correctness = $correctness; performance = $performance; reliability = $allSuccessful; minimum_available_memory_bytes = $minimum
+            metrics = [ordered]@{ cold = [ordered]@{ cpu = Get-MetricSummary @($parsed.cold.cpu); gpu = Get-MetricSummary @($parsed.cold.gpu) }; warm = [ordered]@{ cpu = Get-MetricSummary @($parsed.warm.cpu); gpu = Get-MetricSummary @($parsed.warm.gpu) } }
+        }
+        if (-not $correctness) { $reasons.Add("$power`_correctness_not_equivalent") }; if (-not $allSuccessful) { $reasons.Add("$power`_reliability_not_equivalent") }; if (-not $performance) { $reasons.Add("$power`_gpu_p95_exceeds_cpu_boundary") }
+    }
+    $commonMinimum = $powerEvaluation.ac.minimum_available_memory_bytes
+    if ($null -ne $powerEvaluation.battery -and $null -ne $powerEvaluation.battery.minimum_available_memory_bytes) {
+        $commonMinimum = if ($null -eq $commonMinimum) { [Int64]$powerEvaluation.battery.minimum_available_memory_bytes } else { [Math]::Max([Int64]$commonMinimum, [Int64]$powerEvaluation.battery.minimum_available_memory_bytes) }
+    }
+    $passed = $reasons.Count -eq 0
+    $powerRunSets = [ordered]@{ ac = $Lane.run_sets; battery = if ($null -eq $Lane.battery) { $null } else { $Lane.battery.run_sets } }
+    $summary = [ordered]@{
+        backend = $Lane.identity.backend; device_stable_id = $Lane.identity.device.stable_device_id; driver = $Lane.identity.driver.value; lane_id = $Lane.identity.lane_id
+        metrics = [ordered]@{ ac = $powerEvaluation.ac.metrics; battery = if ($null -eq $powerEvaluation.battery) { $null } else { $powerEvaluation.battery.metrics } }
+        checks = [ordered]@{ by_power = [ordered]@{ ac = [ordered]@{ correctness_equivalent = $powerEvaluation.ac.correctness; performance_passed = $powerEvaluation.ac.performance; reliability_equivalent = $powerEvaluation.ac.reliability }; battery = if ($null -eq $powerEvaluation.battery) { $null } else { [ordered]@{ correctness_equivalent = $powerEvaluation.battery.correctness; performance_passed = $powerEvaluation.battery.performance; reliability_equivalent = $powerEvaluation.battery.reliability } } } }
+        evidence_memory_floor = [ordered]@{ common_minimum_available_memory_bytes = $commonMinimum; minimum_total_memory_bytes = [Int64]$Lane.identity.device.total_memory_bytes; per_power_minimum_available_memory_bytes = [ordered]@{ ac = $powerEvaluation.ac.minimum_available_memory_bytes; battery = if ($null -eq $powerEvaluation.battery) { $null } else { $powerEvaluation.battery.minimum_available_memory_bytes } } }
+        performance_passed = $passed; reasons = $reasons.ToArray()
+        candidate_entry = if ($passed) { Get-AutoProjection $Lane.identity $powerRunSets $powerParsed $commonMinimum 3 } else { $null }
+    }
+    Assert-Condition ($Context.Used.Count -eq $Context.Inventory.Count) "$label signed artifact inventory contains unreferenced files."
+    return $summary
+}
+
+function ConvertTo-RuntimeAutoEntry($Entry) {
+    return [ordered]@{
+        pack = [ordered]@{ pack_id = $Entry.pack.pack_id; pack_version = $Entry.pack.pack_version; pack_digest = $Entry.pack.pack_digest; security_epoch = $Entry.pack.security_epoch; runtime_abi = $Entry.pack.runtime_abi }
+        model_digest = $Entry.model_digest; backend = $Entry.backend; provider_id = $Entry.provider_id; vendor = $Entry.vendor; device_class = $Entry.device_class
+        minimum_total_memory_bytes = $Entry.minimum_total_memory_bytes; minimum_available_memory_bytes = $Entry.minimum_available_memory_bytes
+        driver = [ordered]@{ kind = $Entry.driver.kind; value = $Entry.driver.value }
+        evidence = [ordered]@{ id = $Entry.evidence.id; cold_runs = $Entry.evidence.cold_runs; warm_runs = $Entry.evidence.warm_runs; gpu_p95_ms = $Entry.evidence.gpu_p95_ms; cpu_p95_ms = $Entry.evidence.cpu_p95_ms; correctness_verified = $Entry.evidence.correctness_verified; reliability_verified = $Entry.evidence.reliability_verified; cold_evidence_sha256 = $Entry.evidence.cold_evidence_sha256; warm_evidence_sha256 = $Entry.evidence.warm_evidence_sha256; transcript_parity_evidence_sha256 = $Entry.evidence.transcript_parity_evidence_sha256 }
+    }
+}
+
+function Get-RuntimeAutoCandidate([object[]]$Entries) {
+    $orderedEntries = [Collections.Generic.List[object]]::new()
+    $keys = [Collections.Generic.List[string]]::new()
+    foreach ($entry in $Entries) { Assert-AutoEntry $entry 'performance candidate entry'; $runtime = ConvertTo-RuntimeAutoEntry $entry; $json = $runtime | ConvertTo-Json -Compress -Depth 64; $position = 0; while ($position -lt $keys.Count -and [StringComparer]::Ordinal.Compare($keys[$position], $json) -lt 0) { $position++ }; Assert-Condition ($position -eq $keys.Count -or $keys[$position] -cne $json) 'Performance candidate contains duplicate runtime entries.'; $keys.Insert($position, $json); $orderedEntries.Insert($position, $runtime) }
+    $document = [ordered]@{ schema_version = 2; mode = 'default_deny'; target_os = 'windows'; target_arch = 'x86_64'; entries = $orderedEntries.ToArray() }
+    $text = ($document | ConvertTo-Json -Compress -Depth 64) + "`n"
+    [byte[]]$bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    [object[]]$validated = Import-AutoManifest $bytes
+    Assert-Condition ($validated.Count -eq $Entries.Count) 'Performance candidate runtime manifest did not round-trip through the existing validator.'
+    return [pscustomobject]@{ Sha256 = Get-Sha256Bytes $bytes; Text = $text }
+}
+
+function Invoke-GitRead([string]$RepositoryRoot, [string[]]$Arguments, [string]$Label) {
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    Assert-Condition ($null -ne $git) "$Label requires Git."
+    $start = [Diagnostics.ProcessStartInfo]::new(); $start.FileName = $git.Source; $start.UseShellExecute = $false; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+    foreach ($name in @($start.Environment.Keys)) { if ($name.StartsWith('GIT_', [StringComparison]::OrdinalIgnoreCase)) { $null = $start.Environment.Remove($name) } }
+    $start.ArgumentList.Add('-c'); $start.ArgumentList.Add('core.fsmonitor=false')
+    $start.ArgumentList.Add('-C'); $start.ArgumentList.Add($RepositoryRoot); foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit(); $stdout = $stdoutTask.GetAwaiter().GetResult(); $stderr = $stderrTask.GetAwaiter().GetResult()
+        Assert-Condition ($process.ExitCode -eq 0) "$Label failed: $stderr"
+        return $stdout
+    }
+    finally { $process.Dispose() }
+}
+
+function Assert-ProductionSourceCheckout([string]$RepositoryRoot, [string]$ExpectedRevision) {
+    $head = (Invoke-GitRead $RepositoryRoot @('rev-parse', 'HEAD') 'Production source revision check').Trim()
+    Assert-Condition ($head -ceq $ExpectedRevision) 'Production checkout HEAD differs from the authorized source revision.'
+    $status = Invoke-GitRead $RepositoryRoot @('status', '--porcelain=v1', '--untracked-files=all') 'Production source cleanliness check'
+    Assert-Condition ([string]::IsNullOrWhiteSpace($status)) 'Production checkout has tracked, staged, or untracked changes.'
+}
+
+function Get-PerformanceDecision($Plan, [byte[]]$PlanRaw, $Evidence, [string]$RepositoryRoot, [bool]$FixtureAllowed, [string]$ArtifactDirectory, [string]$ExpectedAuthorization, [string]$ExpectedNonce, [bool]$FixtureClockProvided, [Nullable[Int64]]$FixtureClock) {
+    $validatedPlan = Assert-PerformancePlan $Plan $RepositoryRoot
+    $authority = Import-PerformanceAuthority $RepositoryRoot
+    $authorization = Assert-PerformanceAuthorization $Plan $authority $FixtureAllowed $FixtureClockProvided $FixtureClock $ExpectedAuthorization $ExpectedNonce
+    if (-not $Plan.fixture_only) { Assert-ProductionSourceCheckout $RepositoryRoot $Plan.source.revision }
+    Assert-ExactKeys $Evidence @('schema_version', 'kind', 'fixture_only', 'plan_sha256', 'lanes') 'performance evidence'
+    Assert-Condition ((Get-JsonInteger $Evidence.schema_version 'performance evidence.schema_version' 1 1) -eq 1 -and (Get-JsonString $Evidence.kind 'performance evidence.kind') -ceq 'windows_gpu_performance_candidate_evidence') 'Performance evidence contract is unsupported.'
+    $fixture = Get-JsonBoolean $Evidence.fixture_only 'performance evidence.fixture_only'
+    Assert-Condition ($fixture -eq $Plan.fixture_only) 'Performance plan and evidence fixture modes differ.'
+    $planDigest = Get-Sha256Bytes $PlanRaw
+    Assert-Condition ((Get-Sha256Value $Evidence.plan_sha256 'performance evidence.plan_sha256') -ceq $planDigest) 'Performance evidence does not bind the exact authorized plan.'
+    Assert-Array $Evidence.lanes 'performance evidence.lanes'; [object[]]$lanes = @($Evidence.lanes)
+    Assert-Condition ($lanes.Count -le $MaxLanes -and $lanes.Count -eq $validatedPlan.Required.Count) 'Performance evidence does not exactly cover the reviewed lanes.'
+    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty performance evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) } catch { Fail "Performance artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
+    $context = [pscustomobject]@{ Root = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { '' } else { [IO.Path]::GetFullPath($ArtifactDirectory) }; Paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Count = 0; Bytes = [UInt64]0; Inventory = $null; Used = $null }
+    $generationCaptures = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $captureGenerations = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $challenges = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $validatedCaptures = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $summaries = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $lanes.Count; $index++) {
+        [object[]]$inventory = Assert-PerformanceLaneAttestation $lanes[$index] $Plan $validatedPlan.Required[$index] $authorization.AuthorizationDigest $authorization.ContractDigest "performance evidence lane $index"
+        Read-LaneInventory $context $inventory "performance evidence lane $index"
+        $summaries.Add((Assert-PerformanceLaneEvidence $lanes[$index] $validatedPlan.Required[$index] $Plan $index $context $generationCaptures $captureGenerations $challenges $validatedCaptures))
+    }
+    $summaryArray = $summaries.ToArray(); $complete = $validatedPlan.Required.Count -gt 0 -and $summaryArray.Count -eq $validatedPlan.Required.Count
+    $passed = $complete -and @($summaryArray | Where-Object { -not $_.performance_passed }).Count -eq 0
+    [object[]]$entries = @($summaryArray | Where-Object { $null -ne $_.candidate_entry } | ForEach-Object { $_.candidate_entry })
+    $coverage = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $entries) {
+        # Memory minima are lower-bound predicates. Two entries with the same
+        # categorical match dimensions overlap even when their floors differ.
+        $match = [ordered]@{ pack = $entry.pack; model_digest = $entry.model_digest; backend = $entry.backend; provider_id = $entry.provider_id; vendor = $entry.vendor; device_class = $entry.device_class; driver = $entry.driver }
+        Assert-Condition ($coverage.Add((Get-CanonicalDigest $match))) 'Performance candidate has duplicate or ambiguous runtime coverage.'
+    }
+    $candidate = if ($passed -and $entries.Count -eq $validatedPlan.Required.Count) { Get-RuntimeAutoCandidate $entries } else { $null }
+    $reason = if (-not $complete) { 'incomplete_performance_evidence' } elseif (-not $passed) { 'performance_evidence_failed' } elseif ($fixture) { 'fixture_pending_final_installer_qualification' } else { 'pending_final_installer_qualification' }
+    return [ordered]@{
+        schema_version = 1; kind = 'windows_gpu_performance_candidate_decision'; artifact_bytes = [Int64]$context.Bytes; artifact_count = $context.Count
+        source_revision = $Plan.source.revision; authorization_sha256 = $authorization.AuthorizationDigest; performance_contract_sha256 = $authorization.ContractDigest
+        plan_sha256 = $planDigest; evidence_sha256 = Get-CanonicalDigest $Evidence; fixture_only = $fixture; evidence_complete = $complete; performance_passed = $passed
+        lanes = $summaryArray; candidate_policy = if ($null -eq $candidate) { $null } else { $candidate.Text }; candidate_policy_sha256 = if ($null -eq $candidate) { $null } else { $candidate.Sha256 }
+        auto_eligible = $false; release_approved = $false; decision_reason = $reason; performance_authority_sha256 = $authority.Digest
+    }
+}
+
 function Get-Decision($Plan, [byte[]]$PlanRaw, $Evidence, [string]$RepositoryRoot, [bool]$FixtureAllowed, [string]$ArtifactDirectory) {
     $validatedPlan = Assert-Plan $Plan $RepositoryRoot
     $schemaVersion = [int]$Plan.schema_version
@@ -1786,8 +2196,21 @@ $repositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 try {
     $loadedPlan = Import-CanonicalJson $PlanPath 'qualification plan'
     $loadedEvidence = Import-CanonicalJson $EvidencePath 'qualification evidence'
-    $decision = Get-Decision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot
-    [byte[]]$payload = Get-CanonicalBytesFromObject $decision
+    if ($loadedPlan.Document.kind -ceq 'windows_gpu_performance_candidate_plan') {
+        $decision = Get-PerformanceDecision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot $ExpectedAuthorizationSha256 $ExpectedCampaignNonce $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds') $FixtureNowUnixSeconds
+    }
+    else {
+        Assert-Condition (-not $PSBoundParameters.ContainsKey('ExpectedAuthorizationSha256') -and -not $PSBoundParameters.ContainsKey('ExpectedCampaignNonce') -and -not $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds')) 'Performance-only arguments are not accepted for legacy qualification plans.'
+        $decision = Get-Decision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot
+    }
+    [byte[]]$payload = if ($decision.kind -ceq 'windows_gpu_performance_candidate_decision') {
+        # StrictJson deliberately rejects control characters in decoded string
+        # values. The candidate policy contract requires a decoded trailing LF,
+        # so the new decision uses this stable ordered serializer, which emits
+        # that LF as a JSON escape while preserving the exact decoded string.
+        [Text.UTF8Encoding]::new($false).GetBytes(($decision | ConvertTo-Json -Compress -Depth 64) + "`n")
+    }
+    else { Get-CanonicalBytesFromObject $decision }
     [Console]::OpenStandardOutput().Write($payload, 0, $payload.Length)
     if ($RequireEligible -and -not $decision.auto_eligible) { exit 2 }
     exit 0

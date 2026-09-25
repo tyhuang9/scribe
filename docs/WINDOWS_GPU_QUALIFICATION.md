@@ -295,6 +295,15 @@ dependency without weakening pack or build verification is a separate stage;
 this evidence-schema change does not solve it. CPU defaults and explicit GPU
 delivery are unaffected.
 
+The separate
+[`performance-candidate contract`](WINDOWS_GPU_PERFORMANCE_CANDIDATES.md)
+provides installation-independent worker measurements and derives proposed
+policy bytes without committing a post-capture approval digest. It does not
+reuse or relax this full-qualification authority. Fixed-source UI embedding,
+actual installer scenarios and approval/publication of the unchanged candidate
+remain later integration stages. A performance candidate is never a final
+qualification or release-eligibility decision.
+
 The decision distinguishes structural rejection (exit status 1), a valid
 ineligible decision (exit status 0, or 2 with `-RequireEligible`), and a future
 eligible decision (exit status 0). A structurally valid but slow, incorrect,

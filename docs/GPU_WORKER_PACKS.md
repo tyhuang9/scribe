@@ -106,6 +106,11 @@ prevent mixing the two sets. One runtime projection uses the higher per-power
 exercised memory floor and the worse same-power warm GPU/CPU ratio, with evidence
 digests binding both powers. V2 remains AC-only and cannot complete a
 shared-memory GPU bucket. This adds an evidence capability, not Auto eligibility.
+The separate [performance-candidate boundary](WINDOWS_GPU_PERFORMANCE_CANDIDATES.md)
+can derive installation-independent proposed policy bytes from an approved
+capture campaign. It does not enable Auto or replace final installer scenarios;
+its empty campaign-approval namespace is separate from pack signing and the
+full-qualification authority.
 Passing fixtures can emit diagnostic projections but can never become
 Auto-eligible. The checked-in production plan has no lanes, its independent
 approval authority is empty, its runtime-bucket coverage flag is false, and the

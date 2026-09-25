@@ -17,6 +17,7 @@ runtime-manifests/linux-gpu-qualification-plan-x86_64.json text eol=lf
 runtime-manifests/linux-gpu-qualification-production-authority.json text eol=lf
 runtime-manifests/windows-gpu-qualification-plan-x64.json text eol=lf
 runtime-manifests/windows-gpu-qualification-production-authority.json text eol=lf
+runtime-manifests/windows-gpu-performance-authority.json text eol=lf
 scripts/qualify-windows-gpu-evidence.ps1 text eol=lf
 scripts/test-windows-gpu-qualification.ps1 text eol=lf
 *.sh text eol=lf
