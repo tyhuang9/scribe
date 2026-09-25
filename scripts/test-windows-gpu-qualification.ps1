@@ -503,6 +503,74 @@ function New-PerformanceAuthorization($Plan, [Security.Cryptography.ECDsa]$Key =
     }
 }
 
+function ConvertTo-PerformanceAcquisition($Acquisition) {
+    $cpuAffinity = $Acquisition.threading.cpu_affinity_sha256
+    $gpuAffinity = $Acquisition.threading.gpu_affinity_sha256
+    $Acquisition.threading = [ordered]@{
+        cpu_affinity_sha256 = $cpuAffinity
+        gpu_affinity_sha256 = $gpuAffinity
+        policy = 'native_default'
+        requested_n_threads = 0
+        resolved_n_threads = $null
+    }
+}
+
+function ConvertTo-PerformanceRun($Run, $Identity, [string]$Target) {
+    $privateUsage = [Int64]$Run.peak_process_memory_bytes
+    $providerMemory = if ($Target -ceq 'cpu') {
+        [ordered]@{
+            before = [ordered]@{ reason = 'cpu_provider'; status = 'not_applicable' }
+            after = [ordered]@{ reason = 'cpu_provider'; status = 'not_applicable' }
+        }
+    }
+    else {
+        [ordered]@{
+            before = [ordered]@{
+                admission_validity = 'unestablished'; backend = $Identity.backend; memory_total_bytes = [Int64]$Identity.device.total_memory_bytes
+                provider_id = $Identity.provider_id; provider_reported_memory_free_bytes = [Int64](7000000000 + $Run.sequence * 4096)
+                stable_device = $Identity.device.stable_device_id; status = 'available'; value_semantics = 'native_backend_defined'
+            }
+            after = [ordered]@{
+                admission_validity = 'unestablished'; backend = $Identity.backend; memory_total_bytes = [Int64]$Identity.device.total_memory_bytes
+                provider_id = $Identity.provider_id; provider_reported_memory_free_bytes = [Int64](6500000000 + $Run.sequence * 2048)
+                stable_device = $Identity.device.stable_device_id; status = 'available'; value_semantics = 'native_backend_defined'
+            }
+        }
+    }
+    $videoMemory = if ($Target -ceq 'cpu') {
+        [ordered]@{ status = 'not_applicable' }
+    }
+    else {
+        [ordered]@{
+            status = 'available'
+            local = [ordered]@{
+                sampled_max_current_usage_bytes = [Int64](800000000 + $Run.sequence * 2048)
+                sampled_max_current_reservation_bytes = [Int64](80000000 + $Run.sequence * 1024)
+                sampled_min_budget_bytes = [Int64]10000000000
+                sampled_min_available_for_reservation_bytes = [Int64]9000000000
+            }
+            non_local = [ordered]@{
+                sampled_max_current_usage_bytes = [Int64](64000000 + $Run.sequence * 1024)
+                sampled_max_current_reservation_bytes = [Int64](8000000 + $Run.sequence * 512)
+                sampled_min_budget_bytes = [Int64]4000000000
+                sampled_min_available_for_reservation_bytes = [Int64]3000000000
+            }
+        }
+    }
+    $Run.Remove('peak_process_memory_bytes')
+    $Run.Remove('peak_vram_bytes')
+    $Run.Remove('peak_shared_device_memory_bytes')
+    $Run.sampled_max_private_usage_bytes = $privateUsage
+    $Run.telemetry_sample_count = [Int64](3 + $Run.sequence)
+    $Run.video_memory = $videoMemory
+    $Run.provider_memory = $providerMemory
+    $Run.execution.device_memory_kind = if ($Target -ceq 'cpu') { 'none' } else { 'windows_local_non_local_segments' }
+    if ($Target -ceq 'cpu') {
+        $Run.available_device_memory_bytes_before = $null
+        $Run.available_device_memory_bytes_after = $null
+    }
+}
+
 function New-PerformanceDocuments([string]$DeviceClass = 'integrated_gpu', [int]$AcGpuColdMs = 220, [int]$AcGpuWarmMs = 110, [int]$BatteryGpuColdMs = 220, [int]$BatteryGpuWarmMs = 110, [string]$LaneId = '', [string]$VulkanVendor = '') {
     $source = New-V3FixtureDocuments $DeviceClass $AcGpuColdMs $AcGpuWarmMs $BatteryGpuColdMs $BatteryGpuWarmMs
     if ($VulkanVendor) { Set-VulkanFixture $source $VulkanVendor $(if ($VulkanVendor -ceq 'intel') { '8086' } else { '1002' }) }
@@ -521,6 +589,23 @@ function New-PerformanceDocuments([string]$DeviceClass = 'integrated_gpu', [int]
     $lane.identity.Remove('installation')
     $lane.identity.device.Remove('qualified_minimum_total_memory_bytes')
     $lane.identity.device.Remove('qualified_minimum_available_memory_bytes')
+    $lane.identity.device.memory_model = 'windows_local_non_local_segments'
+    ConvertTo-PerformanceAcquisition $lane.identity.acquisition
+    if ($null -ne $lane.identity.battery_acquisition) { ConvertTo-PerformanceAcquisition $lane.identity.battery_acquisition }
+    foreach ($mode in @('cold', 'warm')) {
+        foreach ($target in @('cpu', 'gpu')) {
+            foreach ($run in @($lane.run_sets[$mode][$target])) {
+                ConvertTo-PerformanceRun $run $lane.identity $target
+                $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.acquisition
+            }
+            if ($null -ne $lane.battery) {
+                foreach ($run in @($lane.battery.run_sets[$mode][$target])) {
+                    ConvertTo-PerformanceRun $run $lane.identity $target
+                    $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.battery_acquisition
+                }
+            }
+        }
+    }
     $lane.Remove('scenarios')
     $lane.captures = New-PowerCaptures $lane $lane.identity $lane.identity.acquisition 'ac' $false $true
     if ($null -ne $lane.battery) { $lane.battery.captures = New-PowerCaptures $lane.battery $lane.identity $lane.identity.battery_acquisition 'battery' $false $true }
@@ -799,6 +884,35 @@ try {
     $performanceDiscrete = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'discrete_gpu') 'performance-discrete' 64
     Assert-True ($null -eq $performanceDiscrete.Decision.lanes[0].metrics.battery) 'Discrete performance candidate unexpectedly contains battery metrics.'
     $performanceUnified = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'unified_gpu' 220 110 220 110 'fixture-performance-unified-vulkan' 'intel') 'performance-unified-intel-vulkan' 128
+    foreach ($result in @($performanceSmoke, $performanceDiscrete, $performanceUnified)) {
+        $gpuMetrics = $result.Decision.lanes[0].metrics.ac.cold.gpu
+        Assert-True ($gpuMetrics.video_memory.status -ceq 'available' -and $gpuMetrics.video_memory.local.sampled_max_current_usage_bytes.p95 -gt 0 -and $gpuMetrics.video_memory.non_local.sampled_max_current_usage_bytes.p95 -gt 0) 'Performance fixture did not preserve nonzero Windows local and non-local segment readings.'
+        Assert-True ($gpuMetrics.sampled_max_private_usage_bytes.p95 -gt 0 -and $gpuMetrics.telemetry_sample_count.p95 -gt 0) 'Performance fixture did not summarize sampled private commit and telemetry sample counts.'
+        Assert-True ($result.Decision.lanes[0].metrics.ac.cold.cpu.video_memory.status -ceq 'not_applicable') 'Performance CPU metrics did not preserve not-applicable video memory.'
+    }
+
+    foreach ($deviceClass in @('discrete_gpu', 'integrated_gpu', 'unified_gpu')) {
+        $zeroSegments = New-PerformanceDocuments $deviceClass
+        $blocks = @($zeroSegments.Evidence.lanes[0]); if ($null -ne $zeroSegments.Evidence.lanes[0].battery) { $blocks += $zeroSegments.Evidence.lanes[0].battery }
+        foreach ($block in $blocks) {
+            foreach ($mode in @('cold', 'warm')) {
+                foreach ($run in @($block.run_sets[$mode].gpu)) {
+                    foreach ($segment in @('local', 'non_local')) {
+                        foreach ($field in @('sampled_max_current_usage_bytes', 'sampled_max_current_reservation_bytes', 'sampled_min_budget_bytes', 'sampled_min_available_for_reservation_bytes')) { $run.video_memory[$segment][$field] = [Int64]0 }
+                    }
+                }
+            }
+        }
+        $zeroExpectedArtifacts = if ($deviceClass -ceq 'discrete_gpu') { 64 } else { 128 }
+        $zeroResult = Invoke-PassingPerformanceFixture $zeroSegments "performance-zero-segments-$deviceClass" $zeroExpectedArtifacts
+        Assert-True ($zeroResult.Decision.lanes[0].metrics.ac.cold.gpu.video_memory.local.sampled_max_current_usage_bytes.p95 -eq 0 -and $zeroResult.Decision.lanes[0].metrics.ac.cold.gpu.video_memory.non_local.sampled_max_current_usage_bytes.p95 -eq 0) "Performance $deviceClass did not preserve measured zero in both Windows segment pools."
+    }
+
+    foreach ($missingSegment in @('local', 'non_local')) {
+        $missingSegmentField = New-PerformanceDocuments
+        $missingSegmentField.Evidence.lanes[0].run_sets.cold.gpu[0].video_memory[$missingSegment].Remove('sampled_max_current_usage_bytes')
+        Assert-Rejected (Invoke-Evaluator (New-Bundle $missingSegmentField "performance-missing-$missingSegment-segment-field")) "Performance missing $missingSegment segment field" 'unexpected or missing fields'
+    }
 
     $repeatResult = Invoke-Evaluator $performanceUnified.Bundle
     Assert-True ($repeatResult.ExitCode -eq 0 -and $repeatResult.Stdout -ceq $performanceUnified.Result.Stdout) 'Repeated stateless performance evaluation was not byte-deterministic.'
@@ -826,6 +940,88 @@ try {
     Assert-Rejected (Invoke-Evaluator (New-Bundle $forbiddenFloor 'performance-forbidden-floor')) 'Performance declared floor field' 'unexpected or missing fields'
     $forbiddenScenarios = New-PerformanceDocuments; $forbiddenScenarios.Evidence.lanes[0].scenarios = @()
     Assert-Rejected (Invoke-Evaluator (New-Bundle $forbiddenScenarios 'performance-forbidden-scenarios')) 'Performance scenarios field' 'unexpected or missing fields'
+    $performancePlanSchema2 = New-PerformanceDocuments; $performancePlanSchema2.Plan.schema_version = 2
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $performancePlanSchema2 'performance-plan-schema-2')) 'Performance plan schema 2' 'bounded JSON integer'
+    $performanceEvidenceSchema2 = New-PerformanceDocuments; $performanceEvidenceSchema2.Evidence.schema_version = 2
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $performanceEvidenceSchema2 'performance-evidence-schema-2')) 'Performance evidence schema 2' 'bounded JSON integer'
+
+    $resolvedThreadCount = New-PerformanceDocuments; $resolvedThreadCount.Evidence.lanes[0].identity.acquisition.threading.resolved_n_threads = 8
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $resolvedThreadCount 'performance-fabricated-resolved-threads')) 'Performance fabricated resolved thread count' 'resolved n_threads must be null'
+    $nondefaultThreadRequest = New-PerformanceDocuments; $nondefaultThreadRequest.Evidence.lanes[0].identity.acquisition.threading.requested_n_threads = 1
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $nondefaultThreadRequest 'performance-nondefault-requested-threads')) 'Performance nondefault requested thread count' 'bounded JSON integer'
+    $wrongThreadPolicy = New-PerformanceDocuments; $wrongThreadPolicy.Evidence.lanes[0].identity.acquisition.threading.policy = 'fixed'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $wrongThreadPolicy 'performance-wrong-thread-policy')) 'Performance wrong thread policy' 'configured native default'
+    $batteryThreadMismatch = New-PerformanceDocuments; $batteryThreadMismatch.Evidence.lanes[0].identity.battery_acquisition.threading.cpu_affinity_sha256 = Get-Digest 'different-battery-cpu-affinity'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $batteryThreadMismatch 'performance-battery-thread-mismatch')) 'Performance AC/battery threading mismatch' 'AC and battery threading identities differ'
+
+    $zeroSampleSuccess = New-PerformanceDocuments; $zeroSampleSuccess.Evidence.lanes[0].run_sets.warm.gpu[0].telemetry_sample_count = 0
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $zeroSampleSuccess 'performance-zero-sample-success')) 'Performance zero-sample success' 'bounded JSON integer'
+    $zeroSampleFailure = New-PerformanceDocuments; Set-RunFailure $zeroSampleFailure.Evidence.lanes[0].run_sets.warm.gpu[0] 'provider_error'; $zeroSampleFailure.Evidence.lanes[0].run_sets.warm.gpu[0].telemetry_sample_count = 0
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $zeroSampleFailure 'performance-zero-sample-failure')) 'Performance zero-sample failure' 'bounded JSON integer'
+    $stringSampleCount = New-PerformanceDocuments; $stringSampleCount.Evidence.lanes[0].run_sets.warm.gpu[0].telemetry_sample_count = '4'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $stringSampleCount 'performance-string-sample-count')) 'Performance string sample count' 'must be a JSON integer'
+    $missingSampleCount = New-PerformanceDocuments; $missingSampleCount.Evidence.lanes[0].run_sets.warm.gpu[0].Remove('telemetry_sample_count')
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $missingSampleCount 'performance-missing-sample-count')) 'Performance missing sample count' 'unexpected or missing fields'
+
+    $mixedAdmissionInputs = New-PerformanceDocuments; $mixedAdmissionInputs.Evidence.lanes[0].run_sets.warm.gpu[0].available_device_memory_bytes_after = $null
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $mixedAdmissionInputs 'performance-mixed-admission-inputs')) 'Performance mixed admission input pair' 'must both be numeric or both be null'
+    $cpuAdmissionInputs = New-PerformanceDocuments; $cpuAdmissionInputs.Evidence.lanes[0].run_sets.warm.cpu[0].available_device_memory_bytes_before = [Int64]0; $cpuAdmissionInputs.Evidence.lanes[0].run_sets.warm.cpu[0].available_device_memory_bytes_after = [Int64]0
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $cpuAdmissionInputs 'performance-cpu-admission-inputs')) 'Performance CPU admission inputs' 'must use null admission'
+
+    $rawZero = New-PerformanceDocuments
+    foreach ($block in @($rawZero.Evidence.lanes[0], $rawZero.Evidence.lanes[0].battery)) { foreach ($mode in @('cold', 'warm')) { foreach ($run in @($block.run_sets[$mode].gpu)) { $run.provider_memory.before.provider_reported_memory_free_bytes = [Int64]0; $run.provider_memory.after.provider_reported_memory_free_bytes = [Int64]0 } } }
+    $rawZeroResult = Invoke-PassingPerformanceFixture $rawZero 'performance-raw-provider-zero' 128
+    Assert-True ($rawZeroResult.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'Raw provider zero improperly changed the separate admission-input floor.'
+    Assert-True ((Get-CanonicalDigest $rawZeroResult.Decision.lanes[0].checks) -ceq (Get-CanonicalDigest $performanceSmoke.Decision.lanes[0].checks)) 'Changing raw provider readings changed performance/parity/reliability/admission-input checks.'
+    Assert-True ($rawZeroResult.Decision.lanes[0].candidate_entry.evidence.cold_evidence_sha256 -cne $performanceSmoke.Decision.lanes[0].candidate_entry.evidence.cold_evidence_sha256 -and $rawZeroResult.Decision.lanes[0].candidate_entry.evidence.warm_evidence_sha256 -cne $performanceSmoke.Decision.lanes[0].candidate_entry.evidence.warm_evidence_sha256) 'Changing raw provider readings did not change the bound run-evidence digests.'
+    Assert-True ($rawZeroResult.Decision.lanes[0].candidate_entry.evidence.transcript_parity_evidence_sha256 -ceq $performanceSmoke.Decision.lanes[0].candidate_entry.evidence.transcript_parity_evidence_sha256) 'Changing raw provider readings changed the transcript-only parity digest.'
+    $rawUnavailable = New-PerformanceDocuments; $rawUnavailableRun = $rawUnavailable.Evidence.lanes[0].run_sets.warm.gpu[0]; $rawUnavailableRun.provider_memory = [ordered]@{ before = [ordered]@{ reason = 'provider_query_failed'; status = 'unavailable' }; after = [ordered]@{ reason = 'memory_total_unreported'; status = 'unavailable' } }
+    $rawUnavailableResult = Invoke-PassingPerformanceFixture $rawUnavailable 'performance-raw-provider-unavailable' 128
+    Assert-True ($rawUnavailableResult.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'Unavailable raw provider observations improperly changed the separate admission-input floor.'
+    $missingProviderField = New-PerformanceDocuments; $missingProviderField.Evidence.lanes[0].run_sets.warm.gpu[0].provider_memory.before.Remove('admission_validity')
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $missingProviderField 'performance-missing-provider-field')) 'Performance missing provider field' 'unexpected or missing fields'
+    $wrongProviderTotal = New-PerformanceDocuments; $wrongProviderTotal.Evidence.lanes[0].run_sets.warm.gpu[0].provider_memory.before.memory_total_bytes++
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $wrongProviderTotal 'performance-wrong-provider-total')) 'Performance wrong provider total' 'does not match the authenticated lane'
+    foreach ($rawMismatch in @(
+        [pscustomobject]@{ Name = 'backend'; Mutate = { param($o) $o.backend = 'vulkan' }; Expected = 'backend does not match' },
+        [pscustomobject]@{ Name = 'provider'; Mutate = { param($o) $o.provider_id = 'transcribe-cpp-ggml-vulkan' }; Expected = 'provider does not match' },
+        [pscustomobject]@{ Name = 'stable-device'; Mutate = { param($o) $o.stable_device = 'native:0000:02:00.0' }; Expected = 'stable device does not match' },
+        [pscustomobject]@{ Name = 'free-over-total'; Mutate = { param($o) $o.provider_reported_memory_free_bytes = [Int64]12000000001 }; Expected = 'bounded JSON integer' },
+        [pscustomobject]@{ Name = 'admission-validity'; Mutate = { param($o) $o.admission_validity = 'established' }; Expected = 'must not claim' }
+    )) {
+        $rawMismatchDocuments = New-PerformanceDocuments; & $rawMismatch.Mutate $rawMismatchDocuments.Evidence.lanes[0].run_sets.warm.gpu[0].provider_memory.before
+        Assert-Rejected (Invoke-Evaluator (New-Bundle $rawMismatchDocuments "performance-raw-$($rawMismatch.Name)-mismatch")) "Performance raw provider $($rawMismatch.Name) mismatch" $rawMismatch.Expected
+    }
+
+    $counterRelationships = New-PerformanceDocuments 'discrete_gpu'; $counterRelationshipRun = $counterRelationships.Evidence.lanes[0].run_sets.cold.gpu[0]
+    $counterRelationshipRun.video_memory.local.sampled_max_current_usage_bytes = [Int64]($counterRelationshipRun.video_memory.local.sampled_min_budget_bytes + 1)
+    $counterRelationshipRun.video_memory.non_local.sampled_max_current_usage_bytes = [Int64]($counterRelationships.Evidence.lanes[0].identity.device.total_memory_bytes + 1)
+    $counterRelationshipResult = Invoke-PassingPerformanceFixture $counterRelationships 'performance-independent-counter-relationships' 64
+    Assert-True ($counterRelationshipResult.Decision.lanes[0].metrics.ac.cold.gpu.video_memory.local.sampled_max_current_usage_bytes.p95 -gt $counterRelationshipRun.video_memory.local.sampled_min_budget_bytes -and $counterRelationshipResult.Decision.lanes[0].metrics.ac.cold.gpu.video_memory.non_local.sampled_max_current_usage_bytes.p95 -gt $counterRelationships.Evidence.lanes[0].identity.device.total_memory_bytes) 'Performance evaluator imposed an unsupported usage/budget or non-local/physical-total comparison.'
+
+    $rawOnlyMissingAdmission = New-PerformanceDocuments; $rawOnlyRun = $rawOnlyMissingAdmission.Evidence.lanes[0].battery.run_sets.warm.gpu[0]
+    Assert-True ($rawOnlyRun.provider_memory.before.provider_reported_memory_free_bytes -gt 0) 'Raw-only fixture did not retain a nonzero provider observation.'
+    $rawOnlyRun.available_device_memory_bytes_before = $null; $rawOnlyRun.available_device_memory_bytes_after = $null
+    $rawOnlyDecision = Invoke-FailingPerformanceFixture $rawOnlyMissingAdmission 'performance-raw-only-missing-admission' 'battery_available_memory_admission_inputs_missing'
+    Assert-True ($rawOnlyDecision.lanes[0].checks.by_power.ac.available_memory_admission_inputs_complete -and -not $rawOnlyDecision.lanes[0].checks.by_power.battery.available_memory_admission_inputs_complete) 'Missing battery admission input was not isolated to its power lane.'
+    Assert-True ($rawOnlyDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -eq 9000000000 -and $null -eq $rawOnlyDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery -and $null -eq $rawOnlyDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes) 'Missing battery admission input did not suppress the battery/common floors.'
+
+    $acMissingAdmission = New-PerformanceDocuments; $acMissingRun = $acMissingAdmission.Evidence.lanes[0].run_sets.warm.gpu[0]; $acMissingRun.available_device_memory_bytes_before = $null; $acMissingRun.available_device_memory_bytes_after = $null
+    $acMissingDecision = Invoke-FailingPerformanceFixture $acMissingAdmission 'performance-ac-missing-admission' 'ac_available_memory_admission_inputs_missing'
+    Assert-True ($null -eq $acMissingDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -and $acMissingDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery -eq 9000000000 -and $null -eq $acMissingDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes) 'Missing AC admission input did not suppress the AC/common floors while retaining the complete battery floor.'
+
+    $multiLaneMissingAdmission = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-missing-a'
+    $multiLaneMissingSecond = New-PerformanceDocuments 'unified_gpu' 220 105 220 99 'fixture-performance-missing-b' 'intel'; $multiLaneMissingRun = $multiLaneMissingSecond.Evidence.lanes[0].battery.run_sets.warm.gpu[0]; $multiLaneMissingRun.available_device_memory_bytes_before = $null; $multiLaneMissingRun.available_device_memory_bytes_after = $null
+    $multiLaneMissingAdmission.Evidence.lanes = @($multiLaneMissingAdmission.Evidence.lanes[0], $multiLaneMissingSecond.Evidence.lanes[0])
+    $multiLaneMissingBundle = New-Bundle $multiLaneMissingAdmission 'performance-multi-lane-missing-admission'; $multiLaneMissingResult = Invoke-Evaluator $multiLaneMissingBundle
+    Assert-True ($multiLaneMissingResult.ExitCode -eq 0) "Multi-lane missing admission input was structurally rejected: $($multiLaneMissingResult.Stderr)"
+    $multiLaneMissingDecision = $multiLaneMissingResult.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True (-not $multiLaneMissingDecision.performance_passed -and $null -eq $multiLaneMissingDecision.candidate_policy -and $null -eq $multiLaneMissingDecision.candidate_policy_sha256 -and $multiLaneMissingDecision.lanes[1].reasons -ccontains 'battery_available_memory_admission_inputs_missing') 'A multi-lane campaign emitted a partial policy or omitted the missing-admission reason.'
+
+    $legacyWithPerformanceRun = New-V3FixtureDocuments; $legacyWithPerformanceRun.Evidence.lanes[0].run_sets.cold.gpu[0] = Copy-Document (New-PerformanceDocuments).Evidence.lanes[0].run_sets.cold.gpu[0]
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $legacyWithPerformanceRun 'legacy-with-performance-run')) 'Legacy schema accepted performance run shape' 'unexpected or missing fields'
+    $performanceWithLegacyRun = New-PerformanceDocuments; $performanceWithLegacyRun.Evidence.lanes[0].run_sets.cold.gpu[0] = Copy-Document (New-V3FixtureDocuments).Evidence.lanes[0].run_sets.cold.gpu[0]
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $performanceWithLegacyRun 'performance-with-legacy-run')) 'Performance schema accepted legacy run shape' 'unexpected or missing fields'
 
     $missingCapture = New-PerformanceDocuments; $missingCapture.Evidence.lanes[0].battery.captures = @($missingCapture.Evidence.lanes[0].battery.captures | Select-Object -Skip 1)
     Assert-Rejected (Invoke-Evaluator (New-Bundle $missingCapture 'performance-missing-capture')) 'Performance missing capture' 'exactly one raw SCIF capture'
@@ -859,6 +1055,8 @@ try {
     foreach ($run in @($allGpuFailed.Evidence.lanes[0].run_sets.cold.gpu) + @($allGpuFailed.Evidence.lanes[0].run_sets.warm.gpu) + @($allGpuFailed.Evidence.lanes[0].battery.run_sets.cold.gpu) + @($allGpuFailed.Evidence.lanes[0].battery.run_sets.warm.gpu)) { Set-RunFailure $run 'provider_error' }
     $allGpuFailedDecision = Invoke-FailingPerformanceFixture $allGpuFailed 'performance-all-gpu-failed' 'ac_correctness_not_equivalent'
     Assert-True ($null -eq $allGpuFailedDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes) 'All-failed GPU evidence fabricated a memory floor.'
+    $allFailedGpuMetrics = $allGpuFailedDecision.lanes[0].metrics.ac.cold.gpu
+    Assert-True ($null -eq $allFailedGpuMetrics.sampled_max_private_usage_bytes -and $null -eq $allFailedGpuMetrics.telemetry_sample_count -and $null -eq $allFailedGpuMetrics.video_memory.local.sampled_max_current_usage_bytes -and $null -eq $allFailedGpuMetrics.video_memory.non_local.sampled_max_current_usage_bytes) 'All-failed GPU evidence summarized unobserved successful-run counters as zero instead of null.'
 
     $captureEqualsApproval = New-PerformanceDocuments
     $captureEqualsApproval.Plan.capture_authority.capture_key_id = 'p256:' + $PerformanceApprovalKeyId.Substring('performance-approval-p256:'.Length)

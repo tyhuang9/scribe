@@ -145,23 +145,23 @@ sampled or altered, and no persistent probe artifact was created.
 
 ## Remaining integration
 
-The unpublished performance contract currently requires an unused memory pool
-to be zero based only on GPU class. That assumption cannot describe general
-Windows observations. Establish the collector's actual measurement APIs first,
-then correct performance-specific semantics and regenerate digest-bound test
-fixtures. Preserve the legacy full-qualification schemas 2/3; never relabel old
-evidence as newly captured observations.
+The [performance-only contract](WINDOWS_GPU_PERFORMANCE_CANDIDATES.md) records
+sampled private commit and separate local/non-local segments without forcing an
+unused pool to zero based on GPU class. Its acquisition records the actual
+native-default thread request of zero, with resolved count null, while retaining
+host/affinity and worker/native-source bindings. The pinned library does not
+expose its resolved count; OS process threads are not a substitute. This keeps
+the application's scheduling unchanged without requiring a native fork just
+for that field. Full-qualification schemas 2/3 keep their legacy shapes and
+rules; neither old evidence nor this unsigned report may be relabelled as a
+new authenticated capture.
 
-The unpublished performance acquisition contract still assumes positive
-observed inference-thread counts. The pinned library does not expose its
-resolved count: its configured native-default request of zero is not an
-observed positive count, and OS process threads are not a substitute. The
-performance-only contract should record the actual configured policy, mark
-the resolved count unavailable, and bind real host/affinity and pinned
-worker/native-source provenance. That measures the unchanged application
-workload without requiring a native fork just for this field. Preserve the
-legacy full-qualification schemas 2/3 rather than weakening their inputs or
-inventing counts in old evidence.
+Raw provider observations remain separate from the performance contract's
+admission inputs. The completeness of separately supplied numeric admission
+values is not proof of their measurement semantics. Null admission inputs must
+prevent a candidate floor or policy; the raw values in this report cannot supply
+them automatically. Reviewed, pinned acquisition code and protected capture
+custody are still required to establish valid production admission observations.
 
 Provider-memory provenance is a separate prerequisite for safe Auto memory
 admission. Existing startup snapshots cannot substitute for fresh before/after
@@ -185,6 +185,12 @@ Hardware counter validation, complete paired-run acquisition, protected capture
 custody, candidate-installer integration and unchanged-artifact promotion remain
 separate acceptance gates. Passing deterministic observer tests alone does not
 establish GPU performance or production readiness.
+
+Final-installer qualification also needs an explicitly versioned contract that
+can represent these actual observations. Legacy full-qualification schemas 2/3
+still require their older threading and memory shapes; neither transforming
+new observations into those shapes nor rebinding old evidence is a valid way
+to qualify the final installer.
 
 ## Development interface
 

@@ -1,7 +1,7 @@
 # Windows GPU performance-policy candidates
 
 This is an offline, pre-installer evidence boundary. It derives proposed Auto
-policy bytes from authenticated measurements of a frozen set of workers. It
+policy bytes from authenticated performance records for frozen workers. It
 does **not** approve an installer, change runtime policy, enable production Auto,
 sign packs, or publish a release.
 
@@ -34,13 +34,17 @@ approval service, candidate builder, final qualification or publication flow.
 In particular, the current release builder still rebuilds its CPU worker; that
 must change in the later fixed-artifact candidate integration.
 
-A real acquisition/writer is also still missing. The existing Windows Vulkan
-evidence script and ignored hardware tests produce fixture-only, metadata-only
-timing reports. They rebuild workers, use a different execution schedule, and do
-not retain the complete per-run telemetry and raw handshake artifacts required
-here. Only the synthetic test constructors currently write complete performance
-bundles. Do not convert an old timing report into qualification evidence or
-invent its missing observations.
+A complete campaign acquisition/writer is still missing. The opt-in
+[capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) now measures one serial
+CPU/GPU pair and retains authenticated handshake frames, sampled process/device
+memory and request-bound raw provider-memory snapshots. Its unsigned schema-2
+report is not a performance bundle, and its instrumented timing window is not
+yet the full campaign's timing contract. The older Windows Vulkan evidence
+script and ignored hardware tests produce fixture-only, metadata-only timing
+reports: they rebuild workers and use a different schedule. Only synthetic
+test constructors currently write complete performance bundles. Do not convert
+either kind of diagnostic report into qualification evidence or invent missing
+observations.
 
 The future collector must consume frozen worker artifacts, execute the exact
 paired schedule, observe actual power/memory/process/device state and handshake
@@ -79,8 +83,9 @@ toolchain, and **base** checked-in Auto manifest, not the not-yet-derived
 candidate policy. Updating an evaluator requires a new capture contract; schema
 compatibility does not authorize rebinding old evidence to new code.
 
-Each lane uses the schema-3 acquisition, CPU/GPU worker, pack, model, workload,
-driver, device and power identities, with two deliberate exclusions:
+Each lane retains the schema-3 CPU/GPU worker, pack, model, workload, driver,
+device and power identity bindings. Its acquisition and measurement fields use
+the performance-only meanings below, with two deliberate exclusions:
 
 - No installation identity, scenarios or mixed-device remapping captures.
 - No declared qualified minimum total or available memory. Observed total memory
@@ -89,6 +94,97 @@ driver, device and power identities, with two deliberate exclusions:
 All desktop/worker build identities must use the frozen source revision and
 application version. Lanes share one exact CPU baseline, and a backend cannot
 mix different packs or GPU worker artifacts into one candidate.
+
+## Performance measurement semantics
+
+These rules apply only to performance schema 1. Full qualification schemas 2/3
+retain their existing threading, memory fields and summaries. The formats are
+not interchangeable, even when a fixture starts from a shared constructor.
+Changing the evaluator still requires a new digest-bound capture contract.
+
+The exact performance `acquisition.threading` fields are:
+
+- `policy: "native_default"` and `requested_n_threads: 0`, recording the
+  application's actual configured request without changing its workload;
+- `resolved_n_threads: null`, because the pinned runtime does not expose its
+  resolved count (zero is not an observed count and OS process threads are not
+  a substitute);
+- `cpu_affinity_sha256` and `gpu_affinity_sha256`, preserving the existing
+  affinity bindings alongside host topology, inference options, worker/native
+  provenance and the AC/battery consistency checks.
+
+Performance GPU identities use
+`device.memory_model: "windows_local_non_local_segments"`, and GPU execution
+records use that same `device_memory_kind`. CPU execution remains `none`.
+Local and non-local are Windows segment labels, not promises of dedicated VRAM
+and shared host memory. Their meaning does not change merely because a GPU is
+discrete, integrated or unified.
+
+Performance runs record `sampled_max_private_usage_bytes`,
+`telemetry_sample_count` and `video_memory`. This format requires a positive
+sample count; successful measurements also require positive sampled private
+commit. CPU video memory is exactly
+`{ "status": "not_applicable" }`; GPU video memory is `available` with both
+`local` and `non_local` segments. Each segment contains:
+
+- `sampled_max_current_usage_bytes`;
+- `sampled_max_current_reservation_bytes`;
+- `sampled_min_budget_bytes`;
+- `sampled_min_available_for_reservation_bytes`.
+
+Each counter is a measured, nonnegative integer. A zero segment is valid;
+missing measurements are not equivalent to zero. Both segments may have
+nonzero usage on any GPU class. Do not require usage below budget or compare
+non-local usage against physical GPU capacity: these are different quantities,
+and their sampled extrema need not occur at the same instant. Sampled maxima
+are not guaranteed instantaneous or lifetime peaks. Performance summaries keep
+these field names and local/non-local nesting instead of the legacy peak labels.
+Metric distributions include successful runs only. When none succeeds, their
+summary counters are null, not fabricated zero measurements.
+
+Measured failed runs remain failures and cannot produce a candidate policy.
+A run that fails before any sample is collected is structurally rejected by
+this format: it has no unavailable-telemetry variant. Do not populate the
+required available segments with invented zero counters to make it admissible.
+Representing such incomplete captures requires a separately defined format;
+they cannot be omitted or replaced with successful runs to qualify a campaign.
+
+### Raw provider observations and admission inputs
+
+Each performance run also has `provider_memory.before` and `after`, using the
+observer's typed snapshots. CPU snapshots are `not_applicable` with reason
+`cpu_provider`. GPU snapshots are either `unavailable` with a finite reason or
+`available` with backend, provider, stable device, total memory and
+`provider_reported_memory_free_bytes`. Available raw snapshots must match the
+authenticated lane identity and total; reported free memory may be zero but
+must not exceed total. Their `value_semantics` remains `native_backend_defined`
+and `admission_validity` remains `unestablished`.
+
+The existing `available_device_memory_bytes_before` and
+`available_device_memory_bytes_after` are separate admission inputs, not aliases
+for those raw readings. Performance CPU records contain null for both. GPU
+records contain either a bounded numeric pair or null for both; mixed pairs
+are rejected. Do not derive, default or replace either admission value from raw
+provider memory or Windows segment counters. Raw identity checks still apply;
+numeric equality between measurements with different meanings is not required.
+
+The per-power `available_memory_admission_inputs_complete` check reports only
+whether all successful GPU runs supplied the separate admission pair. It does
+**not** establish measurement provenance or correctness. A missing pair in even
+one successful cold/warm GPU run produces
+`<power>_available_memory_admission_inputs_missing`, leaves the relevant power
+and common available-memory floors null, and suppresses lane/campaign candidate
+output. Nonzero raw free memory cannot fill that gap. Complete numeric fixtures
+retain the existing positive candidate compiler and its exact-byte/digest tests.
+
+This separation prevents automatic raw-to-floor conversion; it cannot prove
+that a trusted producer did not copy or mislabel a native capacity value. A
+signature authenticates records, not the API or measurement semantics that
+produced them. Production still requires reviewed, pinned acquisition code and
+a protected controller that collects valid admission observations instead of
+signing arbitrary JSON. That producer and its custody are not implemented here,
+and production authorities remain empty. Positive synthetic inputs demonstrate
+compiler behavior only; candidate output still never grants release approval.
 
 ## Separate campaign approval
 
@@ -163,8 +259,9 @@ generation, challenge, device and raw-SCIF bindings remain mandatory.
 Each required power must independently pass success, transcript parity and both
 cold/warm end-to-end p95 limits. Timings are never pooled. The available-memory
 floor is the maximum of the per-power minima actually exercised by successful
-GPU performance starts. Total memory is the observed total. Later scenario
-observations must not recompute these candidate values: a future final gate must
+GPU performance starts, and is calculated only when those separate admission
+inputs are complete. Total memory is the authenticated observed total. Later
+scenario observations must not recompute these candidate values: a future final gate must
 instead reject successful Auto GPU starts below the frozen floor.
 
 The displayed warm CPU/GPU p95 pair comes from the worse same-power ratio, with

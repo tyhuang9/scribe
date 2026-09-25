@@ -775,6 +775,44 @@ function Assert-Acquisition($Acquisition, [string]$Label, [string]$StableId, [st
     $null = Get-JsonInteger $Acquisition.telemetry.sample_interval_ms "$Label.telemetry.sample_interval_ms" 1 1000
 }
 
+function Assert-PerformanceAcquisition($Acquisition, [string]$Label, [string]$StableId, [string]$Vendor, [string]$DeviceClass, [string]$Driver, [Int64]$TotalMemory, [string]$Backend, [string]$PowerSource) {
+    Assert-ExactKeys $Acquisition @('protocol', 'batch_id', 'machine_id_sha256', 'options_sha256', 'host', 'threading', 'controls', 'ordering', 'device_set', 'telemetry') $Label
+    Assert-ExactKeys $Acquisition.protocol @('protocol_id', 'protocol_version', 'harness_sha256') "$Label.protocol"
+    Assert-Condition ((Get-Identifier $Acquisition.protocol.protocol_id "$Label.protocol.protocol_id") -ceq 'scribe-windows-gpu-qualification') "$Label protocol ID is unsupported."
+    Assert-Condition ((Get-JsonInteger $Acquisition.protocol.protocol_version "$Label.protocol.protocol_version" 1 2) -eq 2) "$Label protocol version is unsupported."
+    $null = Get-Sha256Value $Acquisition.protocol.harness_sha256 "$Label.protocol.harness_sha256"
+    $null = Get-Identifier $Acquisition.batch_id "$Label.batch_id"
+    $null = Get-Sha256Value $Acquisition.machine_id_sha256 "$Label.machine_id_sha256"
+    $null = Get-Sha256Value $Acquisition.options_sha256 "$Label.options_sha256"
+    Assert-ExactKeys $Acquisition.host @('cpu_arch', 'cpu_model_sha256', 'physical_cores', 'logical_cpus', 'total_memory_bytes') "$Label.host"
+    Assert-Condition ((Get-JsonString $Acquisition.host.cpu_arch "$Label.host.cpu_arch" 16) -ceq 'x86_64') "$Label host architecture must be x86_64."
+    $null = Get-Sha256Value $Acquisition.host.cpu_model_sha256 "$Label.host.cpu_model_sha256"
+    $physical = Get-JsonInteger $Acquisition.host.physical_cores "$Label.host.physical_cores" 1 4096
+    $logical = Get-JsonInteger $Acquisition.host.logical_cpus "$Label.host.logical_cpus" 1 8192
+    Assert-Condition ($physical -le $logical) "$Label host topology is inconsistent."
+    $null = Get-JsonInteger $Acquisition.host.total_memory_bytes "$Label.host.total_memory_bytes" 1GB
+    Assert-ExactKeys $Acquisition.threading @('policy', 'requested_n_threads', 'resolved_n_threads', 'cpu_affinity_sha256', 'gpu_affinity_sha256') "$Label.threading"
+    Assert-Condition ((Get-JsonString $Acquisition.threading.policy "$Label.threading.policy" 32) -ceq 'native_default') "$Label threading policy must be the configured native default."
+    Assert-Condition ((Get-JsonInteger $Acquisition.threading.requested_n_threads "$Label.threading.requested_n_threads" 0 0) -eq 0) "$Label requested n_threads must be the native-default value zero."
+    Assert-Condition ($null -eq $Acquisition.threading.resolved_n_threads) "$Label resolved n_threads must be null because the pinned runtime API does not expose it."
+    $null = Get-Sha256Value $Acquisition.threading.cpu_affinity_sha256 "$Label.threading.cpu_affinity_sha256"
+    $null = Get-Sha256Value $Acquisition.threading.gpu_affinity_sha256 "$Label.threading.gpu_affinity_sha256"
+    Assert-ExactKeys $Acquisition.controls @('power_source', 'power_plan_sha256', 'gpu_power_profile', 'thermal_policy', 'background_load_policy') "$Label.controls"
+    Assert-Condition ((Get-JsonString $Acquisition.controls.power_source "$Label.controls.power_source" 16) -ceq $PowerSource) "$Label power source does not match its evidence bucket."
+    $null = Get-Sha256Value $Acquisition.controls.power_plan_sha256 "$Label.controls.power_plan_sha256"
+    Assert-Condition ((Get-JsonString $Acquisition.controls.gpu_power_profile "$Label.controls.gpu_power_profile" 64) -ceq 'system_managed') "$Label GPU power profile violates its acquisition protocol."
+    Assert-Condition ((Get-JsonString $Acquisition.controls.thermal_policy "$Label.controls.thermal_policy" 64) -ceq 'no_throttling_observed') "$Label thermal policy violates protocol v2."
+    Assert-Condition ((Get-JsonString $Acquisition.controls.background_load_policy "$Label.controls.background_load_policy" 64) -ceq 'isolated') "$Label background-load policy violates protocol v2."
+    Assert-ExactKeys $Acquisition.ordering @('scheme', 'warm_priming_runs') "$Label.ordering"
+    Assert-Condition ((Get-JsonString $Acquisition.ordering.scheme "$Label.ordering.scheme" 64) -ceq 'paired_alternating_cpu_first_v1') "$Label ordering violates protocol v2."
+    Assert-Condition ((Get-JsonInteger $Acquisition.ordering.warm_priming_runs "$Label.ordering.warm_priming_runs" 0 16) -eq 1) "$Label warm priming violates protocol v2."
+    Assert-DeviceSet $Acquisition.device_set "$Label.device_set" $StableId $Vendor $DeviceClass $Driver $TotalMemory $Backend
+    Assert-ExactKeys $Acquisition.telemetry @('source', 'scope', 'sample_interval_ms') "$Label.telemetry"
+    Assert-Condition ((Get-JsonString $Acquisition.telemetry.source "$Label.telemetry.source" 64) -ceq 'windows_counters_and_provider') "$Label telemetry source is unsupported."
+    Assert-Condition ((Get-JsonString $Acquisition.telemetry.scope "$Label.telemetry.scope" 64) -ceq 'worker_process_and_selected_device') "$Label telemetry scope is unsupported."
+    $null = Get-JsonInteger $Acquisition.telemetry.sample_interval_ms "$Label.telemetry.sample_interval_ms" 1 1000
+}
+
 function Assert-PairedAcquisition($Acquisition, $BatteryAcquisition, [string]$Label) {
     Assert-Condition ($Acquisition.batch_id -cne $BatteryAcquisition.batch_id) "$Label AC and battery acquisition batches must differ."
     foreach ($field in @('machine_id_sha256', 'options_sha256')) {
@@ -899,18 +937,18 @@ function Assert-PerformanceIdentity($Identity, [string]$Label, $Source) {
     Assert-Condition (@('nvidia', 'amd', 'intel') -ccontains $vendor) "$Label.device.vendor is unsupported."
     $class = Get-JsonString $Identity.device.device_class "$Label.device.device_class" 32
     Assert-Condition (@('discrete_gpu', 'integrated_gpu', 'unified_gpu') -ccontains $class) "$Label.device.device_class is unsupported."
-    $memoryModel = Get-JsonString $Identity.device.memory_model "$Label.device.memory_model" 32
-    Assert-Condition ($memoryModel -ceq $(if ($class -ceq 'discrete_gpu') { 'dedicated_vram' } else { 'shared_host_memory' })) "$Label.device.memory_model does not match its class."
+    $memoryModel = Get-JsonString $Identity.device.memory_model "$Label.device.memory_model" 64
+    Assert-Condition ($memoryModel -ceq 'windows_local_non_local_segments') "$Label.device.memory_model must name the Windows local/non-local segment observer."
     $total = Get-JsonInteger $Identity.device.total_memory_bytes "$Label.device.total_memory_bytes" $MinimumGpuMemoryBytes
     Assert-ExactKeys $Identity.driver @('kind', 'value') "$Label.driver"
     Assert-Condition ((Get-JsonString $Identity.driver.kind "$Label.driver.kind" 16) -ceq 'exact') "$Label.driver.kind must be exact."
     $driver = Get-JsonString $Identity.driver.value "$Label.driver.value" 128
     Assert-Condition (Test-DriverVendorBinding $backend $driver $vendor) "$Label.driver.value is not canonical for the selected Windows backend and vendor."
-    Assert-Acquisition $Identity.acquisition "$Label.acquisition" $stable $vendor $class $driver $total $backend 3 'ac'
+    Assert-PerformanceAcquisition $Identity.acquisition "$Label.acquisition" $stable $vendor $class $driver $total $backend 'ac'
     if ($class -ceq 'discrete_gpu') { Assert-Condition ($null -eq $Identity.battery_acquisition) "$Label.battery_acquisition must be null for a discrete GPU." }
     else {
         Assert-Condition ($null -ne $Identity.battery_acquisition) "$Label.battery_acquisition is required for an integrated or unified GPU."
-        Assert-Acquisition $Identity.battery_acquisition "$Label.battery_acquisition" $stable $vendor $class $driver $total $backend 3 'battery'
+        Assert-PerformanceAcquisition $Identity.battery_acquisition "$Label.battery_acquisition" $stable $vendor $class $driver $total $backend 'battery'
         Assert-PairedAcquisition $Identity.acquisition $Identity.battery_acquisition $Label
     }
     $validBinding = ($backend -ceq 'cuda' -and $provider -ceq 'transcribe-cpp-ggml-cuda' -and $vendor -ceq 'nvidia') -or ($backend -ceq 'vulkan' -and $provider -ceq 'transcribe-cpp-ggml-vulkan' -and @('nvidia', 'amd', 'intel') -ccontains $vendor)
@@ -1581,6 +1619,154 @@ function Assert-Execution($Execution, [string]$Label, [string]$Target, $Identity
     }
 }
 
+function Assert-PerformanceExecution($Execution, [string]$Label, [string]$Target, $Identity, $Acquisition, [string]$PowerSource, [string]$Mode, [int]$Sequence, $GenerationCaptures, $CaptureGenerations) {
+    Assert-ExactKeys $Execution @('backend', 'provider_id', 'worker_build_id', 'worker_sha256', 'protocol_version', 'runtime_abi', 'worker_generation', 'capture_sha256', 'stable_device_id', 'device_memory_kind', 'pack_digest', 'model_digest', 'driver', 'windows_version', 'options_sha256') $Label
+    $worker = if ($Target -ceq 'cpu') { $Identity.cpu_baseline } else { $Identity.gpu_worker }
+    $expectedGeneration = if ($Mode -ceq 'cold') { "$($Acquisition.batch_id):$($Identity.lane_id):$PowerSource`:$Mode`:$Target`:$('{0:d2}' -f $Sequence)" } else { "$($Acquisition.batch_id):$($Identity.lane_id):$PowerSource`:warm:$Target" }
+    $expected = [ordered]@{
+        backend = if ($Target -ceq 'cpu') { 'cpu' } else { $Identity.backend }
+        provider_id = $worker.provider_id
+        worker_build_id = $worker.worker_build_id
+        worker_sha256 = $worker.worker_sha256
+        protocol_version = $worker.protocol_version
+        runtime_abi = $worker.runtime_abi
+        worker_generation = $expectedGeneration
+        stable_device_id = if ($Target -ceq 'cpu') { 'cpu:host' } else { $Identity.device.stable_device_id }
+        device_memory_kind = if ($Target -ceq 'cpu') { 'none' } else { 'windows_local_non_local_segments' }
+        pack_digest = if ($Target -ceq 'cpu') { $ZeroSha256 } else { $Identity.pack.pack_digest }
+        model_digest = $Identity.model.model_digest
+        driver = if ($Target -ceq 'cpu') { 'cpu:none' } else { $Identity.driver.value }
+        windows_version = $Identity.windows_version
+        options_sha256 = $Acquisition.options_sha256
+    }
+    foreach ($field in $expected.Keys) {
+        if ($expected[$field] -is [ValueType]) { $null = Get-JsonInteger $Execution[$field] "$Label.$field" 1 }
+        else { $null = Get-JsonString $Execution[$field] "$Label.$field" 160 }
+        Assert-Condition ($Execution[$field] -ceq $expected[$field]) "$Label.$field does not match the admitted execution target."
+    }
+    $capture = Get-Sha256Value $Execution.capture_sha256 "$Label.capture_sha256"
+    $generation = $Execution.worker_generation
+    if ($GenerationCaptures.ContainsKey($generation)) {
+        Assert-Condition ($GenerationCaptures[$generation] -ceq $capture) 'One retained worker generation reported multiple raw captures.'
+    }
+    else {
+        Assert-Condition (-not $CaptureGenerations.ContainsKey($capture)) 'Distinct worker generations reused one raw capture.'
+        $GenerationCaptures[$generation] = $capture
+        $CaptureGenerations[$capture] = $generation
+    }
+}
+
+function Assert-PerformanceSegment($Segment, [string]$Label) {
+    $fields = @('sampled_max_current_usage_bytes', 'sampled_max_current_reservation_bytes', 'sampled_min_budget_bytes', 'sampled_min_available_for_reservation_bytes')
+    Assert-ExactKeys $Segment $fields $Label
+    foreach ($field in $fields) { $null = Get-JsonInteger $Segment[$field] "$Label.$field" }
+}
+
+function Assert-PerformanceVideoMemory($VideoMemory, [string]$Label, [string]$Target) {
+    Assert-Object $VideoMemory $Label
+    Assert-Condition ($VideoMemory.Contains('status')) "$Label has unexpected or missing fields."
+    $status = Get-JsonString $VideoMemory.status "$Label.status" 32
+    if ($Target -ceq 'cpu') {
+        Assert-ExactKeys $VideoMemory @('status') $Label
+        Assert-Condition ($status -ceq 'not_applicable') "$Label must be not_applicable for the CPU baseline."
+        return
+    }
+    Assert-ExactKeys $VideoMemory @('status', 'local', 'non_local') $Label
+    Assert-Condition ($status -ceq 'available') "$Label must contain both Windows local and non-local GPU segment observations."
+    Assert-PerformanceSegment $VideoMemory.local "$Label.local"
+    Assert-PerformanceSegment $VideoMemory.non_local "$Label.non_local"
+}
+
+function Assert-PerformanceProviderMemoryObservation($Observation, [string]$Label, [string]$Target, $Identity) {
+    Assert-Object $Observation $Label
+    Assert-Condition ($Observation.Contains('status')) "$Label has unexpected or missing fields."
+    $status = Get-JsonString $Observation.status "$Label.status" 32
+    if ($Target -ceq 'cpu') {
+        Assert-ExactKeys $Observation @('status', 'reason') $Label
+        Assert-Condition ($status -ceq 'not_applicable' -and (Get-JsonString $Observation.reason "$Label.reason" 32) -ceq 'cpu_provider') "$Label must use the canonical CPU not-applicable observation."
+        return
+    }
+    if ($status -ceq 'unavailable') {
+        Assert-ExactKeys $Observation @('status', 'reason') $Label
+        $reason = Get-JsonString $Observation.reason "$Label.reason" 64
+        Assert-Condition (@('memory_total_unreported', 'provider_query_failed') -ccontains $reason) "$Label unavailable reason is unsupported."
+        return
+    }
+    Assert-Condition ($status -ceq 'available') "$Label status is unsupported."
+    Assert-ExactKeys $Observation @('status', 'backend', 'provider_id', 'stable_device', 'memory_total_bytes', 'provider_reported_memory_free_bytes', 'value_semantics', 'admission_validity') $Label
+    Assert-Condition ((Get-JsonString $Observation.backend "$Label.backend" 16) -ceq $Identity.backend) "$Label backend does not match the authenticated lane."
+    Assert-Condition ((Get-Identifier $Observation.provider_id "$Label.provider_id") -ceq $Identity.provider_id) "$Label provider does not match the authenticated lane."
+    Assert-Condition ((Get-JsonString $Observation.stable_device "$Label.stable_device" 64) -ceq $Identity.device.stable_device_id) "$Label stable device does not match the authenticated lane."
+    $total = Get-JsonInteger $Observation.memory_total_bytes "$Label.memory_total_bytes" $MinimumGpuMemoryBytes
+    Assert-Condition ($total -eq $Identity.device.total_memory_bytes) "$Label total memory does not match the authenticated lane."
+    $null = Get-JsonInteger $Observation.provider_reported_memory_free_bytes "$Label.provider_reported_memory_free_bytes" 0 $total
+    Assert-Condition ((Get-JsonString $Observation.value_semantics "$Label.value_semantics" 64) -ceq 'native_backend_defined') "$Label value semantics are unsupported."
+    Assert-Condition ((Get-JsonString $Observation.admission_validity "$Label.admission_validity" 32) -ceq 'unestablished') "$Label must not claim that raw provider memory establishes Auto admission."
+}
+
+function Assert-PerformanceProviderMemory($ProviderMemory, [string]$Label, [string]$Target, $Identity) {
+    Assert-ExactKeys $ProviderMemory @('before', 'after') $Label
+    Assert-PerformanceProviderMemoryObservation $ProviderMemory.before "$Label.before" $Target $Identity
+    Assert-PerformanceProviderMemoryObservation $ProviderMemory.after "$Label.after" $Target $Identity
+}
+
+function Assert-PerformanceRun($Run, [string]$Label, [int]$Sequence, [string]$Target, [string]$Mode, $Identity, $Acquisition, [string]$PowerSource, $Context, $GenerationCaptures, $CaptureGenerations, [string]$ArtifactKind) {
+    Assert-ExactKeys $Run @(
+        'sequence', 'artifact_path', 'artifact_sha256', 'acquisition_batch_id', 'machine_id_sha256', 'session_id', 'pair_id', 'pair_order', 'reset_state', 'priming_runs',
+        'device_set_sha256', 'acquisition_sha256', 'power_source_before', 'power_source_after', 'execution', 'outcome', 'failure_category', 'end_to_end_ms', 'backend_ms',
+        'sampled_max_private_usage_bytes', 'telemetry_sample_count', 'video_memory', 'provider_memory', 'available_device_memory_bytes_before', 'available_device_memory_bytes_after', 'transcript_sha256'
+    ) $Label
+    Assert-Condition ((Get-JsonInteger $Run.sequence "$Label.sequence" 1 20) -eq $Sequence) "$Label sequence is not contiguous."
+    $artifactDigest = Get-Sha256Value $Run.artifact_sha256 "$Label.artifact_sha256"
+    Assert-Condition ((Get-Identifier $Run.acquisition_batch_id "$Label.acquisition_batch_id") -ceq $Acquisition.batch_id) "$Label is from a different acquisition batch."
+    Assert-Condition ((Get-Sha256Value $Run.machine_id_sha256 "$Label.machine_id_sha256") -ceq $Acquisition.machine_id_sha256) "$Label is from a different machine."
+    Assert-Condition ((Get-Sha256Value $Run.acquisition_sha256 "$Label.acquisition_sha256") -ceq (Get-CanonicalDigest $Acquisition)) "$Label acquisition binding differs from its power bucket."
+    Assert-Condition ((Get-JsonString $Run.power_source_before "$Label.power_source_before" 16) -ceq $PowerSource -and (Get-JsonString $Run.power_source_after "$Label.power_source_after" 16) -ceq $PowerSource) "$Label observed a power transition or an unexpected power source."
+    $expectedSession = if ($Mode -ceq 'cold') { "$($Acquisition.batch_id):$PowerSource`:$Mode`:$('{0:d2}' -f $Sequence):session" } else { "$($Acquisition.batch_id):$PowerSource`:warm:session" }
+    $expectedPair = "$($Acquisition.batch_id):$PowerSource`:$Mode`:$('{0:d2}' -f $Sequence)"
+    $expectedOrder = if ($Sequence % 2) { 'cpu_then_gpu' } else { 'gpu_then_cpu' }
+    $expectedReset = if ($Mode -ceq 'cold') { 'fresh_process_fresh_model' } else { 'same_process_primed_model' }
+    Assert-Condition ((Get-Identifier $Run.session_id "$Label.session_id") -ceq $expectedSession) "$Label session violates acquisition protocol v2."
+    Assert-Condition ((Get-Identifier $Run.pair_id "$Label.pair_id") -ceq $expectedPair) "$Label pair violates acquisition protocol v2."
+    Assert-Condition ((Get-JsonString $Run.pair_order "$Label.pair_order" 32) -ceq $expectedOrder) "$Label order violates acquisition protocol v2."
+    Assert-Condition ((Get-JsonString $Run.reset_state "$Label.reset_state" 40) -ceq $expectedReset) "$Label reset state violates acquisition protocol v2."
+    $expectedPriming = if ($Mode -ceq 'cold') { 0 } else { $Acquisition.ordering.warm_priming_runs }
+    Assert-Condition ((Get-JsonInteger $Run.priming_runs "$Label.priming_runs" 0 16) -eq $expectedPriming) "$Label priming violates acquisition protocol v2."
+    Assert-Condition ((Get-Sha256Value $Run.device_set_sha256 "$Label.device_set_sha256") -ceq $Acquisition.device_set.snapshot_sha256) "$Label device-set binding differs."
+    Assert-PerformanceExecution $Run.execution "$Label.execution" $Target $Identity $Acquisition $PowerSource $Mode $Sequence $GenerationCaptures $CaptureGenerations
+    $outcome = Get-JsonString $Run.outcome "$Label.outcome" 16
+    Assert-Condition (@('success', 'failure') -ccontains $outcome) "$Label outcome is unsupported."
+    $failure = Get-JsonString $Run.failure_category "$Label.failure_category" 32
+    Assert-Condition (@('none', 'unavailable', 'startup', 'handshake', 'timeout', 'oom', 'device_loss', 'provider_error', 'worker_crash', 'correctness_mismatch', 'invalid_input', 'model_corruption', 'cancelled', 'partial_output') -ccontains $failure) "$Label failure category is unsupported."
+    $endToEnd = Get-JsonInteger $Run.end_to_end_ms "$Label.end_to_end_ms"
+    $backendMs = Get-JsonInteger $Run.backend_ms "$Label.backend_ms"
+    $privateUsage = Get-JsonInteger $Run.sampled_max_private_usage_bytes "$Label.sampled_max_private_usage_bytes"
+    $sampleCount = Get-JsonInteger $Run.telemetry_sample_count "$Label.telemetry_sample_count" 1 ([int32]::MaxValue)
+    Assert-PerformanceVideoMemory $Run.video_memory "$Label.video_memory" $Target
+    Assert-PerformanceProviderMemory $Run.provider_memory "$Label.provider_memory" $Target $Identity
+    $beforeMissing = $null -eq $Run.available_device_memory_bytes_before
+    $afterMissing = $null -eq $Run.available_device_memory_bytes_after
+    Assert-Condition ($beforeMissing -eq $afterMissing) "$Label admission available-memory inputs must both be numeric or both be null."
+    if ($Target -ceq 'cpu') {
+        Assert-Condition ($beforeMissing -and $afterMissing) "$Label CPU run must use null admission available-memory inputs."
+    }
+    elseif (-not $beforeMissing) {
+        $null = Get-JsonInteger $Run.available_device_memory_bytes_before "$Label.available_device_memory_bytes_before" 1 $Identity.device.total_memory_bytes
+        $null = Get-JsonInteger $Run.available_device_memory_bytes_after "$Label.available_device_memory_bytes_after" 0 $Identity.device.total_memory_bytes
+    }
+    $transcript = Get-Sha256Value $Run.transcript_sha256 "$Label.transcript_sha256" $true
+    if ($outcome -ceq 'success') {
+        Assert-Condition ($failure -ceq 'none' -and $endToEnd -gt 0 -and $backendMs -gt 0 -and $privateUsage -gt 0 -and $sampleCount -gt 0 -and $backendMs -le $endToEnd -and $transcript -cne $ZeroSha256) "$Label has inconsistent successful-run metrics."
+    }
+    else {
+        Assert-Condition ($failure -cne 'none' -and $transcript -ceq $ZeroSha256) "$Label has inconsistent failure metadata."
+    }
+    $record = [ordered]@{}
+    foreach ($key in $Run.Keys) { if (@('artifact_path', 'artifact_sha256') -cnotcontains $key) { $record[$key] = $Run[$key] } }
+    Assert-ArtifactEnvelope $Context $Run.artifact_path $artifactDigest $ArtifactKind $record $Label
+    return $Run
+}
+
 function Assert-Run($Run, [string]$Label, [int]$Sequence, [string]$Target, [string]$Mode, $Identity, $Acquisition, [string]$PowerSource, [int]$SchemaVersion, $Context, $GenerationCaptures, $CaptureGenerations, [string]$ArtifactKind = 'windows_gpu_qualification_run_artifact') {
     $runKeys = @('sequence', 'artifact_path', 'artifact_sha256', 'acquisition_batch_id', 'machine_id_sha256', 'session_id', 'pair_id', 'pair_order', 'reset_state', 'priming_runs', 'device_set_sha256', 'execution', 'outcome', 'failure_category', 'end_to_end_ms', 'backend_ms', 'peak_process_memory_bytes', 'peak_vram_bytes', 'peak_shared_device_memory_bytes', 'available_device_memory_bytes_before', 'available_device_memory_bytes_after', 'transcript_sha256')
     if ($SchemaVersion -eq 3) { $runKeys += @('acquisition_sha256', 'power_source_before', 'power_source_after') }
@@ -1740,6 +1926,43 @@ function Get-MetricSummary([object[]]$Runs) {
     return $result
 }
 
+function Get-PerformanceMetricSummary([object[]]$Runs, [string]$Target) {
+    [object[]]$successful = @($Runs | Where-Object { $_.outcome -ceq 'success' })
+    $failures = [ordered]@{}
+    foreach ($name in @($Runs | Where-Object { $_.outcome -ceq 'failure' } | ForEach-Object { $_.failure_category } | Sort-Object -Unique)) { $failures[$name] = @($Runs | Where-Object { $_.outcome -ceq 'failure' -and $_.failure_category -ceq $name }).Count }
+    $result = [ordered]@{ failure_categories = $failures; run_count = $Runs.Count; successful_runs = $successful.Count }
+    foreach ($field in @('end_to_end_ms', 'backend_ms', 'sampled_max_private_usage_bytes', 'telemetry_sample_count')) {
+        if ($successful.Count -eq 0) { $result[$field] = $null }
+        else {
+            [Int64[]]$values = @($successful | ForEach-Object { [Int64]$_[$field] })
+            $result[$field] = [ordered]@{ p50 = Get-NearestRank $values 50; p95 = Get-NearestRank $values 95 }
+        }
+    }
+    foreach ($field in @('available_device_memory_bytes_before', 'available_device_memory_bytes_after')) {
+        if ($successful.Count -eq 0 -or @($successful | Where-Object { $null -eq $_[$field] }).Count -gt 0) { $result[$field] = $null }
+        else {
+            [Int64[]]$values = @($successful | ForEach-Object { [Int64]$_[$field] })
+            $result[$field] = [ordered]@{ p50 = Get-NearestRank $values 50; p95 = Get-NearestRank $values 95 }
+        }
+    }
+    if ($Target -ceq 'cpu') {
+        $result.video_memory = [ordered]@{ status = 'not_applicable' }
+    }
+    else {
+        $result.video_memory = [ordered]@{ status = 'available'; local = [ordered]@{}; non_local = [ordered]@{} }
+        foreach ($segment in @('local', 'non_local')) {
+            foreach ($field in @('sampled_max_current_usage_bytes', 'sampled_max_current_reservation_bytes', 'sampled_min_budget_bytes', 'sampled_min_available_for_reservation_bytes')) {
+                if ($successful.Count -eq 0) { $result.video_memory[$segment][$field] = $null }
+                else {
+                    [Int64[]]$values = @($successful | ForEach-Object { [Int64]$_.video_memory[$segment][$field] })
+                    $result.video_memory[$segment][$field] = [ordered]@{ p50 = Get-NearestRank $values 50; p95 = Get-NearestRank $values 95 }
+                }
+            }
+        }
+    }
+    return $result
+}
+
 function Get-AutoProjection($Identity, $PowerRunSets, $PowerParsed, [Int64]$MinimumAvailableMemoryBytes, [int]$SchemaVersion) {
     if ($SchemaVersion -eq 2) {
         $runSets = $PowerRunSets.ac
@@ -1806,7 +2029,7 @@ function Get-AutoProjection($Identity, $PowerRunSets, $PowerParsed, [Int64]$Mini
     }
 }
 
-function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSource, $Plan, [string]$Label, $Context, $GenerationCaptures, $CaptureGenerations, $Challenges, $ValidatedCaptures, [bool]$IncludeMixed = $true, [int]$PowerSchemaVersion = 0, [string]$ArtifactNamespace = 'windows_gpu_qualification') {
+function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSource, $Plan, [string]$Label, $Context, $GenerationCaptures, $CaptureGenerations, $Challenges, $ValidatedCaptures, [bool]$IncludeMixed = $true, [int]$PowerSchemaVersion = 0, [string]$ArtifactNamespace = 'windows_gpu_qualification', [bool]$PerformanceOnly = $false) {
     $schemaVersion = if ($PowerSchemaVersion -gt 0) { $PowerSchemaVersion } else { [int]$Plan.schema_version }
     $acquisitionArtifactDigest = Get-Sha256Value $Block.acquisition_artifact_sha256 "$Label.acquisition_artifact_sha256"
     Assert-ArtifactEnvelope $Context $Block.acquisition_artifact_path $acquisitionArtifactDigest "${ArtifactNamespace}_acquisition_artifact" $Acquisition "$Label acquisition"
@@ -1821,7 +2044,15 @@ function Assert-PowerEvidence($Block, $Identity, $Acquisition, [string]$PowerSou
             [object[]]$runs = @($Block.run_sets[$mode][$target])
             Assert-Condition ($runs.Count -eq $expectedCount) "$Label.$mode.$target has the wrong run count."
             $parsedRuns = [Collections.Generic.List[object]]::new()
-            for ($offset = 0; $offset -lt $runs.Count; $offset++) { $parsedRuns.Add((Assert-Run $runs[$offset] "$Label.$mode.$target[$offset]" ($offset + 1) $target $mode $Identity $Acquisition $PowerSource $schemaVersion $Context $GenerationCaptures $CaptureGenerations "${ArtifactNamespace}_run_artifact")) }
+            for ($offset = 0; $offset -lt $runs.Count; $offset++) {
+                $parsedRun = if ($PerformanceOnly) {
+                    Assert-PerformanceRun $runs[$offset] "$Label.$mode.$target[$offset]" ($offset + 1) $target $mode $Identity $Acquisition $PowerSource $Context $GenerationCaptures $CaptureGenerations "${ArtifactNamespace}_run_artifact"
+                }
+                else {
+                    Assert-Run $runs[$offset] "$Label.$mode.$target[$offset]" ($offset + 1) $target $mode $Identity $Acquisition $PowerSource $schemaVersion $Context $GenerationCaptures $CaptureGenerations "${ArtifactNamespace}_run_artifact"
+                }
+                $parsedRuns.Add($parsedRun)
+            }
             $parsed[$mode][$target] = $parsedRuns.ToArray()
         }
     }
@@ -1988,9 +2219,9 @@ function Assert-PerformanceLaneEvidence($Lane, $Expected, $Plan, [int]$Index, $C
     $powerBlocks.battery = $Lane.battery
     if ($Lane.identity.device.device_class -ceq 'discrete_gpu') { Assert-Condition ($null -eq $Lane.battery) "$label.battery must be null for a discrete GPU." }
     else { Assert-Condition ($null -ne $Lane.battery) "$label.battery is required for an integrated or unified GPU."; Assert-ExactKeys $Lane.battery @('acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'captures') "$label.battery" }
-    $ac = Assert-PowerEvidence $Lane $Lane.identity $Lane.identity.acquisition 'ac' $Plan "$label.ac" $Context $GenerationCaptures $CaptureGenerations $Challenges $ValidatedCaptures $false 3 'windows_gpu_performance'
+    $ac = Assert-PowerEvidence $Lane $Lane.identity $Lane.identity.acquisition 'ac' $Plan "$label.ac" $Context $GenerationCaptures $CaptureGenerations $Challenges $ValidatedCaptures $false 3 'windows_gpu_performance' $true
     $powerParsed.ac = $ac.Parsed
-    if ($null -ne $Lane.battery) { $battery = Assert-PowerEvidence $Lane.battery $Lane.identity $Lane.identity.battery_acquisition 'battery' $Plan "$label.battery" $Context $GenerationCaptures $CaptureGenerations $Challenges $ValidatedCaptures $false 3 'windows_gpu_performance'; $powerParsed.battery = $battery.Parsed }
+    if ($null -ne $Lane.battery) { $battery = Assert-PowerEvidence $Lane.battery $Lane.identity $Lane.identity.battery_acquisition 'battery' $Plan "$label.battery" $Context $GenerationCaptures $CaptureGenerations $Challenges $ValidatedCaptures $false 3 'windows_gpu_performance' $true; $powerParsed.battery = $battery.Parsed }
     $powerEvaluation = [ordered]@{ ac = $null; battery = $null }; $reasons = [Collections.Generic.List[string]]::new()
     foreach ($power in @('ac', 'battery')) {
         $parsed = $powerParsed[$power]; if ($null -eq $parsed) { continue }
@@ -2000,23 +2231,26 @@ function Assert-PerformanceLaneEvidence($Lane, $Expected, $Plan, [int]$Index, $C
         $performance = $allSuccessful
         if ($performance) { foreach ($mode in @('cold', 'warm')) { $gpu = Get-NearestRank @($parsed[$mode].gpu | ForEach-Object { [Int64]$_.end_to_end_ms }) 95; $cpu = Get-NearestRank @($parsed[$mode].cpu | ForEach-Object { [Int64]$_.end_to_end_ms }) 95; if (([Numerics.BigInteger]$gpu * 100) -gt ([Numerics.BigInteger]$cpu * 110)) { $performance = $false } } }
         [object[]]$successfulGpuRuns = @(@($parsed.cold.gpu) + @($parsed.warm.gpu) | Where-Object { $_.outcome -ceq 'success' })
-        $minimum = if ($successfulGpuRuns.Count -eq 0) { $null } else { [Int64](@($successfulGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before }) | Measure-Object -Minimum).Minimum }
+        $missingAdmissionInputs = @($successfulGpuRuns | Where-Object { $null -eq $_.available_device_memory_bytes_before -or $null -eq $_.available_device_memory_bytes_after }).Count -gt 0
+        $admissionInputsComplete = $successfulGpuRuns.Count -gt 0 -and -not $missingAdmissionInputs
+        $minimum = if (-not $admissionInputsComplete) { $null } else { [Int64](@($successfulGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before }) | Measure-Object -Minimum).Minimum }
         $powerEvaluation[$power] = [ordered]@{
-            correctness = $correctness; performance = $performance; reliability = $allSuccessful; minimum_available_memory_bytes = $minimum
-            metrics = [ordered]@{ cold = [ordered]@{ cpu = Get-MetricSummary @($parsed.cold.cpu); gpu = Get-MetricSummary @($parsed.cold.gpu) }; warm = [ordered]@{ cpu = Get-MetricSummary @($parsed.warm.cpu); gpu = Get-MetricSummary @($parsed.warm.gpu) } }
+            available_memory_admission_inputs_complete = $admissionInputsComplete; correctness = $correctness; performance = $performance; reliability = $allSuccessful; minimum_available_memory_bytes = $minimum
+            metrics = [ordered]@{ cold = [ordered]@{ cpu = Get-PerformanceMetricSummary @($parsed.cold.cpu) 'cpu'; gpu = Get-PerformanceMetricSummary @($parsed.cold.gpu) 'gpu' }; warm = [ordered]@{ cpu = Get-PerformanceMetricSummary @($parsed.warm.cpu) 'cpu'; gpu = Get-PerformanceMetricSummary @($parsed.warm.gpu) 'gpu' } }
         }
-        if (-not $correctness) { $reasons.Add("$power`_correctness_not_equivalent") }; if (-not $allSuccessful) { $reasons.Add("$power`_reliability_not_equivalent") }; if (-not $performance) { $reasons.Add("$power`_gpu_p95_exceeds_cpu_boundary") }
+        if (-not $correctness) { $reasons.Add("$power`_correctness_not_equivalent") }; if (-not $allSuccessful) { $reasons.Add("$power`_reliability_not_equivalent") }; if (-not $performance) { $reasons.Add("$power`_gpu_p95_exceeds_cpu_boundary") }; if ($missingAdmissionInputs) { $reasons.Add("$power`_available_memory_admission_inputs_missing") }
     }
-    $commonMinimum = $powerEvaluation.ac.minimum_available_memory_bytes
-    if ($null -ne $powerEvaluation.battery -and $null -ne $powerEvaluation.battery.minimum_available_memory_bytes) {
-        $commonMinimum = if ($null -eq $commonMinimum) { [Int64]$powerEvaluation.battery.minimum_available_memory_bytes } else { [Math]::Max([Int64]$commonMinimum, [Int64]$powerEvaluation.battery.minimum_available_memory_bytes) }
+    $commonMinimum = if ($null -eq $powerEvaluation.ac.minimum_available_memory_bytes) { $null } else { [Int64]$powerEvaluation.ac.minimum_available_memory_bytes }
+    if ($null -ne $powerEvaluation.battery) {
+        if ($null -eq $commonMinimum -or $null -eq $powerEvaluation.battery.minimum_available_memory_bytes) { $commonMinimum = $null }
+        else { $commonMinimum = [Math]::Max([Int64]$commonMinimum, [Int64]$powerEvaluation.battery.minimum_available_memory_bytes) }
     }
     $passed = $reasons.Count -eq 0
     $powerRunSets = [ordered]@{ ac = $Lane.run_sets; battery = if ($null -eq $Lane.battery) { $null } else { $Lane.battery.run_sets } }
     $summary = [ordered]@{
         backend = $Lane.identity.backend; device_stable_id = $Lane.identity.device.stable_device_id; driver = $Lane.identity.driver.value; lane_id = $Lane.identity.lane_id
         metrics = [ordered]@{ ac = $powerEvaluation.ac.metrics; battery = if ($null -eq $powerEvaluation.battery) { $null } else { $powerEvaluation.battery.metrics } }
-        checks = [ordered]@{ by_power = [ordered]@{ ac = [ordered]@{ correctness_equivalent = $powerEvaluation.ac.correctness; performance_passed = $powerEvaluation.ac.performance; reliability_equivalent = $powerEvaluation.ac.reliability }; battery = if ($null -eq $powerEvaluation.battery) { $null } else { [ordered]@{ correctness_equivalent = $powerEvaluation.battery.correctness; performance_passed = $powerEvaluation.battery.performance; reliability_equivalent = $powerEvaluation.battery.reliability } } } }
+        checks = [ordered]@{ by_power = [ordered]@{ ac = [ordered]@{ available_memory_admission_inputs_complete = $powerEvaluation.ac.available_memory_admission_inputs_complete; correctness_equivalent = $powerEvaluation.ac.correctness; performance_passed = $powerEvaluation.ac.performance; reliability_equivalent = $powerEvaluation.ac.reliability }; battery = if ($null -eq $powerEvaluation.battery) { $null } else { [ordered]@{ available_memory_admission_inputs_complete = $powerEvaluation.battery.available_memory_admission_inputs_complete; correctness_equivalent = $powerEvaluation.battery.correctness; performance_passed = $powerEvaluation.battery.performance; reliability_equivalent = $powerEvaluation.battery.reliability } } } }
         evidence_memory_floor = [ordered]@{ common_minimum_available_memory_bytes = $commonMinimum; minimum_total_memory_bytes = [Int64]$Lane.identity.device.total_memory_bytes; per_power_minimum_available_memory_bytes = [ordered]@{ ac = $powerEvaluation.ac.minimum_available_memory_bytes; battery = if ($null -eq $powerEvaluation.battery) { $null } else { $powerEvaluation.battery.minimum_available_memory_bytes } } }
         performance_passed = $passed; reasons = $reasons.ToArray()
         candidate_entry = if ($passed) { Get-AutoProjection $Lane.identity $powerRunSets $powerParsed $commonMinimum 3 } else { $null }
