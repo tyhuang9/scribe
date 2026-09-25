@@ -1144,7 +1144,7 @@ struct WorkerCapability {
     pack: Option<WorkerPackCapability>,
 }
 
-fn expected_worker(role: WorkerRole) -> WorkerExpectation {
+fn expected_worker_for_provider(role: WorkerRole, provider: WorkerProvider) -> WorkerExpectation {
     WorkerExpectation {
         app_build: DESKTOP_BUILD_ID.to_owned(),
         worker_build: match role {
@@ -1159,12 +1159,30 @@ fn expected_worker(role: WorkerRole) -> WorkerExpectation {
         .to_owned(),
         abi: WORKER_ABI_VERSION,
         role,
-        provider: compiled_worker_provider(role),
+        provider,
         pack: None,
     }
 }
 
+fn expected_worker(role: WorkerRole) -> WorkerExpectation {
+    expected_worker_for_provider(role, compiled_worker_provider(role))
+}
+
 fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapability> {
+    worker_capability_for_provider(
+        role,
+        challenge,
+        compiled_worker_provider(role),
+        worker_pack_capability(role)?,
+    )
+}
+
+fn worker_capability_for_provider(
+    role: WorkerRole,
+    challenge: String,
+    provider: WorkerProvider,
+    pack: Option<WorkerPackCapability>,
+) -> Result<WorkerCapability> {
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let artifacts = match role {
         WorkerRole::Inference => vec![
@@ -1201,9 +1219,9 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
         bundled_worker_sha256,
         abi: WORKER_ABI_VERSION,
         role,
-        provider: compiled_worker_provider(role),
+        provider,
         artifacts,
-        pack: worker_pack_capability(role)?,
+        pack,
     };
     // On Linux this closes inherited FD 3 only after the one Hello capability
     // has been completely formed from its sealed image digest.
@@ -2229,12 +2247,22 @@ fn validate_worker_hello(
     challenge: &str,
     expected: &WorkerExpectation,
 ) -> Result<WorkerRole> {
+    let actual_role = role.unwrap_or(expected.role);
+    let mut local = expected_worker(actual_role);
+    local.pack = worker_pack_expectation_from_private_env()?;
+    validate_worker_hello_against_local(role, challenge, expected, &local)
+}
+
+fn validate_worker_hello_against_local(
+    role: Option<WorkerRole>,
+    challenge: &str,
+    expected: &WorkerExpectation,
+    local: &WorkerExpectation,
+) -> Result<WorkerRole> {
     if challenge.len() != 64 || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
     }
     let actual_role = role.unwrap_or(expected.role);
-    let mut local = expected_worker(actual_role);
-    local.pack = worker_pack_expectation_from_private_env()?;
     // Final-image verification is directional: the parent owns the verified
     // executable descriptor and digest. The child validates the protocol and
     // build contract but does not compare the parent-supplied digest against a
@@ -10008,13 +10036,89 @@ struct LoadedRuntimeMetadata {
     load: WireRuntimeLoadExecution,
 }
 
+#[derive(Clone, Copy)]
+enum WorkerLoopIdentityPolicy {
+    Compiled,
+    #[cfg(test)]
+    FixtureCpu,
+}
+
+impl WorkerLoopIdentityPolicy {
+    fn validate_hello(
+        self,
+        role: Option<WorkerRole>,
+        challenge: &str,
+        expected: &WorkerExpectation,
+    ) -> Result<WorkerRole> {
+        match self {
+            Self::Compiled => validate_worker_hello(role, challenge, expected),
+            #[cfg(test)]
+            Self::FixtureCpu => {
+                let actual_role = role.unwrap_or(expected.role);
+                let local = expected_worker_for_provider(actual_role, WorkerProvider::Cpu);
+                validate_worker_hello_against_local(role, challenge, expected, &local)
+            }
+        }
+    }
+
+    fn capability(self, role: WorkerRole, challenge: String) -> Result<WorkerCapability> {
+        match self {
+            Self::Compiled => worker_capability(role, challenge),
+            #[cfg(test)]
+            Self::FixtureCpu => {
+                worker_capability_for_provider(role, challenge, WorkerProvider::Cpu, None)
+            }
+        }
+    }
+}
+
 fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
+    input: impl Read,
+    output: impl Write,
+    factory: &F,
+    vad_factory: &V,
+    role: Option<WorkerRole>,
+    parent_control: Option<std::fs::File>,
+) -> Result<()> {
+    worker_loop_with_factories_and_identity(
+        input,
+        output,
+        factory,
+        vad_factory,
+        role,
+        parent_control,
+        WorkerLoopIdentityPolicy::Compiled,
+    )
+}
+
+#[cfg(test)]
+fn worker_loop_with_factories_as_fixture_cpu<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
+    input: impl Read,
+    output: impl Write,
+    factory: &F,
+    vad_factory: &V,
+    role: Option<WorkerRole>,
+    parent_control: Option<std::fs::File>,
+) -> Result<()> {
+    worker_loop_with_factories_and_identity(
+        input,
+        output,
+        factory,
+        vad_factory,
+        role,
+        parent_control,
+        WorkerLoopIdentityPolicy::FixtureCpu,
+    )
+}
+
+fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
     mut input: impl Read,
     mut output: impl Write,
     factory: &F,
     vad_factory: &V,
     role: Option<WorkerRole>,
     parent_control: Option<std::fs::File>,
+    identity_policy: WorkerLoopIdentityPolicy,
 ) -> Result<()> {
     // This declaration order makes the stream drop before its recognizer on
     // structural protocol failure. Normal replacement paths clear it explicitly.
@@ -10104,7 +10208,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 expected,
             } => {
                 let provider = expected.provider;
-                let actual_role = validate_worker_hello(role, &challenge, &expected)?;
+                let actual_role = identity_policy.validate_hello(role, &challenge, &expected)?;
                 worker_provider = Some(provider);
                 handshake_complete = true;
                 write_worker_response(
@@ -10112,7 +10216,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                     session_id,
                     request_id,
                     Control::Ready {
-                        capability: worker_capability(actual_role, challenge)?,
+                        capability: identity_policy.capability(actual_role, challenge)?,
                     },
                 )?;
             }
@@ -11819,6 +11923,13 @@ mod tests {
         Control::Hello {
             challenge: "ab".repeat(32),
             expected: expected_worker(role),
+        }
+    }
+
+    fn fixture_cpu_hello(role: WorkerRole) -> Control {
+        Control::Hello {
+            challenge: "ab".repeat(32),
+            expected: expected_worker_for_provider(role, WorkerProvider::Cpu),
         }
     }
 
@@ -17400,9 +17511,41 @@ mod tests {
     }
 
     #[test]
+    fn capture_observation_identity_policies_reject_provider_substitution() {
+        let challenge = "ab".repeat(32);
+        let fixture_gpu =
+            expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Vulkan);
+        let fixture_error = WorkerLoopIdentityPolicy::FixtureCpu
+            .validate_hello(Some(WorkerRole::Inference), &challenge, &fixture_gpu)
+            .unwrap_err();
+        assert!(
+            fixture_error
+                .to_string()
+                .contains("expectation is incompatible"),
+            "fixture CPU identity accepted a GPU expectation: {fixture_error:#}"
+        );
+
+        let mut substituted = expected_worker(WorkerRole::Inference);
+        substituted.provider = if substituted.provider == WorkerProvider::Cpu {
+            WorkerProvider::Vulkan
+        } else {
+            WorkerProvider::Cpu
+        };
+        let production_error = WorkerLoopIdentityPolicy::Compiled
+            .validate_hello(Some(WorkerRole::Inference), &challenge, &substituted)
+            .unwrap_err();
+        assert!(
+            production_error
+                .to_string()
+                .contains("expectation is incompatible"),
+            "compiled identity accepted a substituted provider: {production_error:#}"
+        );
+    }
+
+    #[test]
     fn capture_observation_cross_role_command_invalidates_actual_worker_slot() {
         let mut input = Vec::new();
-        append_control(&mut input, 0, 0, test_hello(WorkerRole::Inference));
+        append_control(&mut input, 0, 0, fixture_cpu_hello(WorkerRole::Inference));
         append_control(
             &mut input,
             1,
@@ -17434,7 +17577,7 @@ mod tests {
         append_control(&mut input, 0, 5, Control::Shutdown);
 
         let mut output = Vec::new();
-        worker_loop_with_factories(
+        worker_loop_with_factories_as_fixture_cpu(
             Cursor::new(input),
             &mut output,
             &FakeRecognizerFactory::new(),
@@ -17448,7 +17591,19 @@ mod tests {
         while output.position() < output.get_ref().len() as u64 {
             responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
         }
-        assert!(matches!(responses[0].2, Control::Ready { .. }));
+        assert!(
+            matches!(
+                responses[0].2,
+                Control::Ready {
+                    capability: WorkerCapability {
+                        provider: WorkerProvider::Cpu,
+                        ..
+                    }
+                }
+            ),
+            "unexpected fixture CPU Ready response: {:?}",
+            responses[0].2
+        );
         assert!(
             matches!(
                 responses[1].2,
@@ -17457,13 +17612,17 @@ mod tests {
             "unexpected negotiation response: {:?}",
             responses[1].2
         );
-        assert!(matches!(
-            responses[2].2,
-            Control::RuntimeObservationStarted {
-                before: ProviderMemoryObservation::NotApplicable { .. },
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                responses[2].2,
+                Control::RuntimeObservationStarted {
+                    before: ProviderMemoryObservation::NotApplicable { .. },
+                    ..
+                }
+            ),
+            "unexpected runtime observation start response: {:?}",
+            responses[2].2
+        );
         assert_error(&responses[3], "cross-role");
         assert_error(&responses[4], "no completed runtime observation");
         assert!(matches!(responses[5].2, Control::Ok));
@@ -17472,7 +17631,7 @@ mod tests {
     #[test]
     fn capture_observation_cancel_unload_and_duplicate_begin_clear_actual_worker_slot() {
         let mut input = Vec::new();
-        append_control(&mut input, 0, 0, test_hello(WorkerRole::Inference));
+        append_control(&mut input, 0, 0, fixture_cpu_hello(WorkerRole::Inference));
         append_control(
             &mut input,
             1,
@@ -17531,7 +17690,7 @@ mod tests {
         append_control(&mut input, 0, 11, Control::Shutdown);
 
         let mut output = Vec::new();
-        worker_loop_with_factories(
+        worker_loop_with_factories_as_fixture_cpu(
             Cursor::new(input),
             &mut output,
             &FakeRecognizerFactory::new(),
@@ -17545,22 +17704,25 @@ mod tests {
         while output.position() < output.get_ref().len() as u64 {
             responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
         }
-        assert!(matches!(
-            responses[2].2,
-            Control::RuntimeObservationStarted { .. }
-        ));
+        assert!(
+            matches!(responses[2].2, Control::RuntimeObservationStarted { .. }),
+            "unexpected first runtime observation start response: {:?}",
+            responses[2].2
+        );
         assert_error(&responses[3], "no matching ONNX stream");
         assert_error(&responses[4], "no completed runtime observation");
-        assert!(matches!(
-            responses[5].2,
-            Control::RuntimeObservationStarted { .. }
-        ));
+        assert!(
+            matches!(responses[5].2, Control::RuntimeObservationStarted { .. }),
+            "unexpected second runtime observation start response: {:?}",
+            responses[5].2
+        );
         assert!(matches!(responses[6].2, Control::Ok));
         assert_error(&responses[7], "no completed runtime observation");
-        assert!(matches!(
-            responses[8].2,
-            Control::RuntimeObservationStarted { .. }
-        ));
+        assert!(
+            matches!(responses[8].2, Control::RuntimeObservationStarted { .. }),
+            "unexpected third runtime observation start response: {:?}",
+            responses[8].2
+        );
         assert_error(&responses[9], "invalidated the active runtime observation");
         assert_error(&responses[10], "no completed runtime observation");
         assert!(matches!(responses[11].2, Control::Ok));
