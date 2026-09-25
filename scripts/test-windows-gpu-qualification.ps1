@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -8,21 +8,31 @@ $RepositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $ToolPath = Join-Path $PSScriptRoot 'qualify-windows-gpu-evidence.ps1'
 $AutoManifestPath = Join-Path $RepositoryRoot 'runtime-manifests\gpu-auto-qualification-windows-x64.json'
 $AuthorityPath = Join-Path $RepositoryRoot 'runtime-manifests\windows-gpu-qualification-production-authority.json'
+$PerformanceAuthorityPath = Join-Path $RepositoryRoot 'runtime-manifests\windows-gpu-performance-authority.json'
 $CheckedPlanPath = Join-Path $RepositoryRoot 'runtime-manifests\windows-gpu-qualification-plan-x64.json'
 $ToolchainPath = Join-Path $RepositoryRoot 'runtime-manifests\gpu-worker-toolchain-windows-x64.json'
 $ExpectedAuto = '{"schema_version":2,"mode":"default_deny","target_os":"windows","target_arch":"x86_64","entries":[]}' + "`n"
 $ExpectedAuthority = '{"approved_plans":[],"kind":"windows_gpu_qualification_production_authority","schema_version":2}' + "`n"
+$ExpectedPerformanceAuthority = '{"keys":[],"kind":"windows_gpu_performance_campaign_authority","minimum_policy_epoch":1,"schema_version":1}' + "`n"
 $RequiredScenarios = @('clean_installer', 'device_loss', 'disabled_device', 'driver_change', 'insufficient_vram', 'mixed_gpu', 'power_ac', 'power_battery', 'suspend_resume')
 $ZeroSha256 = '0' * 64
 $Utf8 = [Text.UTF8Encoding]::new($false, $true)
 $AttestationDomain = [Text.Encoding]::ASCII.GetBytes("SCRIBE-WINDOWS-GPU-QUALIFICATION-LANE-ATTESTATION-V1`0")
+$PerformanceAuthorizationDomain = [Text.Encoding]::ASCII.GetBytes("SCRIBE-WINDOWS-GPU-PERFORMANCE-AUTHORIZATION-V1`0")
+$PerformanceAttestationDomain = [Text.Encoding]::ASCII.GetBytes("SCRIBE-WINDOWS-GPU-PERFORMANCE-LANE-ATTESTATION-V1`0")
+$FixtureNow = [Int64]2000000000
 $CaseCounter = 0
 $FixtureKey = [Security.Cryptography.ECDsa]::Create([Security.Cryptography.ECCurve+NamedCurves]::nistP256)
 $FixtureSpki = $FixtureKey.ExportSubjectPublicKeyInfo()
 $FixtureSpkiBase64 = [Convert]::ToBase64String($FixtureSpki)
 $FixtureKeyId = 'p256:' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($FixtureSpki)).ToLowerInvariant()
+$PerformanceApprovalKey = [Security.Cryptography.ECDsa]::Create([Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+$PerformanceApprovalSpki = $PerformanceApprovalKey.ExportSubjectPublicKeyInfo()
+$PerformanceApprovalSpkiBase64 = [Convert]::ToBase64String($PerformanceApprovalSpki)
+$PerformanceApprovalKeyId = 'performance-approval-p256:' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($PerformanceApprovalSpki)).ToLowerInvariant()
 
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
+function Assert-Condition([bool]$Condition, [string]$Message) { Assert-True $Condition $Message }
 function Get-Digest([string]$Label) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::ASCII.GetBytes($Label))).ToLowerInvariant() }
 function Get-FileDigest([string]$Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 
@@ -45,6 +55,13 @@ function Get-CanonicalBytes($Value) {
 function Get-CanonicalDigest($Value) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData((Get-CanonicalBytes $Value))).ToLowerInvariant() }
 function Write-Canonical([string]$Path, $Value) { [IO.File]::WriteAllBytes($Path, (Get-CanonicalBytes $Value)) }
 function Copy-Document($Value) { $Utf8.GetString((Get-CanonicalBytes $Value)) | ConvertFrom-Json -AsHashtable -Depth 64 }
+
+function Get-DomainPreimage([byte[]]$Domain, [byte[]]$RecordBytes) {
+    [byte[]]$length = [BitConverter]::GetBytes([UInt64]$RecordBytes.Length)
+    [byte[]]$preimage = [byte[]]::new($Domain.Length + 8 + $RecordBytes.Length)
+    [Array]::Copy($Domain, 0, $preimage, 0, $Domain.Length); [Array]::Copy($length, 0, $preimage, $Domain.Length, 8); [Array]::Copy($RecordBytes, 0, $preimage, $Domain.Length + 8, $RecordBytes.Length)
+    return ,$preimage
+}
 
 function New-ScifFrame($Control) {
     [byte[]]$body = $Utf8.GetBytes(($Control | ConvertTo-Json -Compress -Depth 64))
@@ -446,6 +463,89 @@ function New-V3FixtureDocuments([string]$DeviceClass = 'integrated_gpu', [int]$A
     return $documents
 }
 
+function Get-PerformanceContractProjection($Plan) {
+    return [ordered]@{
+        approval_key_id = $Plan.authorization.key_id
+        capture_authority = $Plan.capture_authority
+        capture_contract = $Plan.capture_contract
+        cold_runs = $Plan.cold_runs
+        contract_bindings = $Plan.contract_bindings
+        fixture_only = $Plan.fixture_only
+        kind = 'windows_gpu_performance_capture_contract'
+        maximum_gpu_p95_cpu_percent = $Plan.maximum_gpu_p95_cpu_percent
+        required_lane_identities = @($Plan.required_lanes | ForEach-Object { $_.identity })
+        schema_version = 1
+        source = $Plan.source
+        target_arch = $Plan.target_arch
+        target_os = $Plan.target_os
+        warm_runs = $Plan.warm_runs
+    }
+}
+
+function New-PerformanceAuthorization($Plan, [Security.Cryptography.ECDsa]$Key = $PerformanceApprovalKey) {
+    $record = [ordered]@{
+        campaign_nonce = $Plan.capture_authority.campaign_nonce
+        expires_at_unix_seconds = $FixtureNow + 300
+        issued_at_unix_seconds = $FixtureNow - 300
+        kind = 'windows_gpu_performance_campaign_authorization'
+        performance_contract_sha256 = Get-CanonicalDigest (Get-PerformanceContractProjection $Plan)
+        policy_epoch = 1
+        schema_version = 1
+        source_revision = $Plan.source.revision
+    }
+    [byte[]]$signature = $Key.SignData((Get-DomainPreimage $PerformanceAuthorizationDomain (Get-CanonicalBytes $record)), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+    return [ordered]@{
+        fixture_approval_public_key_spki_base64 = $PerformanceApprovalSpkiBase64
+        key_id = $PerformanceApprovalKeyId
+        record = $record
+        signature_base64 = [Convert]::ToBase64String($signature)
+        signature_scheme = 'ecdsa-p256-sha256-ieee-p1363'
+    }
+}
+
+function New-PerformanceDocuments([string]$DeviceClass = 'integrated_gpu', [int]$AcGpuColdMs = 220, [int]$AcGpuWarmMs = 110, [int]$BatteryGpuColdMs = 220, [int]$BatteryGpuWarmMs = 110, [string]$LaneId = '', [string]$VulkanVendor = '') {
+    $source = New-V3FixtureDocuments $DeviceClass $AcGpuColdMs $AcGpuWarmMs $BatteryGpuColdMs $BatteryGpuWarmMs
+    if ($VulkanVendor) { Set-VulkanFixture $source $VulkanVendor $(if ($VulkanVendor -ceq 'intel') { '8086' } else { '1002' }) }
+    $lane = $source.Evidence.lanes[0]
+    if ($LaneId) {
+        $lane.identity.lane_id = $LaneId
+        $lane.identity.acquisition.batch_id = "$LaneId-ac-batch"
+        $lane.acquisition_artifact_path = "$LaneId/acquisition.evidence"
+        $lane.run_sets = New-PowerRunSets $lane.identity $lane.identity.acquisition 'ac' $AcGpuColdMs $AcGpuWarmMs
+        if ($null -ne $lane.battery) {
+            $lane.identity.battery_acquisition.batch_id = "$LaneId-battery-batch"
+            $lane.battery.acquisition_artifact_path = "$LaneId/battery/acquisition.evidence"
+            $lane.battery.run_sets = New-PowerRunSets $lane.identity $lane.identity.battery_acquisition 'battery' $BatteryGpuColdMs $BatteryGpuWarmMs
+        }
+    }
+    $lane.identity.Remove('installation')
+    $lane.identity.device.Remove('qualified_minimum_total_memory_bytes')
+    $lane.identity.device.Remove('qualified_minimum_available_memory_bytes')
+    $lane.Remove('scenarios')
+    $lane.captures = New-PowerCaptures $lane $lane.identity $lane.identity.acquisition 'ac' $false $true
+    if ($null -ne $lane.battery) { $lane.battery.captures = New-PowerCaptures $lane.battery $lane.identity $lane.identity.battery_acquisition 'battery' $false $true }
+    $revision = ([string]$lane.identity.app_build_id).Substring(([string]$lane.identity.app_build_id).LastIndexOf('#') + 1)
+    $plan = [ordered]@{
+        authorization = [ordered]@{ key_id = $PerformanceApprovalKeyId }
+        capture_authority = [ordered]@{ campaign_nonce = Get-Digest 'performance-fixture-campaign'; capture_key_id = $FixtureKeyId; capture_public_key_spki_base64 = $FixtureSpkiBase64 }
+        capture_contract = Copy-Document $source.Plan.capture_contract
+        cold_runs = 5
+        contract_bindings = [ordered]@{ base_auto_manifest_sha256 = Get-FileDigest $AutoManifestPath; evaluator_sha256 = Get-FileDigest $ToolPath; toolchain_contract_sha256 = Get-FileDigest $ToolchainPath }
+        fixture_only = $true
+        kind = 'windows_gpu_performance_candidate_plan'
+        maximum_gpu_p95_cpu_percent = 110
+        required_lanes = @([ordered]@{ evidence_sha256 = Get-Digest 'pending-performance-lane'; identity = $lane.identity })
+        schema_version = 1
+        source = [ordered]@{ app_version = '0.1.0'; ref = 'refs/heads/main'; repository = 'tyhuang9/scribe'; revision = $revision }
+        target_arch = 'x86_64'
+        target_os = 'windows'
+        warm_runs = 20
+    }
+    $plan.authorization = New-PerformanceAuthorization $plan
+    $evidence = [ordered]@{ fixture_only = $true; kind = 'windows_gpu_performance_candidate_evidence'; lanes = @($lane); plan_sha256 = Get-Digest 'pending-performance-plan'; schema_version = 1 }
+    return [pscustomobject]@{ Plan = $plan; Evidence = $evidence }
+}
+
 function Write-Envelope([string]$Path, [string]$Kind, $Record) {
     [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
     Write-Canonical $Path ([ordered]@{ kind = $Kind; record = $Record; schema_version = 1 })
@@ -456,7 +556,7 @@ function Get-ArtifactReferences($Lane) {
     $references = [Collections.Generic.List[object]]::new()
     $references.Add([ordered]@{ artifact_path = $Lane.acquisition_artifact_path; artifact_sha256 = $Lane.acquisition_artifact_sha256 })
     foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($Lane.run_sets[$mode][$target])) { $references.Add([ordered]@{ artifact_path = $run.artifact_path; artifact_sha256 = $run.artifact_sha256 }) } } }
-    foreach ($scenario in @($Lane.scenarios)) { $references.Add([ordered]@{ artifact_path = $scenario.artifact_path; artifact_sha256 = $scenario.artifact_sha256 }) }
+    if ($Lane.Contains('scenarios')) { foreach ($scenario in @($Lane.scenarios)) { $references.Add([ordered]@{ artifact_path = $scenario.artifact_path; artifact_sha256 = $scenario.artifact_sha256 }) } }
     foreach ($capture in @($Lane.captures)) { $references.Add([ordered]@{ artifact_path = $capture.artifact_path; artifact_sha256 = $capture.artifact_sha256 }) }
     if ($Lane.Contains('battery') -and $null -ne $Lane.battery) {
         $references.Add([ordered]@{ artifact_path = $Lane.battery.acquisition_artifact_path; artifact_sha256 = $Lane.battery.acquisition_artifact_sha256 })
@@ -499,7 +599,54 @@ function New-Attestation($Plan, $Lane, [Security.Cryptography.ECDsa]$Key = $Fixt
     return [ordered]@{ key_id = $Plan.capture_authority.capture_key_id; record = $record; signature_base64 = [Convert]::ToBase64String($signature); signature_scheme = 'ecdsa-p256-sha256-ieee-p1363' }
 }
 
+function New-PerformanceAttestation($Plan, $Lane, [Security.Cryptography.ECDsa]$Key = $FixtureKey, [byte[]]$Domain = $PerformanceAttestationDomain) {
+    $record = [ordered]@{
+        acquisition_batch_id = $Lane.identity.acquisition.batch_id
+        artifact_inventory_sha256 = Get-CanonicalDigest $Lane.artifact_inventory
+        authorization_sha256 = Get-CanonicalDigest $Plan.authorization
+        campaign_nonce = $Plan.capture_authority.campaign_nonce
+        kind = 'windows_gpu_performance_lane_attestation'
+        lane_id = $Lane.identity.lane_id
+        lane_payload_sha256 = Get-CanonicalDigest (Get-UnsignedLane $Lane)
+        performance_contract_sha256 = Get-CanonicalDigest (Get-PerformanceContractProjection $Plan)
+        schema_version = 1
+    }
+    [byte[]]$signature = $Key.SignData((Get-DomainPreimage $Domain (Get-CanonicalBytes $record)), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+    return [ordered]@{ key_id = $Plan.capture_authority.capture_key_id; record = $record; signature_base64 = [Convert]::ToBase64String($signature); signature_scheme = 'ecdsa-p256-sha256-ieee-p1363' }
+}
+
+function Update-PerformanceBindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifacts) {
+    $Documents.Plan.required_lanes = @($Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-Digest 'pending-performance-lane'; identity = $_.identity } })
+    $Documents.Plan.authorization = [ordered]@{ key_id = $PerformanceApprovalKeyId }
+    $Documents.Plan.authorization = New-PerformanceAuthorization $Documents.Plan
+    foreach ($lane in @($Documents.Evidence.lanes)) {
+        if ($WriteArtifacts) { $lane.acquisition_artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($lane.acquisition_artifact_path.Replace('/', '\'))) 'windows_gpu_performance_acquisition_artifact' $lane.identity.acquisition }
+        foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_performance_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
+        foreach ($capture in @($lane.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_performance_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
+        if ($null -ne $lane.battery) {
+            if ($WriteArtifacts) { $lane.battery.acquisition_artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($lane.battery.acquisition_artifact_path.Replace('/', '\'))) 'windows_gpu_performance_acquisition_artifact' $lane.identity.battery_acquisition }
+            foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.battery.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_performance_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
+            foreach ($capture in @($lane.battery.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_performance_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
+        }
+        $lane.artifact_inventory = Get-ArtifactReferences $lane
+        $lane.attestation = New-PerformanceAttestation $Documents.Plan $lane
+    }
+    $Documents.Plan.required_lanes = @($Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-CanonicalDigest $_; identity = $_.identity } })
+    $Documents.Evidence.plan_sha256 = Get-CanonicalDigest $Documents.Plan
+}
+
+function Resign-PerformanceBundle($Bundle, [byte[]]$AuthorizationDomain = $PerformanceAuthorizationDomain, [byte[]]$LaneDomain = $PerformanceAttestationDomain) {
+    $record = $Bundle.Documents.Plan.authorization.record
+    [byte[]]$signature = $PerformanceApprovalKey.SignData((Get-DomainPreimage $AuthorizationDomain (Get-CanonicalBytes $record)), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+    $Bundle.Documents.Plan.authorization.signature_base64 = [Convert]::ToBase64String($signature)
+    foreach ($lane in @($Bundle.Documents.Evidence.lanes)) { $lane.attestation = New-PerformanceAttestation $Bundle.Documents.Plan $lane $FixtureKey $LaneDomain }
+    $Bundle.Documents.Plan.required_lanes = @($Bundle.Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-CanonicalDigest $_; identity = $_.identity } })
+    $Bundle.Documents.Evidence.plan_sha256 = Get-CanonicalDigest $Bundle.Documents.Plan
+    Write-Canonical $Bundle.PlanPath $Bundle.Documents.Plan; Write-Canonical $Bundle.EvidencePath $Bundle.Documents.Evidence
+}
+
 function Update-Bindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifacts) {
+    if ($Documents.Plan.kind -ceq 'windows_gpu_performance_candidate_plan') { Update-PerformanceBindings $Documents $ArtifactRoot $WriteArtifacts; return }
     if (@($Documents.Plan.required_lanes).Count -eq @($Documents.Evidence.lanes).Count) {
         for ($laneIndex = 0; $laneIndex -lt @($Documents.Evidence.lanes).Count; $laneIndex++) { $Documents.Plan.required_lanes[$laneIndex].identity = $Documents.Evidence.lanes[$laneIndex].identity }
     }
@@ -542,12 +689,44 @@ function Refresh-BundleSignatures($Bundle) {
     Write-Canonical $Bundle.EvidencePath $Bundle.Documents.Evidence
 }
 
-function Invoke-Evaluator($Bundle, [bool]$AllowFixture = $true, [bool]$RequireEligible = $false, [string]$PlanOverride = '', [string]$EvidenceOverride = '', [string]$ArtifactOverride = '') {
+function Invoke-Evaluator($Bundle, [bool]$AllowFixture = $true, [bool]$RequireEligible = $false, [string]$PlanOverride = '', [string]$EvidenceOverride = '', [string]$ArtifactOverride = '', [bool]$AddPerformanceClock = $true, [string[]]$ExtraArguments = @()) {
     $start = [Diagnostics.ProcessStartInfo]::new(); $start.FileName = (Get-Command pwsh).Source; $start.UseShellExecute = $false; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
     foreach ($argument in @('-NoProfile', '-File', $ToolPath, '-PlanPath', $(if ($PlanOverride) { $PlanOverride } else { $Bundle.PlanPath }), '-EvidencePath', $(if ($EvidenceOverride) { $EvidenceOverride } else { $Bundle.EvidencePath }), '-ArtifactRoot', $(if ($ArtifactOverride) { $ArtifactOverride } else { $Bundle.ArtifactRoot }))) { $start.ArgumentList.Add($argument) }
     if ($AllowFixture) { $start.ArgumentList.Add('-AllowFixture') }; if ($RequireEligible) { $start.ArgumentList.Add('-RequireEligible') }
+    $bundleDocuments = $Bundle.PSObject.Properties['Documents']
+    if ($AddPerformanceClock -and $null -ne $bundleDocuments -and $null -ne $Bundle.Documents -and $Bundle.Documents.Plan.kind -ceq 'windows_gpu_performance_candidate_plan') { $start.ArgumentList.Add('-FixtureNowUnixSeconds'); $start.ArgumentList.Add([string]$FixtureNow) }
+    foreach ($argument in $ExtraArguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::Start($start); $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd(); $process.WaitForExit()
     return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+}
+
+function Invoke-PassingPerformanceFixture($Documents, [string]$Name, [int]$ExpectedArtifacts) {
+    $bundle = New-Bundle $Documents $Name
+    $result = Invoke-Evaluator $bundle
+    Assert-True ($result.ExitCode -eq 0) "$Name failed performance evaluator execution: $($result.Stderr)"
+    $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True ($decision.performance_passed -and -not $decision.auto_eligible -and -not $decision.release_approved -and $decision.decision_reason -ceq 'fixture_pending_final_installer_qualification') "$Name did not produce a passing, non-releasable fixture decision."
+    Assert-True ($decision.artifact_count -eq $ExpectedArtifacts -and $decision.candidate_policy -is [string] -and $decision.candidate_policy.EndsWith("`n")) "$Name did not emit the expected bounded canonical policy candidate."
+    [byte[]]$policyBytes = $Utf8.GetBytes($decision.candidate_policy)
+    $policyDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($policyBytes)).ToLowerInvariant()
+    Assert-True ($decision.candidate_policy_sha256 -ceq $policyDigest) "$Name candidate policy digest does not cover its exact UTF-8 bytes including LF."
+    $candidatePath = Join-Path $bundle.Root 'candidate-policy.json'; [IO.File]::WriteAllBytes($candidatePath, $policyBytes)
+    $report = & (Join-Path $PSScriptRoot 'report-windows-gpu-auto-qualification.ps1') -ManifestPath $candidatePath
+    Assert-True (($report -join "`n").Contains("qualified_entries: $(@($decision.lanes).Count)")) "$Name candidate was not accepted by the existing runtime-manifest report validator."
+    Assert-True (-not $decision.candidate_policy.Contains('installation') -and -not $decision.candidate_policy.Contains('qualified_minimum_') -and -not $decision.candidate_policy.Contains('scenario')) "$Name candidate leaked installer, declared-floor, or scenario fields."
+    $eligibleResult = Invoke-Evaluator $bundle $true $true
+    Assert-True ($eligibleResult.ExitCode -eq 2) "$Name -RequireEligible did not preserve the non-release candidate boundary."
+    return [pscustomobject]@{ Bundle = $bundle; Decision = $decision; Result = $result }
+}
+
+function Invoke-FailingPerformanceFixture($Documents, [string]$Name, [string]$ExpectedReason) {
+    $bundle = New-Bundle $Documents $Name
+    $result = Invoke-Evaluator $bundle
+    Assert-True ($result.ExitCode -eq 0) "$Name was structurally rejected instead of evaluated: $($result.Stderr)"
+    $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True (-not $decision.performance_passed -and $decision.lanes[0].reasons -ccontains $ExpectedReason) "$Name did not report $ExpectedReason."
+    Assert-True ($null -eq $decision.candidate_policy -and $null -eq $decision.candidate_policy_sha256 -and $null -eq $decision.lanes[0].candidate_entry) "$Name emitted a candidate policy or entry for failing evidence."
+    return $decision
 }
 
 function Assert-Rejected($Result, [string]$Label, [string]$Expected = '') {
@@ -591,7 +770,7 @@ function Invoke-FailingFixture($Documents, [string]$Name, [string]$ExpectedReaso
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-windows-gpu-qualification-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($TestRoot) | Out-Null
 try {
-    $immutablePaths = [ordered]@{ auto = $AutoManifestPath; authority = $AuthorityPath; checked_plan = $CheckedPlanPath; evaluator = $ToolPath; toolchain = $ToolchainPath }
+    $immutablePaths = [ordered]@{ auto = $AutoManifestPath; authority = $AuthorityPath; performance_authority = $PerformanceAuthorityPath; checked_plan = $CheckedPlanPath; evaluator = $ToolPath; toolchain = $ToolchainPath }
     $immutableBefore = [ordered]@{}; foreach ($name in $immutablePaths.Keys) { $immutableBefore[$name] = [IO.File]::ReadAllBytes($immutablePaths[$name]) }
     $evaluatorSource = [IO.File]::ReadAllText($ToolPath, $Utf8)
     foreach ($bound in @('$MaxInputBytes = 16MB', '$MaxLanes = 64', '$MaxArtifacts = 4096', '$MaxArtifactBytes = [UInt64](512MB)', '$MaxControlBytes = 256KB')) { Assert-True ($evaluatorSource.Contains($bound)) "Qualification evaluator changed or removed bound: $bound" }
@@ -608,6 +787,203 @@ try {
     Assert-True (-not (Test-ArtifactBudget 4096 ([UInt64](512MB) + 1))) 'Isolated evaluator budget helper accepted byte bound + 1.'
     Assert-True ([IO.File]::ReadAllText($AutoManifestPath, $Utf8) -ceq $ExpectedAuto) 'Windows Auto manifest is not exact default deny.'
     Assert-True ([IO.File]::ReadAllText($AuthorityPath, $Utf8) -ceq $ExpectedAuthority) 'Windows qualification authority is not exact empty schema v2.'
+    Assert-True ([IO.File]::ReadAllText($PerformanceAuthorityPath, $Utf8) -ceq $ExpectedPerformanceAuthority) 'Windows performance authority is not exact empty schema v1.'
+    $performanceSmoke = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'integrated_gpu') 'performance-integrated-smoke' 128
+    Assert-True ($performanceSmoke.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'Performance smoke did not derive its memory floor exclusively from successful GPU starts.'
+    $invalidPerformanceSignature = New-Bundle (New-PerformanceDocuments 'integrated_gpu') 'performance-invalid-authorization-signature'
+    $invalidPerformanceSignature.Documents.Plan.authorization.signature_base64 = [Convert]::ToBase64String(([byte[]](1..64)))
+    Write-Canonical $invalidPerformanceSignature.PlanPath $invalidPerformanceSignature.Documents.Plan
+    Assert-Rejected (Invoke-Evaluator $invalidPerformanceSignature) 'Performance invalid authorization signature' 'authorization signature is invalid'
+    if ($PerformanceSmokeOnly) { Write-Output 'Windows GPU performance candidate focused smoke tests passed.'; return }
+
+    $performanceDiscrete = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'discrete_gpu') 'performance-discrete' 64
+    Assert-True ($null -eq $performanceDiscrete.Decision.lanes[0].metrics.battery) 'Discrete performance candidate unexpectedly contains battery metrics.'
+    $performanceUnified = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'unified_gpu' 220 110 220 110 'fixture-performance-unified-vulkan' 'intel') 'performance-unified-intel-vulkan' 128
+
+    $repeatResult = Invoke-Evaluator $performanceUnified.Bundle
+    Assert-True ($repeatResult.ExitCode -eq 0 -and $repeatResult.Stdout -ceq $performanceUnified.Result.Stdout) 'Repeated stateless performance evaluation was not byte-deterministic.'
+    $resigned = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'unified_gpu' 220 110 220 110 'fixture-performance-unified-vulkan' 'intel') 'performance-resigned-same-policy' 128
+    Assert-True ($resigned.Decision.authorization_sha256 -cne $performanceUnified.Decision.authorization_sha256 -and $resigned.Decision.candidate_policy -ceq $performanceUnified.Decision.candidate_policy -and $resigned.Decision.candidate_policy_sha256 -ceq $performanceUnified.Decision.candidate_policy_sha256) 'Re-signing an unchanged performance contract changed candidate policy bytes.'
+
+    $multiLane = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-a-cuda'
+    $multiLaneSecond = New-PerformanceDocuments 'unified_gpu' 220 105 220 99 'fixture-performance-b-vulkan' 'intel'
+    $multiLane.Evidence.lanes = @($multiLane.Evidence.lanes[0], $multiLaneSecond.Evidence.lanes[0])
+    $multiLaneResult = Invoke-PassingPerformanceFixture $multiLane 'performance-multi-lane' 256
+    $multiPolicy = $multiLaneResult.Decision.candidate_policy | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True (@($multiPolicy.entries).Count -eq 2) 'Multi-lane performance candidate did not contain every required lane.'
+    $multiEntryJson = @($multiPolicy.entries | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 64 })
+    Assert-True ([StringComparer]::Ordinal.Compare($multiEntryJson[0], $multiEntryJson[1]) -lt 0) 'Performance candidate entries are not strict ordinal runtime-entry ordered.'
+
+    $overlap = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-overlap-a'
+    $overlapSecond = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-overlap-b'
+    foreach ($run in @($overlapSecond.Evidence.lanes[0].run_sets.cold.gpu) + @($overlapSecond.Evidence.lanes[0].run_sets.warm.gpu) + @($overlapSecond.Evidence.lanes[0].battery.run_sets.cold.gpu) + @($overlapSecond.Evidence.lanes[0].battery.run_sets.warm.gpu)) { $run.available_device_memory_bytes_before = [Int64]8500000000 }
+    $overlap.Evidence.lanes = @($overlap.Evidence.lanes[0], $overlapSecond.Evidence.lanes[0])
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $overlap 'performance-overlapping-coverage')) 'Performance overlapping coverage' 'duplicate or ambiguous runtime coverage'
+
+    $forbiddenInstallation = New-PerformanceDocuments; $forbiddenInstallation.Evidence.lanes[0].identity.installation = [ordered]@{}
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $forbiddenInstallation 'performance-forbidden-installation')) 'Performance installation field' 'unexpected or missing fields'
+    $forbiddenFloor = New-PerformanceDocuments; $forbiddenFloor.Evidence.lanes[0].identity.device.qualified_minimum_available_memory_bytes = [Int64]9000000000
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $forbiddenFloor 'performance-forbidden-floor')) 'Performance declared floor field' 'unexpected or missing fields'
+    $forbiddenScenarios = New-PerformanceDocuments; $forbiddenScenarios.Evidence.lanes[0].scenarios = @()
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $forbiddenScenarios 'performance-forbidden-scenarios')) 'Performance scenarios field' 'unexpected or missing fields'
+
+    $missingCapture = New-PerformanceDocuments; $missingCapture.Evidence.lanes[0].battery.captures = @($missingCapture.Evidence.lanes[0].battery.captures | Select-Object -Skip 1)
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $missingCapture 'performance-missing-capture')) 'Performance missing capture' 'exactly one raw SCIF capture'
+    $powerTransitionPerformance = New-PerformanceDocuments; $powerTransitionPerformance.Evidence.lanes[0].battery.run_sets.warm.gpu[0].power_source_after = 'ac'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $powerTransitionPerformance 'performance-power-transition')) 'Performance power transition' 'power transition'
+    $wrongCountPerformance = New-PerformanceDocuments; $wrongCountPerformance.Evidence.lanes[0].run_sets.cold.gpu = @($wrongCountPerformance.Evidence.lanes[0].run_sets.cold.gpu | Select-Object -First 4)
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $wrongCountPerformance 'performance-four-cold')) 'Performance four cold runs' 'wrong run count'
+
+    foreach ($thresholdCase in @(
+        [ordered]@{ Name = 'ac-cold'; Power = 'ac'; Mode = 'cold'; Value = 226 },
+        [ordered]@{ Name = 'ac-warm'; Power = 'ac'; Mode = 'warm'; Value = 111 },
+        [ordered]@{ Name = 'battery-cold'; Power = 'battery'; Mode = 'cold'; Value = 226 },
+        [ordered]@{ Name = 'battery-warm'; Power = 'battery'; Mode = 'warm'; Value = 111 }
+    )) {
+        $documents = New-PerformanceDocuments
+        $block = if ($thresholdCase.Power -ceq 'ac') { $documents.Evidence.lanes[0] } else { $documents.Evidence.lanes[0].battery }
+        foreach ($run in @($block.run_sets[$thresholdCase.Mode].gpu)) { $run.end_to_end_ms = $thresholdCase.Value; $run.backend_ms = $thresholdCase.Value - 10 }
+        $decision = Invoke-FailingPerformanceFixture $documents "performance-threshold-$($thresholdCase.Name)" "$($thresholdCase.Power)_gpu_p95_exceeds_cpu_boundary"
+        Assert-True ($decision.lanes[0].checks.by_power[$thresholdCase.Power].performance_passed -eq $false) "Performance $($thresholdCase.Name) threshold did not fail its own power bucket."
+    }
+    $batteryParityPerformance = New-PerformanceDocuments; $batteryParityPerformance.Evidence.lanes[0].battery.run_sets.warm.gpu[0].transcript_sha256 = Get-Digest 'performance-battery-wrong-transcript'
+    $null = Invoke-FailingPerformanceFixture $batteryParityPerformance 'performance-battery-parity' 'battery_correctness_not_equivalent'
+
+    $asymmetricPerformance = New-PerformanceDocuments; foreach ($run in @($asymmetricPerformance.Evidence.lanes[0].run_sets.cold.gpu) + @($asymmetricPerformance.Evidence.lanes[0].run_sets.warm.gpu)) { $run.available_device_memory_bytes_before = [Int64]8000000000 }
+    $asymmetricResult = Invoke-PassingPerformanceFixture $asymmetricPerformance 'performance-asymmetric-floor' 128
+    Assert-True ($asymmetricResult.Decision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -eq 8000000000 -and $asymmetricResult.Decision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery -eq 9000000000 -and $asymmetricResult.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'Performance common floor is not the conservative maximum of per-power GPU-start minima.'
+    $asymmetricPolicy = $asymmetricResult.Decision.candidate_policy | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True ($asymmetricPolicy.entries[0].minimum_available_memory_bytes -eq 9000000000) 'Performance candidate did not use the derived common memory floor.'
+
+    $allGpuFailed = New-PerformanceDocuments
+    foreach ($run in @($allGpuFailed.Evidence.lanes[0].run_sets.cold.gpu) + @($allGpuFailed.Evidence.lanes[0].run_sets.warm.gpu) + @($allGpuFailed.Evidence.lanes[0].battery.run_sets.cold.gpu) + @($allGpuFailed.Evidence.lanes[0].battery.run_sets.warm.gpu)) { Set-RunFailure $run 'provider_error' }
+    $allGpuFailedDecision = Invoke-FailingPerformanceFixture $allGpuFailed 'performance-all-gpu-failed' 'ac_correctness_not_equivalent'
+    Assert-True ($null -eq $allGpuFailedDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes) 'All-failed GPU evidence fabricated a memory floor.'
+
+    $captureEqualsApproval = New-PerformanceDocuments
+    $captureEqualsApproval.Plan.capture_authority.capture_key_id = 'p256:' + $PerformanceApprovalKeyId.Substring('performance-approval-p256:'.Length)
+    $captureEqualsApproval.Plan.capture_authority.capture_public_key_spki_base64 = $PerformanceApprovalSpkiBase64
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $captureEqualsApproval 'performance-key-role-reuse')) 'Performance key role reuse' 'must be distinct'
+
+    $pairedPins = New-Bundle (New-PerformanceDocuments) 'performance-paired-pins'
+    $authDigest = Get-CanonicalDigest $pairedPins.Documents.Plan.authorization
+    Assert-Rejected (Invoke-Evaluator $pairedPins $true $false '' '' '' $true @('-ExpectedAuthorizationSha256', $authDigest)) 'Performance unpaired pin' 'must be supplied together'
+    Assert-Rejected (Invoke-Evaluator $pairedPins $true $false '' '' '' $true @('-ExpectedAuthorizationSha256', $authDigest, '-ExpectedCampaignNonce', (Get-Digest 'wrong-campaign-pin'))) 'Performance wrong nonce pin' 'differs from the caller pin'
+    Assert-Rejected (Invoke-Evaluator $pairedPins $true $false '' '' '' $true @('-ExpectedAuthorizationSha256', (Get-Digest 'wrong-authorization-pin'), '-ExpectedCampaignNonce', $pairedPins.Documents.Plan.capture_authority.campaign_nonce)) 'Performance wrong authorization pin' 'differs from the caller pin'
+    Assert-Rejected (Invoke-Evaluator $pairedPins $false) 'Performance fixture without admission' '-FixtureNowUnixSeconds is allowed only'
+
+    $issuedAtNow = New-Bundle (New-PerformanceDocuments) 'performance-issued-at-now'; $issuedAtNow.Documents.Plan.authorization.record.issued_at_unix_seconds = $FixtureNow; $issuedAtNow.Documents.Plan.authorization.record.expires_at_unix_seconds = $FixtureNow + 300; Resign-PerformanceBundle $issuedAtNow
+    $issuedAtNowResult = Invoke-Evaluator $issuedAtNow
+    Assert-True ($issuedAtNowResult.ExitCode -eq 0) "Performance authorization rejected issued==now: $($issuedAtNowResult.Stderr)"
+    foreach ($timeCase in @(
+        [ordered]@{ Name = 'now-equals-expires'; Issued = $FixtureNow - 300; Expires = $FixtureNow; Expected = 'not currently valid' },
+        [ordered]@{ Name = 'future-issued'; Issued = $FixtureNow + 1; Expires = $FixtureNow + 300; Expected = 'not currently valid' },
+        [ordered]@{ Name = 'window-over-seven-days'; Issued = $FixtureNow; Expires = $FixtureNow + 604801; Expected = 'exceeds seven days' },
+        [ordered]@{ Name = 'zero-issued'; Issued = 0; Expires = $FixtureNow + 300; Expected = 'bounded JSON integer' },
+        [ordered]@{ Name = 'negative-issued'; Issued = -1; Expires = $FixtureNow + 300; Expected = 'bounded JSON integer' },
+        [ordered]@{ Name = 'timestamp-overflow'; Issued = $FixtureNow; Expires = [Int64]253402300800; Expected = 'bounded JSON integer' }
+    )) {
+        $bundle = New-Bundle (New-PerformanceDocuments) "performance-$($timeCase.Name)"
+        $bundle.Documents.Plan.authorization.record.issued_at_unix_seconds = [Int64]$timeCase.Issued; $bundle.Documents.Plan.authorization.record.expires_at_unix_seconds = [Int64]$timeCase.Expires
+        Resign-PerformanceBundle $bundle
+        Assert-Rejected (Invoke-Evaluator $bundle) "Performance $($timeCase.Name)" $timeCase.Expected
+    }
+    foreach ($clockCase in @(
+        [ordered]@{ Name = 'zero-clock'; Value = '0' },
+        [ordered]@{ Name = 'negative-clock'; Value = '-1' },
+        [ordered]@{ Name = 'overflow-clock'; Value = '253402300800' }
+    )) { Assert-Rejected (Invoke-Evaluator $pairedPins $true $false '' '' '' $false @('-FixtureNowUnixSeconds', $clockCase.Value)) "Performance $($clockCase.Name)" 'positive bounded Unix timestamp' }
+
+    $wrongAuthorizationDomain = New-Bundle (New-PerformanceDocuments) 'performance-wrong-authorization-domain'; Resign-PerformanceBundle $wrongAuthorizationDomain $AttestationDomain
+    Assert-Rejected (Invoke-Evaluator $wrongAuthorizationDomain) 'Performance wrong authorization domain' 'authorization signature is invalid'
+    $wrongLaneDomain = New-Bundle (New-PerformanceDocuments) 'performance-wrong-lane-domain'; Resign-PerformanceBundle $wrongLaneDomain $PerformanceAuthorizationDomain $AttestationDomain
+    Assert-Rejected (Invoke-Evaluator $wrongLaneDomain) 'Performance wrong lane domain' 'attestation signature is invalid'
+
+    $expired = New-Bundle (New-PerformanceDocuments) 'performance-expired-authorization'; $expired.Documents.Plan.authorization.record.expires_at_unix_seconds = $FixtureNow
+    Write-Canonical $expired.PlanPath $expired.Documents.Plan
+    Assert-Rejected (Invoke-Evaluator $expired) 'Performance expired authorization' 'not currently valid'
+    foreach ($epochCase in @(
+        [ordered]@{ Name = 'zero'; Value = [Int64]0 },
+        [ordered]@{ Name = 'negative'; Value = [Int64]-1 },
+        [ordered]@{ Name = 'overflow'; Value = [Int64]4294967296 }
+    )) {
+        $epochBundle = New-Bundle (New-PerformanceDocuments) "performance-$($epochCase.Name)-epoch"; $epochBundle.Documents.Plan.authorization.record.policy_epoch = $epochCase.Value
+        Resign-PerformanceBundle $epochBundle
+        Assert-Rejected (Invoke-Evaluator $epochBundle) "Performance $($epochCase.Name) epoch" 'bounded JSON integer'
+    }
+    $contractMutation = New-Bundle (New-PerformanceDocuments) 'performance-contract-mutation'; $contractMutation.Documents.Plan.capture_contract.power_policy = 'different-power-policy'
+    Write-Canonical $contractMutation.PlanPath $contractMutation.Documents.Plan
+    Assert-Rejected (Invoke-Evaluator $contractMutation) 'Performance capture contract mutation' 'power policy is unsupported'
+    $commaJoinedScopes = New-PerformanceDocuments; $commaJoinedScopes.Plan.capture_contract.launch_scopes = @('cpu,provider_discovery,selected_device')
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $commaJoinedScopes 'performance-comma-joined-launch-scopes')) 'Performance comma-joined launch scopes' 'launch scopes are not canonical'
+
+    $legacyNewArgument = New-Bundle (New-FixtureDocuments) 'legacy-performance-argument'
+    foreach ($legacyArgument in @(
+        [ordered]@{ Name = '-ExpectedAuthorizationSha256'; Value = Get-Digest 'legacy-auth-arg' },
+        [ordered]@{ Name = '-ExpectedCampaignNonce'; Value = Get-Digest 'legacy-nonce-arg' },
+        [ordered]@{ Name = '-FixtureNowUnixSeconds'; Value = [string]$FixtureNow }
+    )) { Assert-Rejected (Invoke-Evaluator $legacyNewArgument $true $false '' '' '' $false @($legacyArgument.Name, $legacyArgument.Value)) "Legacy performance argument $($legacyArgument.Name)" 'Performance-only arguments' }
+
+    $wrongSource = New-PerformanceDocuments; $wrongSource.Plan.source.revision = ('a' * 40)
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $wrongSource 'performance-wrong-source-revision')) 'Performance wrong source revision' 'app build does not match'
+    $cpuMismatch = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-cpu-a'
+    $cpuMismatchSecond = New-PerformanceDocuments 'unified_gpu' 220 110 220 110 'fixture-performance-cpu-b' 'intel'; $cpuMismatchSecond.Evidence.lanes[0].identity.cpu_baseline.worker_sha256 = Get-Digest 'different-cpu-worker'
+    $cpuMismatch.Evidence.lanes = @($cpuMismatch.Evidence.lanes[0], $cpuMismatchSecond.Evidence.lanes[0])
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $cpuMismatch 'performance-cpu-identity-mismatch')) 'Performance CPU identity mismatch' 'one exact CPU baseline'
+    $packMismatch = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-pack-a'
+    $packMismatchSecond = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-pack-b'; $packMismatchSecond.Evidence.lanes[0].identity.pack.pack_version = '0.1.0-other'; $packMismatchSecond.Evidence.lanes[0].identity.pack.pack_digest = Get-Digest 'other-pack'
+    $packMismatch.Evidence.lanes = @($packMismatch.Evidence.lanes[0], $packMismatchSecond.Evidence.lanes[0])
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $packMismatch 'performance-backend-pack-mismatch')) 'Performance backend pack mismatch' 'mix pack/worker release identities'
+
+    $partialFailure = New-PerformanceDocuments 'integrated_gpu' 220 110 220 110 'fixture-performance-a-pass-lane'
+    $partialFailureSecond = New-PerformanceDocuments 'unified_gpu' 220 110 220 110 'fixture-performance-b-fail-lane' 'intel'; Set-RunFailure $partialFailureSecond.Evidence.lanes[0].battery.run_sets.warm.gpu[0] 'timeout'
+    $partialFailure.Evidence.lanes = @($partialFailure.Evidence.lanes[0], $partialFailureSecond.Evidence.lanes[0])
+    $partialFailureBundle = New-Bundle $partialFailure 'performance-partial-multi-lane-failure'; $partialFailureResult = Invoke-Evaluator $partialFailureBundle
+    Assert-True ($partialFailureResult.ExitCode -eq 0) "Partial multi-lane failure was structurally rejected: $($partialFailureResult.Stderr)"
+    $partialFailureDecision = $partialFailureResult.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True (-not $partialFailureDecision.performance_passed -and $null -eq $partialFailureDecision.candidate_policy -and $null -eq $partialFailureDecision.candidate_policy_sha256) 'A partially failed multi-lane campaign emitted a partial candidate policy.'
+
+    $productionRelabel = New-Bundle (New-PerformanceDocuments) 'performance-production-relabel'
+    $productionRelabel.Documents.Plan.fixture_only = $false; $productionRelabel.Documents.Evidence.fixture_only = $false
+    $productionRelabel.Documents.Plan.authorization.Remove('fixture_approval_public_key_spki_base64')
+    $productionRelabel.Documents.Plan.authorization.record.performance_contract_sha256 = Get-CanonicalDigest (Get-PerformanceContractProjection $productionRelabel.Documents.Plan)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); $productionRelabel.Documents.Plan.authorization.record.issued_at_unix_seconds = $now - 3600; $productionRelabel.Documents.Plan.authorization.record.expires_at_unix_seconds = $now + 3600
+    Resign-PerformanceBundle $productionRelabel
+    $productionAuthDigest = Get-CanonicalDigest $productionRelabel.Documents.Plan.authorization
+    Assert-Rejected (Invoke-Evaluator $productionRelabel $false $false '' '' '' $false @('-ExpectedAuthorizationSha256', $productionAuthDigest, '-ExpectedCampaignNonce', $productionRelabel.Documents.Plan.capture_authority.campaign_nonce)) 'Performance production relabel' 'not approved by the protected campaign authority'
+
+    $performanceTamper = New-Bundle (New-PerformanceDocuments) 'performance-artifact-tamper'
+    $performanceTamperPath = Join-Path $performanceTamper.ArtifactRoot ($performanceTamper.Documents.Evidence.lanes[0].battery.run_sets.warm.gpu[0].artifact_path.Replace('/', '\'))
+    [IO.File]::WriteAllText($performanceTamperPath, 'tampered', $Utf8)
+    Assert-Rejected (Invoke-Evaluator $performanceTamper) 'Performance artifact tamper' 'digest does not match the supplied file'
+
+    $gitReadAst = $evaluatorAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-GitRead' }, $true)
+    $sourceCheckoutAst = $evaluatorAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-ProductionSourceCheckout' }, $true)
+    Assert-True ($null -ne $gitReadAst -and $null -ne $sourceCheckoutAst) 'Evaluator production source-check helpers are missing.'
+    Invoke-Expression $gitReadAst.Extent.Text; Invoke-Expression $sourceCheckoutAst.Extent.Text
+    $sourceFixture = Join-Path $TestRoot 'source-checkout-fixture'; [IO.Directory]::CreateDirectory($sourceFixture) | Out-Null
+    & git -C $sourceFixture init --quiet; Assert-True ($LASTEXITCODE -eq 0) 'Could not initialize isolated source-check fixture.'
+    [IO.File]::WriteAllText((Join-Path $sourceFixture 'tracked.txt'), 'tracked', $Utf8)
+    & git -C $sourceFixture add tracked.txt; & git -C $sourceFixture -c user.name=ScribeFixture -c user.email=fixture@example.invalid -c commit.gpgsign=false -c core.hooksPath=NUL commit --quiet --no-gpg-sign -m fixture
+    Assert-True ($LASTEXITCODE -eq 0) 'Could not commit isolated source-check fixture.'
+    $sourceHead = (& git -C $sourceFixture rev-parse HEAD).Trim()
+    Assert-ProductionSourceCheckout $sourceFixture $sourceHead
+    $savedGitEnvironment = [ordered]@{}
+    foreach ($name in @('GIT_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0')) { $savedGitEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+    try {
+        $env:GIT_DIR = Join-Path $TestRoot 'redirected-git-dir'
+        $env:GIT_CONFIG_COUNT = '1'; $env:GIT_CONFIG_KEY_0 = 'core.repositoryformatversion'; $env:GIT_CONFIG_VALUE_0 = '999'
+        Assert-ProductionSourceCheckout $sourceFixture $sourceHead
+    }
+    finally {
+        foreach ($name in $savedGitEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedGitEnvironment[$name], 'Process') }
+    }
+    [IO.File]::WriteAllText((Join-Path $sourceFixture 'untracked.txt'), 'untracked', $Utf8)
+    $untrackedRejected = $false; try { Assert-ProductionSourceCheckout $sourceFixture $sourceHead } catch { $untrackedRejected = $_.Exception.Message.Contains('untracked changes') }
+    Assert-True $untrackedRejected 'Production source check accepted an untracked file.'
+    $wrongHeadRejected = $false; try { Assert-ProductionSourceCheckout $sourceFixture ('f' * 40) } catch { $wrongHeadRejected = $_.Exception.Message.Contains('HEAD differs') }
+    Assert-True $wrongHeadRejected 'Production source check accepted the wrong authorized HEAD.'
+    if ($PerformanceOnly) { Write-Output 'Windows GPU performance candidate focused contract tests passed.'; return }
     $checkedPlanRaw = [IO.File]::ReadAllText($CheckedPlanPath, $Utf8)
     $checkedPlan = $checkedPlanRaw | ConvertFrom-Json -AsHashtable -Depth 64
     Assert-True ($checkedPlan.schema_version -eq 3 -and $checkedPlan.capture_contract.power_policy -ceq 'ac_for_discrete_ac_and_battery_for_integrated_or_unified' -and -not $checkedPlan.fixture_only -and $checkedPlan.required_lanes.Count -eq 0 -and -not $checkedPlan.runtime_bucket_complete) 'Checked-in plan is not canonical schema-v3 production default deny.'
@@ -1024,5 +1400,6 @@ try {
 }
 finally {
     $FixtureKey.Dispose()
+    $PerformanceApprovalKey.Dispose()
     if (Test-Path -LiteralPath $TestRoot) { Remove-Item -LiteralPath $TestRoot -Recurse -Force }
 }
