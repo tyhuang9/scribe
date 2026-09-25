@@ -90,7 +90,10 @@ pub(crate) const PACK_DRIVER_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DRIVER_ID";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
-const RUNTIME_OBSERVATION_VERSION: u8 = 1;
+const RUNTIME_OBSERVATION_VERSION_V1: u8 = 1;
+const RUNTIME_OBSERVATION_VERSION_V2: u8 = 2;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+const RUNTIME_OBSERVATION_COLLECTOR_VERSION: u8 = RUNTIME_OBSERVATION_VERSION_V2;
 const MAX_PCM_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PCM_FRAME_SAMPLES: usize = MAX_PCM_FRAME_BYTES / size_of::<f32>();
 const MAX_TRANSCRIPT_TEXT_BYTES: usize = 96 * 1024;
@@ -661,10 +664,19 @@ enum Control {
     RuntimeObservationSupported {
         version: u8,
     },
+    RuntimeObservationV2Supported {
+        version: u8,
+    },
     RuntimeObservationStarted {
         version: u8,
         model_sha256: String,
         before: ProviderMemoryObservation,
+    },
+    RuntimeObservationV2Started {
+        version: u8,
+        model_sha256: String,
+        before: ProviderMemoryObservation,
+        availability_before: WorkerMemoryAvailability,
     },
     RuntimeObservationCompleted {
         version: u8,
@@ -673,6 +685,15 @@ enum Control {
         batch_begin_request_id: u64,
         batch_end_request_id: u64,
         after: ProviderMemoryObservation,
+    },
+    RuntimeObservationV2Completed {
+        version: u8,
+        model_sha256: String,
+        batch_session_id: u64,
+        batch_begin_request_id: u64,
+        batch_end_request_id: u64,
+        after: ProviderMemoryObservation,
+        availability_after: WorkerMemoryAvailability,
     },
     RuntimeLoaded {
         execution: WireRuntimeLoadExecution,
@@ -728,8 +749,11 @@ impl Control {
             self,
             Self::Ready { .. }
                 | Self::RuntimeObservationSupported { .. }
+                | Self::RuntimeObservationV2Supported { .. }
                 | Self::RuntimeObservationStarted { .. }
+                | Self::RuntimeObservationV2Started { .. }
                 | Self::RuntimeObservationCompleted { .. }
+                | Self::RuntimeObservationV2Completed { .. }
                 | Self::RuntimeLoaded { .. }
                 | Self::RuntimeTranscript { .. }
                 | Self::RuntimeFailed { .. }
@@ -786,6 +810,64 @@ pub(crate) enum ProviderMemoryNotApplicableReason {
     CpuProvider,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkerMemoryUnavailableReason {
+    ProviderQueryFailed,
+    StableDeviceMissing,
+    StableDeviceAmbiguous,
+    MemoryBudgetExtensionUnavailable,
+    MemoryBudgetInvalid,
+    MultiInstanceUnsupported,
+    UnsupportedProvider,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VulkanMemoryHeapSelection {
+    AllHeapsIntegrated,
+    DeviceLocalHeaps,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VulkanMemoryHeapObservation {
+    pub(crate) heap_index: u8,
+    pub(crate) size_bytes: u64,
+    pub(crate) flags: u32,
+    pub(crate) budget_bytes: u64,
+    pub(crate) usage_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum WorkerMemoryAvailabilitySource {
+    CudaMemGetInfo,
+    VulkanMemoryBudget {
+        heap_selection: VulkanMemoryHeapSelection,
+        heaps: Vec<VulkanMemoryHeapObservation>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum WorkerMemoryAvailability {
+    Observed {
+        backend: String,
+        provider_id: String,
+        stable_device: String,
+        memory_total_bytes: u64,
+        available_memory_bytes: u64,
+        source: WorkerMemoryAvailabilitySource,
+    },
+    NotApplicable {
+        reason: ProviderMemoryNotApplicableReason,
+    },
+    Unavailable {
+        reason: WorkerMemoryUnavailableReason,
+    },
+}
+
 impl ProviderMemoryObservation {
     fn validate_shape(&self) -> Result<()> {
         match self {
@@ -831,6 +913,102 @@ impl ProviderMemoryObservation {
             | (AccelerationPreference::Gpu, Self::Available { .. })
             | (AccelerationPreference::Gpu, Self::Unavailable { .. }) => Ok(()),
             _ => bail!("runtime provider memory observation does not match the requested provider"),
+        }
+    }
+}
+
+impl WorkerMemoryAvailability {
+    fn validate_shape(&self) -> Result<()> {
+        let Self::Observed {
+            backend,
+            provider_id,
+            stable_device,
+            memory_total_bytes,
+            available_memory_bytes,
+            source,
+        } = self
+        else {
+            return Ok(());
+        };
+        if backend.is_empty()
+            || backend.len() > 32
+            || backend.as_str() != backend.to_ascii_lowercase()
+            || !backend.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || provider_id.is_empty()
+            || provider_id.len() > 128
+            || stable_device.is_empty()
+            || stable_device.len() > 256
+            || provider_id.chars().any(char::is_control)
+            || stable_device.chars().any(char::is_control)
+            || *memory_total_bytes == 0
+            || available_memory_bytes > memory_total_bytes
+        {
+            bail!("worker memory availability is noncanonical or impossible");
+        }
+        match source {
+            WorkerMemoryAvailabilitySource::CudaMemGetInfo => {
+                if backend != "cuda" {
+                    bail!("CUDA memory availability has the wrong backend");
+                }
+            }
+            WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                heap_selection,
+                heaps,
+            } => {
+                if backend != "vulkan" || heaps.is_empty() || heaps.len() > 16 {
+                    bail!("Vulkan memory availability is noncanonical");
+                }
+                let mut derived_total = 0_u64;
+                let mut derived_available = 0_u64;
+                let mut selected = 0_usize;
+                for (index, heap) in heaps.iter().enumerate() {
+                    if usize::from(heap.heap_index) != index
+                        || heap.size_bytes == 0
+                        || heap.flags & !0b11 != 0
+                        || heap.flags & 0b10 != 0
+                        || heap.budget_bytes == 0
+                        || heap.budget_bytes > heap.size_bytes
+                    {
+                        bail!("Vulkan memory-budget heap is noncanonical or impossible");
+                    }
+                    let include = match heap_selection {
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated => true,
+                        VulkanMemoryHeapSelection::DeviceLocalHeaps => heap.flags & 0b1 != 0,
+                    };
+                    if include {
+                        selected += 1;
+                        derived_total = derived_total
+                            .checked_add(heap.size_bytes)
+                            .ok_or_else(|| anyhow!("Vulkan memory capacity overflowed"))?;
+                        derived_available = derived_available
+                            .checked_add(heap.budget_bytes.saturating_sub(heap.usage_bytes))
+                            .ok_or_else(|| anyhow!("Vulkan memory headroom overflowed"))?;
+                    }
+                }
+                if selected == 0
+                    || derived_total != *memory_total_bytes
+                    || derived_available != *available_memory_bytes
+                {
+                    bail!("Vulkan memory availability does not match its heap inventory");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, all(windows, feature = "windows-gpu-capture-observation")))]
+    fn validate_for_preference(&self, preference: AccelerationPreference) -> Result<()> {
+        self.validate_shape()?;
+        match (preference, self) {
+            (
+                AccelerationPreference::Cpu,
+                Self::NotApplicable {
+                    reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                },
+            )
+            | (AccelerationPreference::Gpu, Self::Observed { .. })
+            | (AccelerationPreference::Gpu, Self::Unavailable { .. }) => Ok(()),
+            _ => bail!("worker memory availability does not match the requested provider"),
         }
     }
 }
@@ -1554,6 +1732,283 @@ impl Drop for VulkanInstanceGuard {
         // SAFETY: this guard exclusively owns the instance and all physical
         // device queries have completed before it is dropped.
         unsafe { self.0.destroy_instance(None) };
+    }
+}
+
+#[cfg(any(test, all(windows, feature = "vulkan-acceleration")))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VulkanMemoryDeviceSnapshot {
+    stable_device_identity: Option<String>,
+    device_class: DeviceClass,
+    linked_nodes: bool,
+    memory_budget_supported: bool,
+    heaps: Vec<VulkanMemoryHeapObservation>,
+    unused_budget_or_usage_nonzero: bool,
+}
+
+#[cfg(any(test, all(windows, feature = "vulkan-acceleration")))]
+fn derive_vulkan_memory_availability(
+    snapshots: &[VulkanMemoryDeviceSnapshot],
+    provider_id: &str,
+    stable_device: &str,
+    expected_class: DeviceClass,
+) -> WorkerMemoryAvailability {
+    let matching = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.stable_device_identity.as_deref() == Some(stable_device))
+        .collect::<Vec<_>>();
+    let [snapshot] = matching.as_slice() else {
+        return WorkerMemoryAvailability::Unavailable {
+            reason: if matching.is_empty() {
+                WorkerMemoryUnavailableReason::StableDeviceMissing
+            } else {
+                WorkerMemoryUnavailableReason::StableDeviceAmbiguous
+            },
+        };
+    };
+    if snapshot.linked_nodes || snapshot.heaps.iter().any(|heap| heap.flags & 0b10 != 0) {
+        return WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::MultiInstanceUnsupported,
+        };
+    }
+    if !snapshot.memory_budget_supported {
+        return WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::MemoryBudgetExtensionUnavailable,
+        };
+    }
+    let heap_selection = match expected_class {
+        DeviceClass::IntegratedGpu => VulkanMemoryHeapSelection::AllHeapsIntegrated,
+        DeviceClass::DiscreteGpu => VulkanMemoryHeapSelection::DeviceLocalHeaps,
+        _ => {
+            return WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid,
+            };
+        }
+    };
+    if snapshot.device_class != expected_class
+        || snapshot.heaps.is_empty()
+        || snapshot.heaps.len() > 16
+        || snapshot.unused_budget_or_usage_nonzero
+    {
+        return WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid,
+        };
+    }
+    let mut memory_total_bytes = 0_u64;
+    let mut available_memory_bytes = 0_u64;
+    let mut selected = 0_usize;
+    for (index, heap) in snapshot.heaps.iter().enumerate() {
+        if usize::from(heap.heap_index) != index
+            || heap.size_bytes == 0
+            || heap.flags & !0b11 != 0
+            || heap.budget_bytes == 0
+            || heap.budget_bytes > heap.size_bytes
+        {
+            return WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid,
+            };
+        }
+        let include = match heap_selection {
+            VulkanMemoryHeapSelection::AllHeapsIntegrated => true,
+            VulkanMemoryHeapSelection::DeviceLocalHeaps => heap.flags & 0b1 != 0,
+        };
+        if include {
+            selected += 1;
+            let Some(total) = memory_total_bytes.checked_add(heap.size_bytes) else {
+                return WorkerMemoryAvailability::Unavailable {
+                    reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid,
+                };
+            };
+            memory_total_bytes = total;
+            let Some(available) = available_memory_bytes
+                .checked_add(heap.budget_bytes.saturating_sub(heap.usage_bytes))
+            else {
+                return WorkerMemoryAvailability::Unavailable {
+                    reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid,
+                };
+            };
+            available_memory_bytes = available;
+        }
+    }
+    if selected == 0 || provider_id.is_empty() || stable_device.is_empty() {
+        return WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid,
+        };
+    }
+    WorkerMemoryAvailability::Observed {
+        backend: "vulkan".to_owned(),
+        provider_id: provider_id.to_owned(),
+        stable_device: stable_device.to_owned(),
+        memory_total_bytes,
+        available_memory_bytes,
+        source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+            heap_selection,
+            heaps: snapshot.heaps.clone(),
+        },
+    }
+}
+
+#[cfg(all(windows, feature = "vulkan-acceleration"))]
+fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> {
+    use ash::vk;
+    use std::ffi::CStr;
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+
+    let entry = crate::windows_vulkan_loader::ash_entry(true)?;
+    let application = vk::ApplicationInfo::builder()
+        .application_name(c"scribe-gpu-worker-memory")
+        .application_version(1)
+        .api_version(vk::API_VERSION_1_1);
+    let create_info = vk::InstanceCreateInfo::builder().application_info(&application);
+    // SAFETY: the trusted loader is retained by the pack lease, and the
+    // create-info pointers remain live for the synchronous call.
+    let instance = VulkanInstanceGuard(
+        unsafe { entry.create_instance(&create_info, None) }
+            .context("could not create the Vulkan memory-query instance")?,
+    );
+    // SAFETY: the instance remains live until every physical-device query has
+    // completed and no physical-device handle escapes this function.
+    let physical_devices = unsafe { instance.0.enumerate_physical_devices() }
+        .context("could not enumerate Vulkan physical devices for memory availability")?;
+    if physical_devices.is_empty() || physical_devices.len() > 64 {
+        bail!("Vulkan physical-device memory-query list is empty or oversized");
+    }
+
+    let mut snapshots = Vec::with_capacity(physical_devices.len());
+    for physical_device in physical_devices {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::builder()
+            .push_next(&mut id)
+            .build();
+        // SAFETY: the pNext structure and output remain initialized and live
+        // for the synchronous identity query.
+        unsafe {
+            instance
+                .0
+                .get_physical_device_properties2(physical_device, &mut properties)
+        };
+        let device_class = match properties.properties.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => DeviceClass::DiscreteGpu,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => DeviceClass::IntegratedGpu,
+            _ => DeviceClass::Unknown,
+        };
+        let stable_device_identity =
+            if id.device_luid_valid == vk::TRUE && id.device_luid.iter().any(|byte| *byte != 0) {
+                Some(format!("native:luid:{}", hex(&id.device_luid)))
+            } else if id.device_uuid.iter().any(|byte| *byte != 0) {
+                Some(format!("native:uuid:{}", hex(&id.device_uuid)))
+            } else {
+                None
+            };
+        let linked_nodes =
+            id.device_luid_valid == vk::TRUE && id.device_node_mask.count_ones() != 1;
+        // SAFETY: the physical device belongs to this live instance and the
+        // returned fixed-size extension names are inspected before drop.
+        let extensions = unsafe {
+            instance
+                .0
+                .enumerate_device_extension_properties(physical_device)
+        }
+        .context("could not enumerate Vulkan memory-budget support")?;
+        let memory_budget_supported = extensions.iter().any(|extension| {
+            // SAFETY: Vulkan guarantees each extensionName array is NUL
+            // terminated within its fixed-size storage.
+            (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+                == vk::ExtMemoryBudgetFn::name()
+        });
+        let (heaps, unused_budget_or_usage_nonzero) = if memory_budget_supported {
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut memory = vk::PhysicalDeviceMemoryProperties2::builder()
+                .push_next(&mut budget)
+                .build();
+            // SAFETY: the pNext chain points to initialized writable storage
+            // and remains live for the synchronous properties query.
+            unsafe {
+                instance
+                    .0
+                    .get_physical_device_memory_properties2(physical_device, &mut memory)
+            };
+            let heap_count = usize::try_from(memory.memory_properties.memory_heap_count)
+                .context("Vulkan memory heap count exceeded usize")?;
+            if heap_count == 0 || heap_count > 16 {
+                (Vec::new(), true)
+            } else {
+                let heaps = memory.memory_properties.memory_heaps[..heap_count]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, heap)| VulkanMemoryHeapObservation {
+                        heap_index: u8::try_from(index)
+                            .expect("Vulkan heap count is bounded to sixteen"),
+                        size_bytes: heap.size,
+                        flags: heap.flags.as_raw(),
+                        budget_bytes: budget.heap_budget[index],
+                        usage_bytes: budget.heap_usage[index],
+                    })
+                    .collect();
+                let unused_nonzero = budget.heap_budget[heap_count..]
+                    .iter()
+                    .chain(&budget.heap_usage[heap_count..])
+                    .any(|value| *value != 0);
+                (heaps, unused_nonzero)
+            }
+        } else {
+            (Vec::new(), false)
+        };
+        snapshots.push(VulkanMemoryDeviceSnapshot {
+            stable_device_identity,
+            device_class,
+            linked_nodes,
+            memory_budget_supported,
+            heaps,
+            unused_budget_or_usage_nonzero,
+        });
+    }
+    Ok(snapshots)
+}
+
+#[cfg(all(windows, feature = "vulkan-acceleration"))]
+fn query_vulkan_memory_availability() -> WorkerMemoryAvailability {
+    let stable_device = std::env::var(PACK_DEVICE_ID_ENV).ok();
+    let provider_id = std::env::var(PACK_PROVIDER_ENV).ok();
+    let runtime_device = stable_device
+        .as_deref()
+        .zip(provider_id.as_deref())
+        .and_then(|(stable, provider)| current_pack_runtime_device(stable, provider));
+    let Some(((stable_device, provider_id), runtime_device)) = stable_device
+        .as_deref()
+        .zip(provider_id.as_deref())
+        .zip(runtime_device)
+    else {
+        return WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::StableDeviceMissing,
+        };
+    };
+    match collect_vulkan_memory_snapshots() {
+        Ok(snapshots) => derive_vulkan_memory_availability(
+            &snapshots,
+            provider_id,
+            stable_device,
+            runtime_device.device_class,
+        ),
+        Err(_) => WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::ProviderQueryFailed,
+        },
+    }
+}
+
+#[cfg(not(all(windows, feature = "vulkan-acceleration")))]
+fn query_vulkan_memory_availability() -> WorkerMemoryAvailability {
+    WorkerMemoryAvailability::Unavailable {
+        reason: WorkerMemoryUnavailableReason::UnsupportedProvider,
     }
 }
 
@@ -6357,6 +6812,7 @@ struct RuntimeObservationStart {
     request_id: u64,
     model_sha256: String,
     before: ProviderMemoryObservation,
+    availability_before: WorkerMemoryAvailability,
 }
 
 struct CorrelatedRuntimeExecution {
@@ -6377,6 +6833,8 @@ pub(crate) struct ObservedRuntimeExecution {
     pub(crate) execution: RuntimeExecution,
     pub(crate) before: ProviderMemoryObservation,
     pub(crate) after: ProviderMemoryObservation,
+    pub(crate) availability_before: WorkerMemoryAvailability,
+    pub(crate) availability_after: WorkerMemoryAvailability,
 }
 
 impl InferenceWorkerSupervisor {
@@ -6485,7 +6943,7 @@ impl InferenceWorkerSupervisor {
             correlation,
             correlation,
             &Control::NegotiateRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_COLLECTOR_VERSION,
             },
         )
         .map_err(worker_unavailable)?;
@@ -6494,8 +6952,8 @@ impl InferenceWorkerSupervisor {
             .active_round_trip(context.generation, correlation, correlation, &[frame])
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeObservationSupported { version }
-                if version == RUNTIME_OBSERVATION_VERSION =>
+            Control::RuntimeObservationV2Supported { version }
+                if version == RUNTIME_OBSERVATION_COLLECTOR_VERSION =>
             {
                 Ok(())
             }
@@ -6530,7 +6988,7 @@ impl InferenceWorkerSupervisor {
             session_id,
             request_id,
             &Control::BeginRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_COLLECTOR_VERSION,
                 model_sha256: model_sha256.clone(),
             },
         )
@@ -6546,17 +7004,21 @@ impl InferenceWorkerSupervisor {
             )
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeObservationStarted {
+            Control::RuntimeObservationV2Started {
                 version,
                 model_sha256: echoed_model,
                 before,
-            } if version == RUNTIME_OBSERVATION_VERSION && echoed_model == model_sha256 => {
+                availability_before,
+            } if version == RUNTIME_OBSERVATION_COLLECTOR_VERSION
+                && echoed_model == model_sha256 =>
+            {
                 Ok(RuntimeObservationStart {
                     generation: context.generation,
                     session_id,
                     request_id,
                     model_sha256,
                     before,
+                    availability_before,
                 })
             }
             Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
@@ -6885,6 +7347,12 @@ impl InferenceWorkerSupervisor {
             .map_err(worker_unavailable)?;
         validate_capture_provider_memory(&started.before, preference, expected_gpu)
             .map_err(worker_unavailable)?;
+        started
+            .availability_before
+            .validate_for_preference(preference)
+            .map_err(worker_unavailable)?;
+        validate_capture_worker_memory(&started.availability_before, preference, expected_gpu)
+            .map_err(worker_unavailable)?;
         let cancellation_generation = std::sync::atomic::AtomicU64::new(0);
         let batch = self.transcribe_correlated(
             artifact,
@@ -6906,7 +7374,7 @@ impl InferenceWorkerSupervisor {
             finish_session_id,
             finish_request_id,
             &Control::FinishRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_COLLECTOR_VERSION,
                 begin_session_id: started.session_id,
                 begin_request_id: started.request_id,
             },
@@ -6922,14 +7390,15 @@ impl InferenceWorkerSupervisor {
             )
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeObservationCompleted {
+            Control::RuntimeObservationV2Completed {
                 version,
                 model_sha256: echoed_model,
                 batch_session_id,
                 batch_begin_request_id,
                 batch_end_request_id,
                 after,
-            } if version == RUNTIME_OBSERVATION_VERSION
+                availability_after,
+            } if version == RUNTIME_OBSERVATION_COLLECTOR_VERSION
                 && echoed_model == started.model_sha256
                 && batch_session_id == batch.session_id
                 && batch_begin_request_id == batch.begin_request_id
@@ -6940,10 +7409,17 @@ impl InferenceWorkerSupervisor {
                     .map_err(worker_unavailable)?;
                 validate_capture_provider_memory(&after, preference, expected_gpu)
                     .map_err(worker_unavailable)?;
+                availability_after
+                    .validate_for_preference(preference)
+                    .map_err(worker_unavailable)?;
+                validate_capture_worker_memory(&availability_after, preference, expected_gpu)
+                    .map_err(worker_unavailable)?;
                 Ok(ObservedRuntimeExecution {
                     execution: batch.execution,
                     before: started.before,
                     after,
+                    availability_before: started.availability_before,
+                    availability_after,
                 })
             }
             Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
@@ -7085,6 +7561,56 @@ fn validate_capture_provider_memory(
         }
         ProviderMemoryObservation::Unavailable { .. }
         | ProviderMemoryObservation::NotApplicable { .. } => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+pub(crate) fn validate_capture_worker_memory(
+    availability: &WorkerMemoryAvailability,
+    preference: AccelerationPreference,
+    expected_gpu: Option<&GpuCaptureObservationIdentity>,
+) -> Result<()> {
+    availability.validate_for_preference(preference)?;
+    if preference == AccelerationPreference::Gpu && expected_gpu.is_none() {
+        bail!("GPU memory availability validation omitted its authenticated identity");
+    }
+    let WorkerMemoryAvailability::Observed {
+        backend,
+        provider_id,
+        stable_device,
+        memory_total_bytes,
+        source,
+        ..
+    } = availability
+    else {
+        return Ok(());
+    };
+    let expected = expected_gpu.ok_or_else(|| {
+        anyhow!("GPU memory availability validation omitted its authenticated identity")
+    })?;
+    if backend != &expected.backend
+        || provider_id != &expected.provider
+        || stable_device != &expected.stable_device
+    {
+        bail!("worker memory availability does not match the authenticated GPU");
+    }
+    match source {
+        WorkerMemoryAvailabilitySource::CudaMemGetInfo => {
+            if expected.backend != "cuda" || memory_total_bytes != &expected.memory_total_bytes {
+                bail!("CUDA memory availability does not match the authenticated GPU");
+            }
+        }
+        WorkerMemoryAvailabilitySource::VulkanMemoryBudget { heap_selection, .. } => {
+            let expected_selection = match expected.device_class.as_str() {
+                "integrated_gpu" => VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                "discrete_gpu" => VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                _ => bail!("Vulkan memory availability has an unsupported GPU class"),
+            };
+            if expected.backend != "vulkan" || *heap_selection != expected_selection {
+                bail!("Vulkan memory availability scope does not match the authenticated GPU");
+            }
+        }
     }
     Ok(())
 }
@@ -9927,6 +10453,7 @@ struct PendingWorkerBatch {
 
 #[derive(Clone, Debug)]
 struct RuntimeObservationSlot {
+    version: u8,
     begin_session_id: u64,
     begin_request_id: u64,
     model_sha256: String,
@@ -9934,6 +10461,7 @@ struct RuntimeObservationSlot {
     batch_begin_request_id: Option<u64>,
     batch_end_request_id: Option<u64>,
     after: Option<ProviderMemoryObservation>,
+    availability_after: Option<WorkerMemoryAvailability>,
 }
 
 impl RuntimeObservationSlot {
@@ -9962,6 +10490,7 @@ impl RuntimeObservationSlot {
         session_id: u64,
         request_id: u64,
         after: ProviderMemoryObservation,
+        availability_after: Option<WorkerMemoryAvailability>,
     ) -> Result<()> {
         if self.batch_session_id != Some(session_id) || self.batch_begin_request_id.is_none() {
             bail!("runtime observation batch correlation changed before completion");
@@ -9969,28 +10498,57 @@ impl RuntimeObservationSlot {
         if self.after.is_some() || self.batch_end_request_id.is_some() {
             bail!("runtime observation was already completed");
         }
+        match (self.version, availability_after.as_ref()) {
+            (RUNTIME_OBSERVATION_VERSION_V1, None) | (RUNTIME_OBSERVATION_VERSION_V2, Some(_)) => {}
+            (RUNTIME_OBSERVATION_VERSION_V1, Some(_)) => {
+                bail!("runtime observation V1 cannot retain a V2 availability snapshot")
+            }
+            (RUNTIME_OBSERVATION_VERSION_V2, None) => {
+                bail!("runtime observation V2 requires an availability snapshot")
+            }
+            _ => bail!("runtime observation slot has an unsupported version"),
+        }
         self.batch_end_request_id = Some(request_id);
         self.after = Some(after);
+        self.availability_after = availability_after;
         Ok(())
     }
 
     fn completed_response(self) -> Result<Control> {
-        Ok(Control::RuntimeObservationCompleted {
-            version: RUNTIME_OBSERVATION_VERSION,
-            model_sha256: self.model_sha256,
-            batch_session_id: self
-                .batch_session_id
-                .ok_or_else(|| anyhow!("runtime observation has no bound batch"))?,
-            batch_begin_request_id: self
-                .batch_begin_request_id
-                .ok_or_else(|| anyhow!("runtime observation has no batch begin request"))?,
-            batch_end_request_id: self
-                .batch_end_request_id
-                .ok_or_else(|| anyhow!("runtime observation has no batch end request"))?,
-            after: self
-                .after
-                .ok_or_else(|| anyhow!("runtime observation has no after snapshot"))?,
-        })
+        let batch_session_id = self
+            .batch_session_id
+            .ok_or_else(|| anyhow!("runtime observation has no bound batch"))?;
+        let batch_begin_request_id = self
+            .batch_begin_request_id
+            .ok_or_else(|| anyhow!("runtime observation has no batch begin request"))?;
+        let batch_end_request_id = self
+            .batch_end_request_id
+            .ok_or_else(|| anyhow!("runtime observation has no batch end request"))?;
+        let after = self
+            .after
+            .ok_or_else(|| anyhow!("runtime observation has no after snapshot"))?;
+        match self.version {
+            RUNTIME_OBSERVATION_VERSION_V1 => Ok(Control::RuntimeObservationCompleted {
+                version: self.version,
+                model_sha256: self.model_sha256,
+                batch_session_id,
+                batch_begin_request_id,
+                batch_end_request_id,
+                after,
+            }),
+            RUNTIME_OBSERVATION_VERSION_V2 => Ok(Control::RuntimeObservationV2Completed {
+                version: self.version,
+                model_sha256: self.model_sha256,
+                batch_session_id,
+                batch_begin_request_id,
+                batch_end_request_id,
+                after,
+                availability_after: self.availability_after.ok_or_else(|| {
+                    anyhow!("runtime observation has no after availability snapshot")
+                })?,
+            }),
+            _ => bail!("runtime observation slot has an unsupported version"),
+        }
     }
 }
 
@@ -10010,6 +10568,36 @@ fn observation_preference(provider: WorkerProvider) -> Result<AccelerationPrefer
         WorkerProvider::Cuda | WorkerProvider::Vulkan | WorkerProvider::Metal => {
             Ok(AccelerationPreference::Gpu)
         }
+    }
+}
+
+fn worker_memory_availability_before(
+    runtime_router: &RuntimeRouter,
+    provider: WorkerProvider,
+) -> Result<WorkerMemoryAvailability> {
+    match provider {
+        WorkerProvider::Cpu | WorkerProvider::Cuda => runtime_router
+            .worker_memory_availability_before(observation_preference(provider)?)
+            .map_err(anyhow::Error::new),
+        WorkerProvider::Vulkan => Ok(query_vulkan_memory_availability()),
+        WorkerProvider::Metal => Ok(WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::UnsupportedProvider,
+        }),
+    }
+}
+
+fn worker_memory_availability_after(
+    runtime_router: &RuntimeRouter,
+    provider: WorkerProvider,
+) -> Result<WorkerMemoryAvailability> {
+    match provider {
+        WorkerProvider::Cpu | WorkerProvider::Cuda => runtime_router
+            .worker_memory_availability_after()
+            .map_err(anyhow::Error::new),
+        WorkerProvider::Vulkan => Ok(query_vulkan_memory_availability()),
+        WorkerProvider::Metal => Ok(WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::UnsupportedProvider,
+        }),
     }
 }
 
@@ -10139,7 +10727,7 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
     }
     let mut loaded_runtime: Option<LoadedRuntimeMetadata> = None;
     let mut pending_batch: Option<PendingWorkerBatch> = None;
-    let mut runtime_observation_supported = false;
+    let mut runtime_observation_version = None;
     let mut runtime_observation: Option<RuntimeObservationSlot> = None;
     let mut worker_provider: Option<WorkerProvider> = None;
     let mut handshake_complete = false;
@@ -10222,11 +10810,22 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
             }
             Control::NegotiateRuntimeObservation { version } => {
                 let result = (|| {
-                    if version != RUNTIME_OBSERVATION_VERSION {
+                    if !matches!(
+                        version,
+                        RUNTIME_OBSERVATION_VERSION_V1 | RUNTIME_OBSERVATION_VERSION_V2
+                    ) {
                         bail!("unsupported runtime observation version {version}");
                     }
-                    runtime_observation_supported = true;
-                    Ok(Control::RuntimeObservationSupported { version })
+                    runtime_observation_version = Some(version);
+                    Ok(match version {
+                        RUNTIME_OBSERVATION_VERSION_V1 => {
+                            Control::RuntimeObservationSupported { version }
+                        }
+                        RUNTIME_OBSERVATION_VERSION_V2 => {
+                            Control::RuntimeObservationV2Supported { version }
+                        }
+                        _ => unreachable!("version was bounded above"),
+                    })
                 })();
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
@@ -10235,10 +10834,13 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                 model_sha256,
             } => {
                 let result = (|| {
-                    if !runtime_observation_supported {
+                    if runtime_observation_version != Some(version) {
                         bail!("runtime observation support was not negotiated");
                     }
-                    if version != RUNTIME_OBSERVATION_VERSION {
+                    if !matches!(
+                        version,
+                        RUNTIME_OBSERVATION_VERSION_V1 | RUNTIME_OBSERVATION_VERSION_V2
+                    ) {
                         bail!("unsupported runtime observation version {version}");
                     }
                     if runtime_observation.is_some() {
@@ -10253,13 +10855,18 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                     }
                     let model_sha256 = canonical_runtime_observation_digest(&model_sha256)?;
                     loaded_runtime_matches_observation(loaded_runtime.as_ref(), &model_sha256)?;
-                    let preference = observation_preference(worker_provider.ok_or_else(|| {
+                    let provider = worker_provider.ok_or_else(|| {
                         anyhow!("runtime observation requires an authenticated worker provider")
-                    })?)?;
+                    })?;
+                    let preference = observation_preference(provider)?;
                     let before = runtime_router
                         .provider_memory_observation_before(preference)
                         .map_err(anyhow::Error::new)?;
+                    let availability_before = (version == RUNTIME_OBSERVATION_VERSION_V2)
+                        .then(|| worker_memory_availability_before(&runtime_router, provider))
+                        .transpose()?;
                     runtime_observation = Some(RuntimeObservationSlot {
+                        version,
                         begin_session_id: session_id,
                         begin_request_id: request_id,
                         model_sha256: model_sha256.clone(),
@@ -10267,11 +10874,20 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                         batch_begin_request_id: None,
                         batch_end_request_id: None,
                         after: None,
+                        availability_after: None,
                     });
-                    Ok(Control::RuntimeObservationStarted {
-                        version,
-                        model_sha256,
-                        before,
+                    Ok(match availability_before {
+                        None => Control::RuntimeObservationStarted {
+                            version,
+                            model_sha256,
+                            before,
+                        },
+                        Some(availability_before) => Control::RuntimeObservationV2Started {
+                            version,
+                            model_sha256,
+                            before,
+                            availability_before,
+                        },
                     })
                 })();
                 if result.is_err() {
@@ -10285,13 +10901,17 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                 begin_request_id,
             } => {
                 let result = (|| {
-                    if version != RUNTIME_OBSERVATION_VERSION {
+                    if !matches!(
+                        version,
+                        RUNTIME_OBSERVATION_VERSION_V1 | RUNTIME_OBSERVATION_VERSION_V2
+                    ) {
                         bail!("unsupported runtime observation version {version}");
                     }
                     let slot = runtime_observation
                         .take()
                         .ok_or_else(|| anyhow!("no completed runtime observation is available"))?;
-                    if slot.begin_session_id != begin_session_id
+                    if slot.version != version
+                        || slot.begin_session_id != begin_session_id
                         || slot.begin_request_id != begin_request_id
                     {
                         bail!("runtime observation begin correlation does not match");
@@ -10438,9 +11058,19 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                     let after = runtime_router
                         .provider_memory_observation_after()
                         .map_err(anyhow::Error::new);
-                    match after
-                        .and_then(|after| observation.complete(session_id, request_id, after))
-                    {
+                    let availability_after = match (observation.version, worker_provider) {
+                        (RUNTIME_OBSERVATION_VERSION_V2, Some(provider)) => {
+                            Some(worker_memory_availability_after(&runtime_router, provider))
+                        }
+                        (RUNTIME_OBSERVATION_VERSION_V2, None) => Some(Err(anyhow!(
+                            "runtime observation requires an authenticated worker provider"
+                        ))),
+                        _ => None,
+                    };
+                    match after.and_then(|after| {
+                        let availability_after = availability_after.transpose()?;
+                        observation.complete(session_id, request_id, after, availability_after)
+                    }) {
                         Ok(()) => {}
                         Err(error) => result = Err(error),
                     }
@@ -10701,8 +11331,11 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
             }
             Control::Ready { .. }
             | Control::RuntimeObservationSupported { .. }
+            | Control::RuntimeObservationV2Supported { .. }
             | Control::RuntimeObservationStarted { .. }
+            | Control::RuntimeObservationV2Started { .. }
             | Control::RuntimeObservationCompleted { .. }
+            | Control::RuntimeObservationV2Completed { .. }
             | Control::RuntimeLoaded { .. }
             | Control::RuntimeTranscript { .. }
             | Control::RuntimeFailed { .. }
@@ -11015,7 +11648,13 @@ fn write_worker_response(
 fn validate_worker_response(response: &Control) -> Result<()> {
     match response {
         Control::RuntimeObservationSupported { version } => {
-            if *version != RUNTIME_OBSERVATION_VERSION {
+            if *version != RUNTIME_OBSERVATION_VERSION_V1 {
+                bail!("worker returned an unsupported runtime observation version");
+            }
+            Ok(())
+        }
+        Control::RuntimeObservationV2Supported { version } => {
+            if *version != RUNTIME_OBSERVATION_VERSION_V2 {
                 bail!("worker returned an unsupported runtime observation version");
             }
             Ok(())
@@ -11025,11 +11664,24 @@ fn validate_worker_response(response: &Control) -> Result<()> {
             model_sha256,
             before,
         } => {
-            if *version != RUNTIME_OBSERVATION_VERSION {
+            if *version != RUNTIME_OBSERVATION_VERSION_V1 {
                 bail!("worker returned an unsupported runtime observation version");
             }
             canonical_runtime_observation_digest(model_sha256)?;
             before.validate_shape()
+        }
+        Control::RuntimeObservationV2Started {
+            version,
+            model_sha256,
+            before,
+            availability_before,
+        } => {
+            if *version != RUNTIME_OBSERVATION_VERSION_V2 {
+                bail!("worker returned an unsupported runtime observation version");
+            }
+            canonical_runtime_observation_digest(model_sha256)?;
+            before.validate_shape()?;
+            availability_before.validate_shape()
         }
         Control::RuntimeObservationCompleted {
             version,
@@ -11037,11 +11689,25 @@ fn validate_worker_response(response: &Control) -> Result<()> {
             after,
             ..
         } => {
-            if *version != RUNTIME_OBSERVATION_VERSION {
+            if *version != RUNTIME_OBSERVATION_VERSION_V1 {
                 bail!("worker returned an unsupported runtime observation version");
             }
             canonical_runtime_observation_digest(model_sha256)?;
             after.validate_shape()
+        }
+        Control::RuntimeObservationV2Completed {
+            version,
+            model_sha256,
+            after,
+            availability_after,
+            ..
+        } => {
+            if *version != RUNTIME_OBSERVATION_VERSION_V2 {
+                bail!("worker returned an unsupported runtime observation version");
+            }
+            canonical_runtime_observation_digest(model_sha256)?;
+            after.validate_shape()?;
+            availability_after.validate_shape()
         }
         Control::RuntimeLoaded { execution } => validate_wire_load(execution),
         Control::RuntimeTranscript { execution } => {
@@ -11754,10 +12420,32 @@ mod tests {
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[derive(Clone, Copy, Debug)]
     enum ObservationBeforeMismatch {
-        Backend,
-        Provider,
-        StableDevice,
-        MemoryTotal,
+        ProviderBackend,
+        ProviderId,
+        ProviderStableDevice,
+        ProviderMemoryTotal,
+        AvailabilityBackend,
+        AvailabilityProviderId,
+        AvailabilityStableDevice,
+        AvailabilityMemoryTotal,
+        AvailabilityWrongSource,
+        AvailabilityCpuStatus,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ObservationCompletionMismatch {
+        Version,
+        Model,
+        BatchSession,
+        BatchBeginRequest,
+        BatchEndRequest,
+        LegacyResponse,
+        AvailabilityBackend,
+        AvailabilityProviderId,
+        AvailabilityStableDevice,
+        AvailabilityMemoryTotal,
+        AvailabilityWrongSource,
+        AvailabilityCpuStatus,
     }
 
     enum TestMode {
@@ -11808,7 +12496,9 @@ mod tests {
         },
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         RuntimeObservationSuccess {
-            wrong_completion: bool,
+            completion_mismatch: Option<ObservationCompletionMismatch>,
+            gpu: bool,
+            request_counts: Option<Arc<[AtomicUsize; 2]>>,
         },
         VadNormal,
         VadCrashOnWindow,
@@ -12026,8 +12716,11 @@ mod tests {
                 ),
                 Control::Ready { .. }
                 | Control::RuntimeObservationSupported { .. }
+                | Control::RuntimeObservationV2Supported { .. }
                 | Control::RuntimeObservationStarted { .. }
+                | Control::RuntimeObservationV2Started { .. }
                 | Control::RuntimeObservationCompleted { .. }
+                | Control::RuntimeObservationV2Completed { .. }
                 | Control::RuntimeLoaded { .. }
                 | Control::RuntimeTranscript { .. }
                 | Control::RuntimeFailed { .. }
@@ -12298,27 +12991,90 @@ mod tests {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(
                     control,
-                    Control::NegotiateRuntimeObservation { version: 1 }
+                    Control::NegotiateRuntimeObservation { version: 2 }
                 ));
                 let mut backend = "cuda".to_owned();
                 let mut provider_id = "expected-provider".to_owned();
                 let mut stable_device = "native:pci:0000:01:00.0".to_owned();
                 let mut memory_total_bytes = 8192;
+                let mut availability_before = WorkerMemoryAvailability::Observed {
+                    backend: "cuda".to_owned(),
+                    provider_id: "expected-provider".to_owned(),
+                    stable_device: "native:pci:0000:01:00.0".to_owned(),
+                    memory_total_bytes: 8192,
+                    available_memory_bytes: 4096,
+                    source: WorkerMemoryAvailabilitySource::CudaMemGetInfo,
+                };
                 match mismatch {
-                    ObservationBeforeMismatch::Backend => backend = "vulkan".to_owned(),
-                    ObservationBeforeMismatch::Provider => {
+                    ObservationBeforeMismatch::ProviderBackend => backend = "vulkan".to_owned(),
+                    ObservationBeforeMismatch::ProviderId => {
                         provider_id = "wrong-provider".to_owned()
                     }
-                    ObservationBeforeMismatch::StableDevice => {
+                    ObservationBeforeMismatch::ProviderStableDevice => {
                         stable_device = "native:pci:0000:02:00.0".to_owned()
                     }
-                    ObservationBeforeMismatch::MemoryTotal => memory_total_bytes += 1,
+                    ObservationBeforeMismatch::ProviderMemoryTotal => memory_total_bytes += 1,
+                    ObservationBeforeMismatch::AvailabilityBackend => {
+                        let WorkerMemoryAvailability::Observed { backend, .. } =
+                            &mut availability_before
+                        else {
+                            unreachable!()
+                        };
+                        *backend = "vulkan".to_owned();
+                    }
+                    ObservationBeforeMismatch::AvailabilityProviderId => {
+                        let WorkerMemoryAvailability::Observed { provider_id, .. } =
+                            &mut availability_before
+                        else {
+                            unreachable!()
+                        };
+                        *provider_id = "wrong-provider".to_owned();
+                    }
+                    ObservationBeforeMismatch::AvailabilityStableDevice => {
+                        let WorkerMemoryAvailability::Observed { stable_device, .. } =
+                            &mut availability_before
+                        else {
+                            unreachable!()
+                        };
+                        *stable_device = "native:pci:0000:02:00.0".to_owned();
+                    }
+                    ObservationBeforeMismatch::AvailabilityMemoryTotal => {
+                        let WorkerMemoryAvailability::Observed {
+                            memory_total_bytes, ..
+                        } = &mut availability_before
+                        else {
+                            unreachable!()
+                        };
+                        *memory_total_bytes += 1;
+                    }
+                    ObservationBeforeMismatch::AvailabilityWrongSource => {
+                        let WorkerMemoryAvailability::Observed { source, .. } =
+                            &mut availability_before
+                        else {
+                            unreachable!()
+                        };
+                        *source = WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                            heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                            heaps: vec![VulkanMemoryHeapObservation {
+                                heap_index: 0,
+                                size_bytes: 8192,
+                                flags: 1,
+                                budget_bytes: 8192,
+                                usage_bytes: 4096,
+                            }],
+                        };
+                    }
+                    ObservationBeforeMismatch::AvailabilityCpuStatus => {
+                        availability_before = WorkerMemoryAvailability::NotApplicable {
+                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                        };
+                    }
                 }
                 respond(
                     &mut output,
                     session_id,
                     request_id,
-                    Control::RuntimeObservationSupported { version: 1 },
+                    Control::RuntimeObservationV2Supported { version: 2 },
                 );
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 let Control::BeginRuntimeObservation {
@@ -12332,7 +13088,7 @@ mod tests {
                     &mut output,
                     session_id,
                     request_id,
-                    Control::RuntimeObservationStarted {
+                    Control::RuntimeObservationV2Started {
                         version,
                         model_sha256,
                         before: ProviderMemoryObservation::Available {
@@ -12344,6 +13100,7 @@ mod tests {
                             value_semantics: ProviderMemoryValueSemantics::NativeBackendDefined,
                             admission_validity: ProviderMemoryAdmissionValidity::Unestablished,
                         },
+                        availability_before,
                     },
                 );
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -12354,17 +13111,21 @@ mod tests {
                 }
             }
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-            TestMode::RuntimeObservationSuccess { wrong_completion } => {
+            TestMode::RuntimeObservationSuccess {
+                completion_mismatch,
+                gpu,
+                request_counts,
+            } => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(
                     control,
-                    Control::NegotiateRuntimeObservation { version: 1 }
+                    Control::NegotiateRuntimeObservation { version: 2 }
                 ));
                 respond(
                     &mut output,
                     session_id,
                     request_id,
-                    Control::RuntimeObservationSupported { version: 1 },
+                    Control::RuntimeObservationV2Supported { version: 2 },
                 );
                 let (begin_observation_session, begin_observation_request, control) =
                     read_parent_control(&mut input);
@@ -12375,23 +13136,61 @@ mod tests {
                 else {
                     panic!("expected runtime observation begin");
                 };
+                let provider_memory = || {
+                    if gpu {
+                        ProviderMemoryObservation::Available {
+                            backend: "cuda".to_owned(),
+                            provider_id: "expected-provider".to_owned(),
+                            stable_device: "native:pci:0000:01:00.0".to_owned(),
+                            memory_total_bytes: 8192,
+                            provider_reported_memory_free_bytes: 4096,
+                            value_semantics: ProviderMemoryValueSemantics::NativeBackendDefined,
+                            admission_validity: ProviderMemoryAdmissionValidity::Unestablished,
+                        }
+                    } else {
+                        ProviderMemoryObservation::NotApplicable {
+                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                        }
+                    }
+                };
+                let memory_availability = || {
+                    if gpu {
+                        WorkerMemoryAvailability::Observed {
+                            backend: "cuda".to_owned(),
+                            provider_id: "expected-provider".to_owned(),
+                            stable_device: "native:pci:0000:01:00.0".to_owned(),
+                            memory_total_bytes: 8192,
+                            available_memory_bytes: 4096,
+                            source: WorkerMemoryAvailabilitySource::CudaMemGetInfo,
+                        }
+                    } else {
+                        WorkerMemoryAvailability::NotApplicable {
+                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                        }
+                    }
+                };
                 respond(
                     &mut output,
                     begin_observation_session,
                     begin_observation_request,
-                    Control::RuntimeObservationStarted {
+                    Control::RuntimeObservationV2Started {
                         version,
                         model_sha256: model_sha256.clone(),
-                        before: ProviderMemoryObservation::NotApplicable {
-                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
-                        },
+                        before: provider_memory(),
+                        availability_before: memory_availability(),
                     },
                 );
                 let (batch_session, batch_begin_request, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::BeginBatch { .. }));
+                if let Some(request_counts) = &request_counts {
+                    request_counts[0].fetch_add(1, Ordering::AcqRel);
+                }
                 respond(&mut output, batch_session, batch_begin_request, Control::Ok);
                 let (audio_session, audio_request, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::AudioChunk));
+                if let Some(request_counts) = &request_counts {
+                    request_counts[1].fetch_add(1, Ordering::AcqRel);
+                }
                 let pcm = read_frame(&mut input).unwrap();
                 assert_eq!(
                     (pcm.session_id, pcm.request_id),
@@ -12414,10 +13213,19 @@ mod tests {
                                 duration_ms: Some(1),
                             },
                             diagnostics: WireRuntimeDiagnostics {
-                                resolved_acceleration: resolve_cpu_only_acceleration(
-                                    AccelerationPreference::Cpu,
-                                )
-                                .unwrap(),
+                                resolved_acceleration: if gpu {
+                                    ResolvedAcceleration {
+                                        requested: AccelerationPreference::Gpu,
+                                        resolved: ComputeDevice::Gpu {
+                                            name: "fixture GPU".to_owned(),
+                                        },
+                                        diagnostic: None,
+                                        selection: None,
+                                    }
+                                } else {
+                                    resolve_cpu_only_acceleration(AccelerationPreference::Cpu)
+                                        .unwrap()
+                                },
                                 runtime_location: PathBuf::from("<fixture>"),
                                 warm_reused: false,
                                 model_load_duration_ms: 1,
@@ -12437,29 +13245,146 @@ mod tests {
                 };
                 assert_eq!(begin_session_id, begin_observation_session);
                 assert_eq!(begin_request_id, begin_observation_request);
+                let mut completion_version = RUNTIME_OBSERVATION_VERSION_V2;
+                let mut completion_model = model_sha256.clone();
+                let mut completion_batch_session = batch_session;
+                let mut completion_batch_begin = batch_begin_request;
+                let mut completion_batch_end = batch_end_request;
+                let mut availability_after = memory_availability();
+                match completion_mismatch {
+                    Some(ObservationCompletionMismatch::Version) => completion_version = 1,
+                    Some(ObservationCompletionMismatch::Model) => completion_model = "f".repeat(64),
+                    Some(ObservationCompletionMismatch::BatchSession) => {
+                        completion_batch_session += 1
+                    }
+                    Some(ObservationCompletionMismatch::BatchBeginRequest) => {
+                        completion_batch_begin += 1
+                    }
+                    Some(ObservationCompletionMismatch::BatchEndRequest) => {
+                        completion_batch_end += 1
+                    }
+                    Some(ObservationCompletionMismatch::AvailabilityBackend) => {
+                        let WorkerMemoryAvailability::Observed { backend, .. } =
+                            &mut availability_after
+                        else {
+                            unreachable!()
+                        };
+                        *backend = "vulkan".to_owned();
+                    }
+                    Some(ObservationCompletionMismatch::AvailabilityProviderId) => {
+                        let WorkerMemoryAvailability::Observed { provider_id, .. } =
+                            &mut availability_after
+                        else {
+                            unreachable!()
+                        };
+                        *provider_id = "wrong-provider".to_owned();
+                    }
+                    Some(ObservationCompletionMismatch::AvailabilityStableDevice) => {
+                        let WorkerMemoryAvailability::Observed { stable_device, .. } =
+                            &mut availability_after
+                        else {
+                            unreachable!()
+                        };
+                        *stable_device = "native:pci:0000:02:00.0".to_owned();
+                    }
+                    Some(ObservationCompletionMismatch::AvailabilityMemoryTotal) => {
+                        let WorkerMemoryAvailability::Observed {
+                            memory_total_bytes, ..
+                        } = &mut availability_after
+                        else {
+                            unreachable!()
+                        };
+                        *memory_total_bytes += 1;
+                    }
+                    Some(ObservationCompletionMismatch::AvailabilityWrongSource) => {
+                        let WorkerMemoryAvailability::Observed { source, .. } =
+                            &mut availability_after
+                        else {
+                            unreachable!()
+                        };
+                        *source = WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                            heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                            heaps: vec![VulkanMemoryHeapObservation {
+                                heap_index: 0,
+                                size_bytes: 8192,
+                                flags: 1,
+                                budget_bytes: 8192,
+                                usage_bytes: 4096,
+                            }],
+                        };
+                    }
+                    Some(ObservationCompletionMismatch::AvailabilityCpuStatus) => {
+                        availability_after = WorkerMemoryAvailability::NotApplicable {
+                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                        };
+                    }
+                    Some(ObservationCompletionMismatch::LegacyResponse) | None => {}
+                }
+                if matches!(
+                    completion_mismatch,
+                    Some(ObservationCompletionMismatch::LegacyResponse)
+                ) {
+                    respond(
+                        &mut output,
+                        finish_session,
+                        finish_request,
+                        Control::RuntimeObservationCompleted {
+                            version: RUNTIME_OBSERVATION_VERSION_V1,
+                            model_sha256,
+                            batch_session_id: batch_session,
+                            batch_begin_request_id: batch_begin_request,
+                            batch_end_request_id: batch_end_request,
+                            after: provider_memory(),
+                        },
+                    );
+                    return;
+                }
                 respond(
                     &mut output,
                     finish_session,
                     finish_request,
-                    Control::RuntimeObservationCompleted {
-                        version: RUNTIME_OBSERVATION_VERSION,
-                        model_sha256,
-                        batch_session_id: batch_session,
-                        batch_begin_request_id: batch_begin_request,
-                        batch_end_request_id: if wrong_completion {
-                            batch_end_request + 1
-                        } else {
-                            batch_end_request
-                        },
-                        after: ProviderMemoryObservation::NotApplicable {
-                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
-                        },
+                    Control::RuntimeObservationV2Completed {
+                        version: completion_version,
+                        model_sha256: completion_model,
+                        batch_session_id: completion_batch_session,
+                        batch_begin_request_id: completion_batch_begin,
+                        batch_end_request_id: completion_batch_end,
+                        after: provider_memory(),
+                        availability_after,
                     },
                 );
-                if !wrong_completion {
+                if completion_mismatch.is_none() {
                     let (session_id, request_id, control) = read_parent_control(&mut input);
                     assert!(matches!(control, Control::Shutdown));
                     respond(&mut output, session_id, request_id, Control::Ok);
+                } else if let Some(request_counts) = request_counts {
+                    while let Ok(frame) = read_frame(&mut input) {
+                        let (session_id, request_id, control) =
+                            parse_parent_control(frame).unwrap();
+                        match control {
+                            Control::Shutdown => {
+                                respond(&mut output, session_id, request_id, Control::Ok);
+                                break;
+                            }
+                            Control::BeginBatch { .. } => {
+                                request_counts[0].fetch_add(1, Ordering::AcqRel);
+                                respond(&mut output, session_id, request_id, Control::Ok);
+                            }
+                            Control::AudioChunk => {
+                                request_counts[1].fetch_add(1, Ordering::AcqRel);
+                                let _ = read_frame(&mut input).unwrap();
+                                respond(&mut output, session_id, request_id, Control::Ok);
+                            }
+                            _ => respond(
+                                &mut output,
+                                session_id,
+                                request_id,
+                                Control::Error {
+                                    message: "unexpected post-completion request".to_owned(),
+                                },
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -17551,7 +18476,7 @@ mod tests {
             1,
             1,
             Control::NegotiateRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_VERSION_V1,
             },
         );
         append_control(
@@ -17559,7 +18484,7 @@ mod tests {
             2,
             2,
             Control::BeginRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_VERSION_V1,
                 model_sha256: "a".repeat(64),
             },
         );
@@ -17569,7 +18494,7 @@ mod tests {
             4,
             4,
             Control::FinishRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_VERSION_V1,
                 begin_session_id: 2,
                 begin_request_id: 2,
             },
@@ -17637,7 +18562,7 @@ mod tests {
             1,
             1,
             Control::NegotiateRuntimeObservation {
-                version: RUNTIME_OBSERVATION_VERSION,
+                version: RUNTIME_OBSERVATION_VERSION_V2,
             },
         );
         let begin = |session_id, request_id| {
@@ -17645,7 +18570,7 @@ mod tests {
                 session_id,
                 request_id,
                 Control::BeginRuntimeObservation {
-                    version: RUNTIME_OBSERVATION_VERSION,
+                    version: RUNTIME_OBSERVATION_VERSION_V2,
                     model_sha256: "a".repeat(64),
                 },
             )
@@ -17655,7 +18580,7 @@ mod tests {
                 session_id,
                 request_id,
                 Control::FinishRuntimeObservation {
-                    version: RUNTIME_OBSERVATION_VERSION,
+                    version: RUNTIME_OBSERVATION_VERSION_V2,
                     begin_session_id,
                     begin_request_id,
                 },
@@ -17704,28 +18629,522 @@ mod tests {
         while output.position() < output.get_ref().len() as u64 {
             responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
         }
+        assert!(matches!(
+            responses[1].2,
+            Control::RuntimeObservationV2Supported { version: 2 }
+        ));
         assert!(
-            matches!(responses[2].2, Control::RuntimeObservationStarted { .. }),
+            matches!(responses[2].2, Control::RuntimeObservationV2Started { .. }),
             "unexpected first runtime observation start response: {:?}",
             responses[2].2
         );
         assert_error(&responses[3], "no matching ONNX stream");
         assert_error(&responses[4], "no completed runtime observation");
         assert!(
-            matches!(responses[5].2, Control::RuntimeObservationStarted { .. }),
+            matches!(responses[5].2, Control::RuntimeObservationV2Started { .. }),
             "unexpected second runtime observation start response: {:?}",
             responses[5].2
         );
         assert!(matches!(responses[6].2, Control::Ok));
         assert_error(&responses[7], "no completed runtime observation");
         assert!(
-            matches!(responses[8].2, Control::RuntimeObservationStarted { .. }),
+            matches!(responses[8].2, Control::RuntimeObservationV2Started { .. }),
             "unexpected third runtime observation start response: {:?}",
             responses[8].2
         );
         assert_error(&responses[9], "invalidated the active runtime observation");
         assert_error(&responses[10], "no completed runtime observation");
         assert!(matches!(responses[11].2, Control::Ok));
+    }
+
+    fn vulkan_memory_snapshot(
+        stable_device_identity: &str,
+        device_class: DeviceClass,
+        heaps: Vec<VulkanMemoryHeapObservation>,
+    ) -> VulkanMemoryDeviceSnapshot {
+        VulkanMemoryDeviceSnapshot {
+            stable_device_identity: Some(stable_device_identity.to_owned()),
+            device_class,
+            linked_nodes: false,
+            memory_budget_supported: true,
+            heaps,
+            unused_budget_or_usage_nonzero: false,
+        }
+    }
+
+    fn vulkan_heap(
+        heap_index: u8,
+        size_bytes: u64,
+        flags: u32,
+        budget_bytes: u64,
+        usage_bytes: u64,
+    ) -> VulkanMemoryHeapObservation {
+        VulkanMemoryHeapObservation {
+            heap_index,
+            size_bytes,
+            flags,
+            budget_bytes,
+            usage_bytes,
+        }
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_selects_exact_heap_scope_and_preserves_zero() {
+        let stable = "native:luid:0102030405060708";
+        let heaps = vec![
+            vulkan_heap(0, 100, 0, 80, 90),
+            vulkan_heap(1, 200, 1, 180, 20),
+        ];
+        let integrated = derive_vulkan_memory_availability(
+            &[vulkan_memory_snapshot(
+                stable,
+                DeviceClass::IntegratedGpu,
+                heaps.clone(),
+            )],
+            "transcribe-cpp-ggml-vulkan",
+            stable,
+            DeviceClass::IntegratedGpu,
+        );
+        assert!(matches!(
+            integrated,
+            WorkerMemoryAvailability::Observed {
+                memory_total_bytes: 300,
+                available_memory_bytes: 160,
+                source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                    heap_selection: VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let discrete = derive_vulkan_memory_availability(
+            &[vulkan_memory_snapshot(
+                stable,
+                DeviceClass::DiscreteGpu,
+                heaps,
+            )],
+            "transcribe-cpp-ggml-vulkan",
+            stable,
+            DeviceClass::DiscreteGpu,
+        );
+        assert!(matches!(
+            discrete,
+            WorkerMemoryAvailability::Observed {
+                memory_total_bytes: 200,
+                available_memory_bytes: 160,
+                source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                    heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let exhausted = derive_vulkan_memory_availability(
+            &[vulkan_memory_snapshot(
+                stable,
+                DeviceClass::DiscreteGpu,
+                vec![vulkan_heap(0, 100, 1, 80, 100)],
+            )],
+            "transcribe-cpp-ggml-vulkan",
+            stable,
+            DeviceClass::DiscreteGpu,
+        );
+        assert!(matches!(
+            exhausted,
+            WorkerMemoryAvailability::Observed {
+                available_memory_bytes: 0,
+                ..
+            }
+        ));
+        exhausted.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_rejects_unbound_or_invalid_snapshots() {
+        let stable = "native:uuid:00112233445566778899aabbccddeeff";
+        let valid = vulkan_memory_snapshot(
+            stable,
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        let unavailable_reason = |snapshots: &[VulkanMemoryDeviceSnapshot], expected| {
+            match derive_vulkan_memory_availability(
+                snapshots,
+                "transcribe-cpp-ggml-vulkan",
+                expected,
+                DeviceClass::DiscreteGpu,
+            ) {
+                WorkerMemoryAvailability::Unavailable { reason } => reason,
+                other => panic!("expected unavailable Vulkan observation, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            unavailable_reason(
+                &[valid.clone()],
+                "native:uuid:ffffffffffffffffffffffffffffffff"
+            ),
+            WorkerMemoryUnavailableReason::StableDeviceMissing
+        );
+        assert_eq!(
+            unavailable_reason(&[valid.clone(), valid.clone()], stable),
+            WorkerMemoryUnavailableReason::StableDeviceAmbiguous
+        );
+
+        let mut missing_extension = valid.clone();
+        missing_extension.memory_budget_supported = false;
+        assert_eq!(
+            unavailable_reason(&[missing_extension], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetExtensionUnavailable
+        );
+        let mut linked = valid.clone();
+        linked.linked_nodes = true;
+        assert_eq!(
+            unavailable_reason(&[linked], stable),
+            WorkerMemoryUnavailableReason::MultiInstanceUnsupported
+        );
+        let mut multi_instance = valid.clone();
+        multi_instance.heaps[0].flags = 0b11;
+        assert_eq!(
+            unavailable_reason(&[multi_instance], stable),
+            WorkerMemoryUnavailableReason::MultiInstanceUnsupported
+        );
+
+        let mut zero_budget = valid.clone();
+        zero_budget.heaps[0].budget_bytes = 0;
+        assert_eq!(
+            unavailable_reason(&[zero_budget], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let mut above_size = valid.clone();
+        above_size.heaps[0].budget_bytes = 101;
+        assert_eq!(
+            unavailable_reason(&[above_size], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let mut unknown_flags = valid.clone();
+        unknown_flags.heaps[0].flags = 0b100;
+        assert_eq!(
+            unavailable_reason(&[unknown_flags], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let mut trailing = valid.clone();
+        trailing.unused_budget_or_usage_nonzero = true;
+        assert_eq!(
+            unavailable_reason(&[trailing], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let mut wrong_index = valid.clone();
+        wrong_index.heaps[0].heap_index = 1;
+        assert_eq!(
+            unavailable_reason(&[wrong_index], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let no_local = vulkan_memory_snapshot(
+            stable,
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 0, 80, 20)],
+        );
+        assert_eq!(
+            unavailable_reason(&[no_local], stable),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let overflow = vulkan_memory_snapshot(
+            stable,
+            DeviceClass::IntegratedGpu,
+            vec![
+                vulkan_heap(0, u64::MAX, 0, u64::MAX, 0),
+                vulkan_heap(1, 1, 0, 1, 0),
+            ],
+        );
+        assert!(matches!(
+            derive_vulkan_memory_availability(
+                &[overflow],
+                "transcribe-cpp-ggml-vulkan",
+                stable,
+                DeviceClass::IntegratedGpu,
+            ),
+            WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+            }
+        ));
+        assert!(matches!(
+            derive_vulkan_memory_availability(
+                &[valid],
+                "transcribe-cpp-ggml-vulkan",
+                stable,
+                DeviceClass::UnifiedGpu,
+            ),
+            WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+            }
+        ));
+
+        let wrong_cuda_method = WorkerMemoryAvailability::Observed {
+            backend: "vulkan".to_owned(),
+            provider_id: "transcribe-cpp-ggml-vulkan".to_owned(),
+            stable_device: stable.to_owned(),
+            memory_total_bytes: 100,
+            available_memory_bytes: 60,
+            source: WorkerMemoryAvailabilitySource::CudaMemGetInfo,
+        };
+        assert!(wrong_cuda_method.validate_shape().is_err());
+        let wrong_vulkan_method = WorkerMemoryAvailability::Observed {
+            backend: "cuda".to_owned(),
+            provider_id: "transcribe-cpp-ggml-cuda".to_owned(),
+            stable_device: "native:pci:0000:01:00.0".to_owned(),
+            memory_total_bytes: 100,
+            available_memory_bytes: 60,
+            source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                heaps: vec![vulkan_heap(0, 100, 1, 80, 20)],
+            },
+        };
+        assert!(wrong_vulkan_method.validate_shape().is_err());
+    }
+
+    #[test]
+    fn capture_observation_inbound_memory_availability_shape_is_strictly_bounded() {
+        let observed = || WorkerMemoryAvailability::Observed {
+            backend: "vulkan".to_owned(),
+            provider_id: "transcribe-cpp-ggml-vulkan".to_owned(),
+            stable_device: "native:luid:0102030405060708".to_owned(),
+            memory_total_bytes: 100,
+            available_memory_bytes: 60,
+            source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                heaps: vec![vulkan_heap(0, 100, 1, 80, 20)],
+            },
+        };
+        observed().validate_shape().unwrap();
+        let mut maximum_identity_lengths = observed();
+        let WorkerMemoryAvailability::Observed {
+            provider_id,
+            stable_device,
+            ..
+        } = &mut maximum_identity_lengths
+        else {
+            unreachable!()
+        };
+        *provider_id = "p".repeat(128);
+        *stable_device = "d".repeat(256);
+        maximum_identity_lengths.validate_shape().unwrap();
+
+        let mut malformed = Vec::new();
+        let mut oversized_backend = observed();
+        let WorkerMemoryAvailability::Observed { backend, .. } = &mut oversized_backend else {
+            unreachable!()
+        };
+        *backend = "x".repeat(33);
+        malformed.push(oversized_backend);
+        let mut controlled_provider = observed();
+        let WorkerMemoryAvailability::Observed { provider_id, .. } = &mut controlled_provider
+        else {
+            unreachable!()
+        };
+        *provider_id = "provider\ncontrol".to_owned();
+        malformed.push(controlled_provider);
+        for invalid_provider in [String::new(), "p".repeat(129)] {
+            let mut value = observed();
+            let WorkerMemoryAvailability::Observed { provider_id, .. } = &mut value else {
+                unreachable!()
+            };
+            *provider_id = invalid_provider;
+            malformed.push(value);
+        }
+        let mut controlled_device = observed();
+        let WorkerMemoryAvailability::Observed { stable_device, .. } = &mut controlled_device
+        else {
+            unreachable!()
+        };
+        *stable_device = "device\rcontrol".to_owned();
+        malformed.push(controlled_device);
+        for invalid_device in [String::new(), "d".repeat(257)] {
+            let mut value = observed();
+            let WorkerMemoryAvailability::Observed { stable_device, .. } = &mut value else {
+                unreachable!()
+            };
+            *stable_device = invalid_device;
+            malformed.push(value);
+        }
+
+        let with_heap_count = |heap_count: u8| WorkerMemoryAvailability::Observed {
+            backend: "vulkan".to_owned(),
+            provider_id: "transcribe-cpp-ggml-vulkan".to_owned(),
+            stable_device: "native:luid:0102030405060708".to_owned(),
+            memory_total_bytes: u64::from(heap_count) * 100,
+            available_memory_bytes: u64::from(heap_count) * 60,
+            source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                heaps: (0..heap_count)
+                    .map(|index| vulkan_heap(index, 100, 1, 80, 20))
+                    .collect(),
+            },
+        };
+        with_heap_count(16).validate_shape().unwrap();
+        malformed.push(with_heap_count(17));
+        let mut empty_heaps = observed();
+        let WorkerMemoryAvailability::Observed { source, .. } = &mut empty_heaps else {
+            unreachable!()
+        };
+        let WorkerMemoryAvailabilitySource::VulkanMemoryBudget { heaps, .. } = source else {
+            unreachable!()
+        };
+        heaps.clear();
+        malformed.push(empty_heaps);
+
+        for (mutation, expected) in [
+            ("heap order", (1_u8, 100_u64, 1_u32, 80_u64)),
+            ("zero size", (0, 0, 1, 80)),
+            ("zero budget", (0, 100, 1, 0)),
+            ("unknown flags", (0, 100, 0b101, 80)),
+            ("multi-instance flags", (0, 100, 0b11, 80)),
+        ] {
+            let mut value = observed();
+            let WorkerMemoryAvailability::Observed { source, .. } = &mut value else {
+                unreachable!()
+            };
+            let WorkerMemoryAvailabilitySource::VulkanMemoryBudget { heaps, .. } = source else {
+                unreachable!()
+            };
+            heaps[0].heap_index = expected.0;
+            heaps[0].size_bytes = expected.1;
+            heaps[0].flags = expected.2;
+            heaps[0].budget_bytes = expected.3;
+            assert!(value.validate_shape().is_err(), "{mutation}");
+        }
+
+        let mut wrong_total = observed();
+        let WorkerMemoryAvailability::Observed {
+            memory_total_bytes, ..
+        } = &mut wrong_total
+        else {
+            unreachable!()
+        };
+        *memory_total_bytes += 1;
+        malformed.push(wrong_total);
+        let mut wrong_headroom = observed();
+        let WorkerMemoryAvailability::Observed {
+            available_memory_bytes,
+            ..
+        } = &mut wrong_headroom
+        else {
+            unreachable!()
+        };
+        *available_memory_bytes += 1;
+        malformed.push(wrong_headroom);
+
+        for value in malformed {
+            assert!(value.validate_shape().is_err());
+        }
+    }
+
+    #[test]
+    fn capture_observation_v2_renegotiation_and_unsupported_version_fail_closed() {
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, fixture_cpu_hello(WorkerRole::Inference));
+        append_control(
+            &mut input,
+            1,
+            1,
+            Control::NegotiateRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION_V2,
+            },
+        );
+        append_control(
+            &mut input,
+            2,
+            2,
+            Control::BeginRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION_V2,
+                model_sha256: "a".repeat(64),
+            },
+        );
+        append_control(
+            &mut input,
+            3,
+            3,
+            Control::NegotiateRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION_V1,
+            },
+        );
+        append_control(
+            &mut input,
+            4,
+            4,
+            Control::FinishRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION_V2,
+                begin_session_id: 2,
+                begin_request_id: 2,
+            },
+        );
+        append_control(
+            &mut input,
+            5,
+            5,
+            Control::NegotiateRuntimeObservation { version: 3 },
+        );
+        append_control(&mut input, 0, 6, Control::Shutdown);
+
+        let mut output = Vec::new();
+        worker_loop_with_factories_as_fixture_cpu(
+            Cursor::new(input),
+            &mut output,
+            &FakeRecognizerFactory::new(),
+            &FakeVadFactory::new(),
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        assert!(matches!(
+            responses[1].2,
+            Control::RuntimeObservationV2Supported { version: 2 }
+        ));
+        assert!(matches!(
+            responses[2].2,
+            Control::RuntimeObservationV2Started {
+                before: ProviderMemoryObservation::NotApplicable { .. },
+                availability_before: WorkerMemoryAvailability::NotApplicable { .. },
+                ..
+            }
+        ));
+        assert_error(&responses[3], "invalidated the active runtime observation");
+        assert_error(&responses[4], "no completed runtime observation");
+        assert_error(&responses[5], "unsupported runtime observation version 3");
+        assert!(matches!(responses[6].2, Control::Ok));
+    }
+
+    #[test]
+    fn capture_observation_v1_wire_shape_remains_distinct_from_v2() {
+        let provider = ProviderMemoryObservation::NotApplicable {
+            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+        };
+        let v1 = serde_json::to_value(Control::RuntimeObservationStarted {
+            version: RUNTIME_OBSERVATION_VERSION_V1,
+            model_sha256: "a".repeat(64),
+            before: provider.clone(),
+        })
+        .unwrap();
+        assert_eq!(v1["command"], "runtime_observation_started");
+        assert!(v1.get("availability_before").is_none());
+
+        let v2 = serde_json::to_value(Control::RuntimeObservationV2Started {
+            version: RUNTIME_OBSERVATION_VERSION_V2,
+            model_sha256: "a".repeat(64),
+            before: provider,
+            availability_before: WorkerMemoryAvailability::NotApplicable {
+                reason: ProviderMemoryNotApplicableReason::CpuProvider,
+            },
+        })
+        .unwrap();
+        assert_eq!(v2["command"], "runtime_observation_v2_started");
+        assert_eq!(v2["availability_before"]["status"], "not_applicable");
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -17747,10 +19166,22 @@ mod tests {
         let root = test_root("runtime-observation-transport");
         let model_path = root.join("fixture.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
-        for wrong_completion in [false, true] {
+        for completion_mismatch in [
+            None,
+            Some(ObservationCompletionMismatch::Version),
+            Some(ObservationCompletionMismatch::Model),
+            Some(ObservationCompletionMismatch::BatchSession),
+            Some(ObservationCompletionMismatch::BatchBeginRequest),
+            Some(ObservationCompletionMismatch::BatchEndRequest),
+            Some(ObservationCompletionMismatch::LegacyResponse),
+        ] {
             let worker = CaptureObservationWorker {
                 supervisor: inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
-                    TestMode::RuntimeObservationSuccess { wrong_completion },
+                    TestMode::RuntimeObservationSuccess {
+                        completion_mismatch,
+                        gpu: false,
+                        request_counts: None,
+                    },
                 ]))),
                 gpu_identity: None,
             };
@@ -17764,12 +19195,13 @@ mod tests {
             });
             let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
             let result = worker.transcribe_observed(artifact, AccelerationPreference::Cpu, &audio);
-            if wrong_completion {
+            if completion_mismatch.is_some() {
                 assert!(
                     result
                         .unwrap_err()
                         .to_string()
-                        .contains("unexpected runtime observation completion response")
+                        .contains("unexpected runtime observation completion response"),
+                    "{completion_mismatch:?}"
                 );
             } else {
                 let observed = result.unwrap();
@@ -17781,6 +19213,72 @@ mod tests {
                 assert_eq!(observed.before, observed.after);
                 worker.shutdown().unwrap();
             }
+        }
+        std::fs::remove_file(model_path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_completion_rejects_availability_only_tampering() {
+        let root = test_root("runtime-observation-availability-after");
+        let model_path = root.join("fixture.gguf");
+        std::fs::write(&model_path, b"fixture").unwrap();
+        for completion_mismatch in [
+            ObservationCompletionMismatch::AvailabilityBackend,
+            ObservationCompletionMismatch::AvailabilityProviderId,
+            ObservationCompletionMismatch::AvailabilityStableDevice,
+            ObservationCompletionMismatch::AvailabilityMemoryTotal,
+            ObservationCompletionMismatch::AvailabilityWrongSource,
+            ObservationCompletionMismatch::AvailabilityCpuStatus,
+        ] {
+            let request_counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let launcher = Arc::new(TestLauncher::new([TestMode::RuntimeObservationSuccess {
+                completion_mismatch: Some(completion_mismatch),
+                gpu: true,
+                request_counts: Some(Arc::clone(&request_counts)),
+            }]));
+            let worker = CaptureObservationWorker {
+                supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
+                gpu_identity: Some(GpuCaptureObservationIdentity {
+                    backend: "cuda".to_owned(),
+                    provider: "expected-provider".to_owned(),
+                    stable_device: "native:pci:0000:01:00.0".to_owned(),
+                    driver: "fixture-driver".to_owned(),
+                    device_class: "discrete_gpu".to_owned(),
+                    vendor: "nvidia".to_owned(),
+                    memory_total_bytes: 8192,
+                    pack_id: "fixture-pack".to_owned(),
+                    pack_version: "1".to_owned(),
+                    pack_sha256: "b".repeat(64),
+                    pack_security_epoch: 1,
+                    runtime_abi: 1,
+                }),
+            };
+            worker.negotiate_runtime_observation().unwrap();
+            let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new("fixture-observation"),
+                path: model_path.clone(),
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: "a".repeat(64),
+            });
+            let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+            let error = worker
+                .transcribe_observed(artifact, AccelerationPreference::Gpu, &audio)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("worker memory availability")
+                    || error.contains("CUDA memory availability")
+                    || error.contains("Vulkan memory availability")
+                    || error.contains("requested provider"),
+                "{completion_mismatch:?}: {error}"
+            );
+            worker.shutdown().unwrap();
+            assert_eq!(request_counts[0].load(Ordering::Acquire), 1);
+            assert_eq!(request_counts[1].load(Ordering::Acquire), 1);
+            assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
         }
         std::fs::remove_file(model_path).unwrap();
         std::fs::remove_dir(root).unwrap();
@@ -17800,6 +19298,7 @@ mod tests {
         };
         let after = before.clone();
         let mut slot = RuntimeObservationSlot {
+            version: RUNTIME_OBSERVATION_VERSION_V1,
             begin_session_id: 10,
             begin_request_id: 11,
             model_sha256: "a".repeat(64),
@@ -17807,17 +19306,58 @@ mod tests {
             batch_begin_request_id: None,
             batch_end_request_id: None,
             after: None,
+            availability_after: None,
         };
         slot.bind_batch(20, 21, &artifact).unwrap();
         assert!(slot.bind_batch(20, 22, &artifact).is_err());
-        slot.complete(20, 23, after.clone()).unwrap();
-        assert!(slot.complete(20, 24, after).is_err());
+        let cpu_availability = WorkerMemoryAvailability::NotApplicable {
+            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+        };
+        assert!(
+            slot.clone()
+                .complete(20, 23, after.clone(), Some(cpu_availability.clone()))
+                .is_err()
+        );
+        slot.complete(20, 23, after.clone(), None).unwrap();
+        assert!(slot.complete(20, 24, after, None).is_err());
         assert!(matches!(
             slot.completed_response().unwrap(),
             Control::RuntimeObservationCompleted {
                 batch_session_id: 20,
                 batch_begin_request_id: 21,
                 batch_end_request_id: 23,
+                ..
+            }
+        ));
+
+        let mut v2_slot = RuntimeObservationSlot {
+            version: RUNTIME_OBSERVATION_VERSION_V2,
+            begin_session_id: 30,
+            begin_request_id: 31,
+            model_sha256: "a".repeat(64),
+            batch_session_id: None,
+            batch_begin_request_id: None,
+            batch_end_request_id: None,
+            after: None,
+            availability_after: None,
+        };
+        v2_slot.bind_batch(40, 41, &artifact).unwrap();
+        assert!(
+            v2_slot
+                .clone()
+                .complete(40, 42, before.clone(), None)
+                .is_err()
+        );
+        v2_slot
+            .complete(40, 42, before.clone(), Some(cpu_availability))
+            .unwrap();
+        assert!(matches!(
+            v2_slot.completed_response().unwrap(),
+            Control::RuntimeObservationV2Completed {
+                batch_session_id: 40,
+                batch_begin_request_id: 41,
+                batch_end_request_id: 42,
+                availability_after: WorkerMemoryAvailability::NotApplicable { .. },
                 ..
             }
         ));
@@ -17861,10 +19401,16 @@ mod tests {
     #[test]
     fn capture_observation_wrong_before_identity_sends_no_batch_or_audio() {
         for mismatch in [
-            ObservationBeforeMismatch::Backend,
-            ObservationBeforeMismatch::Provider,
-            ObservationBeforeMismatch::StableDevice,
-            ObservationBeforeMismatch::MemoryTotal,
+            ObservationBeforeMismatch::ProviderBackend,
+            ObservationBeforeMismatch::ProviderId,
+            ObservationBeforeMismatch::ProviderStableDevice,
+            ObservationBeforeMismatch::ProviderMemoryTotal,
+            ObservationBeforeMismatch::AvailabilityBackend,
+            ObservationBeforeMismatch::AvailabilityProviderId,
+            ObservationBeforeMismatch::AvailabilityStableDevice,
+            ObservationBeforeMismatch::AvailabilityMemoryTotal,
+            ObservationBeforeMismatch::AvailabilityWrongSource,
+            ObservationBeforeMismatch::AvailabilityCpuStatus,
         ] {
             let (saw_batch_tx, saw_batch_rx) = channel();
             let supervisor = inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
@@ -17905,7 +19451,10 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("does not match the authenticated GPU"),
+                error.contains("does not match the authenticated GPU")
+                    || error.contains("requested provider")
+                    || error.contains("wrong backend")
+                    || error.contains("Vulkan memory availability"),
                 "{mismatch:?}: {error}"
             );
             worker.shutdown().unwrap();

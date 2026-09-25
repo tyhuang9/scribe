@@ -22,7 +22,7 @@ use crate::embedded_runtime::{EmbeddedRuntime, EmbeddedRuntimeError};
 use crate::model_catalog::{
     ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
 };
-use crate::onnx_worker::ProviderMemoryObservation;
+use crate::onnx_worker::{ProviderMemoryObservation, WorkerMemoryAvailability};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::runtime_contract::TRANSCRIBE_CPP_VERSION;
@@ -330,6 +330,31 @@ impl RuntimeRouter {
                 )
             })?
             .provider_memory_observation_after()
+            .map_err(map_embedded_runtime_error)
+    }
+
+    pub(crate) fn worker_memory_availability_before(
+        &self,
+        preference: AccelerationPreference,
+    ) -> Result<WorkerMemoryAvailability, RuntimeError> {
+        EmbeddedRuntime::worker_memory_availability_before(preference)
+            .map_err(map_embedded_runtime_error)
+    }
+
+    pub(crate) fn worker_memory_availability_after(
+        &self,
+    ) -> Result<WorkerMemoryAvailability, RuntimeError> {
+        self.inner
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?
+            .embedded
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Engine(
+                    "worker memory availability requires a retained embedded model".to_owned(),
+                )
+            })?
+            .worker_memory_availability_after()
             .map_err(map_embedded_runtime_error)
     }
 
