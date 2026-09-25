@@ -6,6 +6,19 @@
 #[cfg(feature = "metal-acceleration")]
 compile_error!("metal-acceleration is worker-only and must not be linked into the desktop");
 
+#[cfg(all(
+    feature = "windows-gpu-capture-observation",
+    any(
+        feature = "inference-worker",
+        feature = "cuda-acceleration",
+        feature = "vulkan-acceleration",
+        feature = "metal-acceleration"
+    )
+))]
+compile_error!(
+    "windows-gpu-capture-observation is collector-only and must not link native inference providers"
+);
+
 mod app;
 mod audio;
 #[allow(
@@ -117,6 +130,8 @@ mod text_output;
 mod transcription;
 mod tray;
 mod ui;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+mod windows_gpu_capture;
 #[cfg(windows)]
 #[allow(
     dead_code,
@@ -155,6 +170,18 @@ fn main() -> eframe::Result<()> {
         std::process::exit(exit_code);
     }
     if let Some(exit_code) = transcription::maybe_run_installation_smoke_helper() {
+        std::process::exit(exit_code);
+    }
+    #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "--scribe-windows-gpu-capture-observation")
+    {
+        eprintln!("Windows GPU capture observation is unavailable in this collector build");
+        std::process::exit(2);
+    }
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    if let Some(exit_code) = windows_gpu_capture::maybe_run_local_command() {
         std::process::exit(exit_code);
     }
     if let Some(exit_code) = benchmark::maybe_run_local_command() {

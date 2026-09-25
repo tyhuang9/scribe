@@ -746,6 +746,40 @@ fn dynamic_whisper_and_standalone_runtime_paths_stay_removed() {
 }
 
 const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
+
+#[test]
+fn windows_gpu_capture_stays_opt_in_and_out_of_release_builds() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = fs::read_to_string(repository.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest
+            .lines()
+            .any(|line| line == "windows-gpu-capture-observation = []"),
+        "capture feature must not enable a native inference provider"
+    );
+    let main = production_source(include_str!("main.rs"));
+    assert!(main.contains(
+        "#[cfg(all(windows, feature = \"windows-gpu-capture-observation\"))]\nmod windows_gpu_capture;"
+    ));
+    let observer = main
+        .find("windows_gpu_capture::maybe_run_local_command()")
+        .expect("collector command remains an explicit optional entry point");
+    let startup = main
+        .find("support_assets::materialize_bundled_support_assets()")
+        .expect("normal startup remains separate");
+    assert!(observer < startup, "observer must not initialize the UI");
+
+    let builder = fs::read_to_string(repository.join("scripts/build-windows-release.ps1")).unwrap();
+    assert!(
+        !builder.contains("windows-gpu-capture-observation"),
+        "ordinary releases must not enable the development observer"
+    );
+    let workflow = fs::read_to_string(repository.join(".github/workflows/release.yml")).unwrap();
+    assert!(workflow.contains(
+        "run: pwsh -NoProfile -File .\\scripts\\test-windows-gpu-capture-observation.ps1"
+    ));
+}
+
 const NATIVE_RUNTIME_OWNER_PATHS: [&str; 4] = [
     "embedded_runtime.rs",
     "inference_server.rs",

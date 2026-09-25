@@ -391,6 +391,12 @@ jobs:
           cargo check --locked --bin local-transcriber --features ui-harness
           cargo check --locked --bin scribe-inference-worker --features inference-worker
 
+      - name: Test Windows GPU capture observation
+        shell: pwsh
+        # Only deterministic fake-worker/native-call tests run here. This
+        # opt-in collector feature must not link a GPU inference provider.
+        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
+
       - name: Lint
         # Hosted PR runners receive the digest-pinned Vulkan SDK above, but do
         # not carry the exact CUDA toolkit required by the release contract.
