@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::onnx_worker::ProviderMemoryObservation;
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::RuntimeArtifact;
 use crate::runtime_contract::{RuntimeError, RuntimeExecution, RuntimeLoadExecution};
@@ -39,6 +40,23 @@ impl RuntimeRouter {
         _cancellation_snapshot: u64,
     ) -> Result<RuntimeExecution, RuntimeError> {
         Err(RuntimeError::UnsupportedModel(artifact.model_id()))
+    }
+
+    pub(crate) fn provider_memory_observation_before(
+        &self,
+        _preference: AccelerationPreference,
+    ) -> Result<ProviderMemoryObservation, RuntimeError> {
+        Err(RuntimeError::Engine(
+            "provider memory observation requires the dedicated inference worker".to_owned(),
+        ))
+    }
+
+    pub(crate) fn provider_memory_observation_after(
+        &self,
+    ) -> Result<ProviderMemoryObservation, RuntimeError> {
+        Err(RuntimeError::Engine(
+            "provider memory observation requires the dedicated inference worker".to_owned(),
+        ))
     }
 
     pub(crate) fn cancel_active(&self) {

@@ -15,7 +15,8 @@ authority. The currently empty production trust still prevents production GPU
 pack use until the separate approved-signing setup is completed.
 
 The initial scope is one CPU request and one GPU request, executed serially,
-with actual handshake, request timing and native memory/power observations.
+with actual handshake, request timing and native memory/power observations,
+including request-bound raw provider-memory snapshots.
 It does not implement the five-cold/twenty-warm campaign, production capture
 signatures, campaign authorization or nonce consumption. Normal application
 routing, saved settings, health records and Auto policy must remain unchanged.
@@ -34,12 +35,56 @@ paths, raw audio or transcript text in the report. Transcript comparison uses
 digests computed in memory. Outputs must be bounded and published without
 replacing an existing result.
 
+## Negotiated provider observations
+
+The collector negotiates version 1 of the runtime-observation extension on
+**both** authenticated worker generations before decoding audio or issuing a
+model request. Negotiation does not sample memory. An unsupported worker fails
+this preflight; the collector does not fall back, rebuild a worker or weaken
+pack verification. Existing Hello, Ready and RuntimeTranscript shapes and
+SCIF protocol 5 / worker ABI 1 remain unchanged. The extension is additive on
+the private, exact-build-bound connection, not compatibility with arbitrary
+older workers. Ordinary workers implement the responder; only the opt-in
+collector initiates it.
+
+Immediately before each individual CPU/GPU batch, `BeginRuntimeObservation`
+binds the next GGUF model digest and captures a fresh provider enumeration.
+The GPU sample is not a cached reading from before the preceding CPU run.
+The worker permits one observation at a time and binds it to the actual
+batch session and begin/end request IDs. A successful batch captures the
+loaded model's fresh device observation. `FinishRuntimeObservation` must
+match the original observation request and consumes that result once.
+Cancellation, failure, unload, invalid correlation or worker replacement
+invalidates the observation. Unrelated or cross-role commands also invalidate
+the pending result; read-only worker health checks are allowed between phases.
+No observation request extends a model lifetime through keepalive inference or
+silently re-primes an expired warm model.
+
+The bounded typed snapshots contain no paths, audio, transcript text or native
+error messages. Available GPU snapshots must match the authenticated backend,
+provider, stable device and total memory, independently of the volatile process
+index. The collector checks this binding before sending the model or audio,
+and checks the after snapshot again before reporting it. CPU snapshots are
+`not_applicable`; an unreported total or failed loaded-model query can be
+explicitly `unavailable`, never fabricated zero memory. Existing device-binding
+checks may reject an observation before it reaches that unavailable result;
+unknown measurements must never relax those checks. Available raw values retain
+`value_semantics: native_backend_defined` and
+`admission_validity: unestablished` on both backends. These are measurement
+reports, not evidence that a model fits or a backend qualifies for Auto.
+
 ## Measurement meanings
 
 Worker process observations must use the retained child process handle, not a
 caller-supplied PID. Sampling stops when the lease is invalidated or the worker
 exits; a replacement generation cannot inherit earlier measurements.
 
+- `elapsed_ms` is the collector's instrumented request window, including
+  sampling setup and observation-control overhead, but excluding sampler
+  finalization after the observed request returns. It is not yet a complete
+  cold/warm qualification timing contract. The full campaign must establish
+  consistent boundaries and measure instrumentation overhead before using
+  these observations to compare ordinary application latency.
 - Process memory is current private commit (`PrivateUsage`), sampled over the
   individual observation window. The reported maximum is a sampled maximum,
   not a guaranteed instantaneous peak or a process-lifetime high-water mark.
@@ -48,6 +93,20 @@ exits; a replacement generation cannot inherit earlier measurements.
   them dedicated VRAM and shared host memory, especially on integrated GPUs.
 - Windows memory budget is not provider free memory. Do not substitute budget
   minus process usage for a CUDA/Vulkan allocator's free-memory observation.
+- A native provider's `memory_free` field is also backend-defined. In the
+  pinned transcribe-cpp 0.1.3 native implementation, CUDA uses `cudaMemGetInfo`,
+  while Vulkan uses heap budget minus heap usage when its memory-budget
+  extension is available and otherwise returns total heap capacity. The public
+  wrapper does not expose which Vulkan path was taken. Record such values as
+  `provider_reported_memory_free_bytes`, not verified physical free memory.
+  A fresh snapshot alone therefore cannot establish Vulkan memory admission
+  or a qualification memory floor; native provenance remains required.
+- The public wrapper also permits zero for an unreported free-memory value.
+  Preserve a reported zero when total memory is known; it might mean exhaustion
+  or an unreported value. Mark admission validity as unestablished rather than
+  inventing that distinction. A zero total is unavailable, and a reported free
+  value greater than total is invalid; never clamp it to produce a plausible
+  successful observation.
 - Preserve unknown or unavailable measurements. Do not replace them with zero,
   claim no throttling, or infer inference-thread count from OS process threads.
 - Record power at both request endpoints; unknown or differing readings
@@ -93,10 +152,28 @@ then correct performance-specific semantics and regenerate digest-bound test
 fixtures. Preserve the legacy full-qualification schemas 2/3; never relabel old
 evidence as newly captured observations.
 
-The worker also needs trustworthy resolved inference-thread and fresh provider
-free-memory observations before it can satisfy the full acquisition contract.
-The current native default thread setting is not an observed positive count.
-Existing startup device snapshots are not fresh before/after measurements.
+The unpublished performance acquisition contract still assumes positive
+observed inference-thread counts. The pinned library does not expose its
+resolved count: its configured native-default request of zero is not an
+observed positive count, and OS process threads are not a substitute. The
+performance-only contract should record the actual configured policy, mark
+the resolved count unavailable, and bind real host/affinity and pinned
+worker/native-source provenance. That measures the unchanged application
+workload without requiring a native fork just for this field. Preserve the
+legacy full-qualification schemas 2/3 rather than weakening their inputs or
+inventing counts in old evidence.
+
+Provider-memory provenance is a separate prerequisite for safe Auto memory
+admission. Existing startup snapshots cannot substitute for fresh before/after
+measurements, nor can a fresh provider value establish its own memory
+semantics. Raw observations here do not satisfy that admission prerequisite.
+An independent worker-only Vulkan memory-budget query can provide a future
+path without modifying the native library: match the exact physical device by
+PCI/LUID/UUID, verify budget-extension support and record the actual heap scope.
+That is budget-headroom evidence, not physical free VRAM or proof of which
+internal native branch was taken. Missing support or ambiguous matching must
+remain unavailable. Qualification and runtime admission must use consistent
+measurement semantics before such evidence can affect Auto.
 
 The later paired warm campaign needs one retained CPU worker and one retained
 GPU worker, executing inference serially. Keep this exception private to the
@@ -127,11 +204,15 @@ the inputs above. Keep the executable and its parent directories in a trusted,
 operator-controlled location. The wrapper's supplied digest does not establish
 build provenance or grant pack trust. It performs no build, download or signing.
 
-The schema-1 report kind is `windows_gpu_capture_observation`, with
+The schema-2 report kind is `windows_gpu_capture_observation`, with
 `unsigned:true`, `unqualified:true`, `auto_eligible:false` and
 `release_approved:false`. It is not accepted as a qualification evidence bundle.
-Unavailable provider free memory, resolved inference-thread count and thermal
-state are explicit unavailable observations, not fabricated successful facts.
+Each worker has a `provider_memory` pair with `before` and `after` typed raw
+observations; this replaces the schema-1 top-level provider-free-memory
+placeholder. Resolved inference-thread count and thermal state remain explicit
+unavailable observations, not fabricated successful facts. There is no legacy
+report conversion or qualification adapter: old observations must not be
+relabelled as new captures.
 
 The canonical offline verification entry point is:
 
@@ -139,10 +220,11 @@ The canonical offline verification entry point is:
 pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 ```
 
-It uses locked, offline Cargo commands: formatting, ordinary desktop and
-collector production checks, strict lint, positive test discovery and four
-test groups: collector, native telemetry, supervisor leases and architecture
-guards. `-ScriptOnly` provides the fast inner-loop check: script parsing and
+It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
+and independent CPU-worker production checks, strict lint, positive test
+discovery and five test groups: collector, native telemetry, supervisor
+observation controls/leases, provider-memory snapshots and architecture guards.
+`-ScriptOnly` provides the fast inner-loop check: script parsing and
 twelve prelaunch argument/file-rejection cases without invoking any
 executable. The three tiny owned fixture files are removed after use.
 It does not replace the full command above.

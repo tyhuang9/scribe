@@ -90,6 +90,7 @@ pub(crate) const PACK_DRIVER_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DRIVER_ID";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
+const RUNTIME_OBSERVATION_VERSION: u8 = 1;
 const MAX_PCM_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PCM_FRAME_SAMPLES: usize = MAX_PCM_FRAME_BYTES / size_of::<f32>();
 const MAX_TRANSCRIPT_TEXT_BYTES: usize = 96 * 1024;
@@ -609,6 +610,18 @@ enum Control {
         challenge: String,
         expected: WorkerExpectation,
     },
+    NegotiateRuntimeObservation {
+        version: u8,
+    },
+    BeginRuntimeObservation {
+        version: u8,
+        model_sha256: String,
+    },
+    FinishRuntimeObservation {
+        version: u8,
+        begin_session_id: u64,
+        begin_request_id: u64,
+    },
     LoadRuntime {
         artifact: WireRuntimeArtifact,
         preference: AccelerationPreference,
@@ -645,6 +658,22 @@ enum Control {
     Ready {
         capability: WorkerCapability,
     },
+    RuntimeObservationSupported {
+        version: u8,
+    },
+    RuntimeObservationStarted {
+        version: u8,
+        model_sha256: String,
+        before: ProviderMemoryObservation,
+    },
+    RuntimeObservationCompleted {
+        version: u8,
+        model_sha256: String,
+        batch_session_id: u64,
+        batch_begin_request_id: u64,
+        batch_end_request_id: u64,
+        after: ProviderMemoryObservation,
+    },
     RuntimeLoaded {
         execution: WireRuntimeLoadExecution,
     },
@@ -673,6 +702,9 @@ impl Control {
         matches!(
             self,
             Self::Hello { .. }
+                | Self::NegotiateRuntimeObservation { .. }
+                | Self::BeginRuntimeObservation { .. }
+                | Self::FinishRuntimeObservation { .. }
                 | Self::LoadRuntime { .. }
                 | Self::BeginBatch { .. }
                 | Self::EndBatch
@@ -695,6 +727,9 @@ impl Control {
         matches!(
             self,
             Self::Ready { .. }
+                | Self::RuntimeObservationSupported { .. }
+                | Self::RuntimeObservationStarted { .. }
+                | Self::RuntimeObservationCompleted { .. }
                 | Self::RuntimeLoaded { .. }
                 | Self::RuntimeTranscript { .. }
                 | Self::RuntimeFailed { .. }
@@ -703,6 +738,100 @@ impl Control {
                 | Self::Ok
                 | Self::Error { .. }
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderMemoryUnavailableReason {
+    MemoryTotalUnreported,
+    ProviderQueryFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ProviderMemoryObservation {
+    Available {
+        backend: String,
+        provider_id: String,
+        stable_device: String,
+        memory_total_bytes: u64,
+        provider_reported_memory_free_bytes: u64,
+        value_semantics: ProviderMemoryValueSemantics,
+        admission_validity: ProviderMemoryAdmissionValidity,
+    },
+    NotApplicable {
+        reason: ProviderMemoryNotApplicableReason,
+    },
+    Unavailable {
+        reason: ProviderMemoryUnavailableReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderMemoryValueSemantics {
+    NativeBackendDefined,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderMemoryAdmissionValidity {
+    Unestablished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderMemoryNotApplicableReason {
+    CpuProvider,
+}
+
+impl ProviderMemoryObservation {
+    fn validate_shape(&self) -> Result<()> {
+        match self {
+            Self::Available {
+                backend,
+                provider_id,
+                stable_device,
+                memory_total_bytes,
+                provider_reported_memory_free_bytes,
+                ..
+            } => {
+                if backend.is_empty()
+                    || backend.len() > 32
+                    || backend.as_str() != backend.to_ascii_lowercase()
+                    || !backend.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    || provider_id.is_empty()
+                    || provider_id.len() > 128
+                    || stable_device.is_empty()
+                    || stable_device.len() > 256
+                    || provider_id.chars().any(char::is_control)
+                    || stable_device.chars().any(char::is_control)
+                    || *memory_total_bytes == 0
+                    || provider_reported_memory_free_bytes > memory_total_bytes
+                {
+                    bail!("runtime provider memory observation is noncanonical or impossible");
+                }
+                Ok(())
+            }
+            Self::NotApplicable { .. } | Self::Unavailable { .. } => Ok(()),
+        }
+    }
+
+    #[cfg(any(test, all(windows, feature = "windows-gpu-capture-observation")))]
+    fn validate_for_preference(&self, preference: AccelerationPreference) -> Result<()> {
+        self.validate_shape()?;
+        match (preference, self) {
+            (
+                AccelerationPreference::Cpu,
+                Self::NotApplicable {
+                    reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                },
+            )
+            | (AccelerationPreference::Gpu, Self::Available { .. })
+            | (AccelerationPreference::Gpu, Self::Unavailable { .. }) => Ok(()),
+            _ => bail!("runtime provider memory observation does not match the requested provider"),
+        }
     }
 }
 
@@ -1015,7 +1144,7 @@ struct WorkerCapability {
     pack: Option<WorkerPackCapability>,
 }
 
-fn expected_worker(role: WorkerRole) -> WorkerExpectation {
+fn expected_worker_for_provider(role: WorkerRole, provider: WorkerProvider) -> WorkerExpectation {
     WorkerExpectation {
         app_build: DESKTOP_BUILD_ID.to_owned(),
         worker_build: match role {
@@ -1030,12 +1159,30 @@ fn expected_worker(role: WorkerRole) -> WorkerExpectation {
         .to_owned(),
         abi: WORKER_ABI_VERSION,
         role,
-        provider: compiled_worker_provider(role),
+        provider,
         pack: None,
     }
 }
 
+fn expected_worker(role: WorkerRole) -> WorkerExpectation {
+    expected_worker_for_provider(role, compiled_worker_provider(role))
+}
+
 fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapability> {
+    worker_capability_for_provider(
+        role,
+        challenge,
+        compiled_worker_provider(role),
+        worker_pack_capability(role)?,
+    )
+}
+
+fn worker_capability_for_provider(
+    role: WorkerRole,
+    challenge: String,
+    provider: WorkerProvider,
+    pack: Option<WorkerPackCapability>,
+) -> Result<WorkerCapability> {
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let artifacts = match role {
         WorkerRole::Inference => vec![
@@ -1072,9 +1219,9 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
         bundled_worker_sha256,
         abi: WORKER_ABI_VERSION,
         role,
-        provider: compiled_worker_provider(role),
+        provider,
         artifacts,
-        pack: worker_pack_capability(role)?,
+        pack,
     };
     // On Linux this closes inherited FD 3 only after the one Hello capability
     // has been completely formed from its sealed image digest.
@@ -2100,12 +2247,22 @@ fn validate_worker_hello(
     challenge: &str,
     expected: &WorkerExpectation,
 ) -> Result<WorkerRole> {
+    let actual_role = role.unwrap_or(expected.role);
+    let mut local = expected_worker(actual_role);
+    local.pack = worker_pack_expectation_from_private_env()?;
+    validate_worker_hello_against_local(role, challenge, expected, &local)
+}
+
+fn validate_worker_hello_against_local(
+    role: Option<WorkerRole>,
+    challenge: &str,
+    expected: &WorkerExpectation,
+    local: &WorkerExpectation,
+) -> Result<WorkerRole> {
     if challenge.len() != 64 || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
     }
     let actual_role = role.unwrap_or(expected.role);
-    let mut local = expected_worker(actual_role);
-    local.pack = worker_pack_expectation_from_private_env()?;
     // Final-image verification is directional: the parent owns the verified
     // executable descriptor and digest. The child validates the protocol and
     // build contract but does not compare the parent-supplied digest against a
@@ -2584,6 +2741,9 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
         WorkerRole::Inference => matches!(
             control,
             Control::Hello { .. }
+                | Control::NegotiateRuntimeObservation { .. }
+                | Control::BeginRuntimeObservation { .. }
+                | Control::FinishRuntimeObservation { .. }
                 | Control::LoadRuntime { .. }
                 | Control::BeginBatch { .. }
                 | Control::EndBatch
@@ -6190,6 +6350,35 @@ pub(crate) struct InferenceWorkerSupervisor {
     next_correlation: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+struct RuntimeObservationStart {
+    generation: u64,
+    session_id: u64,
+    request_id: u64,
+    model_sha256: String,
+    before: ProviderMemoryObservation,
+}
+
+struct CorrelatedRuntimeExecution {
+    execution: RuntimeExecution,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    generation: u64,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    session_id: u64,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    begin_request_id: u64,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    end_request_id: u64,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Debug)]
+pub(crate) struct ObservedRuntimeExecution {
+    pub(crate) execution: RuntimeExecution,
+    pub(crate) before: ProviderMemoryObservation,
+    pub(crate) after: ProviderMemoryObservation,
+}
+
 impl InferenceWorkerSupervisor {
     pub(crate) fn unstarted() -> Self {
         Self {
@@ -6283,6 +6472,105 @@ impl InferenceWorkerSupervisor {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
             .max(1)
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn negotiate_runtime_observation(&self) -> Result<(), RuntimeError> {
+        let context = self
+            .transport
+            .generation_context()
+            .map_err(worker_unavailable)?;
+        let correlation = self.next_id();
+        let frame = control_frame(
+            correlation,
+            correlation,
+            &Control::NegotiateRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+            },
+        )
+        .map_err(worker_unavailable)?;
+        match self
+            .transport
+            .active_round_trip(context.generation, correlation, correlation, &[frame])
+            .map_err(worker_unavailable)?
+        {
+            Control::RuntimeObservationSupported { version }
+                if version == RUNTIME_OBSERVATION_VERSION =>
+            {
+                Ok(())
+            }
+            Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
+            _ => {
+                let _ = self.transport.invalidate_generation(
+                    context.generation,
+                    "unexpected runtime observation negotiation response",
+                    true,
+                );
+                Err(RuntimeError::WorkerUnavailable(
+                    "worker does not support runtime memory observation".to_owned(),
+                ))
+            }
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn begin_runtime_observation(
+        &self,
+        model_sha256: &str,
+    ) -> Result<RuntimeObservationStart, RuntimeError> {
+        let model_sha256 =
+            canonical_runtime_observation_digest(model_sha256).map_err(worker_unavailable)?;
+        let context = self
+            .transport
+            .generation_context()
+            .map_err(worker_unavailable)?;
+        let session_id = self.next_id();
+        let request_id = self.next_id();
+        let frame = control_frame(
+            session_id,
+            request_id,
+            &Control::BeginRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+                model_sha256: model_sha256.clone(),
+            },
+        )
+        .map_err(worker_unavailable)?;
+        match self
+            .transport
+            .active_round_trip_with_timeout(
+                context.generation,
+                session_id,
+                request_id,
+                &[frame],
+                self.transport.inner.deadlines.load,
+            )
+            .map_err(worker_unavailable)?
+        {
+            Control::RuntimeObservationStarted {
+                version,
+                model_sha256: echoed_model,
+                before,
+            } if version == RUNTIME_OBSERVATION_VERSION && echoed_model == model_sha256 => {
+                Ok(RuntimeObservationStart {
+                    generation: context.generation,
+                    session_id,
+                    request_id,
+                    model_sha256,
+                    before,
+                })
+            }
+            Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
+            _ => {
+                let _ = self.transport.invalidate_generation(
+                    context.generation,
+                    "unexpected runtime observation start response",
+                    true,
+                );
+                Err(RuntimeError::WorkerUnavailable(
+                    "unexpected runtime observation start response".to_owned(),
+                ))
+            }
+        }
     }
 
     fn artifact_identity(
@@ -6387,6 +6675,32 @@ impl InferenceWorkerSupervisor {
         cancellation_snapshot: u64,
         cancellation_generation: &std::sync::atomic::AtomicU64,
     ) -> Result<RuntimeExecution, RuntimeError> {
+        self.transcribe_correlated(
+            artifact,
+            preference,
+            audio,
+            options,
+            cancellation_snapshot,
+            cancellation_generation,
+            None,
+        )
+        .map(|result| result.execution)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private adapter preserves the existing transcription call contract and adds only an exact-generation observation guard"
+    )]
+    fn transcribe_correlated(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: TranscriptionOptions,
+        cancellation_snapshot: u64,
+        cancellation_generation: &std::sync::atomic::AtomicU64,
+        expected_generation: Option<u64>,
+    ) -> Result<CorrelatedRuntimeExecution, RuntimeError> {
         let cancelled = || cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot;
         if cancelled() {
             return Err(RuntimeError::Cancelled(
@@ -6400,6 +6714,11 @@ impl InferenceWorkerSupervisor {
             .generation_context()
             .map_err(worker_unavailable)?;
         let generation = context.generation;
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            return Err(RuntimeError::WorkerUnavailable(
+                "runtime observation worker generation changed before batch begin".to_owned(),
+            ));
+        }
         let artifact: WireRuntimeArtifact = artifact.into();
         let artifact_identity =
             wire_artifact_identity(&artifact, preference).map_err(worker_unavailable)?;
@@ -6514,7 +6833,17 @@ impl InferenceWorkerSupervisor {
                     &context.pack_bindings,
                     &mut execution.diagnostics.resolved_acceleration,
                 )?;
-                Ok(execution)
+                Ok(CorrelatedRuntimeExecution {
+                    execution,
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    generation,
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    session_id,
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    begin_request_id: begin_id,
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    end_request_id: end_id,
+                })
             }
             Control::RuntimeFailed { error } => {
                 Err(error.into_runtime_for_generation(&self.transport, generation))
@@ -6528,6 +6857,104 @@ impl InferenceWorkerSupervisor {
                 );
                 Err(RuntimeError::WorkerUnavailable(
                     "unexpected inference batch response".to_owned(),
+                ))
+            }
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn transcribe_with_runtime_observation(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        expected_gpu: Option<&GpuCaptureObservationIdentity>,
+    ) -> Result<ObservedRuntimeExecution, RuntimeError> {
+        let model_sha256 = match &artifact {
+            RuntimeArtifact::Gguf(model) => model.expected_sha256.to_ascii_lowercase(),
+            RuntimeArtifact::OnnxBundle(_) => {
+                return Err(RuntimeError::WorkerUnavailable(
+                    "runtime memory observation requires a GGUF model".to_owned(),
+                ));
+            }
+        };
+        let started = self.begin_runtime_observation(&model_sha256)?;
+        started
+            .before
+            .validate_for_preference(preference)
+            .map_err(worker_unavailable)?;
+        validate_capture_provider_memory(&started.before, preference, expected_gpu)
+            .map_err(worker_unavailable)?;
+        let cancellation_generation = std::sync::atomic::AtomicU64::new(0);
+        let batch = self.transcribe_correlated(
+            artifact,
+            preference,
+            audio,
+            TranscriptionOptions::default(),
+            0,
+            &cancellation_generation,
+            Some(started.generation),
+        )?;
+        if batch.generation != started.generation {
+            return Err(RuntimeError::WorkerUnavailable(
+                "runtime observation worker generation changed during inference".to_owned(),
+            ));
+        }
+        let finish_session_id = self.next_id();
+        let finish_request_id = self.next_id();
+        let frame = control_frame(
+            finish_session_id,
+            finish_request_id,
+            &Control::FinishRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+                begin_session_id: started.session_id,
+                begin_request_id: started.request_id,
+            },
+        )
+        .map_err(worker_unavailable)?;
+        match self
+            .transport
+            .active_round_trip(
+                started.generation,
+                finish_session_id,
+                finish_request_id,
+                &[frame],
+            )
+            .map_err(worker_unavailable)?
+        {
+            Control::RuntimeObservationCompleted {
+                version,
+                model_sha256: echoed_model,
+                batch_session_id,
+                batch_begin_request_id,
+                batch_end_request_id,
+                after,
+            } if version == RUNTIME_OBSERVATION_VERSION
+                && echoed_model == started.model_sha256
+                && batch_session_id == batch.session_id
+                && batch_begin_request_id == batch.begin_request_id
+                && batch_end_request_id == batch.end_request_id =>
+            {
+                after
+                    .validate_for_preference(preference)
+                    .map_err(worker_unavailable)?;
+                validate_capture_provider_memory(&after, preference, expected_gpu)
+                    .map_err(worker_unavailable)?;
+                Ok(ObservedRuntimeExecution {
+                    execution: batch.execution,
+                    before: started.before,
+                    after,
+                })
+            }
+            Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
+            _ => {
+                let _ = self.transport.invalidate_generation(
+                    started.generation,
+                    "unexpected runtime observation completion response",
+                    true,
+                );
+                Err(RuntimeError::WorkerUnavailable(
+                    "unexpected runtime observation completion response".to_owned(),
                 ))
             }
         }
@@ -6631,6 +7058,38 @@ pub(crate) struct GpuCaptureObservationIdentity {
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn validate_capture_provider_memory(
+    observation: &ProviderMemoryObservation,
+    preference: AccelerationPreference,
+    expected_gpu: Option<&GpuCaptureObservationIdentity>,
+) -> Result<()> {
+    observation.validate_for_preference(preference)?;
+    match observation {
+        ProviderMemoryObservation::Available {
+            backend,
+            provider_id,
+            stable_device,
+            memory_total_bytes,
+            ..
+        } => {
+            let expected = expected_gpu.ok_or_else(|| {
+                anyhow!("GPU provider memory validation omitted its authenticated identity")
+            })?;
+            if backend != &expected.backend
+                || provider_id != &expected.provider
+                || stable_device != &expected.stable_device
+                || memory_total_bytes != &expected.memory_total_bytes
+            {
+                bail!("provider memory observation does not match the authenticated GPU");
+            }
+        }
+        ProviderMemoryObservation::Unavailable { .. }
+        | ProviderMemoryObservation::NotApplicable { .. } => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 pub(crate) struct CaptureObservationWorker {
     supervisor: InferenceWorkerSupervisor,
     pub(crate) gpu_identity: Option<GpuCaptureObservationIdentity>,
@@ -6727,21 +7186,24 @@ impl CaptureObservationWorker {
         self.supervisor.transport.observation_lease()
     }
 
-    pub(crate) fn transcribe(
+    pub(crate) fn negotiate_runtime_observation(&self) -> Result<()> {
+        self.supervisor
+            .negotiate_runtime_observation()
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn transcribe_observed(
         &self,
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
         audio: &PreparedAudio,
-    ) -> Result<RuntimeExecution> {
-        let cancellation_generation = std::sync::atomic::AtomicU64::new(0);
+    ) -> Result<ObservedRuntimeExecution> {
         self.supervisor
-            .transcribe(
+            .transcribe_with_runtime_observation(
                 artifact,
                 preference,
                 audio,
-                TranscriptionOptions::default(),
-                0,
-                &cancellation_generation,
+                self.gpu_identity.as_ref(),
             )
             .map_err(anyhow::Error::new)
     }
@@ -9463,6 +9925,110 @@ struct PendingWorkerBatch {
     samples: Vec<f32>,
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeObservationSlot {
+    begin_session_id: u64,
+    begin_request_id: u64,
+    model_sha256: String,
+    batch_session_id: Option<u64>,
+    batch_begin_request_id: Option<u64>,
+    batch_end_request_id: Option<u64>,
+    after: Option<ProviderMemoryObservation>,
+}
+
+impl RuntimeObservationSlot {
+    fn bind_batch(
+        &mut self,
+        session_id: u64,
+        request_id: u64,
+        artifact: &WireRuntimeArtifact,
+    ) -> Result<()> {
+        if self.batch_session_id.is_some() {
+            bail!("runtime observation is already bound to a batch");
+        }
+        let WireRuntimeArtifact::Gguf(model) = artifact else {
+            bail!("runtime observation requires a GGUF batch");
+        };
+        if model.expected_sha256.to_ascii_lowercase() != self.model_sha256 {
+            bail!("runtime observation model digest does not match the next batch");
+        }
+        self.batch_session_id = Some(session_id);
+        self.batch_begin_request_id = Some(request_id);
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        session_id: u64,
+        request_id: u64,
+        after: ProviderMemoryObservation,
+    ) -> Result<()> {
+        if self.batch_session_id != Some(session_id) || self.batch_begin_request_id.is_none() {
+            bail!("runtime observation batch correlation changed before completion");
+        }
+        if self.after.is_some() || self.batch_end_request_id.is_some() {
+            bail!("runtime observation was already completed");
+        }
+        self.batch_end_request_id = Some(request_id);
+        self.after = Some(after);
+        Ok(())
+    }
+
+    fn completed_response(self) -> Result<Control> {
+        Ok(Control::RuntimeObservationCompleted {
+            version: RUNTIME_OBSERVATION_VERSION,
+            model_sha256: self.model_sha256,
+            batch_session_id: self
+                .batch_session_id
+                .ok_or_else(|| anyhow!("runtime observation has no bound batch"))?,
+            batch_begin_request_id: self
+                .batch_begin_request_id
+                .ok_or_else(|| anyhow!("runtime observation has no batch begin request"))?,
+            batch_end_request_id: self
+                .batch_end_request_id
+                .ok_or_else(|| anyhow!("runtime observation has no batch end request"))?,
+            after: self
+                .after
+                .ok_or_else(|| anyhow!("runtime observation has no after snapshot"))?,
+        })
+    }
+}
+
+fn canonical_runtime_observation_digest(value: &str) -> Result<String> {
+    if value.len() != 64
+        || value != value.to_ascii_lowercase()
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("runtime observation model SHA-256 must be canonical lowercase hexadecimal");
+    }
+    Ok(value.to_owned())
+}
+
+fn observation_preference(provider: WorkerProvider) -> Result<AccelerationPreference> {
+    match provider {
+        WorkerProvider::Cpu => Ok(AccelerationPreference::Cpu),
+        WorkerProvider::Cuda | WorkerProvider::Vulkan | WorkerProvider::Metal => {
+            Ok(AccelerationPreference::Gpu)
+        }
+    }
+}
+
+fn loaded_runtime_matches_observation(
+    loaded_runtime: Option<&LoadedRuntimeMetadata>,
+    model_sha256: &str,
+) -> Result<()> {
+    let Some(loaded) = loaded_runtime else {
+        return Ok(());
+    };
+    let WireRuntimeArtifact::Gguf(model) = &loaded.artifact else {
+        bail!("runtime observation cannot replace an already-loaded ONNX model");
+    };
+    if model.expected_sha256.to_ascii_lowercase() != model_sha256 {
+        bail!("runtime observation cannot replace a different loaded GGUF model");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct LoadedRuntimeMetadata {
     identity: String,
@@ -9470,13 +10036,89 @@ struct LoadedRuntimeMetadata {
     load: WireRuntimeLoadExecution,
 }
 
+#[derive(Clone, Copy)]
+enum WorkerLoopIdentityPolicy {
+    Compiled,
+    #[cfg(test)]
+    FixtureCpu,
+}
+
+impl WorkerLoopIdentityPolicy {
+    fn validate_hello(
+        self,
+        role: Option<WorkerRole>,
+        challenge: &str,
+        expected: &WorkerExpectation,
+    ) -> Result<WorkerRole> {
+        match self {
+            Self::Compiled => validate_worker_hello(role, challenge, expected),
+            #[cfg(test)]
+            Self::FixtureCpu => {
+                let actual_role = role.unwrap_or(expected.role);
+                let local = expected_worker_for_provider(actual_role, WorkerProvider::Cpu);
+                validate_worker_hello_against_local(role, challenge, expected, &local)
+            }
+        }
+    }
+
+    fn capability(self, role: WorkerRole, challenge: String) -> Result<WorkerCapability> {
+        match self {
+            Self::Compiled => worker_capability(role, challenge),
+            #[cfg(test)]
+            Self::FixtureCpu => {
+                worker_capability_for_provider(role, challenge, WorkerProvider::Cpu, None)
+            }
+        }
+    }
+}
+
 fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
+    input: impl Read,
+    output: impl Write,
+    factory: &F,
+    vad_factory: &V,
+    role: Option<WorkerRole>,
+    parent_control: Option<std::fs::File>,
+) -> Result<()> {
+    worker_loop_with_factories_and_identity(
+        input,
+        output,
+        factory,
+        vad_factory,
+        role,
+        parent_control,
+        WorkerLoopIdentityPolicy::Compiled,
+    )
+}
+
+#[cfg(test)]
+fn worker_loop_with_factories_as_fixture_cpu<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
+    input: impl Read,
+    output: impl Write,
+    factory: &F,
+    vad_factory: &V,
+    role: Option<WorkerRole>,
+    parent_control: Option<std::fs::File>,
+) -> Result<()> {
+    worker_loop_with_factories_and_identity(
+        input,
+        output,
+        factory,
+        vad_factory,
+        role,
+        parent_control,
+        WorkerLoopIdentityPolicy::FixtureCpu,
+    )
+}
+
+fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
     mut input: impl Read,
     mut output: impl Write,
     factory: &F,
     vad_factory: &V,
     role: Option<WorkerRole>,
     parent_control: Option<std::fs::File>,
+    identity_policy: WorkerLoopIdentityPolicy,
 ) -> Result<()> {
     // This declaration order makes the stream drop before its recognizer on
     // structural protocol failure. Normal replacement paths clear it explicitly.
@@ -9497,6 +10139,9 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
     }
     let mut loaded_runtime: Option<LoadedRuntimeMetadata> = None;
     let mut pending_batch: Option<PendingWorkerBatch> = None;
+    let mut runtime_observation_supported = false;
+    let mut runtime_observation: Option<RuntimeObservationSlot> = None;
+    let mut worker_provider: Option<WorkerProvider> = None;
     let mut handshake_complete = false;
     loop {
         let frame = match read_frame(&mut input) {
@@ -9522,6 +10167,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             (_, true) => {}
         }
         if role.is_some_and(|role| !control_allowed_for_role(&control, role)) {
+            runtime_observation = None;
             write_worker_response(
                 &mut output,
                 session_id,
@@ -9532,27 +10178,141 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             )?;
             continue;
         }
+        if let Some(observation) = runtime_observation.as_ref() {
+            let before_batch = observation.batch_session_id.is_none();
+            let completed = observation.after.is_some();
+            let allowed = matches!(
+                &control,
+                Control::Cancel { .. } | Control::Unload | Control::Health | Control::Shutdown
+            ) || (before_batch && matches!(&control, Control::BeginBatch { .. }))
+                || (!before_batch
+                    && !completed
+                    && matches!(&control, Control::AudioChunk | Control::EndBatch))
+                || (completed && matches!(&control, Control::FinishRuntimeObservation { .. }));
+            if !allowed {
+                runtime_observation = None;
+                write_worker_response(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "command invalidated the active runtime observation".to_owned(),
+                    },
+                )?;
+                continue;
+            }
+        }
         match control {
             Control::Hello {
                 challenge,
                 expected,
             } => {
-                let actual_role = validate_worker_hello(role, &challenge, &expected)?;
+                let provider = expected.provider;
+                let actual_role = identity_policy.validate_hello(role, &challenge, &expected)?;
+                worker_provider = Some(provider);
                 handshake_complete = true;
                 write_worker_response(
                     &mut output,
                     session_id,
                     request_id,
                     Control::Ready {
-                        capability: worker_capability(actual_role, challenge)?,
+                        capability: identity_policy.capability(actual_role, challenge)?,
                     },
                 )?;
+            }
+            Control::NegotiateRuntimeObservation { version } => {
+                let result = (|| {
+                    if version != RUNTIME_OBSERVATION_VERSION {
+                        bail!("unsupported runtime observation version {version}");
+                    }
+                    runtime_observation_supported = true;
+                    Ok(Control::RuntimeObservationSupported { version })
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::BeginRuntimeObservation {
+                version,
+                model_sha256,
+            } => {
+                let result = (|| {
+                    if !runtime_observation_supported {
+                        bail!("runtime observation support was not negotiated");
+                    }
+                    if version != RUNTIME_OBSERVATION_VERSION {
+                        bail!("unsupported runtime observation version {version}");
+                    }
+                    if runtime_observation.is_some() {
+                        bail!("a runtime observation is already active");
+                    }
+                    if pending_batch.is_some()
+                        || active_stream.is_some()
+                        || loaded_vad.is_some()
+                        || active_vad.is_some()
+                    {
+                        bail!("runtime observation requires an idle inference worker");
+                    }
+                    let model_sha256 = canonical_runtime_observation_digest(&model_sha256)?;
+                    loaded_runtime_matches_observation(loaded_runtime.as_ref(), &model_sha256)?;
+                    let preference = observation_preference(worker_provider.ok_or_else(|| {
+                        anyhow!("runtime observation requires an authenticated worker provider")
+                    })?)?;
+                    let before = runtime_router
+                        .provider_memory_observation_before(preference)
+                        .map_err(anyhow::Error::new)?;
+                    runtime_observation = Some(RuntimeObservationSlot {
+                        begin_session_id: session_id,
+                        begin_request_id: request_id,
+                        model_sha256: model_sha256.clone(),
+                        batch_session_id: None,
+                        batch_begin_request_id: None,
+                        batch_end_request_id: None,
+                        after: None,
+                    });
+                    Ok(Control::RuntimeObservationStarted {
+                        version,
+                        model_sha256,
+                        before,
+                    })
+                })();
+                if result.is_err() {
+                    runtime_observation = None;
+                }
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::FinishRuntimeObservation {
+                version,
+                begin_session_id,
+                begin_request_id,
+            } => {
+                let result = (|| {
+                    if version != RUNTIME_OBSERVATION_VERSION {
+                        bail!("unsupported runtime observation version {version}");
+                    }
+                    let slot = runtime_observation
+                        .take()
+                        .ok_or_else(|| anyhow!("no completed runtime observation is available"))?;
+                    if slot.begin_session_id != begin_session_id
+                        || slot.begin_request_id != begin_request_id
+                    {
+                        bail!("runtime observation begin correlation does not match");
+                    }
+                    slot.completed_response()
+                })();
+                if result.is_err() {
+                    runtime_observation = None;
+                }
+                write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::LoadRuntime {
                 artifact,
                 preference,
             } => {
-                let result = if pending_batch.is_some() {
+                let result = if runtime_observation.is_some() {
+                    runtime_observation = None;
+                    Err(anyhow!(
+                        "runtime load invalidated the pending runtime observation"
+                    ))
+                } else if pending_batch.is_some() {
                     Err(anyhow!("cannot replace a runtime while a batch is active"))
                 } else {
                     load_worker_runtime(
@@ -9586,6 +10346,18 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                     }
                     validate_cumulative_sample_count(declared_samples)?;
                     let samples = reserve_batch_samples(declared_samples)?;
+                    if let Some(observation) = runtime_observation.as_mut() {
+                        observation.bind_batch(session_id, request_id, &artifact)?;
+                        let expected_preference =
+                            observation_preference(worker_provider.ok_or_else(|| {
+                                anyhow!(
+                                    "runtime observation requires an authenticated worker provider"
+                                )
+                            })?)?;
+                        if preference != expected_preference {
+                            bail!("runtime observation provider does not match the batch");
+                        }
+                    }
                     let load = load_worker_runtime(
                         &runtime_router,
                         factory,
@@ -9611,6 +10383,9 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                     });
                     Ok(Control::Ok)
                 })();
+                if result.is_err() {
+                    runtime_observation = None;
+                }
                 write_runtime_result(&mut output, session_id, request_id, result)?;
             }
             Control::EndBatch => {
@@ -9638,13 +10413,14 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                     });
                 if let Err(error) = validation {
                     pending_batch = None;
+                    runtime_observation = None;
                     write_worker_result(&mut output, session_id, request_id, Err(error))?;
                     continue;
                 }
                 let batch_is_onnx = pending_batch.as_ref().is_some_and(|batch| {
                     matches!(batch.artifact, WireRuntimeArtifact::OnnxBundle(_))
                 });
-                let result = pending_batch
+                let mut result = pending_batch
                     .take()
                     .ok_or_else(|| anyhow!("runtime batch disappeared after validation"))
                     .and_then(|batch| {
@@ -9656,9 +10432,25 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                         )
                     })
                     .map(|execution| Control::RuntimeTranscript { execution });
+                if result.is_ok()
+                    && let Some(observation) = runtime_observation.as_mut()
+                {
+                    let after = runtime_router
+                        .provider_memory_observation_after()
+                        .map_err(anyhow::Error::new);
+                    match after
+                        .and_then(|after| observation.complete(session_id, request_id, after))
+                    {
+                        Ok(()) => {}
+                        Err(error) => result = Err(error),
+                    }
+                }
                 if batch_is_onnx && result.is_err() {
                     loaded = None;
                     loaded_runtime = None;
+                }
+                if result.is_err() {
+                    runtime_observation = None;
                 }
                 write_runtime_result(&mut output, session_id, request_id, result)?;
             }
@@ -9667,6 +10459,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             }
             Control::Unload => {
                 pending_batch = None;
+                runtime_observation = None;
                 active_stream = None;
                 loaded = None;
                 loaded_runtime = None;
@@ -9679,6 +10472,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 target_session_id,
                 target_request_id,
             } => {
+                runtime_observation = None;
                 let result = match active_stream.as_ref() {
                     Some(stream)
                         if session_id == target_session_id
@@ -9707,6 +10501,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             }
             Control::Shutdown => {
                 drop(pending_batch.take());
+                drop(runtime_observation.take());
                 drop(active_stream.take());
                 drop(loaded.take());
                 drop(loaded_runtime.take());
@@ -9762,6 +10557,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                     });
                     if result.is_err() {
                         pending_batch = None;
+                        runtime_observation = None;
                     }
                     write_worker_result(&mut output, session_id, request_id, result)?;
                     continue;
@@ -9904,6 +10700,9 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::Ready { .. }
+            | Control::RuntimeObservationSupported { .. }
+            | Control::RuntimeObservationStarted { .. }
+            | Control::RuntimeObservationCompleted { .. }
             | Control::RuntimeLoaded { .. }
             | Control::RuntimeTranscript { .. }
             | Control::RuntimeFailed { .. }
@@ -10215,6 +11014,35 @@ fn write_worker_response(
 
 fn validate_worker_response(response: &Control) -> Result<()> {
     match response {
+        Control::RuntimeObservationSupported { version } => {
+            if *version != RUNTIME_OBSERVATION_VERSION {
+                bail!("worker returned an unsupported runtime observation version");
+            }
+            Ok(())
+        }
+        Control::RuntimeObservationStarted {
+            version,
+            model_sha256,
+            before,
+        } => {
+            if *version != RUNTIME_OBSERVATION_VERSION {
+                bail!("worker returned an unsupported runtime observation version");
+            }
+            canonical_runtime_observation_digest(model_sha256)?;
+            before.validate_shape()
+        }
+        Control::RuntimeObservationCompleted {
+            version,
+            model_sha256,
+            after,
+            ..
+        } => {
+            if *version != RUNTIME_OBSERVATION_VERSION {
+                bail!("worker returned an unsupported runtime observation version");
+            }
+            canonical_runtime_observation_digest(model_sha256)?;
+            after.validate_shape()
+        }
         Control::RuntimeLoaded { execution } => validate_wire_load(execution),
         Control::RuntimeTranscript { execution } => {
             validate_wire_transcript(&execution.transcript)?;
@@ -10923,6 +11751,15 @@ mod tests {
         ProviderArtifacts,
     }
 
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[derive(Clone, Copy, Debug)]
+    enum ObservationBeforeMismatch {
+        Backend,
+        Provider,
+        StableDevice,
+        MemoryTotal,
+    }
+
     enum TestMode {
         Normal,
         CapabilityMismatch(CapabilityMismatch),
@@ -10964,6 +11801,15 @@ mod tests {
         RuntimeFailureOnLoad(RuntimeError),
         RuntimeLoad,
         RuntimeLoadThenExit,
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        RuntimeObservationWrongBefore {
+            mismatch: ObservationBeforeMismatch,
+            saw_batch: TestSender<bool>,
+        },
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        RuntimeObservationSuccess {
+            wrong_completion: bool,
+        },
         VadNormal,
         VadCrashOnWindow,
         VadCrashOnReset,
@@ -11080,6 +11926,13 @@ mod tests {
         }
     }
 
+    fn fixture_cpu_hello(role: WorkerRole) -> Control {
+        Control::Hello {
+            challenge: "ab".repeat(32),
+            expected: expected_worker_for_provider(role, WorkerProvider::Cpu),
+        }
+    }
+
     fn handshake(input: &mut impl Read, output: &mut impl Write) -> bool {
         let Ok(frame) = read_frame(input) else {
             return false;
@@ -11129,6 +11982,16 @@ mod tests {
                         },
                     )
                 }
+                Control::NegotiateRuntimeObservation { .. }
+                | Control::BeginRuntimeObservation { .. }
+                | Control::FinishRuntimeObservation { .. } => respond(
+                    output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "runtime observation unavailable in legacy fake".to_owned(),
+                    },
+                ),
                 Control::StartStream | Control::AudioChunk | Control::EndStream => respond(
                     output,
                     session_id,
@@ -11162,6 +12025,9 @@ mod tests {
                     },
                 ),
                 Control::Ready { .. }
+                | Control::RuntimeObservationSupported { .. }
+                | Control::RuntimeObservationStarted { .. }
+                | Control::RuntimeObservationCompleted { .. }
                 | Control::RuntimeLoaded { .. }
                 | Control::RuntimeTranscript { .. }
                 | Control::RuntimeFailed { .. }
@@ -11423,6 +12289,178 @@ mod tests {
                         },
                     },
                 );
+            }
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            TestMode::RuntimeObservationWrongBefore {
+                mismatch,
+                saw_batch,
+            } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(
+                    control,
+                    Control::NegotiateRuntimeObservation { version: 1 }
+                ));
+                let mut backend = "cuda".to_owned();
+                let mut provider_id = "expected-provider".to_owned();
+                let mut stable_device = "native:pci:0000:01:00.0".to_owned();
+                let mut memory_total_bytes = 8192;
+                match mismatch {
+                    ObservationBeforeMismatch::Backend => backend = "vulkan".to_owned(),
+                    ObservationBeforeMismatch::Provider => {
+                        provider_id = "wrong-provider".to_owned()
+                    }
+                    ObservationBeforeMismatch::StableDevice => {
+                        stable_device = "native:pci:0000:02:00.0".to_owned()
+                    }
+                    ObservationBeforeMismatch::MemoryTotal => memory_total_bytes += 1,
+                }
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeObservationSupported { version: 1 },
+                );
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::BeginRuntimeObservation {
+                    version,
+                    model_sha256,
+                } = control
+                else {
+                    panic!("expected runtime observation begin");
+                };
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeObservationStarted {
+                        version,
+                        model_sha256,
+                        before: ProviderMemoryObservation::Available {
+                            backend,
+                            provider_id,
+                            stable_device,
+                            memory_total_bytes,
+                            provider_reported_memory_free_bytes: 4096,
+                            value_semantics: ProviderMemoryValueSemantics::NativeBackendDefined,
+                            admission_validity: ProviderMemoryAdmissionValidity::Unestablished,
+                        },
+                    },
+                );
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let batch = matches!(control, Control::BeginBatch { .. });
+                saw_batch.send(batch).unwrap();
+                if matches!(control, Control::Shutdown) {
+                    respond(&mut output, session_id, request_id, Control::Ok);
+                }
+            }
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            TestMode::RuntimeObservationSuccess { wrong_completion } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(
+                    control,
+                    Control::NegotiateRuntimeObservation { version: 1 }
+                ));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeObservationSupported { version: 1 },
+                );
+                let (begin_observation_session, begin_observation_request, control) =
+                    read_parent_control(&mut input);
+                let Control::BeginRuntimeObservation {
+                    version,
+                    model_sha256,
+                } = control
+                else {
+                    panic!("expected runtime observation begin");
+                };
+                respond(
+                    &mut output,
+                    begin_observation_session,
+                    begin_observation_request,
+                    Control::RuntimeObservationStarted {
+                        version,
+                        model_sha256: model_sha256.clone(),
+                        before: ProviderMemoryObservation::NotApplicable {
+                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                        },
+                    },
+                );
+                let (batch_session, batch_begin_request, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::BeginBatch { .. }));
+                respond(&mut output, batch_session, batch_begin_request, Control::Ok);
+                let (audio_session, audio_request, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::AudioChunk));
+                let pcm = read_frame(&mut input).unwrap();
+                assert_eq!(
+                    (pcm.session_id, pcm.request_id),
+                    (audio_session, audio_request)
+                );
+                respond(&mut output, audio_session, audio_request, Control::Ok);
+                let (end_session, batch_end_request, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::EndBatch));
+                assert_eq!(end_session, batch_session);
+                respond(
+                    &mut output,
+                    end_session,
+                    batch_end_request,
+                    Control::RuntimeTranscript {
+                        execution: WireRuntimeExecution {
+                            transcript: WireTranscript {
+                                text: "fixture transcript".to_owned(),
+                                segments: Vec::new(),
+                                detected_language: None,
+                                duration_ms: Some(1),
+                            },
+                            diagnostics: WireRuntimeDiagnostics {
+                                resolved_acceleration: resolve_cpu_only_acceleration(
+                                    AccelerationPreference::Cpu,
+                                )
+                                .unwrap(),
+                                runtime_location: PathBuf::from("<fixture>"),
+                                warm_reused: false,
+                                model_load_duration_ms: 1,
+                            },
+                            processing_duration_ms: 1,
+                        },
+                    },
+                );
+                let (finish_session, finish_request, control) = read_parent_control(&mut input);
+                let Control::FinishRuntimeObservation {
+                    begin_session_id,
+                    begin_request_id,
+                    ..
+                } = control
+                else {
+                    panic!("expected runtime observation finish");
+                };
+                assert_eq!(begin_session_id, begin_observation_session);
+                assert_eq!(begin_request_id, begin_observation_request);
+                respond(
+                    &mut output,
+                    finish_session,
+                    finish_request,
+                    Control::RuntimeObservationCompleted {
+                        version: RUNTIME_OBSERVATION_VERSION,
+                        model_sha256,
+                        batch_session_id: batch_session,
+                        batch_begin_request_id: batch_begin_request,
+                        batch_end_request_id: if wrong_completion {
+                            batch_end_request + 1
+                        } else {
+                            batch_end_request
+                        },
+                        after: ProviderMemoryObservation::NotApplicable {
+                            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                        },
+                    },
+                );
+                if !wrong_completion {
+                    let (session_id, request_id, control) = read_parent_control(&mut input);
+                    assert!(matches!(control, Control::Shutdown));
+                    respond(&mut output, session_id, request_id, Control::Ok);
+                }
             }
         }
     }
@@ -16470,6 +17508,409 @@ mod tests {
         assert!(process.terminated.load(Ordering::Acquire));
         assert_eq!(supervisor.current_generation().unwrap(), None);
         assert!(response.recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn capture_observation_identity_policies_reject_provider_substitution() {
+        let challenge = "ab".repeat(32);
+        let fixture_gpu =
+            expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Vulkan);
+        let fixture_error = WorkerLoopIdentityPolicy::FixtureCpu
+            .validate_hello(Some(WorkerRole::Inference), &challenge, &fixture_gpu)
+            .unwrap_err();
+        assert!(
+            fixture_error
+                .to_string()
+                .contains("expectation is incompatible"),
+            "fixture CPU identity accepted a GPU expectation: {fixture_error:#}"
+        );
+
+        let mut substituted = expected_worker(WorkerRole::Inference);
+        substituted.provider = if substituted.provider == WorkerProvider::Cpu {
+            WorkerProvider::Vulkan
+        } else {
+            WorkerProvider::Cpu
+        };
+        let production_error = WorkerLoopIdentityPolicy::Compiled
+            .validate_hello(Some(WorkerRole::Inference), &challenge, &substituted)
+            .unwrap_err();
+        assert!(
+            production_error
+                .to_string()
+                .contains("expectation is incompatible"),
+            "compiled identity accepted a substituted provider: {production_error:#}"
+        );
+    }
+
+    #[test]
+    fn capture_observation_cross_role_command_invalidates_actual_worker_slot() {
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, fixture_cpu_hello(WorkerRole::Inference));
+        append_control(
+            &mut input,
+            1,
+            1,
+            Control::NegotiateRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+            },
+        );
+        append_control(
+            &mut input,
+            2,
+            2,
+            Control::BeginRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+                model_sha256: "a".repeat(64),
+            },
+        );
+        append_control(&mut input, 3, 3, Control::LoadVad { num_threads: 1 });
+        append_control(
+            &mut input,
+            4,
+            4,
+            Control::FinishRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+                begin_session_id: 2,
+                begin_request_id: 2,
+            },
+        );
+        append_control(&mut input, 0, 5, Control::Shutdown);
+
+        let mut output = Vec::new();
+        worker_loop_with_factories_as_fixture_cpu(
+            Cursor::new(input),
+            &mut output,
+            &FakeRecognizerFactory::new(),
+            &FakeVadFactory::new(),
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        assert!(
+            matches!(
+                responses[0].2,
+                Control::Ready {
+                    capability: WorkerCapability {
+                        provider: WorkerProvider::Cpu,
+                        ..
+                    }
+                }
+            ),
+            "unexpected fixture CPU Ready response: {:?}",
+            responses[0].2
+        );
+        assert!(
+            matches!(
+                responses[1].2,
+                Control::RuntimeObservationSupported { version: 1 }
+            ),
+            "unexpected negotiation response: {:?}",
+            responses[1].2
+        );
+        assert!(
+            matches!(
+                responses[2].2,
+                Control::RuntimeObservationStarted {
+                    before: ProviderMemoryObservation::NotApplicable { .. },
+                    ..
+                }
+            ),
+            "unexpected runtime observation start response: {:?}",
+            responses[2].2
+        );
+        assert_error(&responses[3], "cross-role");
+        assert_error(&responses[4], "no completed runtime observation");
+        assert!(matches!(responses[5].2, Control::Ok));
+    }
+
+    #[test]
+    fn capture_observation_cancel_unload_and_duplicate_begin_clear_actual_worker_slot() {
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, fixture_cpu_hello(WorkerRole::Inference));
+        append_control(
+            &mut input,
+            1,
+            1,
+            Control::NegotiateRuntimeObservation {
+                version: RUNTIME_OBSERVATION_VERSION,
+            },
+        );
+        let begin = |session_id, request_id| {
+            (
+                session_id,
+                request_id,
+                Control::BeginRuntimeObservation {
+                    version: RUNTIME_OBSERVATION_VERSION,
+                    model_sha256: "a".repeat(64),
+                },
+            )
+        };
+        let finish = |session_id, request_id, begin_session_id, begin_request_id| {
+            (
+                session_id,
+                request_id,
+                Control::FinishRuntimeObservation {
+                    version: RUNTIME_OBSERVATION_VERSION,
+                    begin_session_id,
+                    begin_request_id,
+                },
+            )
+        };
+        let (session, request, control) = begin(2, 2);
+        append_control(&mut input, session, request, control);
+        append_control(
+            &mut input,
+            2,
+            3,
+            Control::Cancel {
+                target_session_id: 2,
+                target_request_id: 2,
+            },
+        );
+        let (session, request, control) = finish(2, 4, 2, 2);
+        append_control(&mut input, session, request, control);
+
+        let (session, request, control) = begin(3, 5);
+        append_control(&mut input, session, request, control);
+        append_control(&mut input, 3, 6, Control::Unload);
+        let (session, request, control) = finish(3, 7, 3, 5);
+        append_control(&mut input, session, request, control);
+
+        let (session, request, control) = begin(4, 8);
+        append_control(&mut input, session, request, control);
+        let (session, request, control) = begin(4, 9);
+        append_control(&mut input, session, request, control);
+        let (session, request, control) = finish(4, 10, 4, 8);
+        append_control(&mut input, session, request, control);
+        append_control(&mut input, 0, 11, Control::Shutdown);
+
+        let mut output = Vec::new();
+        worker_loop_with_factories_as_fixture_cpu(
+            Cursor::new(input),
+            &mut output,
+            &FakeRecognizerFactory::new(),
+            &FakeVadFactory::new(),
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        assert!(
+            matches!(responses[2].2, Control::RuntimeObservationStarted { .. }),
+            "unexpected first runtime observation start response: {:?}",
+            responses[2].2
+        );
+        assert_error(&responses[3], "no matching ONNX stream");
+        assert_error(&responses[4], "no completed runtime observation");
+        assert!(
+            matches!(responses[5].2, Control::RuntimeObservationStarted { .. }),
+            "unexpected second runtime observation start response: {:?}",
+            responses[5].2
+        );
+        assert!(matches!(responses[6].2, Control::Ok));
+        assert_error(&responses[7], "no completed runtime observation");
+        assert!(
+            matches!(responses[8].2, Control::RuntimeObservationStarted { .. }),
+            "unexpected third runtime observation start response: {:?}",
+            responses[8].2
+        );
+        assert_error(&responses[9], "invalidated the active runtime observation");
+        assert_error(&responses[10], "no completed runtime observation");
+        assert!(matches!(responses[11].2, Control::Ok));
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_negotiation_rejects_legacy_worker_before_a_batch() {
+        let supervisor =
+            inference_supervisor_with_launcher(Arc::new(TestLauncher::new([TestMode::Normal])));
+        let error = supervisor
+            .negotiate_runtime_observation()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("runtime observation unavailable in legacy fake"));
+        supervisor.shutdown().unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_scripted_transport_binds_exact_begin_and_end_correlation() {
+        let root = test_root("runtime-observation-transport");
+        let model_path = root.join("fixture.gguf");
+        std::fs::write(&model_path, b"fixture").unwrap();
+        for wrong_completion in [false, true] {
+            let worker = CaptureObservationWorker {
+                supervisor: inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
+                    TestMode::RuntimeObservationSuccess { wrong_completion },
+                ]))),
+                gpu_identity: None,
+            };
+            worker.negotiate_runtime_observation().unwrap();
+            let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new("fixture-observation"),
+                path: model_path.clone(),
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: "a".repeat(64),
+            });
+            let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+            let result = worker.transcribe_observed(artifact, AccelerationPreference::Cpu, &audio);
+            if wrong_completion {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unexpected runtime observation completion response")
+                );
+            } else {
+                let observed = result.unwrap();
+                assert_eq!(observed.execution.transcript.text, "fixture transcript");
+                assert!(matches!(
+                    observed.before,
+                    ProviderMemoryObservation::NotApplicable { .. }
+                ));
+                assert_eq!(observed.before, observed.after);
+                worker.shutdown().unwrap();
+            }
+        }
+        std::fs::remove_file(model_path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn capture_observation_slot_binds_one_exact_batch_and_consumes_once() {
+        let artifact = WireRuntimeArtifact::Gguf(WireRuntimeModel {
+            id: "fixture".to_owned(),
+            path: PathBuf::from("fixture.gguf"),
+            format: WireArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: "a".repeat(64),
+        });
+        let before = ProviderMemoryObservation::NotApplicable {
+            reason: ProviderMemoryNotApplicableReason::CpuProvider,
+        };
+        let after = before.clone();
+        let mut slot = RuntimeObservationSlot {
+            begin_session_id: 10,
+            begin_request_id: 11,
+            model_sha256: "a".repeat(64),
+            batch_session_id: None,
+            batch_begin_request_id: None,
+            batch_end_request_id: None,
+            after: None,
+        };
+        slot.bind_batch(20, 21, &artifact).unwrap();
+        assert!(slot.bind_batch(20, 22, &artifact).is_err());
+        slot.complete(20, 23, after.clone()).unwrap();
+        assert!(slot.complete(20, 24, after).is_err());
+        assert!(matches!(
+            slot.completed_response().unwrap(),
+            Control::RuntimeObservationCompleted {
+                batch_session_id: 20,
+                batch_begin_request_id: 21,
+                batch_end_request_id: 23,
+                ..
+            }
+        ));
+        assert!(
+            before
+                .validate_for_preference(AccelerationPreference::Cpu)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn capture_observation_warm_same_digest_is_retained_but_other_models_fail() {
+        let loaded = LoadedRuntimeMetadata {
+            identity: "warm".to_owned(),
+            artifact: WireRuntimeArtifact::Gguf(WireRuntimeModel {
+                id: "fixture".to_owned(),
+                path: PathBuf::from("fixture.gguf"),
+                format: WireArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: "a".repeat(64),
+            }),
+            load: WireRuntimeLoadExecution {
+                diagnostics: WireRuntimeDiagnostics {
+                    resolved_acceleration: resolve_cpu_only_acceleration(
+                        AccelerationPreference::Cpu,
+                    )
+                    .unwrap(),
+                    runtime_location: PathBuf::from("<fixture>"),
+                    warm_reused: true,
+                    model_load_duration_ms: 0,
+                },
+                detected_architecture: "fixture".to_owned(),
+                capabilities: RuntimeCapabilities::default(),
+            },
+        };
+        assert!(loaded_runtime_matches_observation(Some(&loaded), &"a".repeat(64)).is_ok());
+        assert!(loaded_runtime_matches_observation(Some(&loaded), &"b".repeat(64)).is_err());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_wrong_before_identity_sends_no_batch_or_audio() {
+        for mismatch in [
+            ObservationBeforeMismatch::Backend,
+            ObservationBeforeMismatch::Provider,
+            ObservationBeforeMismatch::StableDevice,
+            ObservationBeforeMismatch::MemoryTotal,
+        ] {
+            let (saw_batch_tx, saw_batch_rx) = channel();
+            let supervisor = inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
+                TestMode::RuntimeObservationWrongBefore {
+                    mismatch,
+                    saw_batch: saw_batch_tx,
+                },
+            ])));
+            let worker = CaptureObservationWorker {
+                supervisor,
+                gpu_identity: Some(GpuCaptureObservationIdentity {
+                    backend: "cuda".to_owned(),
+                    provider: "expected-provider".to_owned(),
+                    stable_device: "native:pci:0000:01:00.0".to_owned(),
+                    driver: "fixture-driver".to_owned(),
+                    device_class: "discrete_gpu".to_owned(),
+                    vendor: "nvidia".to_owned(),
+                    memory_total_bytes: 8192,
+                    pack_id: "fixture-pack".to_owned(),
+                    pack_version: "1".to_owned(),
+                    pack_sha256: "b".repeat(64),
+                    pack_security_epoch: 1,
+                    runtime_abi: 1,
+                }),
+            };
+            worker.negotiate_runtime_observation().unwrap();
+            let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new("fixture-observation"),
+                path: PathBuf::from("fixture.gguf"),
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: "a".repeat(64),
+            });
+            let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+
+            let error = worker
+                .transcribe_observed(artifact, AccelerationPreference::Gpu, &audio)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not match the authenticated GPU"),
+                "{mismatch:?}: {error}"
+            );
+            worker.shutdown().unwrap();
+            assert!(!saw_batch_rx.recv().unwrap(), "{mismatch:?}");
+        }
     }
 
     #[test]
