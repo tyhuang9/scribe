@@ -145,27 +145,36 @@ function New-FixtureIdentity() {
     return $identity
 }
 
-function New-Run($Identity, [string]$Mode, [string]$Target, [int]$Sequence, [int]$GpuWarmMs) {
+function New-Run($Identity, [string]$Mode, [string]$Target, [int]$Sequence, [int]$GpuWarmMs, $Acquisition = $null, [string]$PowerSource = '') {
+    if ($null -eq $Acquisition) { $Acquisition = $Identity.acquisition }
+    $schema3 = -not [string]::IsNullOrEmpty($PowerSource)
     $endToEnd = if ($Mode -ceq 'cold') { if ($Target -ceq 'cpu') { 200 + $Sequence } else { 180 + $Sequence } } elseif ($Target -ceq 'cpu') { 100 } else { $GpuWarmMs }
     $worker = if ($Target -ceq 'cpu') { $Identity.cpu_baseline } else { $Identity.gpu_worker }
-    $generation = if ($Mode -ceq 'cold') { "$($Identity.acquisition.batch_id):$($Identity.lane_id):$Mode`:$Target`:$('{0:d2}' -f $Sequence)" } else { "$($Identity.acquisition.batch_id):$($Identity.lane_id):warm:$Target" }
-    return [ordered]@{
-        acquisition_batch_id = $Identity.acquisition.batch_id; artifact_path = "$($Identity.lane_id)/runs/$Mode/$Target/$('{0:d2}' -f $Sequence).evidence"; artifact_sha256 = Get-Digest "pending-$Mode-$Target-$Sequence"
+    $powerComponent = if ($schema3) { ":$PowerSource" } else { '' }
+    $generation = if ($Mode -ceq 'cold') { "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:$Mode`:$Target`:$('{0:d2}' -f $Sequence)" } else { "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:warm:$Target" }
+    $run = [ordered]@{
+        acquisition_batch_id = $Acquisition.batch_id; artifact_path = "$($Identity.lane_id)/$(if ($schema3) { "$PowerSource/" })runs/$Mode/$Target/$('{0:d2}' -f $Sequence).evidence"; artifact_sha256 = Get-Digest "pending-$PowerSource-$Mode-$Target-$Sequence"
         available_device_memory_bytes_after = if ($Target -ceq 'cpu') { [Int64]0 } else { [Int64]8500000000 }; available_device_memory_bytes_before = if ($Target -ceq 'cpu') { [Int64]0 } else { [Int64]9000000000 }
-        backend_ms = $endToEnd - 10; device_set_sha256 = $Identity.acquisition.device_set.snapshot_sha256; end_to_end_ms = $endToEnd
+        backend_ms = $endToEnd - 10; device_set_sha256 = $Acquisition.device_set.snapshot_sha256; end_to_end_ms = $endToEnd
         execution = [ordered]@{
             backend = if ($Target -ceq 'cpu') { 'cpu' } else { $Identity.backend }; capture_sha256 = Get-Digest "capture-$generation"; device_memory_kind = if ($Target -ceq 'cpu') { 'none' } else { $Identity.device.memory_model }
-            driver = if ($Target -ceq 'cpu') { 'cpu:none' } else { $Identity.driver.value }; model_digest = $Identity.model.model_digest; options_sha256 = $Identity.acquisition.options_sha256
+            driver = if ($Target -ceq 'cpu') { 'cpu:none' } else { $Identity.driver.value }; model_digest = $Identity.model.model_digest; options_sha256 = $Acquisition.options_sha256
             pack_digest = if ($Target -ceq 'cpu') { $ZeroSha256 } else { $Identity.pack.pack_digest }; protocol_version = $worker.protocol_version; provider_id = $worker.provider_id; runtime_abi = $worker.runtime_abi
             stable_device_id = if ($Target -ceq 'cpu') { 'cpu:host' } else { $Identity.device.stable_device_id }; windows_version = $Identity.windows_version; worker_build_id = $worker.worker_build_id; worker_generation = $generation; worker_sha256 = $worker.worker_sha256
         }
-        failure_category = 'none'; machine_id_sha256 = $Identity.acquisition.machine_id_sha256; outcome = 'success'; pair_id = "$($Identity.acquisition.batch_id):$Mode`:$('{0:d2}' -f $Sequence)"
+        failure_category = 'none'; machine_id_sha256 = $Acquisition.machine_id_sha256; outcome = 'success'; pair_id = "$($Acquisition.batch_id)$powerComponent`:$Mode`:$('{0:d2}' -f $Sequence)"
         pair_order = if ($Sequence % 2) { 'cpu_then_gpu' } else { 'gpu_then_cpu' }; peak_process_memory_bytes = [Int64](600000000 + $Sequence * 1024); peak_shared_device_memory_bytes = [Int64]0
         peak_vram_bytes = if ($Target -ceq 'cpu') { [Int64]0 } else { [Int64](800000000 + $Sequence * 2048) }; priming_runs = if ($Mode -ceq 'cold') { 0 } else { 1 }
         reset_state = if ($Mode -ceq 'cold') { 'fresh_process_fresh_model' } else { 'same_process_primed_model' }; sequence = $Sequence
-        session_id = if ($Mode -ceq 'cold') { "$($Identity.acquisition.batch_id):$Mode`:$('{0:d2}' -f $Sequence):session" } else { "$($Identity.acquisition.batch_id):warm:session" }
+        session_id = if ($Mode -ceq 'cold') { "$($Acquisition.batch_id)$powerComponent`:$Mode`:$('{0:d2}' -f $Sequence):session" } else { "$($Acquisition.batch_id)$powerComponent`:warm:session" }
         transcript_sha256 = $Identity.workload.expected_transcript_sha256
     }
+    if ($schema3) {
+        $run.acquisition_sha256 = Get-CanonicalDigest $Acquisition
+        $run.power_source_before = $PowerSource
+        $run.power_source_after = $PowerSource
+    }
+    return $run
 }
 
 function New-Scenario($Identity, [string]$Name) {
@@ -207,7 +216,9 @@ function New-WireDevice($Source, [int]$ProcessIndex) {
     }
 }
 
-function New-Capture($Identity, [string]$Generation, [string]$Scope, [int]$SelectedProcessIndex = 3) {
+function New-Capture($Identity, [string]$Generation, [string]$Scope, [int]$SelectedProcessIndex = 3, $Acquisition = $null, [string]$PowerSource = '') {
+    if ($null -eq $Acquisition) { $Acquisition = $Identity.acquisition }
+    $schema3 = -not [string]::IsNullOrEmpty($PowerSource)
     $cpu = $Scope -ceq 'cpu'
     $challenge = Get-Digest "challenge-$Generation"
     $expected = Get-WireExpectation $Identity $cpu
@@ -218,7 +229,7 @@ function New-Capture($Identity, [string]$Generation, [string]$Scope, [int]$Selec
         artifacts = @([ordered]@{ artifact = 'gguf'; target = 'windows-x86_64' }, [ordered]@{ artifact = 'onnx_asr'; target = 'windows-x86_64' })
     }
     if (-not $cpu) {
-        $providerDevices = @($Identity.acquisition.device_set.devices | Where-Object { $_.provider_eligible })
+        $providerDevices = @($Acquisition.device_set.devices | Where-Object { $_.provider_eligible })
         [object[]]$wireDevices = if ($Scope -ceq 'provider_discovery') {
             @(
                 for ($index = 0; $index -lt $providerDevices.Count; $index++) { New-WireDevice $providerDevices[$index] @(3, 9)[$index] }
@@ -231,11 +242,17 @@ function New-Capture($Identity, [string]$Generation, [string]$Scope, [int]$Selec
         $capability.pack = [ordered]@{ expectation = Get-WirePackExpectation $Identity; devices = $wireDevices }
     }
     $response = [ordered]@{ command = 'ready'; capability = $capability }
-    return [ordered]@{
-        artifact_path = "$($Identity.lane_id)/captures/$((Get-Digest $Generation).Substring(0, 24)).evidence"
+    $capture = [ordered]@{
+        artifact_path = "$($Identity.lane_id)/$(if ($schema3) { "$PowerSource/" })captures/$((Get-Digest $Generation).Substring(0, 24)).evidence"
         artifact_sha256 = Get-Digest "pending-capture-$Generation"; generation = $Generation; launch_scope = $Scope
         request_frame_base64 = New-ScifFrame $request; response_frame_base64 = New-ScifFrame $response
     }
+    if ($schema3) {
+        $capture.acquisition_sha256 = Get-CanonicalDigest $Acquisition
+        $capture.power_source_before = $PowerSource
+        $capture.power_source_after = $PowerSource
+    }
+    return $capture
 }
 
 function Get-RecordWithoutArtifact($Value) {
@@ -247,35 +264,76 @@ function Get-RecordWithoutArtifact($Value) {
 function Sync-DeviceSetBindings($Documents) {
     $lane = $Documents.Evidence.lanes[0]
     $lane.identity.acquisition.device_set.snapshot_sha256 = Get-CanonicalDigest $lane.identity.acquisition.device_set.devices
-    foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { $run.device_set_sha256 = $lane.identity.acquisition.device_set.snapshot_sha256 } } }
-    foreach ($scenario in @($lane.scenarios)) { $scenario.device_set_sha256 = $lane.identity.acquisition.device_set.snapshot_sha256 }
+    foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { $run.device_set_sha256 = $lane.identity.acquisition.device_set.snapshot_sha256; if ($Documents.Plan.schema_version -eq 3) { $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.acquisition } } } }
+    if ($Documents.Plan.schema_version -eq 3 -and $null -ne $lane.identity.battery_acquisition) {
+        $lane.identity.battery_acquisition.device_set.snapshot_sha256 = Get-CanonicalDigest $lane.identity.battery_acquisition.device_set.devices
+        foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.battery.run_sets[$mode][$target])) { $run.device_set_sha256 = $lane.identity.battery_acquisition.device_set.snapshot_sha256; $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.battery_acquisition } } }
+    }
+    foreach ($scenario in @($lane.scenarios)) {
+        $acquisition = if ($Documents.Plan.schema_version -eq 3 -and $scenario.power_source -ceq 'battery' -and $null -ne $lane.identity.battery_acquisition) { $lane.identity.battery_acquisition } else { $lane.identity.acquisition }
+        $scenario.device_set_sha256 = $acquisition.device_set.snapshot_sha256
+    }
+}
+
+function New-PowerCaptures($Block, $Identity, $Acquisition, [string]$PowerSource, [bool]$IncludeMixed, [bool]$Schema3) {
+    $captures = [Collections.Generic.List[object]]::new()
+    foreach ($mode in @('cold', 'warm')) {
+        foreach ($target in @('cpu', 'gpu')) {
+            foreach ($generation in @($Block.run_sets[$mode][$target].execution.worker_generation | Sort-Object -Unique)) {
+                $scope = if ($target -ceq 'cpu') { 'cpu' } else { 'selected_device' }
+                $capture = New-Capture $Identity $generation $scope 3 $Acquisition $(if ($Schema3) { $PowerSource } else { '' })
+                $digest = Get-CanonicalDigest (Get-RecordWithoutArtifact $capture)
+                foreach ($run in @($Block.run_sets[$mode][$target] | Where-Object { $_.execution.worker_generation -ceq $generation })) { $run.execution.capture_sha256 = $digest }
+                $captures.Add($capture)
+            }
+        }
+    }
+    $powerComponent = if ($Schema3) { ":$PowerSource" } else { '' }
+    $discoveryGeneration = "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:provider_discovery"
+    $captures.Add((New-Capture $Identity $discoveryGeneration 'provider_discovery' 3 $Acquisition $(if ($Schema3) { $PowerSource } else { '' })))
+    if ($IncludeMixed) {
+        $before = New-Capture $Identity "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:scenario:mixed_gpu:before" 'selected_device' 3 $Acquisition $(if ($Schema3) { $PowerSource } else { '' })
+        $after = New-Capture $Identity "$($Acquisition.batch_id):$($Identity.lane_id)$powerComponent`:scenario:mixed_gpu:after" 'selected_device' 11 $Acquisition $(if ($Schema3) { $PowerSource } else { '' })
+        $captures.Add($before); $captures.Add($after)
+    }
+    return ,@($captures | Sort-Object generation)
 }
 
 function Sync-Captures($Documents) {
     $lane = $Documents.Evidence.lanes[0]
     $identity = $lane.identity
-    $captures = [Collections.Generic.List[object]]::new()
-    foreach ($mode in @('cold', 'warm')) {
-        foreach ($target in @('cpu', 'gpu')) {
-            foreach ($generation in @($lane.run_sets[$mode][$target].execution.worker_generation | Sort-Object -Unique)) {
-                $scope = if ($target -ceq 'cpu') { 'cpu' } else { 'selected_device' }
-                $capture = New-Capture $identity $generation $scope
-                $digest = Get-CanonicalDigest (Get-RecordWithoutArtifact $capture)
-                foreach ($run in @($lane.run_sets[$mode][$target] | Where-Object { $_.execution.worker_generation -ceq $generation })) { $run.execution.capture_sha256 = $digest }
-                $captures.Add($capture)
+    $schema3 = $Documents.Plan.schema_version -eq 3
+    $lane.captures = New-PowerCaptures $lane $identity $identity.acquisition 'ac' $true $schema3
+    $mixed = @($lane.scenarios | Where-Object { $_.scenario -ceq 'mixed_gpu' })[0]
+    $mixedCaptures = @($lane.captures | Where-Object { $_.generation -like '*scenario:mixed_gpu:*' } | Sort-Object generation)
+    $mixed.capture_after_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact $mixedCaptures[0])
+    $mixed.capture_before_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact $mixedCaptures[1])
+    $mixed.process_index_before = 3; $mixed.process_index_after = 11
+    # Sort order is after,before while the assigned process indexes are defined
+    # by the generation names, not the array position.
+    foreach ($capture in $mixedCaptures) {
+        $control = Get-ScifControl $capture.response_frame_base64
+        $index = $control.capability.pack.devices[0].process_index
+        if ($capture.generation -like '*:before') { $mixed.capture_before_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact $capture); $mixed.process_index_before = $index }
+        else { $mixed.capture_after_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact $capture); $mixed.process_index_after = $index }
+    }
+    if ($schema3 -and $null -ne $lane.battery) {
+        $lane.battery.captures = New-PowerCaptures $lane.battery $identity $identity.battery_acquisition 'battery' $false $true
+    }
+    if ($schema3) {
+        foreach ($scenario in @($lane.scenarios)) {
+            $discreteBattery = $scenario.scenario -ceq 'power_battery' -and $identity.device.device_class -ceq 'discrete_gpu'
+            $acquisition = if ($scenario.power_source -ceq 'battery') { $identity.battery_acquisition } else { $identity.acquisition }
+            $scenario.acquisition_sha256 = if ($discreteBattery) { $ZeroSha256 } else { Get-CanonicalDigest $acquisition }
+            $scenario.power_source_before = $scenario.power_source
+            $scenario.power_source_after = $scenario.power_source
+            if ($scenario.selected_backend -ceq 'cpu') { $scenario.selected_capture_sha256 = $ZeroSha256 }
+            else {
+                $captures = if ($scenario.power_source -ceq 'battery') { $lane.battery.captures } else { $lane.captures }
+                $scenario.selected_capture_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact @($captures | Where-Object { $_.launch_scope -ceq 'selected_device' -and $_.generation -like '*:warm:gpu' })[0])
             }
         }
     }
-    $discoveryGeneration = "$($identity.acquisition.batch_id):$($identity.lane_id):provider_discovery"
-    $captures.Add((New-Capture $identity $discoveryGeneration 'provider_discovery'))
-    $mixed = @($lane.scenarios | Where-Object { $_.scenario -ceq 'mixed_gpu' })[0]
-    $before = New-Capture $identity "$($identity.acquisition.batch_id):$($identity.lane_id):scenario:mixed_gpu:before" 'selected_device' 3
-    $after = New-Capture $identity "$($identity.acquisition.batch_id):$($identity.lane_id):scenario:mixed_gpu:after" 'selected_device' 11
-    $mixed.capture_before_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact $before)
-    $mixed.capture_after_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact $after)
-    $mixed.process_index_before = 3; $mixed.process_index_after = 11
-    $captures.Add($before); $captures.Add($after)
-    $lane.captures = @($captures | Sort-Object generation)
 }
 
 function New-FixtureDocuments([int]$GpuWarmMs = 110) {
@@ -314,8 +372,12 @@ function Set-VulkanFixture($Documents, [string]$Vendor, [string]$VendorId) {
     $identity.gpu_worker.worker_sha256 = Get-Digest 'fixture-vulkan-worker'; $identity.pack.pack_id = 'scribe-vulkan-windows-x64'; $identity.device.vendor = $Vendor
     $driver = "vulkan:$VendorId`:00000001:00000136:00112233445566778899aabbccddeeff"
     $identity.driver.value = $driver
-    foreach ($device in @($identity.acquisition.device_set.devices | Where-Object { $_.provider_eligible })) { $device.vendor = $Vendor; $device.driver = $driver }
-    foreach ($mode in @('cold', 'warm')) { foreach ($run in @($lane.run_sets[$mode].gpu)) { $run.execution.backend = 'vulkan'; $run.execution.provider_id = 'vulkan'; $run.execution.worker_sha256 = $identity.gpu_worker.worker_sha256; $run.execution.driver = $driver } }
+    foreach ($acquisition in @($identity.acquisition, $(if ($Documents.Plan.schema_version -eq 3) { $identity.battery_acquisition })) | Where-Object { $null -ne $_ }) {
+        foreach ($device in @($acquisition.device_set.devices | Where-Object { $_.provider_eligible })) { $device.vendor = $Vendor; $device.driver = $driver }
+    }
+    $runSets = @($lane.run_sets)
+    if ($Documents.Plan.schema_version -eq 3 -and $null -ne $lane.battery) { $runSets += $lane.battery.run_sets }
+    foreach ($sets in $runSets) { foreach ($mode in @('cold', 'warm')) { foreach ($run in @($sets[$mode].gpu)) { $run.execution.backend = 'vulkan'; $run.execution.provider_id = 'vulkan'; $run.execution.worker_sha256 = $identity.gpu_worker.worker_sha256; $run.execution.driver = $driver } } }
     foreach ($scenario in @($lane.scenarios)) { if ($scenario.selected_backend -cne 'cpu') { $scenario.selected_backend = 'vulkan' }; $scenario.driver_after = $driver; $scenario.driver_before = if ($scenario.scenario -ceq 'driver_change') { "vulkan:$VendorId`:00000001:00000135:00112233445566778899aabbccddeeff" } else { $driver } }
     Sync-DeviceSetBindings $Documents; Sync-Captures $Documents
 }
@@ -327,6 +389,61 @@ function Set-IntegratedFixture($Documents) {
     foreach ($mode in @('cold', 'warm')) { foreach ($run in @($lane.run_sets[$mode].gpu)) { $run.execution.device_memory_kind = 'shared_host_memory'; $run.peak_shared_device_memory_bytes = $run.peak_vram_bytes; $run.peak_vram_bytes = [Int64]0 } }
     $battery = @($lane.scenarios | Where-Object { $_.scenario -ceq 'power_battery' })[0]; $battery.selected_backend = $identity.backend; $battery.selected_stable_device_id = $identity.device.stable_device_id
     Sync-Captures $Documents
+}
+
+function New-PowerRunSets($Identity, $Acquisition, [string]$PowerSource, [int]$GpuColdMs, [int]$GpuWarmMs) {
+    $sets = [ordered]@{
+        cold = [ordered]@{ cpu = @(1..5 | ForEach-Object { New-Run $Identity 'cold' 'cpu' $_ $GpuWarmMs $Acquisition $PowerSource }); gpu = @(1..5 | ForEach-Object { New-Run $Identity 'cold' 'gpu' $_ $GpuWarmMs $Acquisition $PowerSource }) }
+        warm = [ordered]@{ cpu = @(1..20 | ForEach-Object { New-Run $Identity 'warm' 'cpu' $_ $GpuWarmMs $Acquisition $PowerSource }); gpu = @(1..20 | ForEach-Object { New-Run $Identity 'warm' 'gpu' $_ $GpuWarmMs $Acquisition $PowerSource }) }
+    }
+    foreach ($run in @($sets.cold.gpu)) { $run.end_to_end_ms = $GpuColdMs; $run.backend_ms = $GpuColdMs - 10 }
+    if ($Identity.device.memory_model -ceq 'shared_host_memory') {
+        foreach ($mode in @('cold', 'warm')) { foreach ($run in @($sets[$mode].gpu)) { $run.peak_shared_device_memory_bytes = $run.peak_vram_bytes; $run.peak_vram_bytes = [Int64]0 } }
+    }
+    return $sets
+}
+
+function New-V3FixtureDocuments([string]$DeviceClass = 'integrated_gpu', [int]$AcGpuColdMs = 220, [int]$AcGpuWarmMs = 110, [int]$BatteryGpuColdMs = 220, [int]$BatteryGpuWarmMs = 110) {
+    Assert-True (@('discrete_gpu', 'integrated_gpu', 'unified_gpu') -ccontains $DeviceClass) "Unsupported v3 fixture class $DeviceClass"
+    $documents = New-FixtureDocuments $AcGpuWarmMs
+    if ($DeviceClass -cne 'discrete_gpu') {
+        Set-IntegratedFixture $documents
+        $identity = $documents.Evidence.lanes[0].identity
+        $identity.device.device_class = $DeviceClass
+        $identity.acquisition.device_set.devices[0].device_class = $DeviceClass
+    }
+    $documents.Plan.schema_version = 3
+    $documents.Evidence.schema_version = 3
+    $documents.Plan.capture_contract.power_policy = 'ac_for_discrete_ac_and_battery_for_integrated_or_unified'
+    $lane = $documents.Evidence.lanes[0]
+    $identity = $lane.identity
+    $identity.acquisition.protocol.protocol_version = 2
+    $identity.acquisition.controls.gpu_power_profile = 'system_managed'
+    $identity.battery_acquisition = $null
+    $lane.run_sets = New-PowerRunSets $identity $identity.acquisition 'ac' $AcGpuColdMs $AcGpuWarmMs
+    $lane.battery = $null
+    if ($DeviceClass -cne 'discrete_gpu') {
+        $batteryAcquisition = Copy-Document $identity.acquisition
+        $batteryAcquisition.batch_id = 'fixture-battery-batch-001'
+        $batteryAcquisition.controls.power_source = 'battery'
+        $batteryAcquisition.controls.power_plan_sha256 = Get-Digest 'balanced-battery-plan'
+        $identity.battery_acquisition = $batteryAcquisition
+        $lane.battery = [ordered]@{
+            acquisition_artifact_path = "$($identity.lane_id)/battery/acquisition.evidence"
+            acquisition_artifact_sha256 = Get-Digest 'pending-battery-acquisition'
+            captures = @()
+            run_sets = New-PowerRunSets $identity $batteryAcquisition 'battery' $BatteryGpuColdMs $BatteryGpuWarmMs
+        }
+    }
+    foreach ($scenario in @($lane.scenarios)) {
+        $scenario.acquisition_sha256 = $ZeroSha256
+        $scenario.power_source_before = $scenario.power_source
+        $scenario.power_source_after = $scenario.power_source
+        $scenario.selected_capture_sha256 = $ZeroSha256
+    }
+    Sync-DeviceSetBindings $documents
+    Sync-Captures $documents
+    return $documents
 }
 
 function Write-Envelope([string]$Path, [string]$Kind, $Record) {
@@ -341,6 +458,11 @@ function Get-ArtifactReferences($Lane) {
     foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($Lane.run_sets[$mode][$target])) { $references.Add([ordered]@{ artifact_path = $run.artifact_path; artifact_sha256 = $run.artifact_sha256 }) } } }
     foreach ($scenario in @($Lane.scenarios)) { $references.Add([ordered]@{ artifact_path = $scenario.artifact_path; artifact_sha256 = $scenario.artifact_sha256 }) }
     foreach ($capture in @($Lane.captures)) { $references.Add([ordered]@{ artifact_path = $capture.artifact_path; artifact_sha256 = $capture.artifact_sha256 }) }
+    if ($Lane.Contains('battery') -and $null -ne $Lane.battery) {
+        $references.Add([ordered]@{ artifact_path = $Lane.battery.acquisition_artifact_path; artifact_sha256 = $Lane.battery.acquisition_artifact_sha256 })
+        foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($Lane.battery.run_sets[$mode][$target])) { $references.Add([ordered]@{ artifact_path = $run.artifact_path; artifact_sha256 = $run.artifact_sha256 }) } } }
+        foreach ($capture in @($Lane.battery.captures)) { $references.Add([ordered]@{ artifact_path = $capture.artifact_path; artifact_sha256 = $capture.artifact_sha256 }) }
+    }
     [object[]]$ordered = $references.ToArray()
     $comparer = [Collections.Generic.Comparer[object]]::Create([Comparison[object]]{ param($left, $right) [StringComparer]::Ordinal.Compare([string]$left.artifact_path, [string]$right.artifact_path) })
     [Array]::Sort($ordered, $comparer)
@@ -378,11 +500,19 @@ function New-Attestation($Plan, $Lane, [Security.Cryptography.ECDsa]$Key = $Fixt
 }
 
 function Update-Bindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifacts) {
+    if (@($Documents.Plan.required_lanes).Count -eq @($Documents.Evidence.lanes).Count) {
+        for ($laneIndex = 0; $laneIndex -lt @($Documents.Evidence.lanes).Count; $laneIndex++) { $Documents.Plan.required_lanes[$laneIndex].identity = $Documents.Evidence.lanes[$laneIndex].identity }
+    }
     foreach ($lane in @($Documents.Evidence.lanes)) {
         if ($WriteArtifacts) { $lane.acquisition_artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($lane.acquisition_artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_acquisition_artifact' $lane.identity.acquisition }
         foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
         foreach ($scenario in @($lane.scenarios)) { if ($WriteArtifacts) { $scenario.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($scenario.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_scenario_artifact' (Get-RecordWithoutArtifact $scenario) } }
         foreach ($capture in @($lane.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
+        if ($Documents.Plan.schema_version -eq 3 -and $null -ne $lane.battery) {
+            if ($WriteArtifacts) { $lane.battery.acquisition_artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($lane.battery.acquisition_artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_acquisition_artifact' $lane.identity.battery_acquisition }
+            foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.battery.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
+            foreach ($capture in @($lane.battery.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
+        }
         $lane.artifact_inventory = Get-ArtifactReferences $lane
         $lane.attestation = New-Attestation $Documents.Plan $lane
     }
@@ -404,6 +534,14 @@ function New-Bundle($Documents, [string]$Name, [bool]$WriteArtifacts = $true) {
 
 function Rewrite-BundleEvidence($Bundle) { Write-Canonical $Bundle.EvidencePath $Bundle.Documents.Evidence }
 
+function Refresh-BundleSignatures($Bundle) {
+    foreach ($lane in @($Bundle.Documents.Evidence.lanes)) { $lane.attestation = New-Attestation $Bundle.Documents.Plan $lane }
+    $Bundle.Documents.Plan.required_lanes = @($Bundle.Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-CanonicalDigest $_; identity = $_.identity } })
+    $Bundle.Documents.Evidence.plan_sha256 = Get-CanonicalDigest $Bundle.Documents.Plan
+    Write-Canonical $Bundle.PlanPath $Bundle.Documents.Plan
+    Write-Canonical $Bundle.EvidencePath $Bundle.Documents.Evidence
+}
+
 function Invoke-Evaluator($Bundle, [bool]$AllowFixture = $true, [bool]$RequireEligible = $false, [string]$PlanOverride = '', [string]$EvidenceOverride = '', [string]$ArtifactOverride = '') {
     $start = [Diagnostics.ProcessStartInfo]::new(); $start.FileName = (Get-Command pwsh).Source; $start.UseShellExecute = $false; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
     foreach ($argument in @('-NoProfile', '-File', $ToolPath, '-PlanPath', $(if ($PlanOverride) { $PlanOverride } else { $Bundle.PlanPath }), '-EvidencePath', $(if ($EvidenceOverride) { $EvidenceOverride } else { $Bundle.EvidencePath }), '-ArtifactRoot', $(if ($ArtifactOverride) { $ArtifactOverride } else { $Bundle.ArtifactRoot }))) { $start.ArgumentList.Add($argument) }
@@ -424,19 +562,58 @@ function Assert-MutatedCaptureRejected([string]$Name, [string]$Scope, [string]$W
     Assert-Rejected (Invoke-Evaluator (New-Bundle $documents $Name)) $Name $Expected
 }
 
+function Set-RunFailure($Run, [string]$Category) {
+    $Run.outcome = 'failure'
+    $Run.failure_category = $Category
+    $Run.transcript_sha256 = $ZeroSha256
+}
+
+function Invoke-PassingFixture($Documents, [string]$Name, [int]$ExpectedArtifacts) {
+    $bundle = New-Bundle $Documents $Name
+    $result = Invoke-Evaluator $bundle
+    Assert-True ($result.ExitCode -eq 0) "$Name failed evaluator execution: $($result.Stderr)"
+    $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True ($decision.qualification_passed -and -not $decision.auto_eligible -and $decision.decision_reason -ceq 'fixture_only_never_auto_eligible') "$Name did not pass as fixture-only/ineligible."
+    Assert-True ($decision.artifact_count -eq $ExpectedArtifacts) "$Name consumed $($decision.artifact_count), expected $ExpectedArtifacts artifacts."
+    return [pscustomobject]@{ Bundle = $bundle; Decision = $decision; Result = $result }
+}
+
+function Invoke-FailingFixture($Documents, [string]$Name, [string]$ExpectedReason) {
+    $bundle = New-Bundle $Documents $Name
+    $result = Invoke-Evaluator $bundle
+    Assert-True ($result.ExitCode -eq 0) "$Name was structurally rejected instead of evaluated: $($result.Stderr)"
+    $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True (-not $decision.qualification_passed -and $decision.lanes[0].reasons -ccontains $ExpectedReason) "$Name did not report $ExpectedReason."
+    Assert-True ($null -eq $decision.lanes[0].auto_entry_projection) "$Name emitted an Auto projection for a failing lane."
+    return $decision
+}
+
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-windows-gpu-qualification-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($TestRoot) | Out-Null
 try {
     $immutablePaths = [ordered]@{ auto = $AutoManifestPath; authority = $AuthorityPath; checked_plan = $CheckedPlanPath; evaluator = $ToolPath; toolchain = $ToolchainPath }
     $immutableBefore = [ordered]@{}; foreach ($name in $immutablePaths.Keys) { $immutableBefore[$name] = [IO.File]::ReadAllBytes($immutablePaths[$name]) }
+    $evaluatorSource = [IO.File]::ReadAllText($ToolPath, $Utf8)
+    foreach ($bound in @('$MaxInputBytes = 16MB', '$MaxLanes = 64', '$MaxArtifacts = 4096', '$MaxArtifactBytes = [UInt64](512MB)', '$MaxControlBytes = 256KB')) { Assert-True ($evaluatorSource.Contains($bound)) "Qualification evaluator changed or removed bound: $bound" }
+    Assert-True ($evaluatorSource.Contains('Test-ArtifactBudget ($Context.Count + $Inventory.Count) $Context.Bytes')) 'Evaluator does not reject cumulative declared artifact overflow before opening the next lane inventory.'
+    $budgetTokens = $null; $budgetErrors = $null
+    $evaluatorAst = [Management.Automation.Language.Parser]::ParseFile($ToolPath, [ref]$budgetTokens, [ref]$budgetErrors)
+    Assert-True ($budgetErrors.Count -eq 0) 'Could not parse evaluator for isolated artifact-budget boundary checks.'
+    $budgetFunctionAst = $evaluatorAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-ArtifactBudget' }, $true)
+    Assert-True ($null -ne $budgetFunctionAst) 'Evaluator artifact-budget helper is missing.'
+    $MaxArtifacts = 4096; [UInt64]$MaxArtifactBytes = 512MB
+    Invoke-Expression $budgetFunctionAst.Extent.Text
+    Assert-True (Test-ArtifactBudget 4096 ([UInt64](512MB))) 'Isolated evaluator budget helper rejected exact count/byte bounds.'
+    Assert-True (-not (Test-ArtifactBudget 4097 ([UInt64](512MB)))) 'Isolated evaluator budget helper accepted count bound + 1.'
+    Assert-True (-not (Test-ArtifactBudget 4096 ([UInt64](512MB) + 1))) 'Isolated evaluator budget helper accepted byte bound + 1.'
     Assert-True ([IO.File]::ReadAllText($AutoManifestPath, $Utf8) -ceq $ExpectedAuto) 'Windows Auto manifest is not exact default deny.'
     Assert-True ([IO.File]::ReadAllText($AuthorityPath, $Utf8) -ceq $ExpectedAuthority) 'Windows qualification authority is not exact empty schema v2.'
     $checkedPlanRaw = [IO.File]::ReadAllText($CheckedPlanPath, $Utf8)
     $checkedPlan = $checkedPlanRaw | ConvertFrom-Json -AsHashtable -Depth 64
-    Assert-True ($checkedPlan.schema_version -eq 2 -and -not $checkedPlan.fixture_only -and $checkedPlan.required_lanes.Count -eq 0 -and -not $checkedPlan.runtime_bucket_complete) 'Checked-in plan is not canonical production default deny.'
+    Assert-True ($checkedPlan.schema_version -eq 3 -and $checkedPlan.capture_contract.power_policy -ceq 'ac_for_discrete_ac_and_battery_for_integrated_or_unified' -and -not $checkedPlan.fixture_only -and $checkedPlan.required_lanes.Count -eq 0 -and -not $checkedPlan.runtime_bucket_complete) 'Checked-in plan is not canonical schema-v3 production default deny.'
     Assert-True (-not $checkedPlan.capture_authority.ContainsKey('fixture_capture_public_key_spki_base64')) 'Checked-in production plan contains a fixture capture key.'
     Assert-True ($checkedPlanRaw -ceq $Utf8.GetString((Get-CanonicalBytes $checkedPlan))) 'Checked-in plan is not canonical LF JSON.'
-    $checkedEvidencePath = Join-Path $TestRoot 'checked-empty-evidence.json'; Write-Canonical $checkedEvidencePath ([ordered]@{ fixture_only = $false; kind = 'windows_gpu_release_qualification_evidence'; lanes = @(); plan_sha256 = Get-FileDigest $CheckedPlanPath; schema_version = 2 })
+    $checkedEvidencePath = Join-Path $TestRoot 'checked-empty-evidence.json'; Write-Canonical $checkedEvidencePath ([ordered]@{ fixture_only = $false; kind = 'windows_gpu_release_qualification_evidence'; lanes = @(); plan_sha256 = Get-FileDigest $CheckedPlanPath; schema_version = 3 })
     $checkedProbe = [pscustomobject]@{ PlanPath = $CheckedPlanPath; EvidencePath = $checkedEvidencePath; ArtifactRoot = $TestRoot }
     Assert-Rejected (Invoke-Evaluator $checkedProbe $false) 'Checked-in default-deny plan validation' 'not approved by the protected production authority'
 
@@ -448,6 +625,176 @@ try {
     Assert-True ($decision.artifact_count -eq 75) 'Passing fixture did not consume the exact acquisition, run, scenario, and raw-capture inventory.'
     Assert-True ((Invoke-Evaluator $valid $false).ExitCode -eq 1) 'Fixture was accepted without -AllowFixture.'
     Assert-True ((Invoke-Evaluator $valid $true $true).ExitCode -eq 2) 'Fixture -RequireEligible did not return valid-ineligible exit 2.'
+
+    # Schema v3 proves AC and battery independently for shared-memory GPUs,
+    # while discrete GPUs keep the exact AC-only evidence inventory.
+    $v3Integrated = Invoke-PassingFixture (New-V3FixtureDocuments 'integrated_gpu') 'v3-integrated' 139
+    Assert-True ($v3Integrated.Decision.schema_version -eq 3 -and $null -ne $v3Integrated.Decision.lanes[0].metrics.battery) 'Integrated v3 decision did not report battery metrics.'
+    Assert-True ((Invoke-Evaluator $v3Integrated.Bundle $true $true).ExitCode -eq 2) 'Passing v3 fixture -RequireEligible did not return valid-ineligible exit 2.'
+    $v3Unified = Invoke-PassingFixture (New-V3FixtureDocuments 'unified_gpu') 'v3-unified' 139
+    foreach ($completeClass in @('integrated_gpu', 'unified_gpu')) {
+        $completeDocuments = New-V3FixtureDocuments $completeClass; $completeDocuments.Plan.runtime_bucket_complete = $true
+        $completeDecision = (Invoke-PassingFixture $completeDocuments "v3-complete-$completeClass" 139).Decision
+        Assert-True ($completeDecision.qualification_passed -and -not $completeDecision.activation_manifest_complete -and -not $completeDecision.auto_eligible) "Complete v3 $completeClass fixture did not pass qualification while remaining inactive/ineligible against empty Auto."
+    }
+    $v3Discrete = Invoke-PassingFixture (New-V3FixtureDocuments 'discrete_gpu') 'v3-discrete' 75
+    Assert-True ($null -eq $v3Discrete.Decision.lanes[0].metrics.battery) 'Discrete v3 decision invented battery performance metrics.'
+    $discreteBatteryScenarioFailure = New-V3FixtureDocuments 'discrete_gpu'; $discreteBatteryScenario = @($discreteBatteryScenarioFailure.Evidence.lanes[0].scenarios | Where-Object scenario -ceq 'power_battery')[0]
+    $discreteBatteryScenario.result = 'fail'; $discreteBatteryScenario.active_request_migrated = $true; $discreteBatteryScenario.partial_output_replayed = $true
+    $discreteFailureDecision = Invoke-FailingFixture $discreteBatteryScenarioFailure 'v3-discrete-battery-scenario-failure' 'battery_scenario_evidence_failed'
+    Assert-True ($null -eq $discreteFailureDecision.lanes[0].auto_entry_projection -and -not $discreteFailureDecision.lanes[0].checks.scenarios_passed) 'Discrete v3 battery scenario failure did not suppress its projection/global scenario check.'
+    $v3IntelDocuments = New-V3FixtureDocuments 'integrated_gpu'; Set-VulkanFixture $v3IntelDocuments 'intel' '8086'
+    $null = Invoke-PassingFixture $v3IntelDocuments 'v3-integrated-intel-vulkan' 139
+    $v3ProductionRelabel = New-V3FixtureDocuments; $v3ProductionRelabel.Plan.fixture_only = $false; $v3ProductionRelabel.Plan.capture_authority.Remove('fixture_capture_public_key_spki_base64'); $v3ProductionRelabel.Evidence.fixture_only = $false
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $v3ProductionRelabel 'v3-fixture-production-relabel') $false) 'V3 fixture relabeled production' 'not approved by the protected production authority'
+
+    # Strict schema separation and required/null paired-power shapes.
+    $mixedSchema = New-V3FixtureDocuments; $mixedSchema.Evidence.schema_version = 2
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $mixedSchema 'v3-mixed-schema')) 'Mixed plan/evidence schemas' 'schema versions differ'
+    $v2PowerPolicy = New-FixtureDocuments; $v2PowerPolicy.Plan.capture_contract.power_policy = 'ac_for_discrete_ac_and_battery_for_integrated_or_unified'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $v2PowerPolicy 'v2-power-policy')) 'Schema v2 accepted v3 power policy' 'unexpected or missing fields'
+    $missingBatteryIdentity = New-V3FixtureDocuments; $missingBatteryIdentity.Evidence.lanes[0].identity.Remove('battery_acquisition'); $missingBatteryIdentity.Evidence.lanes[0].battery = $null
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $missingBatteryIdentity 'v3-missing-battery-identity')) 'Missing v3 battery acquisition' 'unexpected or missing fields'
+    $nullBatteryBlock = New-V3FixtureDocuments; $nullBatteryBlock.Evidence.lanes[0].battery = $null
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $nullBatteryBlock 'v3-null-battery-block')) 'Null shared-memory battery block' 'is required'
+
+    # The paired acquisitions share machine/options/harness/topology/threading
+    # and device inventory, but use distinct power-bound batches and plans.
+    foreach ($pairedCase in @(
+        [pscustomobject]@{ Name = 'machine'; Mutate = { param($a) $a.machine_id_sha256 = Get-Digest 'other-machine' }; Expected = 'machine_id_sha256 values differ' },
+        [pscustomobject]@{ Name = 'options'; Mutate = { param($a) $a.options_sha256 = Get-Digest 'other-options' }; Expected = 'options_sha256 values differ' },
+        [pscustomobject]@{ Name = 'harness'; Mutate = { param($a) $a.protocol.harness_sha256 = Get-Digest 'other-harness' }; Expected = 'protocol identities differ' },
+        [pscustomobject]@{ Name = 'topology'; Mutate = { param($a) $a.host.total_memory_bytes++ }; Expected = 'host identities differ' },
+        [pscustomobject]@{ Name = 'threading'; Mutate = { param($a) $a.threading.gpu_affinity_sha256 = Get-Digest 'other-affinity' }; Expected = 'threading identities differ' },
+        [pscustomobject]@{ Name = 'devices'; Mutate = { param($a) $a.device_set.snapshot_sha256 = Get-Digest 'other-device-set' }; Expected = 'does not match the canonical complete device inventory' }
+    )) {
+        $documents = New-V3FixtureDocuments; & $pairedCase.Mutate $documents.Evidence.lanes[0].identity.battery_acquisition
+        Assert-Rejected (Invoke-Evaluator (New-Bundle $documents "v3-paired-$($pairedCase.Name)")) "V3 paired acquisition $($pairedCase.Name)" $pairedCase.Expected
+    }
+    $selfConsistentDeviceMismatch = New-V3FixtureDocuments; $selfConsistentBattery = $selfConsistentDeviceMismatch.Evidence.lanes[0].identity.battery_acquisition
+    $selfConsistentBattery.device_set.devices[1].total_memory_bytes--
+    Sync-DeviceSetBindings $selfConsistentDeviceMismatch; Sync-Captures $selfConsistentDeviceMismatch
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $selfConsistentDeviceMismatch 'v3-paired-self-consistent-device-set')) 'Self-consistent cross-power device-set mismatch' 'device_set identities differ'
+    $sameBatch = New-V3FixtureDocuments; $sameBatch.Evidence.lanes[0].identity.battery_acquisition.batch_id = $sameBatch.Evidence.lanes[0].identity.acquisition.batch_id
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $sameBatch 'v3-same-batch')) 'Reused AC/battery batch' 'batches must differ'
+
+    # Power metadata, sessions, generations, captures, challenges, and scenario
+    # bindings cannot be substituted across AC and battery.
+    $powerTransition = New-V3FixtureDocuments; $powerTransition.Evidence.lanes[0].battery.run_sets.warm.gpu[0].power_source_after = 'ac'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $powerTransition 'v3-power-transition')) 'Battery run power transition' 'power transition'
+    $captureRelabel = New-V3FixtureDocuments; $captureRelabel.Evidence.lanes[0].battery.captures[0].power_source_before = 'ac'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $captureRelabel 'v3-capture-power-relabel')) 'Battery capture relabeled AC' 'power transition'
+    $crossSession = New-V3FixtureDocuments; $crossSession.Evidence.lanes[0].battery.run_sets.warm.cpu[0].session_id = $crossSession.Evidence.lanes[0].run_sets.warm.cpu[0].session_id
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $crossSession 'v3-cross-session')) 'Cross-power session reuse' 'session violates'
+    $crossGeneration = New-V3FixtureDocuments; $crossGeneration.Evidence.lanes[0].battery.run_sets.cold.gpu[0].execution.worker_generation = $crossGeneration.Evidence.lanes[0].run_sets.cold.gpu[0].execution.worker_generation
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $crossGeneration 'v3-cross-generation')) 'Cross-power generation reuse' 'worker_generation'
+    $crossCapture = New-V3FixtureDocuments; $crossCapture.Evidence.lanes[0].battery.run_sets.cold.gpu[0].execution.capture_sha256 = $crossCapture.Evidence.lanes[0].run_sets.cold.gpu[0].execution.capture_sha256
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $crossCapture 'v3-cross-capture')) 'Cross-power capture reuse' 'reused one raw capture'
+    $crossChallenge = New-V3FixtureDocuments; $acCapture = $crossChallenge.Evidence.lanes[0].captures[0]; $batteryCapture = $crossChallenge.Evidence.lanes[0].battery.captures[0]; $challenge = (Get-ScifControl $acCapture.request_frame_base64).challenge
+    Update-CaptureControl $batteryCapture 'request' { param($c) $c.challenge = $challenge }; Update-CaptureControl $batteryCapture 'response' { param($c) $c.capability.challenge = $challenge }
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $crossChallenge 'v3-cross-challenge')) 'Cross-power challenge reuse' 'unique challenge'
+    $crossScenarioCapture = New-V3FixtureDocuments; $batteryScenario = @($crossScenarioCapture.Evidence.lanes[0].scenarios | Where-Object scenario -ceq 'power_battery')[0]; $batteryScenario.selected_capture_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact @($crossScenarioCapture.Evidence.lanes[0].captures | Where-Object { $_.generation -like '*:warm:gpu' })[0])
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $crossScenarioCapture 'v3-cross-scenario-capture')) 'Battery scenario borrowed AC capture' 'matching power acquisition'
+    $reboundNonBatteryScenario = New-V3FixtureDocuments; $reboundScenarioLane = $reboundNonBatteryScenario.Evidence.lanes[0]; $reboundScenario = @($reboundScenarioLane.scenarios | Where-Object scenario -ceq 'suspend_resume')[0]
+    $reboundScenario.power_source = 'battery'; $reboundScenario.power_source_before = 'battery'; $reboundScenario.power_source_after = 'battery'; $reboundScenario.acquisition_sha256 = Get-CanonicalDigest $reboundScenarioLane.identity.battery_acquisition
+    $reboundScenario.selected_capture_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact @($reboundScenarioLane.battery.captures | Where-Object { $_.generation -like '*:warm:gpu' })[0]); $reboundScenario.device_set_sha256 = $reboundScenarioLane.identity.battery_acquisition.device_set.snapshot_sha256
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $reboundNonBatteryScenario 'v3-rebound-nonbattery-scenario')) 'Non-battery scenario rebound to battery' 'canonical power source'
+
+    # Exact independent cardinalities and acquisition ordering controls.
+    foreach ($countCase in @(
+        [pscustomobject]@{ Name = 'cold-4'; Mode = 'cold'; Count = 4 }, [pscustomobject]@{ Name = 'cold-6'; Mode = 'cold'; Count = 6 },
+        [pscustomobject]@{ Name = 'warm-19'; Mode = 'warm'; Count = 19 }, [pscustomobject]@{ Name = 'warm-21'; Mode = 'warm'; Count = 21 }
+    )) {
+        $documents = New-V3FixtureDocuments; $runs = @($documents.Evidence.lanes[0].battery.run_sets[$countCase.Mode].gpu)
+        if ($countCase.Count -lt $runs.Count) { $documents.Evidence.lanes[0].battery.run_sets[$countCase.Mode].gpu = @($runs | Select-Object -First $countCase.Count) }
+        else {
+            $extraRun = Copy-Document $runs[-1]
+            $extraRun.artifact_path = "fixture-windows-nvidia-cuda/battery/runs/$($countCase.Mode)/gpu/$('{0:d2}' -f $countCase.Count).evidence"
+            $extraRun.sequence = $countCase.Count
+            $documents.Evidence.lanes[0].battery.run_sets[$countCase.Mode].gpu = @($runs + $extraRun)
+        }
+        Assert-Rejected (Invoke-Evaluator (New-Bundle $documents "v3-$($countCase.Name)")) "V3 $($countCase.Name)" 'wrong run count'
+    }
+    foreach ($controlCase in @(
+        [pscustomobject]@{ Name = 'order'; Mutate = { param($r) $r.pair_order = 'gpu_then_cpu' }; Expected = 'order violates' },
+        [pscustomobject]@{ Name = 'reset'; Mutate = { param($r) $r.reset_state = 'fresh_process_fresh_model' }; Expected = 'reset state violates' },
+        [pscustomobject]@{ Name = 'priming'; Mutate = { param($r) $r.priming_runs = 0 }; Expected = 'priming violates' }
+    )) {
+        $documents = New-V3FixtureDocuments; & $controlCase.Mutate $documents.Evidence.lanes[0].battery.run_sets.warm.gpu[0]
+        Assert-Rejected (Invoke-Evaluator (New-Bundle $documents "v3-$($controlCase.Name)")) "V3 $($controlCase.Name)" $controlCase.Expected
+    }
+
+    # Inclusive exact 110% boundary for both modes and powers.
+    $exactBoundaryDocuments = New-V3FixtureDocuments 'integrated_gpu' 220 110 220 110
+    foreach ($sets in @($exactBoundaryDocuments.Evidence.lanes[0].run_sets, $exactBoundaryDocuments.Evidence.lanes[0].battery.run_sets)) {
+        foreach ($run in @($sets.cold.cpu)) { $run.end_to_end_ms = 200; $run.backend_ms = 190 }
+    }
+    $exactBoundary = Invoke-PassingFixture $exactBoundaryDocuments 'v3-exact-110-boundary' 139
+    foreach ($performanceCase in @(
+        [pscustomobject]@{ Name = 'ac-cold'; Power = 'ac'; Mode = 'cold'; Value = 221 },
+        [pscustomobject]@{ Name = 'ac-warm'; Power = 'ac'; Mode = 'warm'; Value = 111 },
+        [pscustomobject]@{ Name = 'battery-cold'; Power = 'battery'; Mode = 'cold'; Value = 221 },
+        [pscustomobject]@{ Name = 'battery-warm'; Power = 'battery'; Mode = 'warm'; Value = 111 }
+    )) {
+        $documents = New-V3FixtureDocuments 'integrated_gpu' 220 110 220 110
+        $sets = if ($performanceCase.Power -ceq 'ac') { $documents.Evidence.lanes[0].run_sets } else { $documents.Evidence.lanes[0].battery.run_sets }
+        if ($performanceCase.Mode -ceq 'cold') { foreach ($cpuRun in @($sets.cold.cpu)) { $cpuRun.end_to_end_ms = 200; $cpuRun.backend_ms = 190 } }
+        foreach ($run in @($sets[$performanceCase.Mode].gpu)) { $run.end_to_end_ms = $performanceCase.Value; $run.backend_ms = $performanceCase.Value - 10 }
+        $null = Invoke-FailingFixture $documents "v3-over-$($performanceCase.Name)" "$($performanceCase.Power)_gpu_p95_exceeds_cpu_boundary"
+    }
+
+    # Battery failures are not hidden by successful AC evidence.
+    foreach ($failureCase in @(
+        [pscustomobject]@{ Name = 'timeout'; Category = 'timeout' },
+        [pscustomobject]@{ Name = 'cancelled'; Category = 'cancelled' },
+        [pscustomobject]@{ Name = 'partial-output'; Category = 'partial_output' }
+    )) {
+        $documents = New-V3FixtureDocuments; Set-RunFailure $documents.Evidence.lanes[0].battery.run_sets.warm.gpu[0] $failureCase.Category
+        $decision = Invoke-FailingFixture $documents "v3-battery-$($failureCase.Name)" 'battery_reliability_not_equivalent'
+        Assert-True ($decision.lanes[0].reasons -ccontains 'battery_correctness_not_equivalent') "Battery $($failureCase.Name) did not also suppress correctness."
+    }
+    $batteryParity = New-V3FixtureDocuments; $batteryParity.Evidence.lanes[0].battery.run_sets.warm.gpu[0].transcript_sha256 = Get-Digest 'battery-wrong-transcript'
+    $null = Invoke-FailingFixture $batteryParity 'v3-battery-parity' 'battery_correctness_not_equivalent'
+
+    # The common floor is max(per-power minima); lower valid AC observations
+    # remain acceptable and battery/AC scenarios contribute only to their power.
+    $asymmetricMemory = New-V3FixtureDocuments; $asymmetricLane = $asymmetricMemory.Evidence.lanes[0]
+    foreach ($mode in @('cold', 'warm')) { foreach ($run in @($asymmetricLane.run_sets[$mode].gpu)) { $run.available_device_memory_bytes_before = [Int64]8000000000 } }
+    foreach ($scenario in @($asymmetricLane.scenarios | Where-Object { $_.power_source -ceq 'ac' -and $_.selected_backend -ceq $asymmetricLane.identity.backend })) { $scenario.available_device_memory_bytes = [Int64]8000000000 }
+    $asymmetricLane.identity.device.qualified_minimum_available_memory_bytes = [Int64]9000000000
+    $asymmetricDecision = (Invoke-PassingFixture $asymmetricMemory 'v3-asymmetric-memory' 139).Decision
+    Assert-True ($asymmetricDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -eq 8000000000 -and $asymmetricDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery -eq 9000000000 -and $asymmetricDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'V3 memory floor did not use max(per-power minima).'
+    $lowerDeclaredFloor = Copy-Document $asymmetricMemory; $lowerDeclaredFloor.Evidence.lanes[0].identity.device.qualified_minimum_available_memory_bytes = [Int64]8000000000
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $lowerDeclaredFloor 'v3-lower-declared-floor')) 'Lower common memory floor' 'conservative maximum'
+    $batteryScenarioFloor = New-V3FixtureDocuments; $batteryScenarioLane = $batteryScenarioFloor.Evidence.lanes[0]; @($batteryScenarioLane.scenarios | Where-Object scenario -ceq 'power_battery')[0].available_device_memory_bytes = [Int64]7000000000
+    $batteryScenarioLane.identity.device.qualified_minimum_available_memory_bytes = [Int64]9000000000
+    # AC remains 9 GB, so a battery-only 7 GB observation cannot lower the
+    # common max floor below the independently exercised AC requirement.
+    $null = Invoke-PassingFixture $batteryScenarioFloor 'v3-battery-scenario-attribution' 139
+
+    # Select the warm p95 pair from the worst same-power ratio, never from
+    # independent maxima. Battery wins despite a lower absolute GPU time.
+    $worstRatio = New-V3FixtureDocuments 'integrated_gpu' 220 100 220 88
+    foreach ($run in @($worstRatio.Evidence.lanes[0].battery.run_sets.warm.cpu)) { $run.end_to_end_ms = 80; $run.backend_ms = 70 }
+    $worstRatioDecision = (Invoke-PassingFixture $worstRatio 'v3-worst-same-power-ratio' 139).Decision
+    $worstEvidence = $worstRatioDecision.lanes[0].auto_entry_projection.evidence
+    Assert-True ($worstEvidence.gpu_p95_ms -eq 88 -and $worstEvidence.cpu_p95_ms -eq 80) 'Worst-ratio projection did not retain the same-power battery pair.'
+    $ratioTie = New-V3FixtureDocuments 'integrated_gpu' 220 110 220 99
+    foreach ($run in @($ratioTie.Evidence.lanes[0].battery.run_sets.warm.cpu)) { $run.end_to_end_ms = 90; $run.backend_ms = 80 }
+    $tieEvidence = (Invoke-PassingFixture $ratioTie 'v3-ratio-tie-ac' 139).Decision.lanes[0].auto_entry_projection.evidence
+    Assert-True ($tieEvidence.gpu_p95_ms -eq 110 -and $tieEvidence.cpu_p95_ms -eq 100) 'Equal ratios did not deterministically choose AC.'
+
+    # Both powers are included in projection digests; changing battery cold or
+    # warm evidence changes the corresponding digest, and parity corruption
+    # suppresses the projection entirely.
+    $baselineProjection = $v3Integrated.Decision.lanes[0].auto_entry_projection.evidence
+    $changedBatteryCold = New-V3FixtureDocuments; $changedBatteryCold.Evidence.lanes[0].battery.run_sets.cold.gpu[0].end_to_end_ms++; $changedBatteryCold.Evidence.lanes[0].battery.run_sets.cold.gpu[0].backend_ms++
+    $changedColdProjection = (Invoke-PassingFixture $changedBatteryCold 'v3-battery-cold-digest' 139).Decision.lanes[0].auto_entry_projection.evidence
+    Assert-True ($changedColdProjection.cold_evidence_sha256 -cne $baselineProjection.cold_evidence_sha256) 'Battery cold evidence did not affect projected cold digest.'
+    $changedBatteryWarm = New-V3FixtureDocuments; $changedBatteryWarm.Evidence.lanes[0].battery.run_sets.warm.gpu[0].end_to_end_ms++; $changedBatteryWarm.Evidence.lanes[0].battery.run_sets.warm.gpu[0].backend_ms++
+    $changedWarmProjection = (Invoke-PassingFixture $changedBatteryWarm 'v3-battery-warm-digest' 139).Decision.lanes[0].auto_entry_projection.evidence
+    Assert-True ($changedWarmProjection.warm_evidence_sha256 -cne $baselineProjection.warm_evidence_sha256) 'Battery warm evidence did not affect projected warm digest.'
+    Assert-True ($changedWarmProjection.transcript_parity_evidence_sha256 -ceq $baselineProjection.transcript_parity_evidence_sha256) 'Timing-only mutation unexpectedly changed transcript parity digest.'
     $wrongToolchainVersion = New-FixtureDocuments; $wrongVersionIdentity = $wrongToolchainVersion.Evidence.lanes[0].identity; $revision = $wrongVersionIdentity.app_build_id.Split('#')[1]
     $wrongVersionIdentity.app_build_id = "local-transcriber@9.9.9#$revision"; $wrongWorkerBuild = "scribe-inference-worker@9.9.9#$revision"
     $wrongVersionIdentity.cpu_baseline.worker_build_id = $wrongWorkerBuild; $wrongVersionIdentity.gpu_worker.worker_build_id = $wrongWorkerBuild
@@ -458,6 +805,11 @@ try {
     # Attestation/key/campaign fail-closed cases.
     $payloadTamper = New-Bundle (New-FixtureDocuments) 'signed-payload-tamper'; $payloadTamper.Documents.Evidence.lanes[0].run_sets.warm.gpu[0].end_to_end_ms++
     Rewrite-BundleEvidence $payloadTamper; Assert-Rejected (Invoke-Evaluator $payloadTamper) 'Signed lane payload tamper' 'attestation record does not bind'
+    $batteryPayloadTamper = New-Bundle (New-V3FixtureDocuments) 'signed-battery-payload-tamper'; $batteryPayloadTamper.Documents.Evidence.lanes[0].battery.run_sets.warm.gpu[0].end_to_end_ms++
+    Rewrite-BundleEvidence $batteryPayloadTamper; Assert-Rejected (Invoke-Evaluator $batteryPayloadTamper) 'Signed battery payload tamper' 'attestation record does not bind'
+    $powerContractTamper = New-Bundle (New-V3FixtureDocuments) 'signed-power-contract-tamper'; $powerContractTamper.Documents.Plan.capture_contract.power_policy = 'different-power-policy'; $powerContractTamper.Documents.Evidence.plan_sha256 = Get-CanonicalDigest $powerContractTamper.Documents.Plan
+    Write-Canonical $powerContractTamper.PlanPath $powerContractTamper.Documents.Plan; Rewrite-BundleEvidence $powerContractTamper
+    Assert-Rejected (Invoke-Evaluator $powerContractTamper) 'Signed v3 capture power contract tamper' 'power policy is unsupported'
     $signatureTamper = New-Bundle (New-FixtureDocuments) 'signature-tamper'; [byte[]]$signatureBytes = [Convert]::FromBase64String($signatureTamper.Documents.Evidence.lanes[0].attestation.signature_base64); $signatureBytes[0] = $signatureBytes[0] -bxor 1
     $signatureTamper.Documents.Evidence.lanes[0].attestation.signature_base64 = [Convert]::ToBase64String($signatureBytes); Rewrite-BundleEvidence $signatureTamper
     Assert-Rejected (Invoke-Evaluator $signatureTamper) 'Signature tamper' 'attestation signature is invalid'
@@ -597,11 +949,50 @@ try {
     Assert-True (-not $parityDecision.qualification_passed -and $parityDecision.lanes[0].reasons -ccontains 'correctness_not_equivalent') 'Transcript parity failure was not ineligible.'
     $inventoryTamper = New-Bundle (New-FixtureDocuments) 'artifact-tamper'; $tamperedPath = Join-Path $inventoryTamper.ArtifactRoot 'fixture-windows-nvidia-cuda\runs\warm\gpu\01.evidence'; [IO.File]::WriteAllText($tamperedPath, 'tampered', $Utf8)
     Assert-Rejected (Invoke-Evaluator $inventoryTamper) 'Signed inventory artifact tamper' 'digest does not match'
+    $batteryArtifactTamper = New-Bundle (New-V3FixtureDocuments) 'battery-artifact-tamper'; $batteryTamperedPath = Join-Path $batteryArtifactTamper.ArtifactRoot 'fixture-windows-nvidia-cuda\battery\runs\warm\gpu\01.evidence'; [IO.File]::WriteAllText($batteryTamperedPath, 'tampered', $Utf8)
+    Assert-Rejected (Invoke-Evaluator $batteryArtifactTamper) 'Signed battery artifact tamper' 'digest does not match'
+    $signedLeftover = New-Bundle (New-V3FixtureDocuments) 'v3-signed-leftover'; $leftoverRelative = 'fixture-windows-nvidia-cuda/zz-signed-leftover.evidence'; $leftoverPath = Join-Path $signedLeftover.ArtifactRoot ($leftoverRelative.Replace('/', '\'))
+    $leftoverDigest = Write-Envelope $leftoverPath 'windows_gpu_qualification_run_artifact' ([ordered]@{ marker = 'unreferenced' })
+    $signedLeftover.Documents.Evidence.lanes[0].artifact_inventory = @($signedLeftover.Documents.Evidence.lanes[0].artifact_inventory + [ordered]@{ artifact_path = $leftoverRelative; artifact_sha256 = $leftoverDigest })
+    Refresh-BundleSignatures $signedLeftover
+    Assert-Rejected (Invoke-Evaluator $signedLeftover) 'Signed v3 inventory leftover' 'contains unreferenced files'
     $unsignedExtra = New-Bundle (New-FixtureDocuments) 'unsigned-extra'; [IO.File]::WriteAllText((Join-Path $unsignedExtra.ArtifactRoot 'extra.evidence'), 'extra', $Utf8)
     $extraResult = Invoke-Evaluator $unsignedExtra; Assert-True ($extraResult.ExitCode -eq 0) "Unreferenced filesystem file changed signed-inventory evaluation: $($extraResult.Stderr)"
     $inventoryEntryTamper = New-Bundle (New-FixtureDocuments) 'inventory-entry-tamper'; $inventoryEntryTamper.Documents.Evidence.lanes[0].artifact_inventory[0].artifact_sha256 = Get-Digest 'other-artifact'; Rewrite-BundleEvidence $inventoryEntryTamper
     Assert-Rejected (Invoke-Evaluator $inventoryEntryTamper) 'Signed inventory entry tamper' 'attestation record does not bind'
     $missingArtifacts = New-Bundle (New-FixtureDocuments) 'missing-artifacts' $false; Assert-Rejected (Invoke-Evaluator $missingArtifacts) 'Missing signed artifacts' 'Could not read'
+    $oversizedArtifact = New-Bundle (New-V3FixtureDocuments) 'v3-oversized-artifact'; $oversizedArtifactPath = Join-Path $oversizedArtifact.ArtifactRoot 'fixture-windows-nvidia-cuda\battery\runs\cold\cpu\01.evidence'
+    $oversizedStream = [IO.File]::Open($oversizedArtifactPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $oversizedStream.SetLength(16MB + 1) } finally { $oversizedStream.Dispose() }
+    Assert-Rejected (Invoke-Evaluator $oversizedArtifact) 'V3 per-file 16 MiB overflow' 'empty or oversized'
+    $declaredOverflow = New-Bundle (New-V3FixtureDocuments) 'v3-declared-artifact-overflow'
+    $declaredOverflow.Documents.Evidence.lanes[0].artifact_inventory = @(
+        0..4096 | ForEach-Object { [ordered]@{ artifact_path = ('overflow/{0:d4}.evidence' -f $_); artifact_sha256 = Get-Digest "overflow-$_" } }
+    )
+    Refresh-BundleSignatures $declaredOverflow
+    Assert-Rejected (Invoke-Evaluator $declaredOverflow) 'V3 declared artifact-count overflow' 'inventory is empty or oversized'
+    $cumulativeOverflow = New-Bundle (New-V3FixtureDocuments) 'v3-cumulative-artifact-overflow'; $firstCumulativeLane = $cumulativeOverflow.Documents.Evidence.lanes[0]; $secondCumulativeLane = Copy-Document $firstCumulativeLane
+    $secondCumulativeLane.identity.lane_id = 'fixture-windows-nvidia-cuda-z'
+    $secondCumulativeLane.artifact_inventory = @(0..3957 | ForEach-Object { [ordered]@{ artifact_path = ('second-overflow/{0:d4}.evidence' -f $_); artifact_sha256 = Get-Digest "second-overflow-$_" } })
+    $cumulativeOverflow.Documents.Plan.required_lanes = @(
+        [ordered]@{ evidence_sha256 = Get-Digest 'first-cumulative-placeholder'; identity = $firstCumulativeLane.identity },
+        [ordered]@{ evidence_sha256 = Get-Digest 'second-cumulative-placeholder'; identity = $secondCumulativeLane.identity }
+    )
+    $firstCumulativeLane.attestation = New-Attestation $cumulativeOverflow.Documents.Plan $firstCumulativeLane
+    $secondCumulativeLane.attestation = New-Attestation $cumulativeOverflow.Documents.Plan $secondCumulativeLane
+    $cumulativeOverflow.Documents.Evidence.lanes = @($firstCumulativeLane, $secondCumulativeLane)
+    $cumulativeOverflow.Documents.Plan.required_lanes = @(
+        [ordered]@{ evidence_sha256 = Get-CanonicalDigest $firstCumulativeLane; identity = $firstCumulativeLane.identity },
+        [ordered]@{ evidence_sha256 = Get-CanonicalDigest $secondCumulativeLane; identity = $secondCumulativeLane.identity }
+    )
+    $cumulativeOverflow.Documents.Evidence.plan_sha256 = Get-CanonicalDigest $cumulativeOverflow.Documents.Plan
+    Write-Canonical $cumulativeOverflow.PlanPath $cumulativeOverflow.Documents.Plan; Rewrite-BundleEvidence $cumulativeOverflow
+    Assert-Rejected (Invoke-Evaluator $cumulativeOverflow) 'V3 cumulative 4097 artifact overflow before second inventory read' 'artifact-count bound'
+    $integratedV2Memory = New-FixtureDocuments; Set-IntegratedFixture $integratedV2Memory; $integratedV2Lane = $integratedV2Memory.Evidence.lanes[0]
+    @($integratedV2Lane.scenarios | Where-Object scenario -ceq 'power_battery')[0].available_device_memory_bytes = [Int64]7000000000
+    $integratedV2Lane.identity.device.qualified_minimum_available_memory_bytes = [Int64]7000000000
+    $integratedV2Decision = (Invoke-PassingFixture $integratedV2Memory 'v2-integrated-heterogeneous-memory' 75).Decision
+    Assert-True ($integratedV2Decision.lanes[0].evidence_memory_floor.minimum_available_memory_bytes -eq 7000000000) 'Schema v2 no longer pools its legacy successful GPU scenario memory evidence.'
     $integrated = New-FixtureDocuments; Set-IntegratedFixture $integrated; $integrated.Plan.runtime_bucket_complete = $true
     Assert-Rejected (Invoke-Evaluator (New-Bundle $integrated 'integrated-bucket')) 'Integrated v2 incomplete battery bucket' 'cannot mark an integrated or unified GPU runtime bucket complete'
 

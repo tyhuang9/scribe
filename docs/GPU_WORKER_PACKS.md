@@ -91,12 +91,21 @@ nonmatching entry denies Auto GPU use.
 The offline Windows qualification boundary is specified in
 [`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md). It digest-binds
 the evaluator, toolchain, Auto manifest, plan, lane identities, 50 paired run
-records, lane-level P-256 capture attestation, exact per-generation SCIF v5
+records per required power source, lane-level P-256 capture attestation, exact
+per-generation SCIF v5
 Hello/Ready frames, separate complete provider-discovery inventories,
 selected-device launches, stable-ID remapping, source artifacts,
 power/mixed-device behavior, lifecycle recovery, and clean-installer evidence.
 Vulkan runtime identities are cross-bound to NVIDIA (`10de`), AMD (`1002` or
 `1022`), and Intel (`8086`) PCI vendor IDs.
+Qualification schema v3 requires independent AC and battery performance for
+integrated/unified GPUs; discrete GPUs need AC performance and CPU selection on
+battery. Each power must meet the 5-cold/20-warm correctness, reliability, and
+110% p95 limits. Power-bound acquisitions, sessions, captures, and scenarios
+prevent mixing the two sets. One runtime projection uses the higher per-power
+exercised memory floor and the worse same-power warm GPU/CPU ratio, with evidence
+digests binding both powers. V2 remains AC-only and cannot complete a
+shared-memory GPU bucket. This adds an evidence capability, not Auto eligibility.
 Passing fixtures can emit diagnostic projections but can never become
 Auto-eligible. The checked-in production plan has no lanes, its independent
 approval authority is empty, its runtime-bucket coverage flag is false, and the

@@ -20,9 +20,10 @@ already be listed in the fixed checked-in production authority.
 
 ## Bound review inputs
 
-A canonical schema-v2 plan fixes the exact evaluator, Windows worker toolchain,
+A canonical schema-v3 plan fixes the exact evaluator, Windows worker toolchain,
 and Auto manifest SHA-256 digests. It also fixes exactly five cold and twenty warm
-CPU/GPU pairs, the inclusive 110 percent p95 boundary, the required scenario
+CPU/GPU pairs per required power source, the inclusive 110 percent p95 boundary,
+the required scenario
 set, whether reviewers have established complete coverage of an Auto runtime
 bucket, and every required lane with a digest of its complete evidence object.
 The evidence document binds the exact plan digest. The plan also binds a
@@ -30,6 +31,16 @@ The evidence document binds the exact plan digest. The plan also binds a
 the exact raw-frame/capture policy. A fixture plan alone may carry a fixture
 SPKI and still requires `-AllowFixture`; a production SPKI resolves only from
 the fixed production authority.
+
+Schema v3 requires AC performance for discrete GPUs and independent AC and
+battery performance for integrated/unified GPUs. The capture contract fixes
+this power matrix as
+`power_policy: "ac_for_discrete_ac_and_battery_for_integrated_or_unified"`;
+it is not a caller-selectable shortcut. Schema-v2 evidence
+retains its original AC-only shapes and rules, including the prohibition on
+completing integrated/unified runtime buckets. Plan and evidence versions must
+match. Supporting the old schema does not waive its exact evaluator digest or
+authorize rebinding historical evidence to a new evaluator.
 
 Each lane binds:
 
@@ -43,7 +54,7 @@ Each lane binds:
   index—plus exact driver, vendor, class, memory model, and minimum total and
   available memory;
 - opaque machine and acquisition-batch identities, CPU topology, thread and
-  affinity facts, power plan, AC benchmark conditions, thermal/background-load
+  affinity facts, power plan, benchmark power conditions, thermal/background-load
   controls, and a recomputed digest of the complete stable device inventory;
 - the telemetry source, worker/selected-device scope, and bounded sampling
   interval; and
@@ -55,6 +66,17 @@ the lane's selected-device identity. The `mixed_gpu` fact must agree with
 actual vendor or device-class diversity rather than merely the device count.
 At least one mixed-device lane is required before the overall evidence can
 pass.
+
+In v3, the existing `identity.acquisition` and lane performance fields describe
+AC. `identity.battery_acquisition` and the lane's `battery` evidence block are
+required for integrated/unified GPUs and must both be `null` for discrete GPUs.
+The battery block contains its acquisition artifact, cold/warm CPU/GPU run sets,
+and raw captures. Both acquisitions use protocol 2 and the `system_managed`
+GPU power profile, with independently bound power-plan digests. Battery testing
+does not force maximum-performance mode. Machine, hardware, topology, threading,
+affinity, inference options, device inventory, and harness identities must match
+across powers; acquisition batch IDs must differ. Protocol 1 and its fixed
+maximum-performance AC control remain unchanged for v2.
 
 Every worker generation has one signed capture containing the exact base64 SCIF
 v5 Hello request and Ready response bytes. The evaluator validates the 26-byte
@@ -76,6 +98,14 @@ twenty warm measurements per target bind one retained, once-primed capture.
 Transient indexes need only be unique, not contiguous, and are never persistent
 identity.
 
+V3 run and raw-capture records bind the canonical acquisition digest and observed
+power source before and after the operation. Both observations must match the
+containing AC or battery acquisition; transitions and unknown power are rejected.
+Session, pair, and generation IDs also include the power source. Each power uses
+fresh worker generations, provider discovery, and globally unique challenges.
+These observations are signed capture-envelope metadata: SCIF remains version 5,
+and its Hello/Ready frames do not themselves report host power.
+
 CUDA lanes require a bounded canonical `windows-display:` version. Vulkan
 lanes may use that Windows display form or the exact provider runtime identity
 `vulkan:<vendor-id>:<driver-id>:<driver-version>:<driver-uuid>`, with fixed
@@ -85,9 +115,10 @@ and truncated driver identities are rejected.
 
 ## Paired performance and parity
 
-The evaluator consumes exactly 50 measured records per lane: five cold CPU and
-GPU pairs followed by twenty warm CPU and GPU pairs. Odd pairs are CPU then GPU;
-even pairs are GPU then CPU. Every cold measurement names a fresh worker/model
+The evaluator consumes exactly 50 measured records per required power source:
+five cold CPU and GPU pairs followed by twenty warm CPU and GPU pairs. A v3
+integrated/unified lane therefore contains 100 measurements. Odd pairs are CPU
+then GPU; even pairs are GPU then CPU. Every cold measurement names a fresh worker/model
 generation for each target and pair. Warm measurements name one retained
 generation per target after exactly one unmeasured priming run. Session, pair,
 order, reset state, machine, batch, options, Windows build, device set, worker,
@@ -103,18 +134,34 @@ shared-host-memory telemetry and zero dedicated VRAM. Failed records remain in
 the report and prevent correctness and reliability equivalence; they are never
 dropped to improve a percentile.
 
-The projected minimum total memory equals the observed lane total; schema v2
-does not generalize one device's result to a smaller adapter. The projected
-minimum available memory equals the lowest availability actually exercised by
-a successful GPU run or successful Auto-to-GPU scenario. Every successful GPU
-start must meet that emitted floor. A lower plan-asserted threshold is rejected
-instead of turning untested memory capacity into an Auto promise.
+The projected minimum total memory equals the observed lane total; neither
+schema generalizes one device's result to a smaller adapter. For each power,
+the evaluator finds the lowest availability actually exercised by a successful
+GPU run or successful Auto-to-GPU scenario on that power. The v3 shared-memory
+projection uses the **higher** of those AC and battery minima, so evidence at a
+lower availability on one power cannot weaken the other power's requirement.
+Valid measurements below this conservative common floor remain evidence for
+their own power. A lower plan-asserted common threshold is rejected. AC-only v3
+lanes use the AC exercised minimum. V2 retains its legacy minimum across AC
+runs and all successful GPU scenario observations; it still cannot complete an
+integrated/unified runtime bucket without battery performance.
 
 The evaluator recomputes nearest-rank p50 and p95 using integers. The cold p95
 is rank 5 of 5; the warm p95 is rank 19 of 20. Both cold and warm pass only
 when `gpu_p95 * 100 <= cpu_p95 * 110`. Overflow-safe integer arithmetic is
-used. Every one of the 50 transcript digests must equal the plan-bound expected
-digest, and every record must succeed.
+used independently for every required power; AC and battery timings are never
+pooled. Every transcript digest must equal the plan-bound expected digest, and
+every record must succeed. Failure on either power suppresses the lane's Auto
+projection, even when the other power passes.
+
+There is still only one Auto projection per lane. Its displayed warm CPU/GPU
+p95 pair comes from the worse same-power GPU/CPU ratio, compared using
+overflow-safe integer cross-products, with AC winning ties. The evaluator never
+combines a CPU value from one power with a GPU value from the other. Its 5/20
+run counts describe the minimum independently satisfied on each power; cold,
+warm, and parity evidence digests bind explicitly power-keyed evidence for all
+required powers. Diagnostic decisions retain separate per-power metrics and
+failure results.
 
 ## Required Windows scenarios
 
@@ -136,11 +183,26 @@ Every lane carries a separately hashed canonical artifact for:
 All scenarios prohibit active-request migration and partial-output replay,
 require selection reevaluation, and require recovery on the next request.
 For a discrete lane, Auto must select CPU on battery. Integrated or unified
-GPUs remain eligible on battery in the runtime policy, but schema v2 collects
-its 5/20 performance pairs on AC only. Therefore schema v2 rejects
-`runtime_bucket_complete: true` when any lane is integrated or unified. A
-future schema must add paired battery performance before those runtime buckets
-can be activated.
+GPUs remain eligible on battery in the runtime policy. V3 binds their
+`power_battery` scenario to the battery acquisition and a battery selected-device
+capture; AC GPU scenarios bind to AC. Scenario memory is attributed only to the
+matching power. Discrete battery scenarios continue to require CPU selection.
+Their success remains mandatory even though discrete lanes have no battery
+performance metrics. V3 reports an aggregate `checks.scenarios_passed` across
+all nine scenarios as well as the per-power performance checks.
+Schema v2 collects its 5/20 performance pairs on AC only and therefore still
+rejects `runtime_bucket_complete: true` when any lane is integrated or unified.
+V3 supplies the missing evidence shape, not representative hardware coverage or
+permission to activate a runtime bucket.
+
+V3 scenarios add `acquisition_sha256`, `power_source_before`,
+`power_source_after`, and `selected_capture_sha256`. A GPU selection must name a
+selected-device capture from the matching acquisition and power, not a discovery
+capture. CPU selection requires a zero selected-capture digest. The discrete
+`power_battery` scenario is the explicit exception to acquisition binding: it
+has no battery performance acquisition, requires both power observations to be
+`battery`, and uses zero acquisition and selected-capture digests. Existing
+mixed-device before/after capture fields retain their remapping purpose.
 
 ## Capture attestation and inventory
 
@@ -154,6 +216,11 @@ includes all plan policy and checked-in contract bindings plus the complete
 ordered required-lane identity matrix, while deliberately excluding final
 evidence digests to avoid a signature/plan cycle.
 
+The attestation record's `acquisition_batch_id` continues to denote the AC
+acquisition. In v3, the signed lane identity and payload additionally bind the
+battery acquisition, its batch, and every battery artifact; the attestation
+preimage and signature scheme do not change.
+
 The signing preimage is exactly:
 
 ```text
@@ -165,8 +232,10 @@ ASCII("SCRIBE-WINDOWS-GPU-QUALIFICATION-LANE-ATTESTATION-V1\0")
 ECDSA signs SHA-256 of that preimage. The evaluator authenticates this record
 before opening any referenced artifact. It then opens every signed inventory
 member through retained handles, checks its digest and limits, and only then
-parses the acquisition, 50 runs, nine scenarios, and 15 raw captures. Every
-inventory member must be consumed exactly once.
+parses the acquisitions, runs, scenarios, and raw captures. AC-only lanes have
+one acquisition, 50 runs, nine scenarios, and 15 captures (75 artifacts). V3
+integrated/unified lanes add one battery acquisition, 50 runs, and 13 captures
+(139 artifacts total). Every inventory member must be consumed exactly once.
 
 ## Filesystem and JSON boundary
 
@@ -186,6 +255,9 @@ acquisition, run, scenario, and raw SCIF capture artifact is a canonical version
 envelope whose record must exactly equal the digest-bound evidence record. The
 global limits are 64 lanes, 4096 artifacts, 16 MiB per file, and 512 MiB total
 artifacts.
+The limits apply to the entire evidence document, not separately to each power.
+Adding battery evidence does not double the budgets. The cumulative declared
+artifact count is checked before the next signed inventory is opened.
 
 The evaluator writes only one canonical decision to stdout. It has no apply,
 activate, output-file, trust, catalog, state, or Auto-manifest mutation mode.
@@ -212,6 +284,16 @@ Even complete approved evidence is not Auto-eligible until its projections
 match the checked-in Auto entries exactly one-for-one. This evaluator never
 performs that later policy edit. Pack trust and release signing remain separate
 gates.
+
+The current release path also has a source-revision feedback constraint: pack
+digests include build identities tied to the source revision, and the installer
+requires a pack from its own revision. Committing a qualification entry for an
+already built pack changes that revision; rebuilding the pack then changes its
+digest. The ordinary "qualify, commit entry, rebuild" sequence therefore cannot
+activate the first nonempty Auto policy unchanged. Resolving this release-policy
+dependency without weakening pack or build verification is a separate stage;
+this evidence-schema change does not solve it. CPU defaults and explicit GPU
+delivery are unaffected.
 
 The decision distinguishes structural rejection (exit status 1), a valid
 ineligible decision (exit status 0, or 2 with `-RequireEligible`), and a future
