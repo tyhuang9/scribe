@@ -59,6 +59,8 @@ pub(crate) use crate::worker_identity::{
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -434,6 +436,13 @@ struct Frame {
 }
 
 fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<()> {
+    let bytes = encode_frame_bytes(frame)?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn encode_frame_bytes(frame: &Frame) -> Result<Vec<u8>> {
     let limit = match frame.kind {
         FrameKind::Control => MAX_CONTROL_BYTES,
         FrameKind::Pcm => MAX_PCM_FRAME_BYTES,
@@ -441,17 +450,30 @@ fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<()> {
     if frame.body.len() > limit {
         bail!("worker frame exceeds {limit}-byte limit");
     }
-    writer.write_all(&PROTOCOL_MAGIC)?;
-    writer.write_all(&[PROTOCOL_VERSION, frame.kind as u8])?;
-    writer.write_all(&(frame.body.len() as u32).to_le_bytes())?;
-    writer.write_all(&frame.session_id.to_le_bytes())?;
-    writer.write_all(&frame.request_id.to_le_bytes())?;
-    writer.write_all(&frame.body)?;
-    writer.flush()?;
-    Ok(())
+    let mut bytes = Vec::with_capacity(HEADER_LEN.saturating_add(frame.body.len()));
+    bytes.extend_from_slice(&PROTOCOL_MAGIC);
+    bytes.extend_from_slice(&[PROTOCOL_VERSION, frame.kind as u8]);
+    bytes.extend_from_slice(&(frame.body.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&frame.session_id.to_le_bytes());
+    bytes.extend_from_slice(&frame.request_id.to_le_bytes());
+    bytes.extend_from_slice(&frame.body);
+    Ok(bytes)
 }
 
 fn read_frame(reader: &mut impl Read) -> Result<Frame> {
+    read_frame_components(reader).map(|(_, frame)| frame)
+}
+
+#[cfg(feature = "windows-gpu-capture-observation")]
+fn read_frame_with_raw(reader: &mut impl Read) -> Result<(Frame, Vec<u8>)> {
+    let (header, frame) = read_frame_components(reader)?;
+    let mut raw = Vec::with_capacity(HEADER_LEN.saturating_add(frame.body.len()));
+    raw.extend_from_slice(&header);
+    raw.extend_from_slice(&frame.body);
+    Ok((frame, raw))
+}
+
+fn read_frame_components(reader: &mut impl Read) -> Result<([u8; HEADER_LEN], Frame)> {
     let mut header = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header)?;
     if header[..4] != PROTOCOL_MAGIC {
@@ -471,12 +493,13 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame> {
     }
     let mut body = vec![0; body_len];
     reader.read_exact(&mut body)?;
-    Ok(Frame {
+    let frame = Frame {
         kind,
         session_id: u64::from_le_bytes(header[10..18].try_into().unwrap()),
         request_id: u64::from_le_bytes(header[18..26].try_into().unwrap()),
         body,
-    })
+    };
+    Ok((header, frame))
 }
 
 fn encode_pcm(samples: &[f32]) -> Result<Vec<u8>> {
@@ -722,7 +745,21 @@ fn parse_worker_control(frame: Frame) -> Result<(u64, u64, Control)> {
     Ok(parsed)
 }
 
-type PendingResult = std::result::Result<Control, String>;
+struct WorkerResponse {
+    control: Control,
+    #[cfg(feature = "windows-gpu-capture-observation")]
+    raw_frame: Vec<u8>,
+}
+
+struct ParsedWorkerResponse {
+    session_id: u64,
+    request_id: u64,
+    control: Control,
+    #[cfg(feature = "windows-gpu-capture-observation")]
+    raw_frame: Vec<u8>,
+}
+
+type PendingResult = std::result::Result<WorkerResponse, String>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Correlation {
@@ -745,6 +782,10 @@ trait WorkerProcess: Send + Sync {
     }
     fn terminate(&self) -> Result<()>;
     fn wait(&self) -> Result<()>;
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
+        bail!("worker process does not expose a Windows observation handle")
+    }
 }
 
 struct SpawnedWorker {
@@ -1624,8 +1665,17 @@ impl PackDriverCatalog {
     }
 }
 
-#[cfg(any(all(windows, feature = "inference-worker"), test))]
-fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32)> {
+#[cfg(any(
+    all(
+        windows,
+        any(
+            feature = "inference-worker",
+            feature = "windows-gpu-capture-observation"
+        )
+    ),
+    test
+))]
+pub(crate) fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32)> {
     if identity != identity.to_ascii_lowercase() {
         return None;
     }
@@ -3963,6 +4013,42 @@ impl WorkerProcess for OsWorkerProcess {
             .wait()?;
         Ok(())
     }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("process worker process lock was poisoned"))?;
+        if child.try_wait()?.is_some() {
+            bail!("process worker exited before its observation handle was retained");
+        }
+        let mut duplicate: HANDLE = std::ptr::null_mut();
+        // SAFETY: both source and target process pseudo-handles refer to this
+        // process, the Child owns a live process handle, and `duplicate` is
+        // writable for the synchronous call. The returned handle is uniquely
+        // transferred into OwnedHandle below.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                child.as_raw_handle() as HANDLE,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 || duplicate.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("could not retain the worker process observation handle");
+        }
+        // SAFETY: DuplicateHandle returned a new owned handle on success.
+        Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+    }
 }
 
 struct WriterSlot {
@@ -3976,11 +4062,71 @@ struct CurrentGeneration {
     expectation: WorkerExpectation,
     pack_launch: Option<PackLaunchContext>,
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
+    #[cfg(feature = "windows-gpu-capture-observation")]
+    validated_handshake: Option<ValidatedWorkerHandshake>,
+}
+
+#[cfg(feature = "windows-gpu-capture-observation")]
+#[derive(Clone)]
+struct ValidatedWorkerHandshake {
+    hello_frame: Arc<[u8]>,
+    ready_frame: Arc<[u8]>,
 }
 
 struct WorkerGenerationContext {
     generation: u64,
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
+}
+
+/// A read-only observation lease for one validated worker generation.
+///
+/// It deliberately exposes no PID. The duplicated process handle remains
+/// useful only while the same supervisor generation is current and running;
+/// cancellation, crash, shutdown, or replacement invalidates the lease.
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone)]
+pub(crate) struct WorkerObservationLease {
+    supervisor: Weak<SupervisorInner>,
+    generation: u64,
+    process: Arc<dyn WorkerProcess>,
+    process_handle: Arc<OwnedHandle>,
+    handshake: ValidatedWorkerHandshake,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl WorkerObservationLease {
+    pub(crate) fn hello_frame(&self) -> &[u8] {
+        &self.handshake.hello_frame
+    }
+
+    pub(crate) fn ready_frame(&self) -> &[u8] {
+        &self.handshake.ready_frame
+    }
+
+    pub(crate) fn process_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.process_handle.as_raw_handle() as _
+    }
+
+    pub(crate) fn require_current(&self) -> Result<()> {
+        let inner = self
+            .supervisor
+            .upgrade()
+            .ok_or_else(|| anyhow!("worker observation supervisor was dropped"))?;
+        let current = inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .is_some_and(|current| {
+                current.generation == self.generation
+                    && Arc::ptr_eq(&current.process, &self.process)
+            });
+        if !current || !self.process.is_running()? {
+            bail!("worker observation lease is no longer current")
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4543,6 +4689,8 @@ impl ProcessWorkerSupervisor {
                 expectation: expectation.clone(),
                 pack_launch,
                 pack_bindings: Vec::new(),
+                #[cfg(feature = "windows-gpu-capture-observation")]
+                validated_handshake: None,
             });
             state.active_stream = None;
             state.active_model = None;
@@ -4663,11 +4811,31 @@ impl ProcessWorkerSupervisor {
             .name(format!("scribe-process-worker-reader-{generation}"))
             .spawn(move || {
                 loop {
-                    let response = read_frame(&mut stdout).and_then(parse_worker_control);
+                    #[cfg(feature = "windows-gpu-capture-observation")]
+                    let response = read_frame_with_raw(&mut stdout).and_then(|(frame, raw_frame)| {
+                        parse_worker_control(frame).map(|(session_id, request_id, control)| {
+                            ParsedWorkerResponse {
+                                session_id,
+                                request_id,
+                                control,
+                                raw_frame,
+                            }
+                        })
+                    });
+                    #[cfg(not(feature = "windows-gpu-capture-observation"))]
+                    let response = read_frame(&mut stdout).and_then(|frame| {
+                        parse_worker_control(frame).map(|(session_id, request_id, control)| {
+                            ParsedWorkerResponse {
+                                session_id,
+                                request_id,
+                                control,
+                            }
+                        })
+                    });
                     let Some(inner) = Weak::upgrade(&weak) else {
                         break;
                     };
-                    let (session_id, request_id, control) = match response {
+                    let response = match response {
                         Ok(response) => response,
                         Err(error) => {
                             if let Err(retire_error) = ProcessWorkerSupervisor::from_inner(inner)
@@ -4685,8 +4853,8 @@ impl ProcessWorkerSupervisor {
                     };
                     let correlation = Correlation {
                         generation,
-                        session_id,
-                        request_id,
+                        session_id: response.session_id,
+                        request_id: response.request_id,
                     };
                     let waiter = match inner.pending.lock() {
                         Ok(mut pending) => pending.remove(&correlation),
@@ -4698,7 +4866,11 @@ impl ProcessWorkerSupervisor {
                         // request owns the last public supervisor handle, its
                         // subsequent drop must synchronously reach shutdown.
                         drop(inner);
-                        let _ = waiter.send(Ok(control));
+                        let _ = waiter.send(Ok(WorkerResponse {
+                            control: response.control,
+                            #[cfg(feature = "windows-gpu-capture-observation")]
+                            raw_frame: response.raw_frame,
+                        }));
                         continue;
                     }
                     if let Err(error) = ProcessWorkerSupervisor::from_inner(inner)
@@ -4844,7 +5016,7 @@ impl ProcessWorkerSupervisor {
         let result =
             self.await_response_with_cancellation(correlation, response, timeout, cancelled);
         self.clear_active(correlation);
-        result
+        result.map(|response| response.control)
     }
 
     fn require_stream(&self, session_id: u64) -> Result<SupervisorStream> {
@@ -4912,16 +5084,42 @@ impl ProcessWorkerSupervisor {
                 return Err(error);
             }
         };
+        #[cfg(feature = "windows-gpu-capture-observation")]
+        let raw_hello = match hello
+            .as_ref()
+            .map(|_| encode_frame_bytes(&frame))
+            .transpose()
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.unregister(correlation);
+                return Err(error);
+            }
+        };
         if let Err(error) = self.write_frames(generation, &[frame]) {
             self.unregister(correlation);
             self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
-        match self.await_response_with_cancellation(correlation, response, timeout, cancelled)? {
+        let response =
+            self.await_response_with_cancellation(correlation, response, timeout, cancelled)?;
+        match response.control {
             Control::Ready { capability } if hello.is_some() => {
                 let (challenge, expected) = hello.expect("checked above");
                 validate_worker_capability(&capability, &challenge, &expected)?;
-                self.bind_generation_pack_capability(generation, &expected, &capability)
+                self.bind_generation_pack_capability(generation, &expected, &capability)?;
+                #[cfg(feature = "windows-gpu-capture-observation")]
+                {
+                    self.record_validated_handshake(
+                        generation,
+                        raw_hello.expect("Hello frame was serialized above"),
+                        response.raw_frame,
+                    )
+                }
+                #[cfg(not(feature = "windows-gpu-capture-observation"))]
+                {
+                    Ok(())
+                }
             }
             Control::Ok if hello.is_none() => Ok(()),
             Control::Error { message } => bail!("process worker: {message}"),
@@ -4963,6 +5161,70 @@ impl ProcessWorkerSupervisor {
             }
             _ => bail!("process worker pack capability did not match launch authority"),
         }
+    }
+
+    #[cfg(feature = "windows-gpu-capture-observation")]
+    fn record_validated_handshake(
+        &self,
+        generation: u64,
+        hello_frame: Vec<u8>,
+        ready_frame: Vec<u8>,
+    ) -> Result<()> {
+        if hello_frame.len() > HEADER_LEN + MAX_CONTROL_BYTES
+            || ready_frame.len() > HEADER_LEN + MAX_CONTROL_BYTES
+        {
+            bail!("validated worker handshake exceeded the control-frame bound")
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_mut()
+            .filter(|current| current.generation == generation)
+            .ok_or_else(|| anyhow!("process worker generation changed during Hello"))?;
+        if current.validated_handshake.is_some() {
+            bail!("process worker generation already has a validated Hello/Ready capture")
+        }
+        current.validated_handshake = Some(ValidatedWorkerHandshake {
+            hello_frame: hello_frame.into(),
+            ready_frame: ready_frame.into(),
+        });
+        Ok(())
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn observation_lease(&self) -> Result<WorkerObservationLease> {
+        let generation = self.ensure_generation()?;
+        let (process, handshake) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let current = state
+                .current
+                .as_ref()
+                .filter(|current| current.generation == generation)
+                .ok_or_else(|| anyhow!("process worker generation changed before observation"))?;
+            let handshake = current
+                .validated_handshake
+                .clone()
+                .ok_or_else(|| anyhow!("worker observation requires a validated Hello/Ready"))?;
+            (Arc::clone(&current.process), handshake)
+        };
+        let process_handle = Arc::new(process.duplicate_observation_handle()?);
+        let lease = WorkerObservationLease {
+            supervisor: Arc::downgrade(&self.inner),
+            generation,
+            process,
+            process_handle,
+            handshake,
+        };
+        lease.require_current()?;
+        Ok(lease)
     }
 
     fn generation_context(&self) -> Result<WorkerGenerationContext> {
@@ -5010,7 +5272,7 @@ impl ProcessWorkerSupervisor {
         response: Receiver<PendingResult>,
         timeout: Duration,
         cancelled: Option<&AtomicBool>,
-    ) -> Result<Control> {
+    ) -> Result<WorkerResponse> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| anyhow!("process worker response deadline overflowed"))?;
@@ -6348,6 +6610,144 @@ impl InferenceWorkerSupervisor {
                 .map_err(worker_unavailable)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GpuCaptureObservationIdentity {
+    pub(crate) backend: String,
+    pub(crate) provider: String,
+    pub(crate) stable_device: String,
+    pub(crate) driver: String,
+    pub(crate) device_class: String,
+    pub(crate) vendor: String,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) pack_id: String,
+    pub(crate) pack_version: String,
+    pub(crate) pack_sha256: String,
+    pub(crate) pack_security_epoch: u64,
+    pub(crate) runtime_abi: u16,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+pub(crate) struct CaptureObservationWorker {
+    supervisor: InferenceWorkerSupervisor,
+    pub(crate) gpu_identity: Option<GpuCaptureObservationIdentity>,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl CaptureObservationWorker {
+    pub(crate) fn cpu() -> Self {
+        Self {
+            supervisor: InferenceWorkerSupervisor::unstarted(),
+            gpu_identity: None,
+        }
+    }
+
+    pub(crate) fn gpu(pack_id: &str, backend: &str, stable_device: &str) -> Result<Self> {
+        let backend = match backend {
+            "cuda" => BackendKind::Cuda,
+            "vulkan" => BackendKind::Vulkan,
+            _ => bail!("GPU observation backend must be cuda or vulkan"),
+        };
+        let registry = discover_production_pack_launch_bindings(
+            crate::gpu_worker_pack::discover_production_pack_leases(),
+        );
+        let (bindings, _) = registry.into_parts();
+        let mut matches = bindings.into_iter().filter(|binding| {
+            let target = binding.backend_target();
+            target.backend == backend
+                && target.device_id.as_str() == stable_device
+                && target
+                    .pack
+                    .as_ref()
+                    .is_some_and(|pack| pack.pack_id == pack_id)
+        });
+        let binding = matches
+            .next()
+            .ok_or_else(|| anyhow!("no exact verified GPU pack/device binding is available"))?;
+        if matches.next().is_some() {
+            bail!("verified GPU pack/device binding is ambiguous")
+        }
+        let target = binding.backend_target();
+        let pack = target
+            .pack
+            .as_ref()
+            .ok_or_else(|| anyhow!("verified GPU binding omitted its pack identity"))?;
+        let driver = target
+            .driver_version
+            .clone()
+            .ok_or_else(|| anyhow!("verified GPU binding omitted its driver identity"))?;
+        let identity = GpuCaptureObservationIdentity {
+            backend: match target.backend {
+                BackendKind::Cuda => "cuda",
+                BackendKind::Vulkan => "vulkan",
+                BackendKind::Cpu | BackendKind::Metal => {
+                    bail!("GPU observation selected an unsupported backend")
+                }
+            }
+            .to_owned(),
+            provider: target.provider_id.as_str().to_owned(),
+            stable_device: target.device_id.as_str().to_owned(),
+            driver,
+            device_class: match target.device_class {
+                DeviceClass::DiscreteGpu => "discrete_gpu",
+                DeviceClass::IntegratedGpu => "integrated_gpu",
+                DeviceClass::UnifiedGpu => "unified_gpu",
+                DeviceClass::Unknown => "unknown",
+                DeviceClass::Cpu | DeviceClass::Accelerator => {
+                    bail!("GPU observation binding has a non-GPU device class")
+                }
+            }
+            .to_owned(),
+            vendor: match target.vendor {
+                GpuVendor::Nvidia => "nvidia",
+                GpuVendor::Amd => "amd",
+                GpuVendor::Intel => "intel",
+                GpuVendor::Apple => "apple",
+                GpuVendor::Other => "other",
+                GpuVendor::Unknown => "unknown",
+            }
+            .to_owned(),
+            memory_total_bytes: target.memory_total_bytes,
+            pack_id: pack.pack_id.clone(),
+            pack_version: pack.pack_version.clone(),
+            pack_sha256: pack.pack_digest.clone(),
+            pack_security_epoch: pack.security_epoch,
+            runtime_abi: pack.runtime_abi,
+        };
+        Ok(Self {
+            supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+            gpu_identity: Some(identity),
+        })
+    }
+
+    pub(crate) fn prepare_observation(&self) -> Result<WorkerObservationLease> {
+        self.supervisor.transport.observation_lease()
+    }
+
+    pub(crate) fn transcribe(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+    ) -> Result<RuntimeExecution> {
+        let cancellation_generation = std::sync::atomic::AtomicU64::new(0);
+        self.supervisor
+            .transcribe(
+                artifact,
+                preference,
+                audio,
+                TranscriptionOptions::default(),
+                0,
+                &cancellation_generation,
+            )
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<()> {
+        self.supervisor.shutdown().map_err(anyhow::Error::new)
     }
 }
 
@@ -10419,6 +10819,34 @@ mod tests {
                 let _ = reaped.send(());
             }
             Ok(())
+        }
+
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
+            use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+            let current = unsafe { GetCurrentProcess() };
+            let mut duplicate: HANDLE = std::ptr::null_mut();
+            // SAFETY: this test duplicates the current-process pseudo-handle
+            // only to exercise ownership and generation invalidation. Native
+            // child telemetry is not queried by these supervisor tests.
+            if unsafe {
+                DuplicateHandle(
+                    current,
+                    current,
+                    current,
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("could not create the test observation handle");
+            }
+            Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
         }
     }
 
@@ -15880,6 +16308,100 @@ mod tests {
         assert_eq!(transport.current_generation().unwrap(), None);
     }
 
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_retains_exact_validated_handshake_bytes() {
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            Arc::new(TestLauncher::new([TestMode::Normal])),
+            SupervisorDeadlines::default(),
+        );
+        let lease = transport.observation_lease().unwrap();
+        lease.require_current().unwrap();
+
+        let (hello, hello_raw) =
+            read_frame_with_raw(&mut Cursor::new(lease.hello_frame())).unwrap();
+        assert_eq!(hello_raw, lease.hello_frame());
+        let (_, _, hello) = parse_parent_control(hello).unwrap();
+        assert!(matches!(hello, Control::Hello { .. }));
+
+        let (ready, ready_raw) =
+            read_frame_with_raw(&mut Cursor::new(lease.ready_frame())).unwrap();
+        assert_eq!(ready_raw, lease.ready_frame());
+        let (_, _, ready) = parse_worker_control(ready).unwrap();
+        assert!(matches!(ready, Control::Ready { .. }));
+
+        assert!(!lease.hello_frame().windows(3).any(|bytes| bytes == b"pcm"));
+        assert!(
+            !lease
+                .ready_frame()
+                .windows(10)
+                .any(|bytes| bytes == b"transcript")
+        );
+        transport.terminate_current().unwrap();
+        assert!(lease.require_current().is_err());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_lease_invalidates_on_cancel_crash_and_replacement() {
+        let (received_tx, received_rx) = channel();
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            Arc::new(TestLauncher::new([
+                TestMode::Normal,
+                TestMode::FailRequest {
+                    received: received_tx,
+                    malformed: true,
+                },
+                TestMode::Normal,
+            ])),
+            short_deadlines(),
+        );
+
+        let cancelled = transport.observation_lease().unwrap();
+        let cancellation = InferenceWorkerSupervisor {
+            transport: transport.clone(),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        cancellation.cancel_active();
+        assert!(cancelled.require_current().is_err());
+
+        let crashed = transport.observation_lease().unwrap();
+        let request = {
+            let transport = transport.clone();
+            std::thread::spawn(move || transport.health(7, 9))
+        };
+        received_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.join().unwrap().is_err());
+        assert!(crashed.require_current().is_err());
+
+        let replacement = transport.observation_lease().unwrap();
+        replacement.require_current().unwrap();
+        assert_ne!(
+            replacement.hello_frame(),
+            crashed.hello_frame(),
+            "a replacement generation must retain its own Hello challenge"
+        );
+        transport.terminate_current().unwrap();
+        assert!(replacement.require_current().is_err());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_supervisor_drop_terminates_and_reaps_preflight_worker() {
+        let (kill_tx, kill_rx) = channel();
+        let (reap_tx, reap_rx) = channel();
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            Arc::new(TestLauncher::new([TestMode::Normal]).with_process_events(kill_tx, reap_tx)),
+            short_deadlines(),
+        );
+        let lease = transport.observation_lease().unwrap();
+        lease.require_current().unwrap();
+        drop(transport);
+        kill_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        reap_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(lease.require_current().is_err());
+    }
+
     fn cooperative_cancel_fixture(
         acknowledge: bool,
     ) -> (
@@ -15916,6 +16438,8 @@ mod tests {
             expectation: expected_worker(WorkerRole::Inference),
             pack_launch: None,
             pack_bindings: Vec::new(),
+            #[cfg(feature = "windows-gpu-capture-observation")]
+            validated_handshake: None,
         });
         state.active_request = Some(correlation);
         drop(state);
