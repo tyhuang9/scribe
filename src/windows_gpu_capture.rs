@@ -24,7 +24,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::backend_policy::PowerSource;
 use crate::model_catalog::ArtifactFormat;
 use crate::onnx_worker::{
-    CaptureObservationWorker, GpuCaptureObservationIdentity, WorkerObservationLease,
+    CaptureObservationWorker, GpuCaptureObservationIdentity, ProviderMemoryNotApplicableReason,
+    ProviderMemoryObservation, WorkerObservationLease,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
@@ -90,7 +91,14 @@ struct WorkerReport {
     sampled_max_private_usage_bytes: u64,
     telemetry_sample_count: u64,
     video_memory: VideoMemoryReport,
+    provider_memory: ProviderMemoryReport,
     normalized_transcript_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ProviderMemoryReport {
+    before: ProviderMemoryObservation,
+    after: ProviderMemoryObservation,
 }
 
 #[derive(Serialize)]
@@ -105,7 +113,6 @@ enum VideoMemoryReport {
 
 #[derive(Serialize)]
 struct UnavailableReport {
-    provider_free_memory_bytes: UnavailableField,
     inference_thread_count: UnavailableField,
     thermal_state: UnavailableField,
 }
@@ -119,6 +126,14 @@ struct UnavailableField {
 struct ObservedWorker {
     report: WorkerReport,
     normalized_transcript_sha256: String,
+}
+
+struct WorkerObservationMeasurements {
+    provider_memory: ProviderMemoryReport,
+    telemetry: TelemetrySummary,
+    power_source_before: PowerSource,
+    power_source_after: PowerSource,
+    elapsed_ms: u128,
 }
 
 pub(crate) fn maybe_run_local_command() -> Option<i32> {
@@ -193,6 +208,18 @@ fn run_local_command(args: &[OsString]) -> Result<()> {
             );
         }
     };
+    if let Err(error) = cpu_worker
+        .negotiate_runtime_observation()
+        .context("bundled CPU worker does not support runtime memory observation")
+        .and_then(|()| {
+            gpu_worker
+                .negotiate_runtime_observation()
+                .context("selected GPU worker does not support runtime memory observation")
+        })
+    {
+        let cleanup = gpu_worker.shutdown().and(cpu_worker.shutdown());
+        return combine_operation_cleanup(Err(error), cleanup);
+    }
     wav.file.seek(SeekFrom::Start(0))?;
     let audio = match PreparedAudio::from_wav_reader(&mut wav.file)
         .context("hash-pinned WAV input could not be prepared")
@@ -237,7 +264,7 @@ fn run_local_command(args: &[OsString]) -> Result<()> {
         reason: "not_observed",
     };
     let report = CaptureReport {
-        schema_version: 1,
+        schema_version: 2,
         kind: "windows_gpu_capture_observation",
         unsigned: true,
         unqualified: true,
@@ -253,8 +280,10 @@ fn run_local_command(args: &[OsString]) -> Result<()> {
         gpu: gpu.report,
         transcript_parity,
         unavailable: UnavailableReport {
-            provider_free_memory_bytes: unavailable,
-            inference_thread_count: unavailable,
+            inference_thread_count: UnavailableField {
+                status: "unavailable",
+                reason: "unsupported_by_pinned_runtime_api",
+            },
             thermal_state: unavailable,
         },
     };
@@ -317,7 +346,7 @@ fn observe_worker(
     } else {
         SamplingSession::cpu(lease.clone())?
     };
-    let execution = worker.transcribe(artifact, preference, audio);
+    let execution = worker.transcribe_observed(artifact, preference, audio);
     let elapsed = started.elapsed().as_millis();
     let telemetry = sampler.finish();
     let power_source_after = PowerSource::current();
@@ -327,12 +356,19 @@ fn observe_worker(
     require_stable_power(power_source_before, power_source_after)?;
     build_worker_report(
         &lease,
-        execution,
-        telemetry,
-        power_source_before,
-        power_source_after,
-        elapsed,
+        execution.execution,
+        WorkerObservationMeasurements {
+            provider_memory: ProviderMemoryReport {
+                before: execution.before,
+                after: execution.after,
+            },
+            telemetry,
+            power_source_before,
+            power_source_after,
+            elapsed_ms: elapsed,
+        },
         gpu,
+        worker.gpu_identity.as_ref(),
     )
 }
 
@@ -358,12 +394,17 @@ fn validate_handshake_capture(lease: &WorkerObservationLease) -> Result<()> {
 fn build_worker_report(
     lease: &WorkerObservationLease,
     execution: RuntimeExecution,
-    telemetry: TelemetrySummary,
-    power_source_before: PowerSource,
-    power_source_after: PowerSource,
-    elapsed_ms: u128,
+    measurements: WorkerObservationMeasurements,
     gpu: bool,
+    expected_gpu: Option<&GpuCaptureObservationIdentity>,
 ) -> Result<ObservedWorker> {
+    let WorkerObservationMeasurements {
+        provider_memory,
+        telemetry,
+        power_source_before,
+        power_source_after,
+        elapsed_ms,
+    } = measurements;
     let normalized = normalize_transcript(&execution.transcript.text);
     let normalized_transcript_sha256 = format!("{:x}", Sha256::digest(normalized.as_bytes()));
     let video_memory = match (gpu, telemetry.video_memory) {
@@ -374,6 +415,7 @@ fn build_worker_report(
         (false, None) => VideoMemoryReport::NotApplicable,
         (false, Some(_)) => bail!("CPU observation unexpectedly reported GPU video memory"),
     };
+    validate_provider_memory_report(gpu, expected_gpu, &provider_memory)?;
     let report = WorkerReport {
         hello_frame_hex: hex(lease.hello_frame()),
         ready_frame_hex: hex(lease.ready_frame()),
@@ -384,12 +426,54 @@ fn build_worker_report(
         sampled_max_private_usage_bytes: telemetry.sampled_max_private_usage_bytes,
         telemetry_sample_count: telemetry.sample_count,
         video_memory,
+        provider_memory,
         normalized_transcript_sha256: normalized_transcript_sha256.clone(),
     };
     Ok(ObservedWorker {
         report,
         normalized_transcript_sha256,
     })
+}
+
+fn validate_provider_memory_report(
+    gpu: bool,
+    expected_gpu: Option<&GpuCaptureObservationIdentity>,
+    report: &ProviderMemoryReport,
+) -> Result<()> {
+    for observation in [&report.before, &report.after] {
+        match (gpu, observation) {
+            (
+                false,
+                ProviderMemoryObservation::NotApplicable {
+                    reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                },
+            )
+            | (true, ProviderMemoryObservation::Unavailable { .. }) => {}
+            (
+                true,
+                ProviderMemoryObservation::Available {
+                    backend,
+                    provider_id,
+                    stable_device,
+                    memory_total_bytes,
+                    ..
+                },
+            ) => {
+                let expected = expected_gpu.ok_or_else(|| {
+                    anyhow!("GPU provider memory validation omitted the authenticated identity")
+                })?;
+                if backend != &expected.backend
+                    || provider_id != &expected.provider
+                    || stable_device != &expected.stable_device
+                    || memory_total_bytes != &expected.memory_total_bytes
+                {
+                    bail!("provider memory observation does not match the authenticated GPU")
+                }
+            }
+            _ => bail!("provider memory observation does not match the worker provider"),
+        }
+    }
+    Ok(())
 }
 
 fn normalize_transcript(value: &str) -> String {
@@ -707,7 +791,7 @@ mod tests {
             status: "unavailable",
             reason: "not_observed",
         };
-        let worker = |transcript: &str, video_memory| WorkerReport {
+        let worker = |transcript: &str, video_memory, provider_memory| WorkerReport {
             hello_frame_hex: hex(b"SCIF-hello"),
             ready_frame_hex: hex(b"SCIF-ready"),
             power_source_before: PowerSource::Ac,
@@ -716,10 +800,11 @@ mod tests {
             sampled_max_private_usage_bytes: 20,
             telemetry_sample_count: 2,
             video_memory,
+            provider_memory,
             normalized_transcript_sha256: format!("{:x}", Sha256::digest(transcript.as_bytes())),
         };
         let report = CaptureReport {
-            schema_version: 1,
+            schema_version: 2,
             kind: "windows_gpu_capture_observation",
             unsigned: true,
             unqualified: true,
@@ -744,7 +829,18 @@ mod tests {
                 pack_security_epoch: 1,
                 runtime_abi: 1,
             },
-            cpu: worker("private transcript text", VideoMemoryReport::NotApplicable),
+            cpu: worker(
+                "private transcript text",
+                VideoMemoryReport::NotApplicable,
+                ProviderMemoryReport {
+                    before: ProviderMemoryObservation::NotApplicable {
+                        reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                    },
+                    after: ProviderMemoryObservation::NotApplicable {
+                        reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                    },
+                },
+            ),
             gpu: worker(
                 "private transcript text",
                 VideoMemoryReport::Available {
@@ -761,16 +857,45 @@ mod tests {
                         sampled_min_available_for_reservation_bytes: 160,
                     },
                 },
+                ProviderMemoryReport {
+                    before: ProviderMemoryObservation::Available {
+                        backend: "vulkan".to_owned(),
+                        provider_id: "fixture-provider".to_owned(),
+                        stable_device: "native:luid:0102030405060708".to_owned(),
+                        memory_total_bytes: 1024,
+                        provider_reported_memory_free_bytes: 0,
+                        value_semantics:
+                            crate::onnx_worker::ProviderMemoryValueSemantics::NativeBackendDefined,
+                        admission_validity:
+                            crate::onnx_worker::ProviderMemoryAdmissionValidity::Unestablished,
+                    },
+                    after: ProviderMemoryObservation::Unavailable {
+                        reason:
+                            crate::onnx_worker::ProviderMemoryUnavailableReason::ProviderQueryFailed,
+                    },
+                },
             ),
             transcript_parity: true,
             unavailable: UnavailableReport {
-                provider_free_memory_bytes: unavailable,
-                inference_thread_count: unavailable,
+                inference_thread_count: UnavailableField {
+                    status: "unavailable",
+                    reason: "unsupported_by_pinned_runtime_api",
+                },
                 thermal_state: unavailable,
             },
         };
         let bytes = serde_json::to_vec(&report).unwrap();
         let text = String::from_utf8(bytes).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(
+            parsed["unavailable"]["inference_thread_count"]["status"],
+            "unavailable"
+        );
+        assert_eq!(
+            parsed["unavailable"]["inference_thread_count"]["reason"],
+            "unsupported_by_pinned_runtime_api"
+        );
         assert!(text.contains("\"unsigned\":true"));
         assert!(text.contains("\"unqualified\":true"));
         assert!(text.contains("\"auto_eligible\":false"));
@@ -778,6 +903,7 @@ mod tests {
         assert!(text.contains("\"local\""));
         assert!(text.contains("\"non_local\""));
         assert!(text.contains("\"status\":\"not_applicable\""));
+        assert!(!text.contains("provider_free_memory_bytes"));
         assert!(!text.contains("private transcript text"));
         assert!(!text.contains("known.gguf"));
         assert!(!text.contains("known.wav"));
@@ -788,6 +914,47 @@ mod tests {
     fn capture_observation_normalization_hashes_without_retaining_transcript() {
         assert_eq!(normalize_transcript("  Hello\nWORLD  "), "hello world");
         assert_eq!(normalize_transcript("hello world"), "hello world");
+    }
+
+    #[test]
+    fn capture_observation_provider_memory_is_bound_and_zero_is_preserved() {
+        let identity = GpuCaptureObservationIdentity {
+            backend: "vulkan".to_owned(),
+            provider: "fixture-provider".to_owned(),
+            stable_device: "native:pci:0000:01:00.0".to_owned(),
+            driver: "fixture-driver".to_owned(),
+            device_class: "integrated_gpu".to_owned(),
+            vendor: "intel".to_owned(),
+            memory_total_bytes: 8192,
+            pack_id: "fixture-pack".to_owned(),
+            pack_version: "1".to_owned(),
+            pack_sha256: "c".repeat(64),
+            pack_security_epoch: 1,
+            runtime_abi: 1,
+        };
+        let available = ProviderMemoryObservation::Available {
+            backend: identity.backend.clone(),
+            provider_id: identity.provider.clone(),
+            stable_device: identity.stable_device.clone(),
+            memory_total_bytes: identity.memory_total_bytes,
+            provider_reported_memory_free_bytes: 0,
+            value_semantics: crate::onnx_worker::ProviderMemoryValueSemantics::NativeBackendDefined,
+            admission_validity: crate::onnx_worker::ProviderMemoryAdmissionValidity::Unestablished,
+        };
+        let report = ProviderMemoryReport {
+            before: available.clone(),
+            after: available,
+        };
+        validate_provider_memory_report(true, Some(&identity), &report).unwrap();
+
+        let mut wrong_total = report;
+        if let ProviderMemoryObservation::Available {
+            memory_total_bytes, ..
+        } = &mut wrong_total.before
+        {
+            *memory_total_bytes += 1;
+        }
+        assert!(validate_provider_memory_report(true, Some(&identity), &wrong_total).is_err());
     }
 
     #[test]

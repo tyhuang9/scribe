@@ -120,6 +120,9 @@ try {
     Invoke-CaptureCargo @('fmt', '--all', '--', '--check')
     Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'local-transcriber')
     Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $feature)
+    # The authenticated responder is in ordinary worker builds, while only the
+    # opt-in collector initiates observation. Check that independent boundary.
+    Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', 'inference-worker')
     # Match the existing release lint's shared UI-route coverage while keeping
     # both production checks above free of test-only UI features. Neither lint
     # configuration enables an inference provider in the desktop process.
@@ -129,7 +132,8 @@ try {
     # Cargo normally succeeds for an empty filter. Require discovery before
     # executing each group so a disabled module cannot produce a false pass.
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
-            'onnx_worker::tests::capture_observation', 'architecture_guard::windows_gpu_capture')) {
+            'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
+            'architecture_guard::windows_gpu_capture')) {
         $listing = @(& cargo test --locked --offline --bin local-transcriber --features $feature $filter -- --list)
         if ($LASTEXITCODE -ne 0) { throw 'Capture observation test discovery failed.' }
         $pattern = '^' + [Regex]::Escape($filter) + '[^\r\n]*: test$'

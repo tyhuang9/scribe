@@ -22,6 +22,7 @@ use crate::embedded_runtime::{EmbeddedRuntime, EmbeddedRuntimeError};
 use crate::model_catalog::{
     ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
 };
+use crate::onnx_worker::ProviderMemoryObservation;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::runtime_contract::TRANSCRIBE_CPP_VERSION;
@@ -305,6 +306,31 @@ impl RuntimeRouter {
                     },
                 ),
         }
+    }
+
+    pub(crate) fn provider_memory_observation_before(
+        &self,
+        preference: AccelerationPreference,
+    ) -> Result<ProviderMemoryObservation, RuntimeError> {
+        EmbeddedRuntime::provider_memory_observation_before(preference)
+            .map_err(map_embedded_runtime_error)
+    }
+
+    pub(crate) fn provider_memory_observation_after(
+        &self,
+    ) -> Result<ProviderMemoryObservation, RuntimeError> {
+        self.inner
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?
+            .embedded
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Engine(
+                    "runtime memory observation requires a retained embedded model".to_owned(),
+                )
+            })?
+            .provider_memory_observation_after()
+            .map_err(map_embedded_runtime_error)
     }
 
     pub(crate) fn load(

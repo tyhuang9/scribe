@@ -26,6 +26,10 @@ use crate::backend_policy::{
     DeviceClass, DeviceIdentity, GpuVendor, OperatingSystem, PowerSource, ProviderIdentity,
     select_backend,
 };
+use crate::onnx_worker::{
+    ProviderMemoryAdmissionValidity, ProviderMemoryNotApplicableReason, ProviderMemoryObservation,
+    ProviderMemoryUnavailableReason, ProviderMemoryValueSemantics,
+};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ResolvedAcceleration, RuntimeCapabilities, SpeechEngine,
@@ -141,6 +145,58 @@ impl EmbeddedRuntime {
 
     pub(crate) fn cancellation_handle(&self) -> CancelToken {
         self.cancellation.clone()
+    }
+
+    pub(crate) fn provider_memory_observation_before(
+        preference: AccelerationPreference,
+    ) -> Result<ProviderMemoryObservation> {
+        if preference == AccelerationPreference::Cpu {
+            return Ok(cpu_provider_memory_not_applicable());
+        }
+        if preference != AccelerationPreference::Gpu {
+            return Err(anyhow!(EmbeddedRuntimeError::UnsupportedOperation(
+                "runtime memory observation requires an explicit CPU or GPU request".to_owned(),
+            )));
+        }
+        Self::ensure_backends()?;
+        let environment = current_runtime_backend_environment(preference)?;
+        provider_memory_observation_before_from_environment(environment)
+    }
+
+    pub(crate) fn provider_memory_observation_after(&self) -> Result<ProviderMemoryObservation> {
+        if self.preference == AccelerationPreference::Cpu {
+            return Ok(cpu_provider_memory_not_applicable());
+        }
+        if self.preference != AccelerationPreference::Gpu {
+            return Err(anyhow!(EmbeddedRuntimeError::UnsupportedOperation(
+                "runtime memory observation requires an explicit CPU or GPU request".to_owned(),
+            )));
+        }
+        let resolved = self.resolved_acceleration.as_ref().ok_or_else(|| {
+            anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+                "runtime memory observation requires a resolved model".to_owned(),
+            ))
+        })?;
+        let mut selection = resolved.selection.clone().ok_or_else(|| {
+            anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+                "runtime memory observation omitted the selected device binding".to_owned(),
+            ))
+        })?;
+        let model = self.model.as_ref().ok_or_else(|| {
+            anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+                "runtime memory observation requires a loaded model".to_owned(),
+            ))
+        })?;
+        let device = match model.device() {
+            Ok(device) => device,
+            Err(_) => {
+                return Ok(ProviderMemoryObservation::Unavailable {
+                    reason: ProviderMemoryUnavailableReason::ProviderQueryFailed,
+                });
+            }
+        };
+        reconcile_observed_target(&mut selection, &model.backend(), &device)?;
+        provider_memory_observation_from_target(&selection.target)
     }
 
     pub(crate) fn transcribe_with_cancellation(
@@ -264,6 +320,60 @@ impl EmbeddedRuntime {
         self.resolved_acceleration = None;
         self.backend_environment = None;
     }
+}
+
+fn cpu_provider_memory_not_applicable() -> ProviderMemoryObservation {
+    ProviderMemoryObservation::NotApplicable {
+        reason: ProviderMemoryNotApplicableReason::CpuProvider,
+    }
+}
+
+fn provider_memory_observation_before_from_environment(
+    environment: RuntimeBackendEnvironment,
+) -> Result<ProviderMemoryObservation> {
+    provider_memory_observation_from_target(&environment.selection.target)
+}
+
+fn provider_memory_observation_from_target(
+    target: &BackendTarget,
+) -> Result<ProviderMemoryObservation> {
+    if target.backend == BackendKind::Cpu {
+        return Ok(cpu_provider_memory_not_applicable());
+    }
+    if !target.backend.is_gpu()
+        || !matches!(
+            target.backend,
+            BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Metal
+        )
+        || target.provider_id.as_str().is_empty()
+        || target.provider_id.as_str().len() > 128
+        || target.device_id.as_str().is_empty()
+        || target.device_id.as_str().len() > 256
+    {
+        return Err(anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+            "runtime memory observation has an invalid provider or stable device binding"
+                .to_owned(),
+        )));
+    }
+    if target.memory_available_bytes > target.memory_total_bytes {
+        return Err(anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+            "runtime provider reported free memory above total memory".to_owned(),
+        )));
+    }
+    if target.memory_total_bytes == 0 {
+        return Ok(ProviderMemoryObservation::Unavailable {
+            reason: ProviderMemoryUnavailableReason::MemoryTotalUnreported,
+        });
+    }
+    Ok(ProviderMemoryObservation::Available {
+        backend: target.backend.label().to_ascii_lowercase(),
+        provider_id: target.provider_id.as_str().to_owned(),
+        stable_device: target.device_id.as_str().to_owned(),
+        memory_total_bytes: target.memory_total_bytes,
+        provider_reported_memory_free_bytes: target.memory_available_bytes,
+        value_semantics: ProviderMemoryValueSemantics::NativeBackendDefined,
+        admission_validity: ProviderMemoryAdmissionValidity::Unestablished,
+    })
 }
 
 impl SpeechEngine for EmbeddedRuntime {
@@ -1113,6 +1223,109 @@ mod tests {
             memory_free: 0,
             index: None,
         }
+    }
+
+    #[test]
+    fn provider_memory_observation_preserves_zero_and_rejects_impossible_values() {
+        let mut target = native_backend_candidate(Device {
+            name: "Vulkan0".to_owned(),
+            description: "NVIDIA fixture GPU".to_owned(),
+            kind: "vulkan".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:01:00.0".to_owned()),
+            memory_total: 8 * 1024,
+            memory_free: 0,
+            index: Some(1),
+        })
+        .unwrap()
+        .target;
+        assert!(matches!(
+            provider_memory_observation_from_target(&target).unwrap(),
+            ProviderMemoryObservation::Available {
+                memory_total_bytes: 8192,
+                provider_reported_memory_free_bytes: 0,
+                value_semantics: ProviderMemoryValueSemantics::NativeBackendDefined,
+                admission_validity: ProviderMemoryAdmissionValidity::Unestablished,
+                ..
+            }
+        ));
+
+        target.memory_available_bytes = target.memory_total_bytes + 1;
+        assert!(provider_memory_observation_from_target(&target).is_err());
+        target.memory_total_bytes = 0;
+        target.memory_available_bytes = 0;
+        assert_eq!(
+            provider_memory_observation_from_target(&target).unwrap(),
+            ProviderMemoryObservation::Unavailable {
+                reason: ProviderMemoryUnavailableReason::MemoryTotalUnreported,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_memory_observation_before_uses_each_fresh_selected_snapshot() {
+        let environment = |free| {
+            let mut candidate = native_backend_candidate(Device {
+                name: "Vulkan0".to_owned(),
+                description: "NVIDIA fixture GPU".to_owned(),
+                kind: "vulkan".to_owned(),
+                device_type: DeviceType::Gpu,
+                device_id: Some("0000:01:00.0".to_owned()),
+                memory_total: 8 * 1024,
+                memory_free: free,
+                index: Some(1),
+            })
+            .unwrap();
+            candidate.availability = CandidateAvailability::Available;
+            select_backend_environment(
+                AccelerationPreference::Gpu,
+                &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![candidate]),
+            )
+            .unwrap()
+        };
+        let first = provider_memory_observation_before_from_environment(environment(6144)).unwrap();
+        let second =
+            provider_memory_observation_before_from_environment(environment(2048)).unwrap();
+
+        assert!(matches!(
+            first,
+            ProviderMemoryObservation::Available {
+                provider_reported_memory_free_bytes: 6144,
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            ProviderMemoryObservation::Available {
+                provider_reported_memory_free_bytes: 2048,
+                ..
+            }
+        ));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn provider_memory_observation_reconciliation_rejects_device_drift() {
+        let mut enumerated = device(DeviceType::Gpu, "Vulkan0", "NVIDIA fixture GPU");
+        enumerated.device_id = Some("0000:01:00.0".to_owned());
+        enumerated.memory_total = 8192;
+        enumerated.memory_free = 6144;
+        enumerated.index = Some(1);
+        let mut selection = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(
+                OperatingSystem::Windows,
+                PowerSource::Ac,
+                vec![native_backend_candidate(enumerated.clone()).unwrap()],
+            ),
+        )
+        .unwrap();
+        let mut wrong = enumerated;
+        wrong.device_id = Some("0000:02:00.0".to_owned());
+        wrong.memory_free = 1;
+
+        assert!(reconcile_observed_target(&mut selection, "vulkan", &wrong).is_err());
+        assert_eq!(selection.target.memory_available_bytes, 6144);
     }
 
     fn snapshot(
