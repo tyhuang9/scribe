@@ -28,7 +28,8 @@ use crate::backend_policy::{
 };
 use crate::onnx_worker::{
     ProviderMemoryAdmissionValidity, ProviderMemoryNotApplicableReason, ProviderMemoryObservation,
-    ProviderMemoryUnavailableReason, ProviderMemoryValueSemantics,
+    ProviderMemoryUnavailableReason, ProviderMemoryValueSemantics, WorkerMemoryAvailability,
+    WorkerMemoryAvailabilitySource, WorkerMemoryUnavailableReason,
 };
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
@@ -199,6 +200,68 @@ impl EmbeddedRuntime {
         provider_memory_observation_from_target(&selection.target)
     }
 
+    pub(crate) fn worker_memory_availability_before(
+        preference: AccelerationPreference,
+    ) -> Result<WorkerMemoryAvailability> {
+        if preference == AccelerationPreference::Cpu {
+            return Ok(cpu_worker_memory_not_applicable());
+        }
+        if preference != AccelerationPreference::Gpu {
+            return Err(anyhow!(EmbeddedRuntimeError::UnsupportedOperation(
+                "worker memory availability requires an explicit CPU or GPU request".to_owned(),
+            )));
+        }
+        if !cfg!(feature = "cuda-acceleration") {
+            return Ok(WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::UnsupportedProvider,
+            });
+        }
+        Self::ensure_backends()?;
+        let environment = current_runtime_backend_environment(preference)?;
+        cuda_memory_availability_from_fresh_target(&environment.selection.target)
+    }
+
+    pub(crate) fn worker_memory_availability_after(&self) -> Result<WorkerMemoryAvailability> {
+        if self.preference == AccelerationPreference::Cpu {
+            return Ok(cpu_worker_memory_not_applicable());
+        }
+        if self.preference != AccelerationPreference::Gpu {
+            return Err(anyhow!(EmbeddedRuntimeError::UnsupportedOperation(
+                "worker memory availability requires an explicit CPU or GPU request".to_owned(),
+            )));
+        }
+        if !cfg!(feature = "cuda-acceleration") {
+            return Ok(WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::UnsupportedProvider,
+            });
+        }
+        let resolved = self.resolved_acceleration.as_ref().ok_or_else(|| {
+            anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+                "worker memory availability requires a resolved model".to_owned(),
+            ))
+        })?;
+        let mut selection = resolved.selection.clone().ok_or_else(|| {
+            anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+                "worker memory availability omitted the selected device binding".to_owned(),
+            ))
+        })?;
+        let model = self.model.as_ref().ok_or_else(|| {
+            anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+                "worker memory availability requires a loaded model".to_owned(),
+            ))
+        })?;
+        let device = match model.device() {
+            Ok(device) => device,
+            Err(_) => {
+                return Ok(WorkerMemoryAvailability::Unavailable {
+                    reason: WorkerMemoryUnavailableReason::ProviderQueryFailed,
+                });
+            }
+        };
+        reconcile_observed_target(&mut selection, &model.backend(), &device)?;
+        cuda_memory_availability_from_fresh_target(&selection.target)
+    }
+
     pub(crate) fn transcribe_with_cancellation(
         &mut self,
         audio: &PreparedAudio,
@@ -326,6 +389,44 @@ fn cpu_provider_memory_not_applicable() -> ProviderMemoryObservation {
     ProviderMemoryObservation::NotApplicable {
         reason: ProviderMemoryNotApplicableReason::CpuProvider,
     }
+}
+
+fn cpu_worker_memory_not_applicable() -> WorkerMemoryAvailability {
+    WorkerMemoryAvailability::NotApplicable {
+        reason: ProviderMemoryNotApplicableReason::CpuProvider,
+    }
+}
+
+fn cuda_memory_availability_from_fresh_target(
+    target: &BackendTarget,
+) -> Result<WorkerMemoryAvailability> {
+    // This helper is private to the two methods above. Both obtain `target`
+    // from a fresh call into the pinned transcribe-cpp wrapper; the compiled
+    // CUDA backend implements that query with cudaMemGetInfo. Callers cannot
+    // attach this provenance label to a serialized or startup-only snapshot.
+    if target.backend != BackendKind::Cuda
+        || target.provider_id.as_str().is_empty()
+        || target.provider_id.as_str().len() > 128
+        || target.device_id.as_str().is_empty()
+        || target.device_id.as_str().len() > 256
+    {
+        return Err(anyhow!(EmbeddedRuntimeError::BackendUnavailable(
+            "CUDA memory availability has an invalid provider or stable device binding".to_owned(),
+        )));
+    }
+    if target.memory_total_bytes == 0 || target.memory_available_bytes > target.memory_total_bytes {
+        return Ok(WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::ProviderQueryFailed,
+        });
+    }
+    Ok(WorkerMemoryAvailability::Observed {
+        backend: "cuda".to_owned(),
+        provider_id: target.provider_id.as_str().to_owned(),
+        stable_device: target.device_id.as_str().to_owned(),
+        memory_total_bytes: target.memory_total_bytes,
+        available_memory_bytes: target.memory_available_bytes,
+        source: WorkerMemoryAvailabilitySource::CudaMemGetInfo,
+    })
 }
 
 fn provider_memory_observation_before_from_environment(
@@ -1260,6 +1361,62 @@ mod tests {
                 reason: ProviderMemoryUnavailableReason::MemoryTotalUnreported,
             }
         );
+    }
+
+    #[test]
+    fn provider_memory_observation_cuda_availability_is_source_bound_and_preserves_zero() {
+        let mut target = native_backend_candidate(Device {
+            name: "CUDA0".to_owned(),
+            description: "NVIDIA fixture GPU".to_owned(),
+            kind: "cuda".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:01:00.0".to_owned()),
+            memory_total: 8192,
+            memory_free: 0,
+            index: Some(1),
+        })
+        .unwrap()
+        .target;
+        assert!(matches!(
+            cuda_memory_availability_from_fresh_target(&target).unwrap(),
+            WorkerMemoryAvailability::Observed {
+                backend,
+                memory_total_bytes: 8192,
+                available_memory_bytes: 0,
+                source: WorkerMemoryAvailabilitySource::CudaMemGetInfo,
+                ..
+            } if backend == "cuda"
+        ));
+
+        target.memory_available_bytes = target.memory_total_bytes + 1;
+        assert_eq!(
+            cuda_memory_availability_from_fresh_target(&target).unwrap(),
+            WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::ProviderQueryFailed,
+            }
+        );
+        target.memory_total_bytes = 0;
+        target.memory_available_bytes = 0;
+        assert_eq!(
+            cuda_memory_availability_from_fresh_target(&target).unwrap(),
+            WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::ProviderQueryFailed,
+            }
+        );
+
+        let wrong_backend = native_backend_candidate(Device {
+            name: "Vulkan0".to_owned(),
+            description: "NVIDIA fixture GPU".to_owned(),
+            kind: "vulkan".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:01:00.0".to_owned()),
+            memory_total: 8192,
+            memory_free: 4096,
+            index: Some(1),
+        })
+        .unwrap()
+        .target;
+        assert!(cuda_memory_availability_from_fresh_target(&wrong_backend).is_err());
     }
 
     #[test]

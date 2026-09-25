@@ -2,6 +2,8 @@
 param(
     [string]$CargoTargetDirectory,
     [string]$NativeArchiveDirectory,
+    [ValidateSet('None', 'Cuda', 'Vulkan')]
+    [string]$GpuProviderCheck = 'None',
     [switch]$ScriptOnly
 )
 
@@ -9,6 +11,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $IsWindows -or -not [Environment]::Is64BitProcess) {
     throw 'Capture observation verification requires 64-bit PowerShell on Windows.'
+}
+if ($ScriptOnly -and $GpuProviderCheck -ne 'None') {
+    throw 'ScriptOnly cannot verify a GPU provider; omit GpuProviderCheck or run native checks.'
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -21,10 +26,23 @@ function Invoke-CaptureCargo([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw 'Capture observation Cargo verification failed.' }
 }
 
+function Invoke-CaptureTests([string]$Features, [string]$Filter) {
+    # Cargo normally succeeds for an empty filter. Require discovery before
+    # executing each group so a disabled module cannot produce a false pass.
+    $listing = @(& cargo test --locked --offline --bin local-transcriber --features $Features $Filter -- --list)
+    if ($LASTEXITCODE -ne 0) { throw 'Capture observation test discovery failed.' }
+    $pattern = '^' + [Regex]::Escape($Filter) + '[^\r\n]*: test$'
+    $tests = @($listing | Where-Object { $_ -cmatch $pattern })
+    if ($tests.Count -eq 0) { throw "Expected capture observation tests were not discovered: $Filter" }
+    Invoke-CaptureCargo @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $Features, $Filter, '--', '--test-threads=1')
+}
+
 Push-Location $repositoryRoot
 try {
     if ($CargoTargetDirectory) { $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($CargoTargetDirectory) }
     if ($NativeArchiveDirectory) { $env:SHERPA_ONNX_ARCHIVE_DIR = [IO.Path]::GetFullPath($NativeArchiveDirectory) }
+
+    & (Join-Path $PSScriptRoot 'test-windows-gpu-capture-runner-contract.ps1')
 
     foreach ($script in @($PSCommandPath, (Join-Path $PSScriptRoot 'run-windows-gpu-capture-observation.ps1'))) {
         $tokens = $null
@@ -129,17 +147,22 @@ try {
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', 'ui-harness', '--', '-D', 'warnings')
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
-    # Cargo normally succeeds for an empty filter. Require discovery before
-    # executing each group so a disabled module cannot produce a false pass.
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
             'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
             'architecture_guard::windows_gpu_capture')) {
-        $listing = @(& cargo test --locked --offline --bin local-transcriber --features $feature $filter -- --list)
-        if ($LASTEXITCODE -ne 0) { throw 'Capture observation test discovery failed.' }
-        $pattern = '^' + [Regex]::Escape($filter) + '[^\r\n]*: test$'
-        $tests = @($listing | Where-Object { $_ -cmatch $pattern })
-        if ($tests.Count -eq 0) { throw "Expected capture observation tests were not discovered: $filter" }
-        Invoke-CaptureCargo @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $feature, $filter, '--', '--test-threads=1')
+        Invoke-CaptureTests $feature $filter
+    }
+    if ($GpuProviderCheck -ne 'None') {
+        # The caller must provision the reviewed SDK/toolchain first. This
+        # command neither installs tools nor grants pack/signing authority.
+        # Never combine a GPU provider with the desktop collector feature.
+        $providerFeature = $GpuProviderCheck.ToLowerInvariant() + '-acceleration'
+        Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', $providerFeature)
+        foreach ($filter in @('onnx_worker::tests::capture_observation',
+                'embedded_runtime::tests::provider_memory_observation')) {
+            Invoke-CaptureTests "ui-harness,$providerFeature" $filter
+        }
+        Write-Output "$GpuProviderCheck worker compilation and deterministic observation tests passed; hardware qualification not run."
     }
     Write-Output 'Windows GPU capture observation verification passed.'
 }

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::onnx_worker::ProviderMemoryObservation;
+use crate::onnx_worker::{ProviderMemoryObservation, WorkerMemoryAvailability};
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::RuntimeArtifact;
 use crate::runtime_contract::{RuntimeError, RuntimeExecution, RuntimeLoadExecution};
@@ -56,6 +56,23 @@ impl RuntimeRouter {
     ) -> Result<ProviderMemoryObservation, RuntimeError> {
         Err(RuntimeError::Engine(
             "provider memory observation requires the dedicated inference worker".to_owned(),
+        ))
+    }
+
+    pub(crate) fn worker_memory_availability_before(
+        &self,
+        _preference: AccelerationPreference,
+    ) -> Result<WorkerMemoryAvailability, RuntimeError> {
+        Err(RuntimeError::Engine(
+            "worker memory availability requires the dedicated inference worker".to_owned(),
+        ))
+    }
+
+    pub(crate) fn worker_memory_availability_after(
+        &self,
+    ) -> Result<WorkerMemoryAvailability, RuntimeError> {
+        Err(RuntimeError::Engine(
+            "worker memory availability requires the dedicated inference worker".to_owned(),
         ))
     }
 
