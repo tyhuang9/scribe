@@ -8,7 +8,7 @@ $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($runner, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw 'Capture runner does not parse.' }
-$definitions = foreach ($name in @('Invoke-CaptureCargo', 'Invoke-CaptureTests')) {
+$definitions = foreach ($name in @('Invoke-CaptureCargo', 'Invoke-CaptureTests', 'Invoke-CaptureProviderCheck')) {
     $functions = @($ast.FindAll({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
@@ -94,6 +94,232 @@ finally {
     else { Set-Variable LASTEXITCODE -Scope Global -Value $originalExitCode }
 }
 Write-Output 'Capture runner contracts passed (15 mocked cases); no Cargo process was launched.'
+
+# Provider checks are worker-only builds. Exercise the real helper through the
+# parsed AST while a fake Cargo command verifies every native invocation. This
+# must cover both provider feature spellings, each discovery boundary and the
+# exact worker-link context without starting a compiler or a GPU workload.
+$providerEnvironmentNames = @('SCRIBE_BUILDING_WORKER', 'SCRIBE_BUNDLED_WORKER_SHA256')
+$savedProviderEnvironment = @{}
+foreach ($name in $providerEnvironmentNames) {
+    $savedProviderEnvironment[$name] = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
+$savedProviderExitCode = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+$hadProviderExitCode = $null -ne $savedProviderExitCode
+$originalProviderExitCode = if ($hadProviderExitCode) { $savedProviderExitCode.Value } else { $null }
+try {
+    & {
+        param([string[]]$Definitions)
+        . ([scriptblock]::Create($Definitions -join "`n"))
+
+        $testGroups = @(
+            'onnx_worker::tests::capture_observation',
+            'onnx_worker::tests::vulkan_identity_catalog_',
+            'embedded_runtime::tests::provider_memory_observation'
+        )
+        $state = @{ Calls = 0; Expected = @(); Failure = 'success'; FailureCall = -1 }
+
+        function New-CaptureProviderExpectedCalls([string]$ProviderFeature) {
+            $testFeatures = "ui-harness,$ProviderFeature"
+            $calls = @()
+            $calls += [pscustomobject]@{
+                Kind = 'check'
+                Filter = $null
+                Arguments = @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', $ProviderFeature)
+            }
+            $calls += [pscustomobject]@{
+                Kind = 'lint'
+                Filter = $null
+                Arguments = @('clippy', '--locked', '--offline', '--all-targets', '--features', $testFeatures, '--', '-D', 'warnings')
+            }
+            foreach ($filter in $testGroups) {
+                $calls += [pscustomobject]@{
+                    Kind = 'list'
+                    Filter = $filter
+                    Arguments = @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $testFeatures, $filter, '--list')
+                }
+                $calls += [pscustomobject]@{
+                    Kind = 'test'
+                    Filter = $filter
+                    Arguments = @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $testFeatures, $filter, '--', '--test-threads=1')
+                }
+            }
+            return $calls
+        }
+
+        function Get-CaptureProviderEnvironmentState([string]$Name) {
+            $item = Get-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+            if ($null -eq $item) {
+                return [pscustomobject]@{ Exists = $false; Value = $null }
+            }
+            return [pscustomobject]@{ Exists = $true; Value = [string]$item.Value }
+        }
+
+        function Set-CaptureProviderEnvironment([string]$Name, [psobject]$State) {
+            if (-not $State.Exists) {
+                Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+                return
+            }
+            [Environment]::SetEnvironmentVariable($Name, [string]$State.Value, 'Process')
+        }
+
+        function Assert-CaptureProviderEnvironment([string]$Name, [psobject]$Expected) {
+            $actual = Get-CaptureProviderEnvironmentState $Name
+            if ($actual.Exists -ne $Expected.Exists -or
+                ($actual.Exists -and $actual.Value -cne [string]$Expected.Value)) {
+                throw "Capture provider helper did not restore $Name exactly."
+            }
+        }
+
+        function cargo {
+            $actual = @($args)
+            $callIndex = $state.Calls
+            if ($callIndex -ge $state.Expected.Count) {
+                throw 'Capture provider helper called Cargo more than expected.'
+            }
+            $expected = $state.Expected[$callIndex]
+            $state.Calls++
+            if ($actual.Count -ne $expected.Arguments.Count) {
+                throw 'Capture provider helper changed a Cargo argument count.'
+            }
+            for ($index = 0; $index -lt $expected.Arguments.Count; $index++) {
+                if ($actual[$index] -cne $expected.Arguments[$index]) {
+                    throw 'Capture provider helper changed locked/offline, worker, feature, discovery or serial execution arguments.'
+                }
+            }
+            if ($actual -ccontains 'windows-gpu-capture-observation') {
+                throw 'Capture provider helper combined a GPU provider with the desktop collector feature.'
+            }
+            if ([Environment]::GetEnvironmentVariable('SCRIBE_BUILDING_WORKER', 'Process') -cne '1') {
+                throw 'Capture provider helper did not set worker context for every Cargo invocation.'
+            }
+            if ($null -ne [Environment]::GetEnvironmentVariable('SCRIBE_BUNDLED_WORKER_SHA256', 'Process')) {
+                throw 'Capture provider helper did not clear the desktop worker digest for every Cargo invocation.'
+            }
+            $global:LASTEXITCODE = 0
+            if ($callIndex -eq $state.FailureCall) {
+                switch ($state.Failure) {
+                    'empty' { return }
+                    'wrong' { return 'other::tests::example: test' }
+                    default {
+                        $global:LASTEXITCODE = 1
+                        return
+                    }
+                }
+            }
+            if ($expected.Kind -ceq 'list') { return ($expected.Filter + 'fixture: test') }
+        }
+
+        function Invoke-CaptureProviderFixtureCase(
+            [ValidateSet('Cuda', 'Vulkan')]
+            [string]$Provider,
+            [ValidateSet('success', 'check_failure', 'lint_failure', 'empty', 'wrong', 'list_failure', 'test_failure')]
+            [string]$Failure,
+            [int]$GroupIndex,
+            [psobject]$InitialBuildingWorker,
+            [psobject]$InitialWorkerDigest
+        ) {
+            $providerFeature = $Provider.ToLowerInvariant() + '-acceleration'
+            $state.Calls = 0
+            $state.Expected = @(New-CaptureProviderExpectedCalls $providerFeature)
+            $state.Failure = $Failure
+            $state.FailureCall = switch ($Failure) {
+                'check_failure' { 0 }
+                'lint_failure' { 1 }
+                'empty' { 2 + (2 * $GroupIndex) }
+                'wrong' { 2 + (2 * $GroupIndex) }
+                'list_failure' { 2 + (2 * $GroupIndex) }
+                'test_failure' { 3 + (2 * $GroupIndex) }
+                default { -1 }
+            }
+            if ($Failure -notin @('success', 'check_failure', 'lint_failure') -and ($GroupIndex -lt 0 -or $GroupIndex -ge $testGroups.Count)) {
+                throw 'Capture provider fixture configured an invalid test group.'
+            }
+            Set-CaptureProviderEnvironment 'SCRIBE_BUILDING_WORKER' $InitialBuildingWorker
+            Set-CaptureProviderEnvironment 'SCRIBE_BUNDLED_WORKER_SHA256' $InitialWorkerDigest
+            $actualError = $null
+            try { $null = Invoke-CaptureProviderCheck $Provider }
+            catch { $actualError = $_.Exception.Message }
+
+            $expectedError = switch ($Failure) {
+                'empty' { 'Expected capture observation tests were not discovered: ' + $testGroups[$GroupIndex] }
+                'wrong' { 'Expected capture observation tests were not discovered: ' + $testGroups[$GroupIndex] }
+                'list_failure' { 'Capture observation test discovery failed.' }
+                'success' { $null }
+                default { 'Capture observation Cargo verification failed.' }
+            }
+            if ($actualError -cne $expectedError) {
+                throw "Capture provider runner contract failed for $Provider/$Failure/$GroupIndex`: $actualError"
+            }
+            $expectedCalls = if ($state.FailureCall -ge 0) { $state.FailureCall + 1 } else { $state.Expected.Count }
+            if ($state.Calls -ne $expectedCalls) {
+                throw "Capture provider helper continued after an unsuccessful $Failure boundary."
+            }
+            Assert-CaptureProviderEnvironment 'SCRIBE_BUILDING_WORKER' $InitialBuildingWorker
+            Assert-CaptureProviderEnvironment 'SCRIBE_BUNDLED_WORKER_SHA256' $InitialWorkerDigest
+        }
+
+        $environmentStates = @(
+            [pscustomobject]@{
+                BuildingWorker = [pscustomobject]@{ Exists = $false; Value = $null }
+                WorkerDigest = [pscustomobject]@{ Exists = $false; Value = $null }
+            },
+            [pscustomobject]@{
+                BuildingWorker = [pscustomobject]@{ Exists = $true; Value = '' }
+                WorkerDigest = [pscustomobject]@{ Exists = $true; Value = '' }
+            },
+            [pscustomobject]@{
+                BuildingWorker = [pscustomobject]@{ Exists = $true; Value = 'ambient-worker' }
+                WorkerDigest = [pscustomobject]@{ Exists = $false; Value = $null }
+            },
+            [pscustomobject]@{
+                BuildingWorker = [pscustomobject]@{ Exists = $false; Value = $null }
+                WorkerDigest = [pscustomobject]@{ Exists = $true; Value = ('a' * 64) }
+            },
+            [pscustomobject]@{
+                BuildingWorker = [pscustomobject]@{ Exists = $true; Value = 'ambient-worker' }
+                WorkerDigest = [pscustomobject]@{ Exists = $true; Value = ('b' * 64) }
+            }
+        )
+        $caseCount = 0
+        foreach ($provider in @('Cuda', 'Vulkan')) {
+            foreach ($environmentState in $environmentStates) {
+                Invoke-CaptureProviderFixtureCase $provider 'success' -1 $environmentState.BuildingWorker $environmentState.WorkerDigest
+                $caseCount++
+            }
+            $failureIndex = 0
+            foreach ($failure in @('check_failure', 'lint_failure')) {
+                $environmentState = $environmentStates[$failureIndex % $environmentStates.Count]
+                Invoke-CaptureProviderFixtureCase $provider $failure -1 $environmentState.BuildingWorker $environmentState.WorkerDigest
+                $caseCount++
+                $failureIndex++
+            }
+            foreach ($groupIndex in 0..($testGroups.Count - 1)) {
+                foreach ($failure in @('empty', 'wrong', 'list_failure', 'test_failure')) {
+                    $environmentState = $environmentStates[$failureIndex % $environmentStates.Count]
+                    Invoke-CaptureProviderFixtureCase $provider $failure $groupIndex $environmentState.BuildingWorker $environmentState.WorkerDigest
+                    $caseCount++
+                    $failureIndex++
+                }
+            }
+        }
+        if ($caseCount -ne 38) { throw 'Capture provider runner contract case count changed unexpectedly.' }
+    } -Definitions $definitions
+}
+finally {
+    foreach ($name in $providerEnvironmentNames) {
+        $saved = $savedProviderEnvironment[$name]
+        if ($null -eq $saved) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($name, [string]$saved.Value, 'Process')
+        }
+    }
+    if (-not $hadProviderExitCode) { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    else { Set-Variable LASTEXITCODE -Scope Global -Value $originalProviderExitCode }
+}
+Write-Output 'Capture provider runner contracts passed (38 mocked cases); no Cargo process was launched.'
 
 # Test the actual argument builder without running a collector, accessing
 # inputs, or composing a shell command. Keep spaces/metacharacters as values.
