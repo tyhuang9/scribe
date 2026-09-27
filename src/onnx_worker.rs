@@ -2012,7 +2012,7 @@ fn query_vulkan_memory_availability() -> WorkerMemoryAvailability {
     }
 }
 
-#[cfg(all(windows, any(feature = "inference-worker", test)))]
+#[cfg(all(windows, any(feature = "vulkan-acceleration", test)))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VulkanDeviceIdentity {
     normalized_display_name: String,
@@ -2023,12 +2023,12 @@ struct VulkanDeviceIdentity {
     claimed: bool,
 }
 
-#[cfg(all(windows, any(feature = "inference-worker", test)))]
+#[cfg(all(windows, any(feature = "vulkan-acceleration", test)))]
 struct VulkanDeviceCatalog {
     devices: Vec<VulkanDeviceIdentity>,
 }
 
-#[cfg(all(windows, any(feature = "inference-worker", test)))]
+#[cfg(all(windows, any(feature = "vulkan-acceleration", test)))]
 impl VulkanDeviceCatalog {
     #[cfg(feature = "vulkan-acceleration")]
     fn discover(require_policy_loader: bool) -> Result<Self> {
@@ -2180,7 +2180,7 @@ impl VulkanDeviceCatalog {
     }
 }
 
-#[cfg(all(windows, any(feature = "inference-worker", test)))]
+#[cfg(all(windows, any(feature = "vulkan-acceleration", test)))]
 fn resolve_vulkan_provider_identity(
     native_id: Option<&str>,
     display_name: &str,
@@ -2208,7 +2208,7 @@ fn resolve_vulkan_provider_identity(
     vulkan_catalog.claim(display_name, device_class, vendor)
 }
 
-#[cfg(all(windows, any(feature = "inference-worker", test)))]
+#[cfg(all(windows, any(feature = "vulkan-acceleration", test)))]
 fn normalize_gpu_display_name(value: &str) -> Option<String> {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     (!normalized.is_empty()
