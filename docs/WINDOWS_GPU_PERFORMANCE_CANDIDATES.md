@@ -31,8 +31,12 @@ The intended release sequence is:
 
 This delivery implements the evidence boundary in steps 2–3, not the protected
 approval service, candidate builder, final qualification or publication flow.
-In particular, the current release builder still rebuilds its CPU worker; that
-must change in the later fixed-artifact candidate integration.
+The normal release builder still builds its CPU worker. The separate
+[local frozen-worker packaging path](WINDOWS_FROZEN_CPU_WORKER_PACKAGING.md)
+can retain exact CPU-worker bytes across desktop construction, but its unsigned
+local integrity record and explicitly non-publishing bundle are not production
+provenance or a complete candidate installer. Authenticated input custody,
+candidate-policy embedding and production acceptance remain later integration.
 
 A complete authenticated campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial

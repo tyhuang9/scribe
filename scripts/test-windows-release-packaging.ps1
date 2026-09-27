@@ -6,6 +6,9 @@ $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
 $packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
 $gpuReleasePolicyScript = Join-Path $PSScriptRoot "resolve-windows-gpu-release-policy.ps1"
+$InstallerPackAllowlistPath = $null
+$FrozenCpuWorkerRecordPath = $null
+$modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
 $helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
@@ -65,7 +68,7 @@ finally {
     $encodedHolderScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($holderScript))
     Start-Process -FilePath $PowerShellPath -ArgumentList @(
         '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedHolderScript
-    ) -PassThru
+    ) -PassThru -WindowStyle Hidden
 }
 
 function Wait-TestLogHandleHolderReady(
@@ -150,7 +153,14 @@ function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
         $ReleaseSource.Contains('vulkan-acceleration')) {
         throw 'Windows release packaging must build the desktop and CPU inference worker independently without enabling GPU or every Cargo feature.'
     }
-    Assert-OrderedWorkflowTokens $ReleaseSource @(
+    # Frozen mode clears the worker-build flag in its separate branch before
+    # this normal worker/hash/desktop sequence. Check the normal sequence from
+    # its digest reset through the shared desktop build, not the other branch.
+    $normalBuildStart = $ReleaseSource.IndexOf('$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null', [StringComparison]::Ordinal)
+    if ($normalBuildStart -lt 0) {
+        throw 'Windows release packaging is missing its normal worker digest reset.'
+    }
+    Assert-OrderedWorkflowTokens ($ReleaseSource.Substring($normalBuildStart)) @(
         '$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null',
         '$env:SCRIBE_BUILDING_WORKER = ''1''',
         $expectedWorkerBuild,
@@ -1671,6 +1681,7 @@ Set-StrictMode -Version Latest
 
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-frozen-cpu-worker-packaging.ps1')
     Write-Output "Windows release packaging fail-closed tests passed."
 }
 finally {
