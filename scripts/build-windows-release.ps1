@@ -3,22 +3,20 @@ param(
     [string]$ModelSource,
     [string]$BundlePath,
     [string[]]$WorkerPackRoot = @(),
-    [string]$InstallerPackAllowlistPath
+    [string]$InstallerPackAllowlistPath,
+    [string]$FrozenCpuWorkerRecordPath
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
+. (Join-Path $PSScriptRoot "windows-frozen-cpu-worker-integrity.ps1")
 
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-if ([string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)) {
-    $InstallerPackAllowlistPath = Join-Path $repositoryRoot "dist\worker-pack-allowlist.iss"
-}
 $modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
-$modelManifest = Get-Content -LiteralPath $modelManifestPath -Raw | ConvertFrom-Json
 $legalFiles = @(
     [pscustomobject]@{ Source = "resources/licenses/Apache-2.0.txt"; Destination = "licenses/Apache-2.0.txt" },
     [pscustomobject]@{ Source = "resources/licenses/OpenAI-Whisper-MIT.txt"; Destination = "licenses/OpenAI-Whisper-MIT.txt" },
@@ -343,6 +341,27 @@ function Assert-ReleaseSmokeDiagnostics([psobject]$Smoke) {
     }
 }
 
+function Test-PathIsWithin([string]$CandidatePath, [string]$RootPath) {
+    $candidate = Get-NormalizedFullPath $CandidatePath
+    $root = Get-NormalizedFullPath $RootPath
+    return [string]::Equals($candidate, $root, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $candidate.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+$frozenCpuWorkerRequested = $PSBoundParameters.ContainsKey('FrozenCpuWorkerRecordPath')
+$installerPackAllowlistWasExplicit = $PSBoundParameters.ContainsKey('InstallerPackAllowlistPath') -and
+    -not [string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)
+if ($frozenCpuWorkerRequested -and [string]::IsNullOrWhiteSpace($FrozenCpuWorkerRecordPath)) {
+    throw 'FrozenCpuWorkerRecordPath was explicitly supplied but is empty or whitespace.'
+}
+if ($frozenCpuWorkerRequested) {
+    Assert-WindowsFrozenCpuWorkerLocalOnlyEnvironment
+}
+if (-not $frozenCpuWorkerRequested -and [string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)) {
+    $InstallerPackAllowlistPath = Join-Path $repositoryRoot "dist\worker-pack-allowlist.iss"
+}
+$modelManifest = Get-Content -LiteralPath $modelManifestPath -Raw | ConvertFrom-Json
+
 if (-not [Environment]::Is64BitOperatingSystem -or
     [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "The release bundle is qualified only for Windows x64."
@@ -397,6 +416,15 @@ foreach ($protectedCargoTargetRoot in @($defaultCargoTargetRoot, $cargoTargetRoo
         throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
     }
 }
+if ($frozenCpuWorkerRequested) {
+    $frozenInputRoot = Split-Path -Parent (Get-NormalizedFullPath $FrozenCpuWorkerRecordPath)
+    # Reject overlapping outputs before creating any directories: even a failed
+    # build must leave the exact frozen input inventory untouched.
+    if ((Test-PathIsWithin $finalBundle $frozenInputRoot) -or
+        ($installerPackAllowlistWasExplicit -and (Test-PathIsWithin $InstallerPackAllowlistPath $frozenInputRoot))) {
+        throw 'Frozen CPU worker inputs cannot contain bundle, staging, or installer-allowlist outputs.'
+    }
+}
 Assert-NoReparseAncestors $bundleParent
 if (Test-Path -LiteralPath $finalBundle) {
     throw "Final release bundle already exists; remove or archive it explicitly first: $finalBundle"
@@ -426,35 +454,60 @@ Assert-ExactFile $modelSourcePath ([int64]$modelManifest.size_bytes) $modelManif
 $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 $sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
-$previousWorkerSha256 = $env:SCRIBE_BUNDLED_WORKER_SHA256
-$previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
-Push-Location $repositoryRoot
+$frozenCpuWorker = $null
 try {
-    # The worker is built and hashed first. The desktop then embeds that exact
-    # SHA-256 as its bundled-worker trust anchor; this is intentionally separate
-    # from the future signed GPU pack catalog.
-    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
-    $env:SCRIBE_BUILDING_WORKER = '1'
-    & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
-    if ($LASTEXITCODE -ne 0) {
-        throw "The locked offline Windows x64 CPU inference worker release build failed."
+    if ($frozenCpuWorkerRequested) {
+        if (Test-PathIsWithin $stagingBundle $frozenInputRoot) {
+            throw 'Frozen CPU worker inputs cannot contain bundle, staging, or installer-allowlist outputs.'
+        }
+        # Validate every source/build-contract field and retain the exact worker
+        # read handle before any Cargo invocation.  This is local byte integrity,
+        # never a substitute for production provenance or signing.
+        $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $repositoryRoot
+        $sourceInferenceWorker = $frozenCpuWorker.WorkerPath
     }
-    Assert-Amd64Pe $sourceInferenceWorker
-    $env:SCRIBE_BUILDING_WORKER = $null
-    $env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker).Hash.ToLowerInvariant()
-    if ($env:SCRIBE_BUNDLED_WORKER_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
-        throw "The CPU inference worker did not produce a valid SHA-256 trust anchor."
+    $previousWorkerSha256 = $env:SCRIBE_BUNDLED_WORKER_SHA256
+    $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
+    $previousBuildRevision = $env:SCRIBE_BUILD_REVISION
+    Push-Location $repositoryRoot
+    try {
+        if ($frozenCpuWorkerRequested) {
+            $env:SCRIBE_BUILDING_WORKER = $null
+            $env:SCRIBE_BUNDLED_WORKER_SHA256 = [string]$frozenCpuWorker.Record.worker_sha256
+            $env:SCRIBE_BUILD_REVISION = [string]$frozenCpuWorker.Context.SourceRevision
+        }
+        else {
+            # The worker is built and hashed first. The desktop then embeds that exact
+            # SHA-256 as its bundled-worker trust anchor; this is intentionally separate
+            # from the future signed GPU pack catalog.
+            $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
+            $env:SCRIBE_BUILDING_WORKER = '1'
+            & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+            if ($LASTEXITCODE -ne 0) {
+                throw "The locked offline Windows x64 CPU inference worker release build failed."
+            }
+            Assert-Amd64Pe $sourceInferenceWorker
+            $env:SCRIBE_BUILDING_WORKER = $null
+            $env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker).Hash.ToLowerInvariant()
+            if ($env:SCRIBE_BUNDLED_WORKER_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw "The CPU inference worker did not produce a valid SHA-256 trust anchor."
+            }
+        }
+        & cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+        if ($LASTEXITCODE -ne 0) {
+            throw "The locked offline Windows x64 desktop release build failed."
+        }
     }
-    & cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
-    if ($LASTEXITCODE -ne 0) {
-        throw "The locked offline Windows x64 desktop release build failed."
+    finally {
+        $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerSha256
+        $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
+        $env:SCRIBE_BUILD_REVISION = $previousBuildRevision
+        Pop-Location
     }
-}
-finally {
-    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerSha256
-    $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
-    Pop-Location
-}
+
+    if ($frozenCpuWorkerRequested) {
+        Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
+    }
 
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
@@ -468,8 +521,21 @@ try {
     $stagedExecutable = Join-Path $stagingBundle "local-transcriber.exe"
     $stagedInferenceWorker = Join-Path $stagingBundle "scribe-inference-worker.exe"
     Copy-Item -LiteralPath $sourceExecutable -Destination $stagedExecutable
-    Copy-Item -LiteralPath $sourceInferenceWorker -Destination $stagedInferenceWorker
+    if ($frozenCpuWorkerRequested) {
+        Copy-WindowsFrozenCpuWorkerOpenHandle $frozenCpuWorker.WorkerStream $stagedInferenceWorker
+    }
+    else {
+        Copy-Item -LiteralPath $sourceInferenceWorker -Destination $stagedInferenceWorker
+    }
 
+    $removeFrozenInstallerAllowlist = $false
+    if ($frozenCpuWorkerRequested -and -not $installerPackAllowlistWasExplicit) {
+        # The pack-stage helper requires an allowlist output even for the empty
+        # CPU-only catalog.  Keep this transient sidecar inside our transaction
+        # rather than dirtying the checkout's normal dist path.
+        $InstallerPackAllowlistPath = Join-Path $stagingBundle 'worker-pack-allowlist.iss'
+        $removeFrozenInstallerAllowlist = $true
+    }
     $packStageOutput = @(& (Join-Path $PSScriptRoot "stage-verified-worker-packs.ps1") `
         -BundleRoot $stagingBundle `
         -VerifierExecutable $stagedExecutable `
@@ -479,6 +545,14 @@ try {
         throw "Worker-pack staging did not return exactly one bounded result."
     }
     $packStage = $packStageOutput[0]
+    if ($removeFrozenInstallerAllowlist) {
+        if ((Get-NormalizedFullPath $InstallerPackAllowlistPath) -cne
+            (Get-NormalizedFullPath (Join-Path $stagingBundle 'worker-pack-allowlist.iss')) -or
+            -not (Test-Path -LiteralPath $InstallerPackAllowlistPath -PathType Leaf)) {
+            throw 'Frozen CPU worker pack staging did not produce its owned transient allowlist.'
+        }
+        Remove-Item -LiteralPath $InstallerPackAllowlistPath -Force
+    }
 
     $stagedModel = Join-Path $stagingBundle $modelManifest.artifact_filename
     Copy-Item -LiteralPath $modelSourcePath -Destination $stagedModel
@@ -527,11 +601,20 @@ try {
         "To roll back the installer, close Scribe, uninstall the current program payload, and install a previously verified installer. To roll back portable use, close Scribe and launch a previously verified complete portable folder. Do not delete per-user app data or external/imported models as part of rollback.",
         ""
     ) -join "`r`n"
+    if ($frozenCpuWorkerRequested) {
+        $portableReadmeText = "LOCAL-ONLY FROZEN CPU WORKER PACKAGE: this bundle is not release-approved and the production package verifier intentionally rejects it.`r`n`r`n$portableReadmeText"
+    }
     [System.IO.File]::WriteAllText(
         $portableReadme,
         $portableReadmeText,
         [System.Text.UTF8Encoding]::new($false)
     )
+    if ($frozenCpuWorkerRequested) {
+        $frozenBundleMarker = Join-Path $stagingBundle (Get-WindowsFrozenCpuWorkerMarkerFileName)
+        Write-WindowsFrozenCpuWorkerAtomicUtf8File `
+            $frozenBundleMarker `
+            (Get-WindowsFrozenCpuWorkerBundleMarkerText $frozenCpuWorker.RecordSha256 $frozenCpuWorker.Record)
+    }
 
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
@@ -552,6 +635,9 @@ try {
     $expectedPaths = [System.Collections.Generic.List[string]]::new()
     $null = $expectedPaths.Add("local-transcriber.exe")
     $null = $expectedPaths.Add("scribe-inference-worker.exe")
+    if ($frozenCpuWorkerRequested) {
+        $null = $expectedPaths.Add((Get-WindowsFrozenCpuWorkerMarkerFileName))
+    }
     $null = $expectedPaths.Add($modelManifest.artifact_filename)
     foreach ($legalFile in $legalFiles) {
         $null = $expectedPaths.Add($legalFile.Destination)
@@ -624,10 +710,18 @@ try {
     Assert-SafeStagingPath $stagingBundle $finalBundle
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
+    if ($frozenCpuWorkerRequested) {
+        Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
+    }
     if (Test-Path -LiteralPath $finalBundle) {
         throw "Final release bundle appeared during staging; refusing to replace it: $finalBundle"
     }
-    Move-Item -LiteralPath $stagingBundle -Destination $finalBundle
+    if ($frozenCpuWorkerRequested) {
+        [System.IO.Directory]::Move($stagingBundle, $finalBundle)
+    }
+    else {
+        Move-Item -LiteralPath $stagingBundle -Destination $finalBundle
+    }
 
     Write-Output "Windows x64 release bundle ready: $finalBundle"
     Write-Output "Bundle inventory SHA-256: $inventoryHash"
@@ -640,4 +734,10 @@ catch {
         Write-Warning "Refused automatic staging cleanup because its bounds could not be proven: $($_.Exception.Message)"
     }
     throw
+}
+}
+finally {
+    if ($null -ne $frozenCpuWorker -and $null -ne $frozenCpuWorker.WorkerStream) {
+        $frozenCpuWorker.WorkerStream.Dispose()
+    }
 }
