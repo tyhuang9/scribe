@@ -1,8 +1,8 @@
 # Windows GPU capture observations
 
-This development-only observer is the first real acquisition primitive for the
+This development-only observer provides acquisition primitives for the
 [performance-candidate pipeline](WINDOWS_GPU_PERFORMANCE_CANDIDATES.md). It is
-not a completed qualification campaign. Do not use its output as signed
+not a completed qualification system. Do not use its output as signed
 evidence or release approval.
 
 ## Scope and invariants
@@ -14,13 +14,15 @@ anchor remain required. An arbitrary path plus a supplied digest is not launch
 authority. The currently empty production trust still prevents production GPU
 pack use until the separate approved-signing setup is completed.
 
-The initial scope is one CPU request and one GPU request, executed serially,
+The default mode is one CPU request and one GPU request, executed serially,
 with actual handshake, request timing and native memory/power observations,
 including request-bound raw provider-memory snapshots and separately sourced
 memory-availability observations.
-It does not implement the five-cold/twenty-warm campaign, production capture
-signatures, campaign authorization or nonce consumption. Normal application
-routing, saved settings, health records and Auto policy must remain unchanged.
+An explicit one-power campaign mode adds five cold and twenty warm CPU/GPU
+pairs, with separately identified priming requests. Neither mode implements
+production capture signatures, campaign authorization or nonce consumption.
+Normal application routing, saved settings, health records and Auto policy
+must remain unchanged.
 The optional collector must not enable the `inference-worker` feature or link
 CUDA/Vulkan inference providers into the desktop process. Existing CPU-only
 voice-activity support is unchanged.
@@ -132,9 +134,9 @@ exits; a replacement generation cannot inherit earlier measurements.
 - `elapsed_ms` is the collector's instrumented request window, including
   sampling setup and observation-control overhead, but excluding sampler
   finalization after the observed request returns. It is not yet a complete
-  cold/warm qualification timing contract. The full campaign must establish
-  consistent boundaries and measure instrumentation overhead before using
-  these observations to compare ordinary application latency.
+  cold/warm qualification timing contract. Campaign mode defines separate
+  cold/warm boundaries below; qualification must still measure instrumentation
+  overhead before comparing these observations with ordinary application latency.
 - Process memory is current private commit (`PrivateUsage`), sampled over the
   individual observation window. The reported maximum is a sampled maximum,
   not a guaranteed instantaneous peak or a process-lifetime high-water mark.
@@ -223,13 +225,14 @@ branch supplied the unchanged raw snapshot. Qualification and runtime
 admission must use consistent measurement semantics before such observations
 can affect Auto; there is no evaluator adapter in this observer.
 
-The later paired warm campaign needs one retained CPU worker and one retained
-GPU worker, executing inference serially. Keep this exception private to the
-collector, bound it to two workers and account for retained-model interference.
-Preserve the five-minute idle lifetime and reject an expired warm generation;
-do not add keepalive inference or silently prime it again.
+The paired warm campaign retains one CPU worker and one GPU worker, executing
+inference serially. This exception stays private to the collector and is bounded
+to two workers; ordinary application residency is unchanged. Retained-model
+interference still needs measurement before qualification. The collector owns
+the five-minute idle lifetime; it rejects an expired warm generation instead
+of adding keepalive inference or silently priming it again.
 
-Hardware counter validation, complete paired-run acquisition, protected capture
+Hardware counter validation, qualified paired-run evidence, protected capture
 custody, candidate-installer integration and unchanged-artifact promotion remain
 separate acceptance gates. Passing deterministic observer tests alone does not
 establish GPU performance or production readiness.
@@ -269,6 +272,86 @@ unavailable observations, not fabricated successful facts. There is no legacy
 report conversion or qualification adapter: old observations must not be
 relabelled as new captures.
 
+## One-power paired campaign
+
+Add `--campaign-power ac` or `--campaign-power battery` to select campaign mode.
+The PowerShell wrapper exposes the same option as `-CampaignPower ac` or
+`-CampaignPower battery`. Omit it to preserve the single-pair schema-3 report.
+Values must be lowercase and explicit; there is no `auto` or unknown-power
+campaign. The collector observes power, never changes it or asks the operating
+system to switch plans. Each request must match the requested power at both
+endpoints. As with single-pair observations, this does not establish the absence
+of a brief power transition between endpoint readings.
+Cold and priming requests retain their initial power reading from before worker
+launch and check power again before dispatch; a change during startup must not
+be hidden by a later pre-inference reading.
+
+The fixed sequence is:
+
+1. Resolve and retain the verified model/WAV and exact GPU pack/device binding.
+   Preflight both workers' observation support outside measured windows, then
+   shut down these probe workers. They cannot become cold-run generations.
+2. Run five cold CPU/GPU pairs, alternating which target runs first. Every
+   measured request creates a fresh worker/model and shuts it down afterward.
+3. Create two fresh workers and prime each exactly once. Preserve these two
+   priming observations separately; they are not warm measurements.
+4. Run twenty warm CPU/GPU pairs, alternating order and executing inference
+   serially. Require the primed worker generation and actual warm-reuse/model
+   load diagnostics; do not restart, fall back, repeat a failed request, or
+   silently prime again.
+
+Each subsequent worker launch still performs ordinary pack verification and
+stable-device remapping. Retaining a selection does not grant a worker-path,
+pack-trust or device-index override.
+After capture, both capability negotiation and transcription stay bound to that
+worker generation. Losing the worker fails the attempt; neither operation may
+implicitly launch a replacement.
+
+The collector's idle watchdog enforces `WARM_MODEL_TTL` (five minutes), including
+when the opposite target is still transcribing or priming. Idle time starts at
+the correlated request result, before report processing. Expiry retires only
+the idle generation, makes the campaign incomplete, and prevents another warm
+request. An already active request may settle; its output is not replayed.
+
+### Timing and report boundary
+
+The timing label is an **instrumented, prepared-audio, fixed-target request
+window**, not ordinary-application end-to-end latency:
+
+- Cold timing begins before constructing/launching the measured worker and
+  includes handshake, observation negotiation, model loading and the request.
+- Warm timing begins before the per-request observation/sampling setup.
+- Both stop when the correlated observed result returns. Sampler finalization,
+  transcript hashing, report serialization/publication and shutdown are outside
+  the window. Discovery, input hashing and audio preparation are also outside.
+- Record `backend_ms` from the runtime's reported processing duration, plus
+  `model_load_ms` and `warm_reused`. Never subtract an estimated instrumentation
+  overhead or replace a measured zero duration with a fabricated positive value.
+
+Campaigns use a distinct `windows_gpu_capture_campaign` schema-1 report, bounded
+to 32 MiB, at most 14 captured worker handshakes and 52 request records. A
+successful sequence has 50 measured records and two separately identified
+priming records. Deduplicate actual validated Hello/Ready bytes by their bound
+generation; retain timing, memory, power and transcript digests without raw
+audio, transcript text, user paths or native error messages.
+
+Handled acquisition failures retain categorized failed records and publish an
+incomplete report after cleanup attempts. Do not drop a failure or fabricate
+unattempted records to fill the expected count. Input-validation or publication
+failures can prevent report creation; a report is never overwritten. Incomplete
+campaigns return failure even when a diagnostic report was written.
+
+The report remains unsigned and unqualified, with `auto_eligible:false` and
+`release_approved:false`. Missing thermal/background-load, complete host,
+affinity and power-plan controls remain unknown, not successful facts. This
+runner does not convert reports into signed evidence, derive admission floors,
+or enable Auto. Warm availability already includes a resident model and cannot
+establish the free memory needed to load it from cold. A separately reviewed
+qualification stage must validate instrumentation overhead, retained-model
+interference, native counters, representative hardware and capture custody.
+
+## Verification
+
 The canonical offline verification entry point is:
 
 ```powershell
@@ -277,15 +360,21 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and five test groups: collector, native telemetry, supervisor
-observation controls/leases, provider-memory snapshots and architecture guards.
+discovery and six test groups: collector, native telemetry, paired campaigns,
+supervisor observation controls/leases, provider-memory snapshots and architecture
+guards.
 `-ScriptOnly` provides the fast inner-loop check: script parsing and
-twelve prelaunch argument/file-rejection cases without invoking any
+nineteen prelaunch argument/file-rejection cases without invoking any
 executable. The three tiny owned fixture files are removed after use.
 Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo
 command and cannot substitute for native verification.
+Six in-memory forwarding cases additionally cover both GPU backends with the
+campaign option omitted, on AC, or on battery, preserving individual argument
+values containing spaces and shell metacharacters. They exercise the actual
+PowerShell bound-parameter dictionary, not just a Hashtable substitute, and
+launch no collector.
 It does not replace the full command above.
 Both strict lint configurations include `ui-harness`, matching the existing
 release checks' shared UI-route coverage; one excludes the observer and one

@@ -90,6 +90,33 @@ try {
         if (-not $rejected) { throw 'Capture wrapper accepted a malformed input.' }
     }
 
+    foreach ($power in @('AC', 'Battery')) {
+        $arguments = $wrapperArguments.Clone()
+        $arguments.CampaignPower = $power
+        $rejected = $false
+        try { & $wrapper @arguments }
+        catch {
+            if ($_.Exception.Message -cne 'Capture campaign power must be lowercase ac or battery.') {
+                throw 'Capture wrapper rejected noncanonical campaign power at the wrong boundary.'
+            }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Capture wrapper accepted noncanonical campaign power.' }
+    }
+    foreach ($power in @('', 'unknown', 'auto', ' ac', 'battery ')) {
+        $arguments = $wrapperArguments.Clone()
+        $arguments.CampaignPower = $power
+        $rejected = $false
+        try { & $wrapper @arguments }
+        catch {
+            if ($_.FullyQualifiedErrorId -notlike 'ParameterArgumentValidationError*') {
+                throw 'Capture wrapper did not reject invalid campaign power during parameter binding.'
+            }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Capture wrapper accepted an invalid campaign power.' }
+    }
+
     $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('scribe-capture-wrapper-' + [Guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop
     $emptyExe = Join-Path $fixtureRoot 'empty.exe'
@@ -131,7 +158,7 @@ try {
         Remove-Item -LiteralPath $fixtureRoot -ErrorAction Stop
     }
     if ($ScriptOnly) {
-        Write-Output 'Windows GPU capture observation script contracts passed (12 prelaunch cases); native checks not run.'
+        Write-Output 'Windows GPU capture observation script contracts passed (19 prelaunch cases); native checks not run.'
         return
     }
 
@@ -148,6 +175,7 @@ try {
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
+            'windows_gpu_capture::campaign::tests',
             'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
             'architecture_guard::windows_gpu_capture')) {
         Invoke-CaptureTests $feature $filter

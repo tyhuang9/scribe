@@ -5605,7 +5605,8 @@ impl ProcessWorkerSupervisor {
                 if state
                     .current
                     .as_ref()
-                    .is_some_and(|current| current.generation == generation) =>
+                    .is_some_and(|current| current.generation == generation)
+                    && !state.retiring_generations.contains(&generation) =>
             {
                 if state.active_request.is_some() {
                     Some(anyhow!("a process worker request is already active"))
@@ -5842,12 +5843,142 @@ impl ProcessWorkerSupervisor {
         Ok(lease)
     }
 
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn retire_observation_lease(&self, lease: &WorkerObservationLease) -> Result<()> {
+        let owner = lease
+            .supervisor
+            .upgrade()
+            .ok_or_else(|| anyhow!("worker observation supervisor was dropped"))?;
+        if !Arc::ptr_eq(&owner, &self.inner) {
+            bail!("worker observation lease belongs to another supervisor")
+        }
+        let process = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let Some(current) = state.current.as_ref() else {
+                return Ok(());
+            };
+            if current.generation != lease.generation
+                || !Arc::ptr_eq(&current.process, &lease.process)
+            {
+                bail!("worker observation lease no longer identifies the current generation")
+            }
+            if state
+                .active_request
+                .is_some_and(|request| request.generation == lease.generation)
+            {
+                bail!("cannot retire an active observation generation")
+            }
+            if state
+                .active_stream
+                .is_some_and(|stream| stream.generation == lease.generation)
+            {
+                bail!("cannot retire an observation generation with an active stream")
+            }
+            let process = Arc::clone(&current.process);
+            if !state.retiring_generations.insert(lease.generation) {
+                bail!("worker observation generation is already being retired")
+            }
+            process
+        };
+        self.finish_generation_invalidation(
+            lease.generation,
+            "capture observation generation was explicitly retired",
+            true,
+            process,
+        )
+    }
+
     fn generation_context(&self) -> Result<WorkerGenerationContext> {
         let generation = self.ensure_generation()?;
         Ok(WorkerGenerationContext {
             generation,
             pack_bindings: self.pack_bindings_for_generation(generation)?,
         })
+    }
+
+    fn generation_context_for(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> Result<WorkerGenerationContext> {
+        match expected_generation {
+            Some(generation) => self.generation_context_exact(generation),
+            None => self.generation_context(),
+        }
+    }
+
+    fn generation_context_exact(&self, generation: u64) -> Result<WorkerGenerationContext> {
+        let process = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let current = state
+                .current
+                .as_ref()
+                .filter(|current| current.generation == generation)
+                .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))?;
+            if state.retiring_generations.contains(&generation) {
+                bail!("process worker generation {generation} is being retired")
+            }
+            Arc::clone(&current.process)
+        };
+        if !process.is_running()? {
+            bail!("process worker generation {generation} is no longer running")
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_ref()
+            .filter(|current| {
+                current.generation == generation && Arc::ptr_eq(&current.process, &process)
+            })
+            .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))?;
+        if state.retiring_generations.contains(&generation) {
+            bail!("process worker generation {generation} is being retired")
+        }
+        Ok(WorkerGenerationContext {
+            generation,
+            pack_bindings: current.pack_bindings.clone(),
+        })
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn observation_generation_context(
+        &self,
+        lease: &WorkerObservationLease,
+    ) -> Result<WorkerGenerationContext> {
+        let owner = lease
+            .supervisor
+            .upgrade()
+            .ok_or_else(|| anyhow!("worker observation supervisor was dropped"))?;
+        if !Arc::ptr_eq(&owner, &self.inner) {
+            bail!("worker observation lease belongs to another supervisor")
+        }
+        let context = self.generation_context_exact(lease.generation)?;
+        let matches_process = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .is_some_and(|current| {
+                current.generation == lease.generation
+                    && Arc::ptr_eq(&current.process, &lease.process)
+            });
+        if !matches_process {
+            bail!("worker observation lease no longer identifies the current generation")
+        }
+        Ok(context)
     }
 
     fn pack_bindings_for_generation(
@@ -5969,6 +6100,16 @@ impl ProcessWorkerSupervisor {
                 }
             }
         };
+        self.finish_generation_invalidation(generation, reason, force_kill, process)
+    }
+
+    fn finish_generation_invalidation(
+        &self,
+        generation: u64,
+        reason: &str,
+        force_kill: bool,
+        process: Arc<dyn WorkerProcess>,
+    ) -> Result<()> {
         if force_kill && let Err(error) = process.terminate() {
             if let Ok(mut state) = self.inner.state.lock() {
                 state.retiring_generations.remove(&generation);
@@ -6835,6 +6976,7 @@ pub(crate) struct ObservedRuntimeExecution {
     pub(crate) after: ProviderMemoryObservation,
     pub(crate) availability_before: WorkerMemoryAvailability,
     pub(crate) availability_after: WorkerMemoryAvailability,
+    pub(crate) result_at: Instant,
 }
 
 impl InferenceWorkerSupervisor {
@@ -6934,9 +7076,17 @@ impl InferenceWorkerSupervisor {
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn negotiate_runtime_observation(&self) -> Result<(), RuntimeError> {
+        self.negotiate_runtime_observation_on_generation(None)
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn negotiate_runtime_observation_on_generation(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> Result<(), RuntimeError> {
         let context = self
             .transport
-            .generation_context()
+            .generation_context_for(expected_generation)
             .map_err(worker_unavailable)?;
         let correlation = self.next_id();
         let frame = control_frame(
@@ -6975,12 +7125,13 @@ impl InferenceWorkerSupervisor {
     fn begin_runtime_observation(
         &self,
         model_sha256: &str,
+        expected_generation: Option<u64>,
     ) -> Result<RuntimeObservationStart, RuntimeError> {
         let model_sha256 =
             canonical_runtime_observation_digest(model_sha256).map_err(worker_unavailable)?;
         let context = self
             .transport
-            .generation_context()
+            .generation_context_for(expected_generation)
             .map_err(worker_unavailable)?;
         let session_id = self.next_id();
         let request_id = self.next_id();
@@ -7173,7 +7324,7 @@ impl InferenceWorkerSupervisor {
             .map_err(|error| RuntimeError::Engine(error.to_string()))?;
         let context = self
             .transport
-            .generation_context()
+            .generation_context_for(expected_generation)
             .map_err(worker_unavailable)?;
         let generation = context.generation;
         if expected_generation.is_some_and(|expected| expected != generation) {
@@ -7331,6 +7482,7 @@ impl InferenceWorkerSupervisor {
         preference: AccelerationPreference,
         audio: &PreparedAudio,
         expected_gpu: Option<&GpuCaptureObservationIdentity>,
+        expected_generation: Option<u64>,
     ) -> Result<ObservedRuntimeExecution, RuntimeError> {
         let model_sha256 = match &artifact {
             RuntimeArtifact::Gguf(model) => model.expected_sha256.to_ascii_lowercase(),
@@ -7340,7 +7492,7 @@ impl InferenceWorkerSupervisor {
                 ));
             }
         };
-        let started = self.begin_runtime_observation(&model_sha256)?;
+        let started = self.begin_runtime_observation(&model_sha256, expected_generation)?;
         started
             .before
             .validate_for_preference(preference)
@@ -7380,7 +7532,7 @@ impl InferenceWorkerSupervisor {
             },
         )
         .map_err(worker_unavailable)?;
-        match self
+        let completion = self
             .transport
             .active_round_trip(
                 started.generation,
@@ -7388,8 +7540,9 @@ impl InferenceWorkerSupervisor {
                 finish_request_id,
                 &[frame],
             )
-            .map_err(worker_unavailable)?
-        {
+            .map_err(worker_unavailable)?;
+        let result_at = Instant::now();
+        match completion {
             Control::RuntimeObservationV2Completed {
                 version,
                 model_sha256: echoed_model,
@@ -7420,6 +7573,7 @@ impl InferenceWorkerSupervisor {
                     after,
                     availability_before: started.availability_before,
                     availability_after,
+                    result_at,
                 })
             }
             Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
@@ -7517,7 +7671,7 @@ impl InferenceWorkerSupervisor {
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuCaptureObservationIdentity {
     pub(crate) backend: String,
     pub(crate) provider: String,
@@ -7621,16 +7775,28 @@ pub(crate) struct CaptureObservationWorker {
     pub(crate) gpu_identity: Option<GpuCaptureObservationIdentity>,
 }
 
+/// A resolved worker construction authority for the bounded capture campaign.
+///
+/// GPU discovery happens once when the factory is created. Every `spawn` still
+/// constructs an independent supervisor and the retained pack binding performs
+/// its normal launch-time revalidation and stable-device reconciliation.
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-impl CaptureObservationWorker {
+#[derive(Clone)]
+pub(crate) struct CaptureObservationWorkerFactory {
+    binding: Option<VerifiedPackLaunchBinding>,
+    gpu_identity: Option<GpuCaptureObservationIdentity>,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl CaptureObservationWorkerFactory {
     pub(crate) fn cpu() -> Self {
         Self {
-            supervisor: InferenceWorkerSupervisor::unstarted(),
+            binding: None,
             gpu_identity: None,
         }
     }
 
-    pub(crate) fn gpu(pack_id: &str, backend: &str, stable_device: &str) -> Result<Self> {
+    pub(crate) fn gpu_exact(pack_id: &str, backend: &str, stable_device: &str) -> Result<Self> {
         let backend = match backend {
             "cuda" => BackendKind::Cuda,
             "vulkan" => BackendKind::Vulkan,
@@ -7703,9 +7869,35 @@ impl CaptureObservationWorker {
             runtime_abi: pack.runtime_abi,
         };
         Ok(Self {
-            supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+            binding: Some(binding),
             gpu_identity: Some(identity),
         })
+    }
+
+    pub(crate) fn spawn(&self) -> CaptureObservationWorker {
+        let supervisor = match &self.binding {
+            Some(binding) => InferenceWorkerSupervisor::for_pack_binding(binding.clone()),
+            None => InferenceWorkerSupervisor::unstarted(),
+        };
+        CaptureObservationWorker {
+            supervisor,
+            gpu_identity: self.gpu_identity.clone(),
+        }
+    }
+
+    pub(crate) fn gpu_identity(&self) -> Option<&GpuCaptureObservationIdentity> {
+        self.gpu_identity.as_ref()
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl CaptureObservationWorker {
+    pub(crate) fn cpu() -> Self {
+        CaptureObservationWorkerFactory::cpu().spawn()
+    }
+
+    pub(crate) fn gpu(pack_id: &str, backend: &str, stable_device: &str) -> Result<Self> {
+        Ok(CaptureObservationWorkerFactory::gpu_exact(pack_id, backend, stable_device)?.spawn())
     }
 
     pub(crate) fn prepare_observation(&self) -> Result<WorkerObservationLease> {
@@ -7715,6 +7907,21 @@ impl CaptureObservationWorker {
     pub(crate) fn negotiate_runtime_observation(&self) -> Result<()> {
         self.supervisor
             .negotiate_runtime_observation()
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Negotiation for a campaign must use its captured generation too. A
+    /// failure between Hello and negotiation cannot launch an unrecorded retry.
+    pub(crate) fn negotiate_runtime_observation_retained(
+        &self,
+        lease: &WorkerObservationLease,
+    ) -> Result<()> {
+        let context = self
+            .supervisor
+            .transport
+            .observation_generation_context(lease)?;
+        self.supervisor
+            .negotiate_runtime_observation_on_generation(Some(context.generation))
             .map_err(anyhow::Error::new)
     }
 
@@ -7730,12 +7937,47 @@ impl CaptureObservationWorker {
                 preference,
                 audio,
                 self.gpu_identity.as_ref(),
+                None,
+            )
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Runs an observed request only on the exact live generation retained by
+    /// `lease`. This path never starts a replacement worker.
+    pub(crate) fn transcribe_observed_retained(
+        &self,
+        lease: &WorkerObservationLease,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+    ) -> Result<ObservedRuntimeExecution> {
+        let context = self
+            .supervisor
+            .transport
+            .observation_generation_context(lease)?;
+        self.supervisor
+            .transcribe_with_runtime_observation(
+                artifact,
+                preference,
+                audio,
+                self.gpu_identity.as_ref(),
+                Some(context.generation),
             )
             .map_err(anyhow::Error::new)
     }
 
     pub(crate) fn shutdown(&self) -> Result<()> {
         self.supervisor.shutdown().map_err(anyhow::Error::new)
+    }
+
+    /// Force-retires only the exact generation represented by `lease`.
+    /// This collector-only path never calls `ensure_generation`, so expiry and
+    /// cleanup cannot silently create a replacement observation generation.
+    pub(crate) fn retire_observation_generation(
+        &self,
+        lease: &WorkerObservationLease,
+    ) -> Result<()> {
+        self.supervisor.transport.retire_observation_lease(lease)
     }
 }
 
@@ -18349,6 +18591,193 @@ mod tests {
         assert!(replacement.require_current().is_err());
     }
 
+    #[test]
+    fn active_request_admission_rejects_a_generation_reserved_for_retirement() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let supervisor = inference_supervisor_with_launcher(Arc::clone(&launcher));
+        let transport = &supervisor.transport;
+        let generation = transport.ensure_generation().unwrap();
+        let frame = control_frame(41, 42, &Control::Health).unwrap();
+        {
+            let mut state = transport.inner.state.lock().unwrap();
+            assert!(state.retiring_generations.insert(generation));
+        }
+        assert!(
+            transport
+                .active_round_trip(generation, 41, 42, &[frame])
+                .is_err()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        {
+            let mut state = transport.inner.state.lock().unwrap();
+            assert!(state.active_request.is_none());
+            assert_eq!(state.current.as_ref().unwrap().generation, generation);
+            assert!(state.retiring_generations.remove(&generation));
+        }
+        let frame = control_frame(41, 43, &Control::Health).unwrap();
+        assert!(matches!(
+            transport
+                .active_round_trip(generation, 41, 43, &[frame])
+                .unwrap(),
+            Control::Ok
+        ));
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        transport.terminate_current().unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_retained_crash_never_launches_a_replacement() {
+        let (received_tx, received_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::FailRequest {
+                received: received_tx,
+                malformed: true,
+            },
+            TestMode::RuntimeObservationSuccess {
+                completion_mismatch: None,
+                gpu: false,
+                request_counts: None,
+            },
+        ]));
+        let worker = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
+            gpu_identity: None,
+        };
+        let lease = worker.prepare_observation().unwrap();
+        lease.require_current().unwrap();
+
+        let request = {
+            let transport = worker.supervisor.transport.clone();
+            std::thread::spawn(move || transport.health(7, 9))
+        };
+        received_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.join().unwrap().is_err());
+        assert!(lease.require_current().is_err());
+
+        assert!(
+            worker
+                .negotiate_runtime_observation_retained(&lease)
+                .is_err()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        // Model the worker dying after the lease/owner check but before the
+        // inner negotiation acquires its context: that path must not ensure a
+        // replacement generation either.
+        assert!(
+            worker
+                .supervisor
+                .negotiate_runtime_observation_on_generation(Some(lease.generation))
+                .is_err()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+
+        let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+        let error = worker
+            .transcribe_observed_retained(
+                &lease,
+                missing_gguf_artifact(),
+                AccelerationPreference::Cpu,
+                &audio,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unavailable")
+                || error.contains("no longer running")
+                || error.contains("no longer identifies"),
+            "{error}"
+        );
+        assert_eq!(
+            launcher.launches.load(Ordering::Acquire),
+            1,
+            "a crashed retained generation must not be replaced"
+        );
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_retained_negotiation_rejects_foreign_and_retired_generations() {
+        let mode = || TestMode::RuntimeObservationSuccess {
+            completion_mismatch: None,
+            gpu: false,
+            request_counts: None,
+        };
+        let launcher = Arc::new(TestLauncher::new([mode(), mode()]));
+        let worker = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
+            gpu_identity: None,
+        };
+        let foreign_launcher = Arc::new(TestLauncher::new([]));
+        let foreign = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(Arc::clone(&foreign_launcher)),
+            gpu_identity: None,
+        };
+        let lease = worker.prepare_observation().unwrap();
+        assert!(
+            foreign
+                .negotiate_runtime_observation_retained(&lease)
+                .is_err()
+        );
+        assert_eq!(foreign_launcher.launches.load(Ordering::Acquire), 0);
+        worker
+            .negotiate_runtime_observation_retained(&lease)
+            .unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        worker.retire_observation_generation(&lease).unwrap();
+        assert!(
+            worker
+                .negotiate_runtime_observation_retained(&lease)
+                .is_err()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_retirement_rejects_foreign_and_stale_leases() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
+        let worker = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
+            gpu_identity: None,
+        };
+        let foreign_launcher = Arc::new(TestLauncher::new([]));
+        let foreign = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(Arc::clone(&foreign_launcher)),
+            gpu_identity: None,
+        };
+
+        let first = worker.prepare_observation().unwrap();
+        assert!(
+            foreign
+                .retire_observation_generation(&first)
+                .unwrap_err()
+                .to_string()
+                .contains("another supervisor")
+        );
+        assert_eq!(foreign_launcher.launches.load(Ordering::Acquire), 0);
+        first.require_current().unwrap();
+
+        worker.retire_observation_generation(&first).unwrap();
+        assert!(first.require_current().is_err());
+        worker.retire_observation_generation(&first).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        let second = worker.prepare_observation().unwrap();
+        second.require_current().unwrap();
+        assert!(
+            worker
+                .retire_observation_generation(&first)
+                .unwrap_err()
+                .to_string()
+                .contains("no longer identifies")
+        );
+        second.require_current().unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        worker.shutdown().unwrap();
+        worker.retire_observation_generation(&second).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+    }
+
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
     fn capture_observation_supervisor_drop_terminates_and_reaps_preflight_worker() {
@@ -19195,7 +19624,9 @@ mod tests {
                 expected_sha256: "a".repeat(64),
             });
             let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+            let request_started_at = Instant::now();
             let result = worker.transcribe_observed(artifact, AccelerationPreference::Cpu, &audio);
+            let request_returned_at = Instant::now();
             if completion_mismatch.is_some() {
                 assert!(
                     result
@@ -19212,6 +19643,8 @@ mod tests {
                     ProviderMemoryObservation::NotApplicable { .. }
                 ));
                 assert_eq!(observed.before, observed.after);
+                assert!(observed.result_at >= request_started_at);
+                assert!(observed.result_at <= request_returned_at);
                 worker.shutdown().unwrap();
             }
         }

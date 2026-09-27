@@ -4,6 +4,7 @@
 //! and one exact verified-GPU request, retains only validated Hello/Ready
 //! bytes plus bounded native telemetry, and publishes an unqualified report.
 
+mod campaign;
 mod telemetry;
 
 use std::ffi::{OsStr, OsString};
@@ -50,6 +51,23 @@ struct CommandOptions {
     gpu_backend: String,
     gpu_device: String,
     output: PathBuf,
+    campaign_power: Option<CampaignPower>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CampaignPower {
+    Ac,
+    Battery,
+}
+
+impl CampaignPower {
+    fn source(self) -> PowerSource {
+        match self {
+            Self::Ac => PowerSource::Ac,
+            Self::Battery => PowerSource::Battery,
+        }
+    }
 }
 
 struct VerifiedInput {
@@ -161,6 +179,13 @@ pub(crate) fn maybe_run_local_command() -> Option<i32> {
 
 fn run_local_command(args: &[OsString]) -> Result<()> {
     let options = parse_command(args)?;
+    if options.campaign_power.is_some() {
+        return campaign::run(options);
+    }
+    run_single_capture(options)
+}
+
+fn run_single_capture(options: CommandOptions) -> Result<()> {
     let mut model = verify_input(
         &options.model,
         &options.model_sha256,
@@ -519,12 +544,30 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     let mut gpu_backend = None;
     let mut gpu_device = None;
     let mut output = None;
+    let mut campaign_power = None;
     let mut saw_command = false;
     let mut index = 0;
     while index < args.len() {
         let name = args[index]
             .to_str()
             .ok_or_else(|| anyhow!("capture observation arguments must be Unicode"))?;
+        if name == "--campaign-power" {
+            if campaign_power.is_some() {
+                bail!("--campaign-power may be specified only once")
+            }
+            index += 1;
+            let value = args
+                .get(index)
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow!("--campaign-power requires a Unicode value"))?;
+            campaign_power = Some(match value {
+                "ac" => CampaignPower::Ac,
+                "battery" => CampaignPower::Battery,
+                _ => bail!("--campaign-power must be ac or battery"),
+            });
+            index += 1;
+            continue;
+        }
         let slot = match name {
             COMMAND_FLAG => {
                 if saw_command {
@@ -590,6 +633,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
         gpu_backend,
         gpu_device: canonical_text(gpu_device, "--gpu-device")?,
         output: PathBuf::from(required(output, "--output")?),
+        campaign_power,
     })
 }
 
@@ -793,6 +837,7 @@ mod tests {
     #[test]
     fn capture_observation_cli_is_exact_and_bounded() {
         let parsed = parse_command(&command_args()).unwrap();
+        assert_eq!(parsed.campaign_power, None);
         assert_eq!(parsed.gpu_backend, "vulkan");
         assert_eq!(parsed.gpu_device, "native:luid:0102030405060708");
         let mut duplicate = command_args();
@@ -809,6 +854,30 @@ mod tests {
             + 1;
         uppercase[digest] = "B".repeat(64).into();
         assert!(parse_command(&uppercase).is_err());
+    }
+
+    #[test]
+    fn capture_campaign_cli_requires_one_exact_optional_power() {
+        for (text, expected) in [
+            ("ac", CampaignPower::Ac),
+            ("battery", CampaignPower::Battery),
+        ] {
+            let mut args = command_args();
+            args.extend(["--campaign-power".into(), text.into()]);
+            assert_eq!(parse_command(&args).unwrap().campaign_power, Some(expected));
+            args.extend(["--campaign-power".into(), text.into()]);
+            assert!(parse_command(&args).is_err());
+        }
+        for invalid in [
+            "", "AC", "Battery", "unknown", "auto", " ac", "battery ", "--output",
+        ] {
+            let mut args = command_args();
+            args.extend(["--campaign-power".into(), invalid.into()]);
+            assert!(parse_command(&args).is_err());
+        }
+        let mut missing = command_args();
+        missing.push("--campaign-power".into());
+        assert!(parse_command(&missing).is_err());
     }
 
     #[test]
