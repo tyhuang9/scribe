@@ -9,7 +9,8 @@ param(
     [Parameter(Mandatory)][string]$GpuPackId,
     [Parameter(Mandatory)][ValidateSet('cuda', 'vulkan')][string]$GpuBackend,
     [Parameter(Mandatory)][string]$GpuDevice,
-    [Parameter(Mandatory)][string]$OutputPath
+    [Parameter(Mandatory)][string]$OutputPath,
+    [ValidateSet('ac', 'battery')][string]$CampaignPower
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,23 @@ foreach ($digest in @($CollectorSha256, $ModelSha256, $WavSha256)) {
 }
 if ($GpuBackend -cnotin @('cuda', 'vulkan')) {
     throw 'Capture observation backend must be lowercase cuda or vulkan.'
+}
+if ($PSBoundParameters.ContainsKey('CampaignPower') -and $CampaignPower -cnotin @('ac', 'battery')) {
+    throw 'Capture campaign power must be lowercase ac or battery.'
+}
+
+function Get-CaptureObservationArguments([Collections.IDictionary]$Options) {
+    $arguments = @(
+        '--scribe-windows-gpu-capture-observation',
+        '--model', $Options['ModelPath'], '--model-sha256', $Options['ModelSha256'],
+        '--wav', $Options['WavPath'], '--wav-sha256', $Options['WavSha256'],
+        '--gpu-pack-id', $Options['GpuPackId'], '--gpu-backend', $Options['GpuBackend'],
+        '--gpu-device', $Options['GpuDevice'], '--output', $Options['OutputPath']
+    )
+    if ($Options.Keys -contains 'CampaignPower') {
+        $arguments += @('--campaign-power', $Options['CampaignPower'])
+    }
+    return $arguments
 }
 
 # This wrapper runs an operator-selected, trusted collector build. Its digest
@@ -53,13 +71,7 @@ try {
 
     # Pass individual arguments, never a composed shell command. Rust owns the
     # actual input/output checks, observation lifetime and no-replace publication.
-    $arguments = @(
-        '--scribe-windows-gpu-capture-observation',
-        '--model', $ModelPath, '--model-sha256', $ModelSha256,
-        '--wav', $WavPath, '--wav-sha256', $WavSha256,
-        '--gpu-pack-id', $GpuPackId, '--gpu-backend', $GpuBackend,
-        '--gpu-device', $GpuDevice, '--output', $OutputPath
-    )
+    $arguments = @(Get-CaptureObservationArguments $PSBoundParameters)
     & $collectorPathFull @arguments
     if ($LASTEXITCODE -ne 0) {
         throw 'Capture observation failed; no qualification or release approval was produced.'

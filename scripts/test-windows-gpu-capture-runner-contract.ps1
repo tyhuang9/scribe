@@ -94,3 +94,64 @@ finally {
     else { Set-Variable LASTEXITCODE -Scope Global -Value $originalExitCode }
 }
 Write-Output 'Capture runner contracts passed (15 mocked cases); no Cargo process was launched.'
+
+# Test the actual argument builder without running a collector, accessing
+# inputs, or composing a shell command. Keep spaces/metacharacters as values.
+$wrapper = Join-Path $PSScriptRoot 'run-windows-gpu-capture-observation.ps1'
+$wrapperAst = [Management.Automation.Language.Parser]::ParseFile($wrapper, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) { throw 'Capture wrapper does not parse.' }
+$argumentBuilder = @($wrapperAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Get-CaptureObservationArguments'
+}, $true))
+if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper argument builder.' }
+& {
+    param([string]$Definition)
+    . ([scriptblock]::Create($Definition))
+    function Invoke-CaptureBoundArgumentFixture {
+        param(
+            [string]$ModelPath,
+            [string]$ModelSha256,
+            [string]$WavPath,
+            [string]$WavSha256,
+            [string]$GpuPackId,
+            [string]$GpuBackend,
+            [string]$GpuDevice,
+            [string]$OutputPath,
+            [string]$CampaignPower
+        )
+        # Production passes this dictionary, not a Hashtable. In particular,
+        # Hashtable.Contains must not appear to work only in these fixtures.
+        Get-CaptureObservationArguments $PSBoundParameters
+    }
+    foreach ($backend in @('cuda', 'vulkan')) {
+        foreach ($power in @($null, 'ac', 'battery')) {
+            $options = @{
+                ModelPath = 'C:\fixture dir\model&(one).gguf'
+                ModelSha256 = 'a' * 64
+                WavPath = 'C:\fixture dir\input;audio.wav'
+                WavSha256 = 'b' * 64
+                GpuPackId = 'fixture-pack'
+                GpuBackend = $backend
+                GpuDevice = 'native:luid:0102030405060708'
+                OutputPath = 'C:\fixture dir\new report.json'
+            }
+            if ($null -ne $power) { $options.CampaignPower = $power }
+            $expected = @('--scribe-windows-gpu-capture-observation',
+                '--model', $options.ModelPath, '--model-sha256', $options.ModelSha256,
+                '--wav', $options.WavPath, '--wav-sha256', $options.WavSha256,
+                '--gpu-pack-id', 'fixture-pack', '--gpu-backend', $backend,
+                '--gpu-device', 'native:luid:0102030405060708', '--output', $options.OutputPath)
+            if ($null -ne $power) { $expected += @('--campaign-power', $power) }
+            $actual = @(Invoke-CaptureBoundArgumentFixture @options)
+            if ($actual.Count -ne $expected.Count) { throw 'Capture wrapper changed its argument count.' }
+            for ($index = 0; $index -lt $expected.Count; $index++) {
+                if ($actual[$index] -cne $expected[$index]) {
+                    throw 'Capture wrapper changed an input or the explicit campaign power.'
+                }
+            }
+        }
+    }
+} -Definition $argumentBuilder[0].Extent.Text
+Write-Output 'Capture wrapper forwarding contracts passed (6 cases); no collector was launched.'

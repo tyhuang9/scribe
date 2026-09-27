@@ -34,24 +34,31 @@ approval service, candidate builder, final qualification or publication flow.
 In particular, the current release builder still rebuilds its CPU worker; that
 must change in the later fixed-artifact candidate integration.
 
-A complete campaign acquisition/writer is still missing. The opt-in
-[capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) now measures one serial
-CPU/GPU pair and retains authenticated handshake frames, sampled process/device
-memory and request-bound raw provider-memory snapshots. Its unsigned schema-2
-report is not a performance bundle, and its instrumented timing window is not
-yet the full campaign's timing contract. The older Windows Vulkan evidence
+A complete authenticated campaign writer is still missing. The opt-in
+[capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
+CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct
+campaign schema 1). The campaign executes five cold and twenty warm pairs,
+with two separate priming records, authenticated handshake frames, sampled
+process/device memory and request-bound raw and source-defined availability
+observations. These unsigned diagnostic reports are not performance bundles;
+their instrumented, prepared-audio windows do not establish ordinary application
+latency or qualified measurements. The older Windows Vulkan evidence
 script and ignored hardware tests produce fixture-only, metadata-only timing
 reports: they rebuild workers and use a different schedule. Only synthetic
 test constructors currently write complete performance bundles. Do not convert
-either kind of diagnostic report into qualification evidence or invent missing
+any of these diagnostic reports into qualification evidence or invent missing
 observations.
 
-The future collector must consume frozen worker artifacts, execute the exact
-paired schedule, observe actual power/memory/process/device state and handshake
-frames, and write the bounded canonical artifacts and unsigned lane inventory.
-Protected capture signing and campaign/nonce custody remain separate; signing
-arbitrary caller-supplied JSON is not proof that a capture occurred. Collector
-integration and candidate-installer integration are distinct remaining stages.
+The paired collector consumes existing verified workers, retains its exact
+pack/device binding and rechecks each launch without replacing captured
+generations. Remaining integration must establish the missing acquisition
+controls and admission semantics, validate instrumentation and retained-model
+interference, and produce the bounded canonical artifacts and lane inventory
+through reviewed, pinned acquisition code. Protected capture signing and
+campaign/nonce custody remain separate; signing arbitrary caller-supplied JSON
+is not proof that a capture occurred. Neither diagnostic format may be relabelled
+or padded into qualified evidence. Collector integration and fixed-artifact
+candidate-installer integration remain distinct stages.
 
 ## Versioned inputs
 
