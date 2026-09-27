@@ -996,7 +996,7 @@ impl WorkerMemoryAvailability {
         Ok(())
     }
 
-    #[cfg(any(test, all(windows, feature = "windows-gpu-capture-observation")))]
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn validate_for_preference(&self, preference: AccelerationPreference) -> Result<()> {
         self.validate_shape()?;
         match (preference, self) {
@@ -12432,6 +12432,7 @@ mod tests {
         AvailabilityCpuStatus,
     }
 
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[derive(Clone, Copy, Debug)]
     enum ObservationCompletionMismatch {
         Version,
@@ -18782,7 +18783,7 @@ mod tests {
         };
         assert_eq!(
             unavailable_reason(
-                &[valid.clone()],
+                std::slice::from_ref(&valid),
                 "native:uuid:ffffffffffffffffffffffffffffffff"
             ),
             WorkerMemoryUnavailableReason::StableDeviceMissing

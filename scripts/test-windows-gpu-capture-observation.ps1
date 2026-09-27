@@ -158,6 +158,9 @@ try {
         # Never combine a GPU provider with the desktop collector feature.
         $providerFeature = $GpuProviderCheck.ToLowerInvariant() + '-acceleration'
         Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', $providerFeature)
+        # Include test-only code in the provider configuration, matching the
+        # release lint. A production-only check cannot catch unused test helpers.
+        Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$providerFeature", '--', '-D', 'warnings')
         foreach ($filter in @('onnx_worker::tests::capture_observation',
                 'embedded_runtime::tests::provider_memory_observation')) {
             Invoke-CaptureTests "ui-harness,$providerFeature" $filter

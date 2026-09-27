@@ -295,8 +295,9 @@ this command enables a GPU inference provider by default.
 For a provider-enabled worker check, use the same command with
 `-GpuProviderCheck Vulkan` or `-GpuProviderCheck Cuda` after provisioning the
 reviewed backend SDK and compiler. This additionally checks the independent
-worker and runs the deterministic worker-observation/provider test groups in
-that backend configuration. It never enables a GPU provider on the collector.
+worker, strictly lints all targets in the provider-enabled test configuration,
+and runs the deterministic worker-observation/provider test groups in that
+configuration. It never enables a GPU provider on the collector.
 `-ScriptOnly` rejects a simultaneous provider check rather than silently
 skipping it. The command does not install or authenticate a toolchain itself;
 toolchain provenance remains a separate prerequisite.
