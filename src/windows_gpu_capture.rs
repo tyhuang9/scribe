@@ -25,7 +25,8 @@ use crate::backend_policy::PowerSource;
 use crate::model_catalog::ArtifactFormat;
 use crate::onnx_worker::{
     CaptureObservationWorker, GpuCaptureObservationIdentity, ProviderMemoryNotApplicableReason,
-    ProviderMemoryObservation, WorkerObservationLease,
+    ProviderMemoryObservation, WorkerMemoryAvailability, WorkerObservationLease,
+    validate_capture_worker_memory,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
@@ -92,6 +93,7 @@ struct WorkerReport {
     telemetry_sample_count: u64,
     video_memory: VideoMemoryReport,
     provider_memory: ProviderMemoryReport,
+    memory_availability: MemoryAvailabilityReport,
     normalized_transcript_sha256: String,
 }
 
@@ -99,6 +101,12 @@ struct WorkerReport {
 struct ProviderMemoryReport {
     before: ProviderMemoryObservation,
     after: ProviderMemoryObservation,
+}
+
+#[derive(Serialize)]
+struct MemoryAvailabilityReport {
+    before: WorkerMemoryAvailability,
+    after: WorkerMemoryAvailability,
 }
 
 #[derive(Serialize)]
@@ -130,6 +138,7 @@ struct ObservedWorker {
 
 struct WorkerObservationMeasurements {
     provider_memory: ProviderMemoryReport,
+    memory_availability: MemoryAvailabilityReport,
     telemetry: TelemetrySummary,
     power_source_before: PowerSource,
     power_source_after: PowerSource,
@@ -264,7 +273,7 @@ fn run_local_command(args: &[OsString]) -> Result<()> {
         reason: "not_observed",
     };
     let report = CaptureReport {
-        schema_version: 2,
+        schema_version: 3,
         kind: "windows_gpu_capture_observation",
         unsigned: true,
         unqualified: true,
@@ -362,6 +371,10 @@ fn observe_worker(
                 before: execution.before,
                 after: execution.after,
             },
+            memory_availability: MemoryAvailabilityReport {
+                before: execution.availability_before,
+                after: execution.availability_after,
+            },
             telemetry,
             power_source_before,
             power_source_after,
@@ -400,6 +413,7 @@ fn build_worker_report(
 ) -> Result<ObservedWorker> {
     let WorkerObservationMeasurements {
         provider_memory,
+        memory_availability,
         telemetry,
         power_source_before,
         power_source_after,
@@ -416,6 +430,17 @@ fn build_worker_report(
         (false, Some(_)) => bail!("CPU observation unexpectedly reported GPU video memory"),
     };
     validate_provider_memory_report(gpu, expected_gpu, &provider_memory)?;
+    for availability in [&memory_availability.before, &memory_availability.after] {
+        validate_capture_worker_memory(
+            availability,
+            if gpu {
+                AccelerationPreference::Gpu
+            } else {
+                AccelerationPreference::Cpu
+            },
+            expected_gpu,
+        )?;
+    }
     let report = WorkerReport {
         hello_frame_hex: hex(lease.hello_frame()),
         ready_frame_hex: hex(lease.ready_frame()),
@@ -427,6 +452,7 @@ fn build_worker_report(
         telemetry_sample_count: telemetry.sample_count,
         video_memory,
         provider_memory,
+        memory_availability,
         normalized_transcript_sha256: normalized_transcript_sha256.clone(),
     };
     Ok(ObservedWorker {
@@ -791,20 +817,25 @@ mod tests {
             status: "unavailable",
             reason: "not_observed",
         };
-        let worker = |transcript: &str, video_memory, provider_memory| WorkerReport {
-            hello_frame_hex: hex(b"SCIF-hello"),
-            ready_frame_hex: hex(b"SCIF-ready"),
-            power_source_before: PowerSource::Ac,
-            power_source_after: PowerSource::Ac,
-            elapsed_ms: 10,
-            sampled_max_private_usage_bytes: 20,
-            telemetry_sample_count: 2,
-            video_memory,
-            provider_memory,
-            normalized_transcript_sha256: format!("{:x}", Sha256::digest(transcript.as_bytes())),
-        };
+        let worker =
+            |transcript: &str, video_memory, provider_memory, memory_availability| WorkerReport {
+                hello_frame_hex: hex(b"SCIF-hello"),
+                ready_frame_hex: hex(b"SCIF-ready"),
+                power_source_before: PowerSource::Ac,
+                power_source_after: PowerSource::Ac,
+                elapsed_ms: 10,
+                sampled_max_private_usage_bytes: 20,
+                telemetry_sample_count: 2,
+                video_memory,
+                provider_memory,
+                memory_availability,
+                normalized_transcript_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(transcript.as_bytes())
+                ),
+            };
         let report = CaptureReport {
-            schema_version: 2,
+            schema_version: 3,
             kind: "windows_gpu_capture_observation",
             unsigned: true,
             unqualified: true,
@@ -837,6 +868,14 @@ mod tests {
                         reason: ProviderMemoryNotApplicableReason::CpuProvider,
                     },
                     after: ProviderMemoryObservation::NotApplicable {
+                        reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                    },
+                },
+                MemoryAvailabilityReport {
+                    before: WorkerMemoryAvailability::NotApplicable {
+                        reason: ProviderMemoryNotApplicableReason::CpuProvider,
+                    },
+                    after: WorkerMemoryAvailability::NotApplicable {
                         reason: ProviderMemoryNotApplicableReason::CpuProvider,
                     },
                 },
@@ -874,6 +913,28 @@ mod tests {
                             crate::onnx_worker::ProviderMemoryUnavailableReason::ProviderQueryFailed,
                     },
                 },
+                MemoryAvailabilityReport {
+                    before: WorkerMemoryAvailability::Observed {
+                        backend: "vulkan".to_owned(),
+                        provider_id: "fixture-provider".to_owned(),
+                        stable_device: "native:luid:0102030405060708".to_owned(),
+                        memory_total_bytes: 1024,
+                        available_memory_bytes: 0,
+                        source: crate::onnx_worker::WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                            heap_selection: crate::onnx_worker::VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                            heaps: vec![crate::onnx_worker::VulkanMemoryHeapObservation {
+                                heap_index: 0,
+                                size_bytes: 1024,
+                                flags: 0,
+                                budget_bytes: 1024,
+                                usage_bytes: 2048,
+                            }],
+                        },
+                    },
+                    after: WorkerMemoryAvailability::Unavailable {
+                        reason: crate::onnx_worker::WorkerMemoryUnavailableReason::ProviderQueryFailed,
+                    },
+                },
             ),
             transcript_parity: true,
             unavailable: UnavailableReport {
@@ -887,7 +948,15 @@ mod tests {
         let bytes = serde_json::to_vec(&report).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(parsed["schema_version"], 3);
+        assert_eq!(
+            parsed["gpu"]["memory_availability"]["before"]["source"]["method"],
+            "vulkan_memory_budget"
+        );
+        assert_eq!(
+            parsed["gpu"]["memory_availability"]["before"]["available_memory_bytes"],
+            0
+        );
         assert_eq!(
             parsed["unavailable"]["inference_thread_count"]["status"],
             "unavailable"
@@ -955,6 +1024,87 @@ mod tests {
             *memory_total_bytes += 1;
         }
         assert!(validate_provider_memory_report(true, Some(&identity), &wrong_total).is_err());
+    }
+
+    #[test]
+    fn capture_observation_memory_availability_is_bound_without_equating_vulkan_capacity() {
+        let identity = GpuCaptureObservationIdentity {
+            backend: "vulkan".to_owned(),
+            provider: "fixture-provider".to_owned(),
+            stable_device: "native:luid:0102030405060708".to_owned(),
+            driver: "fixture-driver".to_owned(),
+            device_class: "integrated_gpu".to_owned(),
+            vendor: "intel".to_owned(),
+            memory_total_bytes: 8192,
+            pack_id: "fixture-pack".to_owned(),
+            pack_version: "1".to_owned(),
+            pack_sha256: "c".repeat(64),
+            pack_security_epoch: 1,
+            runtime_abi: 1,
+        };
+        let observed = WorkerMemoryAvailability::Observed {
+            backend: identity.backend.clone(),
+            provider_id: identity.provider.clone(),
+            stable_device: identity.stable_device.clone(),
+            memory_total_bytes: 12_288,
+            available_memory_bytes: 0,
+            source: crate::onnx_worker::WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                heap_selection: crate::onnx_worker::VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                heaps: vec![crate::onnx_worker::VulkanMemoryHeapObservation {
+                    heap_index: 0,
+                    size_bytes: 12_288,
+                    flags: 0,
+                    budget_bytes: 10_000,
+                    usage_bytes: 11_000,
+                }],
+            },
+        };
+        validate_capture_worker_memory(&observed, AccelerationPreference::Gpu, Some(&identity))
+            .unwrap();
+
+        let mut wrong_device = observed.clone();
+        if let WorkerMemoryAvailability::Observed { stable_device, .. } = &mut wrong_device {
+            *stable_device = "native:luid:ffffffffffffffff".to_owned();
+        }
+        assert!(
+            validate_capture_worker_memory(
+                &wrong_device,
+                AccelerationPreference::Gpu,
+                Some(&identity),
+            )
+            .is_err()
+        );
+
+        let mut wrong_scope = observed;
+        if let WorkerMemoryAvailability::Observed {
+            source:
+                crate::onnx_worker::WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                    heap_selection,
+                    ..
+                },
+            ..
+        } = &mut wrong_scope
+        {
+            *heap_selection = crate::onnx_worker::VulkanMemoryHeapSelection::DeviceLocalHeaps;
+        }
+        assert!(
+            validate_capture_worker_memory(
+                &wrong_scope,
+                AccelerationPreference::Gpu,
+                Some(&identity),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_capture_worker_memory(
+                &WorkerMemoryAvailability::Unavailable {
+                    reason: crate::onnx_worker::WorkerMemoryUnavailableReason::ProviderQueryFailed,
+                },
+                AccelerationPreference::Gpu,
+                Some(&identity),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

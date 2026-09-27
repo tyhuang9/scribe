@@ -395,7 +395,8 @@ jobs:
         shell: pwsh
         # Only deterministic fake-worker/native-call tests run here. This
         # opt-in collector feature must not link a GPU inference provider.
-        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
+        # Separately check the Vulkan worker using the pinned SDK above.
+        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1 -GpuProviderCheck Vulkan
 
       - name: Lint
         # Hosted PR runners receive the digest-pinned Vulkan SDK above, but do

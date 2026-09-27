@@ -208,6 +208,14 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
         throw 'Hosted Windows CI must compile the CPU-safe desktop and CPU inference worker as independent production feature sets.'
     }
 
+    $observation = Get-WorkflowStepBlock $Workflow 'Test Windows GPU capture observation' 'Lint'
+    $expectedObservation = 'run: pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1 -GpuProviderCheck Vulkan'
+    if (-not $observation.Contains($expectedObservation) -or
+        $observation.Contains('-ScriptOnly') -or
+        $observation.Contains('-GpuProviderCheck Cuda')) {
+        throw 'Hosted capture observation checks must verify the independent Vulkan worker without skipping native checks or claiming CUDA coverage.'
+    }
+
     $lint = Get-WorkflowStepBlock $Workflow 'Lint' 'Test'
     $test = Get-WorkflowStepBlock $Workflow 'Test' 'Download and verify pinned release inputs'
     $verifiedHostedFeatures = 'ui-harness,inference-worker,vulkan-acceleration'
@@ -905,6 +913,12 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     Assert-ReleaseCargoFeatureContract $source
     Assert-VulkanSdkWorkflowContract $workflow
+    foreach ($replacement in @('', ' -GpuProviderCheck Cuda', ' -GpuProviderCheck Vulkan -ScriptOnly')) {
+        $mutatedObservationWorkflow = $workflow.Replace(' -GpuProviderCheck Vulkan', $replacement)
+        Invoke-ExpectedFailure {
+            Assert-VulkanSdkWorkflowContract $mutatedObservationWorkflow
+        } 'Hosted capture observation checks must verify the independent Vulkan worker'
+    }
     Assert-GpuWorkerPackWorkflowContract $workflow
     Assert-GpuReleasePolicyScriptContract $gpuReleasePolicyScript $testRoot
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
