@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 ui-harness = []
-windows-gpu-capture-observation = []
+windows-gpu-capture-observation = ["windows-sys/Win32_System_Registry"]
 inference-worker = ["dep:transcribe-cpp"]
 cuda-acceleration = ["inference-worker", "transcribe-cpp/cuda"]
 cuda-test-harness = ["cuda-acceleration"]

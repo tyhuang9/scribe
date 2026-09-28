@@ -37,11 +37,14 @@ must change in the later fixed-artifact candidate integration.
 A complete authenticated campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
 CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct
-campaign schema 1). The campaign executes five cold and twenty warm pairs,
+campaign schema 2). The campaign executes five cold and twenty warm pairs,
 with two separate priming records, authenticated handshake frames, sampled
 process/device memory and request-bound raw and source-defined availability
-observations. These unsigned diagnostic reports are not performance bundles;
-their instrumented, prepared-audio windows do not establish ordinary application
+observations. It also records active Windows power-scheme identity at request
+boundaries and stops on changes or unavailable queries. This does not establish
+complete power-plan settings or continuous stability: qualification power-plan
+controls remain unavailable. These unsigned diagnostic reports are not
+performance bundles; their instrumented, prepared-audio windows do not establish ordinary application
 latency or qualified measurements. The older Windows Vulkan evidence
 script and ignored hardware tests produce fixture-only, metadata-only timing
 reports: they rebuild workers and use a different schedule. Only synthetic

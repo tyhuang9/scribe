@@ -226,6 +226,7 @@ try {
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
+            'windows_gpu_capture::power_scheme::tests',
             'windows_gpu_capture::campaign::tests',
             'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
             'architecture_guard::windows_gpu_capture')) {

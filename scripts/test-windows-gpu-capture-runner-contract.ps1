@@ -8,6 +8,45 @@ $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($runner, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw 'Capture runner does not parse.' }
+# Keep every collector group connected to the real discovery-before-run helper.
+# Provider-only groups have their independent invocation contract below.
+function Assert-CaptureCollectorGroups([Management.Automation.Language.Ast]$RunnerAst) {
+    $loops = @($RunnerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ForEachStatementAst] -and
+            $node.Variable.VariablePath.UserPath -ceq 'filter' -and
+            @($node.Body.FindAll({
+                param($call)
+                $call -is [Management.Automation.Language.CommandAst] -and
+                    $call.Extent.Text -ceq 'Invoke-CaptureTests $feature $filter'
+            }, $true)).Count -eq 1
+    }, $true))
+    if ($loops.Count -ne 1) { throw 'Expected exactly one collector test-group loop.' }
+    $groups = @($loops[0].Condition.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.StringConstantExpressionAst]
+    }, $true) | ForEach-Object { $_.Value })
+    $expected = @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
+        'windows_gpu_capture::power_scheme::tests', 'windows_gpu_capture::campaign::tests',
+        'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
+        'architecture_guard::windows_gpu_capture')
+    if (($groups -join "`n") -cne ($expected -join "`n")) {
+        throw 'Collector test groups must include all seven required discovery/run filters.'
+    }
+}
+Assert-CaptureCollectorGroups $ast
+# Prove this wiring guard rejects a runner with the new group disconnected.
+$disconnectedSource = $ast.Extent.Text.Replace("'windows_gpu_capture::power_scheme::tests',", '')
+if ($disconnectedSource -ceq $ast.Extent.Text) { throw 'Collector wiring mutation did not change the source.' }
+$mutationAst = [Management.Automation.Language.Parser]::ParseInput($disconnectedSource, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) { throw 'Collector wiring mutation must remain valid PowerShell.' }
+$mutationError = $null
+try { Assert-CaptureCollectorGroups $mutationAst }
+catch { $mutationError = $_.Exception.Message }
+if ($mutationError -cne 'Collector test groups must include all seven required discovery/run filters.') {
+    throw 'Collector wiring guard did not reject the missing power-scheme test group.'
+}
+Write-Output 'Collector test-group wiring contracts passed (2 cases); no Cargo process was launched.'
 $definitions = foreach ($name in @('Invoke-CaptureCargo', 'Invoke-CaptureTests', 'Invoke-CaptureProviderCheck')) {
     $functions = @($ast.FindAll({
         param($node)

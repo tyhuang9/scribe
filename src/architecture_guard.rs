@@ -752,10 +752,10 @@ fn windows_gpu_capture_stays_opt_in_and_out_of_release_builds() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(repository.join("Cargo.toml")).unwrap();
     assert!(
-        manifest
-            .lines()
-            .any(|line| line == "windows-gpu-capture-observation = []"),
-        "capture feature must not enable a native inference provider"
+        manifest.lines().any(|line| {
+            line == r#"windows-gpu-capture-observation = ["windows-sys/Win32_System_Registry"]"#
+        }),
+        "capture feature must enable only the Windows active-scheme API binding, not a native inference provider"
     );
     let main = production_source(include_str!("main.rs"));
     assert!(main.contains(

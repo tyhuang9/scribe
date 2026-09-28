@@ -14,6 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::power_scheme::{
+    ActivePowerSchemeObservation, ActivePowerSchemeReader, WindowsActivePowerSchemeReader,
+};
 use super::telemetry::SamplingSession;
 use super::{
     CampaignPower, CommandOptions, InputReport, MemoryAvailabilityReport, ProviderMemoryReport,
@@ -33,7 +36,7 @@ use crate::runtime_contract::WARM_MODEL_TTL;
 use crate::transcription::{AccelerationPreference, ModelId};
 
 const KIND: &str = "windows_gpu_capture_campaign";
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
 const COLD_PAIRS: u8 = 5;
 const WARM_PAIRS: u8 = 20;
 const MAX_CAPTURES: usize = 14;
@@ -91,6 +94,11 @@ enum RecordStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FailureStage {
+    PowerSchemeBaseline,
+    PowerSchemePreflight,
+    PowerSchemeBeforeLaunch,
+    PowerSchemeBeforeDispatch,
+    PowerSchemeAfterResult,
     PowerPreflight,
     WorkerPreflight,
     AudioPreparation,
@@ -108,6 +116,8 @@ enum FailureStage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FailureCategory {
+    PowerSchemeUnavailable,
+    PowerSchemeChanged,
     PowerUnknown,
     PowerMismatch,
     PowerChanged,
@@ -180,6 +190,7 @@ struct CampaignReport {
     release_approved: bool,
     collector_build_revision: &'static str,
     expected_power: CampaignPower,
+    active_power_scheme: ActivePowerSchemeObservation,
     inputs: InputReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     gpu_identity: Option<GpuCaptureObservationIdentity>,
@@ -223,6 +234,7 @@ struct CampaignRunRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_ref: Option<String>,
     status: RecordStatus,
+    power_scheme: RunPowerSchemeObservations,
     #[serde(skip_serializing_if = "Option::is_none")]
     power_source_before: Option<PowerSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,6 +262,49 @@ struct CampaignRunRecord {
     failure: Option<FailureDescriptor>,
 }
 
+#[derive(Clone, Default, Serialize)]
+struct RunPowerSchemeObservations {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before_launch: Option<ActivePowerSchemeObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before_dispatch: Option<ActivePowerSchemeObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_result: Option<ActivePowerSchemeObservation>,
+}
+
+struct CampaignPowerContext<'a> {
+    expected: CampaignPower,
+    baseline_scheme: &'a str,
+    reader: &'a dyn ActivePowerSchemeReader,
+}
+
+impl CampaignPowerContext<'_> {
+    fn observe_stable_scheme(
+        &self,
+    ) -> (
+        ActivePowerSchemeObservation,
+        std::result::Result<(), FailureCategory>,
+    ) {
+        let observation = self.reader.observe_active_scheme();
+        let result = require_stable_power_scheme(self.baseline_scheme, &observation);
+        (observation, result)
+    }
+
+    fn power_now(&self) -> std::result::Result<PowerSource, FailureCategory> {
+        require_power(self.expected, PowerSource::current())
+    }
+}
+
+fn observe_then<T>(
+    power: &CampaignPowerContext<'_>,
+    observation_slot: &mut Option<ActivePowerSchemeObservation>,
+    action: impl FnOnce() -> T,
+) -> std::result::Result<T, FailureCategory> {
+    let (observation, stable) = power.observe_stable_scheme();
+    *observation_slot = Some(observation);
+    stable.map(|()| action())
+}
+
 impl CampaignRunRecord {
     fn failed(
         spec: RunSpec,
@@ -267,6 +322,7 @@ impl CampaignRunRecord {
             target: spec.target,
             generation_ref,
             status: RecordStatus::Failed,
+            power_scheme: RunPowerSchemeObservations::default(),
             power_source_before: power_before,
             power_source_after: power_after,
             end_to_end_ms: duration_millis(elapsed),
@@ -282,6 +338,11 @@ impl CampaignRunRecord {
             failure: Some(failure),
         }
     }
+
+    fn with_power_scheme(mut self, power_scheme: RunPowerSchemeObservations) -> Self {
+        self.power_scheme = power_scheme;
+        self
+    }
 }
 
 struct ReportBuilder {
@@ -292,6 +353,7 @@ struct ReportBuilder {
 impl ReportBuilder {
     fn new(
         expected_power: CampaignPower,
+        active_power_scheme: ActivePowerSchemeObservation,
         inputs: InputReport,
         gpu_identity: Option<GpuCaptureObservationIdentity>,
     ) -> Self {
@@ -309,6 +371,7 @@ impl ReportBuilder {
                 release_approved: false,
                 collector_build_revision: env!("SCRIBE_BUILD_REVISION"),
                 expected_power,
+                active_power_scheme,
                 inputs,
                 gpu_identity,
                 incomplete: false,
@@ -411,6 +474,31 @@ fn duration_millis(value: Duration) -> u64 {
 
 fn duration_nanos(value: Duration) -> u64 {
     u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn require_stable_power_scheme(
+    baseline: &str,
+    observation: &ActivePowerSchemeObservation,
+) -> std::result::Result<(), FailureCategory> {
+    match observation.scheme_guid() {
+        None => Err(FailureCategory::PowerSchemeUnavailable),
+        Some(scheme_guid) if scheme_guid == baseline => Ok(()),
+        Some(_) => Err(FailureCategory::PowerSchemeChanged),
+    }
+}
+
+const fn power_scheme_preflight_failure(
+    target: Target,
+    category: FailureCategory,
+) -> FailureDescriptor {
+    FailureDescriptor {
+        stage: FailureStage::PowerSchemePreflight,
+        category,
+        target: Some(target),
+        phase: None,
+        pair_index: None,
+        order_in_pair: None,
+    }
 }
 
 fn pair_order(pair_index: u8) -> [Target; 2] {
@@ -770,6 +858,14 @@ fn watchdog_loop(shared: Arc<(Mutex<WarmSharedState>, Condvar)>, origin: Instant
 }
 
 pub(super) fn run(options: CommandOptions) -> Result<()> {
+    let reader = WindowsActivePowerSchemeReader;
+    run_with_power_scheme_reader(options, &reader)
+}
+
+fn run_with_power_scheme_reader(
+    options: CommandOptions,
+    reader: &dyn ActivePowerSchemeReader,
+) -> Result<()> {
     let expected_power = options
         .campaign_power
         .ok_or_else(|| anyhow!("campaign mode requires an expected power source"))?;
@@ -798,6 +894,25 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
         model_sha256: model.sha256.clone(),
         wav_sha256: wav.sha256.clone(),
     };
+    // This baseline is deliberately read after the pinned inputs are valid,
+    // but before any worker preflight can launch a process.
+    let active_power_scheme = reader.observe_active_scheme();
+    let mut builder = ReportBuilder::new(expected_power, active_power_scheme.clone(), inputs, None);
+    let baseline_power_scheme = match active_power_scheme.scheme_guid() {
+        Some(scheme_guid) => scheme_guid.to_owned(),
+        None => {
+            builder.fail(FailureDescriptor::global(
+                FailureStage::PowerSchemeBaseline,
+                FailureCategory::PowerSchemeUnavailable,
+            ));
+            return publish_campaign(builder.report, &options.output);
+        }
+    };
+    let campaign_power = CampaignPowerContext {
+        expected: expected_power,
+        baseline_scheme: &baseline_power_scheme,
+        reader,
+    };
     let cpu_factory = CaptureObservationWorkerFactory::cpu();
     let gpu_factory = match CaptureObservationWorkerFactory::gpu_exact(
         &options.gpu_pack_id,
@@ -806,7 +921,6 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
     ) {
         Ok(factory) => factory,
         Err(_) => {
-            let mut builder = ReportBuilder::new(expected_power, inputs, None);
             builder.fail(FailureDescriptor::global(
                 FailureStage::WorkerPreflight,
                 FailureCategory::WorkerUnavailable,
@@ -814,10 +928,9 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
             return publish_campaign(builder.report, &options.output);
         }
     };
-    let mut builder =
-        ReportBuilder::new(expected_power, inputs, gpu_factory.gpu_identity().cloned());
+    builder.report.gpu_identity = gpu_factory.gpu_identity().cloned();
 
-    if let Err(category) = power_now(expected_power) {
+    if let Err(category) = campaign_power.power_now() {
         builder.fail(FailureDescriptor::global(
             FailureStage::PowerPreflight,
             category,
@@ -826,7 +939,7 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
     }
 
     if let Err(failure) =
-        preflight_workers(&cpu_factory, &gpu_factory, expected_power, &mut builder)
+        preflight_workers(&cpu_factory, &gpu_factory, &campaign_power, &mut builder)
     {
         builder.fail(failure);
         return publish_campaign(builder.report, &options.output);
@@ -863,7 +976,7 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
             factory,
             artifact.clone(),
             &audio,
-            expected_power,
+            &campaign_power,
             &mut builder,
         );
         let failed = record.failure;
@@ -884,7 +997,7 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
                 &gpu_factory,
                 artifact,
                 &audio,
-                expected_power,
+                &campaign_power,
                 &mut builder,
             ),
             Err(_) => builder.fail(FailureDescriptor::global(
@@ -900,25 +1013,37 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
 fn preflight_workers(
     cpu_factory: &CaptureObservationWorkerFactory,
     gpu_factory: &CaptureObservationWorkerFactory,
-    expected_power: CampaignPower,
+    campaign_power: &CampaignPowerContext<'_>,
     builder: &mut ReportBuilder,
 ) -> std::result::Result<(), FailureDescriptor> {
-    let cpu = Arc::new(cpu_factory.spawn());
-    let gpu = Arc::new(gpu_factory.spawn());
+    let mut cpu = None;
+    let mut gpu = None;
     let mut cpu_lease = None;
     let mut gpu_lease = None;
     let operation = (|| {
-        power_now(expected_power).map_err(|category| {
+        campaign_power.power_now().map_err(|category| {
             FailureDescriptor::global(FailureStage::PowerPreflight, category)
         })?;
-        cpu_lease = Some(cpu.prepare_observation().map_err(|_| FailureDescriptor {
-            stage: FailureStage::Handshake,
-            category: FailureCategory::WorkerUnavailable,
-            target: Some(Target::Cpu),
-            phase: None,
-            pair_index: None,
-            order_in_pair: None,
-        })?);
+        let mut cpu_launch_scheme = None;
+        cpu = Some(Arc::new(
+            observe_then(campaign_power, &mut cpu_launch_scheme, || {
+                cpu_factory.spawn()
+            })
+            .map_err(|category| power_scheme_preflight_failure(Target::Cpu, category))?,
+        ));
+        let cpu_worker = cpu.as_ref().expect("CPU preflight worker was launched");
+        cpu_lease = Some(
+            cpu_worker
+                .prepare_observation()
+                .map_err(|_| FailureDescriptor {
+                    stage: FailureStage::Handshake,
+                    category: FailureCategory::WorkerUnavailable,
+                    target: Some(Target::Cpu),
+                    phase: None,
+                    pair_index: None,
+                    order_in_pair: None,
+                })?,
+        );
         builder
             .register_capture(
                 Target::Cpu,
@@ -933,14 +1058,29 @@ fn preflight_workers(
                 pair_index: None,
                 order_in_pair: None,
             })?;
-        gpu_lease = Some(gpu.prepare_observation().map_err(|_| FailureDescriptor {
-            stage: FailureStage::Handshake,
-            category: FailureCategory::WorkerUnavailable,
-            target: Some(Target::Gpu),
-            phase: None,
-            pair_index: None,
-            order_in_pair: None,
-        })?);
+        campaign_power.power_now().map_err(|category| {
+            FailureDescriptor::global(FailureStage::PowerPreflight, category)
+        })?;
+        let mut gpu_launch_scheme = None;
+        gpu = Some(Arc::new(
+            observe_then(campaign_power, &mut gpu_launch_scheme, || {
+                gpu_factory.spawn()
+            })
+            .map_err(|category| power_scheme_preflight_failure(Target::Gpu, category))?,
+        ));
+        let gpu_worker = gpu.as_ref().expect("GPU preflight worker was launched");
+        gpu_lease = Some(
+            gpu_worker
+                .prepare_observation()
+                .map_err(|_| FailureDescriptor {
+                    stage: FailureStage::Handshake,
+                    category: FailureCategory::WorkerUnavailable,
+                    target: Some(Target::Gpu),
+                    phase: None,
+                    pair_index: None,
+                    order_in_pair: None,
+                })?,
+        );
         builder
             .register_capture(
                 Target::Gpu,
@@ -955,29 +1095,31 @@ fn preflight_workers(
                 pair_index: None,
                 order_in_pair: None,
             })?;
-        cpu.negotiate_runtime_observation_retained(
-            cpu_lease.as_ref().expect("preflight CPU lease retained"),
-        )
-        .map_err(|_| FailureDescriptor {
-            stage: FailureStage::ObservationNegotiation,
-            category: FailureCategory::ObservationUnsupported,
-            target: Some(Target::Cpu),
-            phase: None,
-            pair_index: None,
-            order_in_pair: None,
-        })?;
-        gpu.negotiate_runtime_observation_retained(
-            gpu_lease.as_ref().expect("preflight GPU lease retained"),
-        )
-        .map_err(|_| FailureDescriptor {
-            stage: FailureStage::ObservationNegotiation,
-            category: FailureCategory::ObservationUnsupported,
-            target: Some(Target::Gpu),
-            phase: None,
-            pair_index: None,
-            order_in_pair: None,
-        })?;
-        power_now(expected_power).map_err(|category| {
+        cpu_worker
+            .negotiate_runtime_observation_retained(
+                cpu_lease.as_ref().expect("preflight CPU lease retained"),
+            )
+            .map_err(|_| FailureDescriptor {
+                stage: FailureStage::ObservationNegotiation,
+                category: FailureCategory::ObservationUnsupported,
+                target: Some(Target::Cpu),
+                phase: None,
+                pair_index: None,
+                order_in_pair: None,
+            })?;
+        gpu_worker
+            .negotiate_runtime_observation_retained(
+                gpu_lease.as_ref().expect("preflight GPU lease retained"),
+            )
+            .map_err(|_| FailureDescriptor {
+                stage: FailureStage::ObservationNegotiation,
+                category: FailureCategory::ObservationUnsupported,
+                target: Some(Target::Gpu),
+                phase: None,
+                pair_index: None,
+                order_in_pair: None,
+            })?;
+        campaign_power.power_now().map_err(|category| {
             FailureDescriptor::global(FailureStage::PowerPreflight, category)
         })?;
         Ok(())
@@ -985,8 +1127,12 @@ fn preflight_workers(
     if let Err(failure) = operation {
         builder.fail(failure);
     }
-    let gpu_clean = cleanup_worker(&gpu, gpu_lease.as_ref());
-    let cpu_clean = cleanup_worker(&cpu, cpu_lease.as_ref());
+    let gpu_clean = gpu
+        .as_ref()
+        .is_none_or(|worker| cleanup_worker(worker, gpu_lease.as_ref()));
+    let cpu_clean = cpu
+        .as_ref()
+        .is_none_or(|worker| cleanup_worker(worker, cpu_lease.as_ref()));
     if !gpu_clean {
         builder.cleanup_failed(Some(Target::Gpu), None);
     }
@@ -1007,25 +1153,47 @@ fn run_cold(
     factory: &CaptureObservationWorkerFactory,
     artifact: RuntimeArtifact,
     audio: &PreparedAudio,
-    expected_power: CampaignPower,
+    campaign_power: &CampaignPowerContext<'_>,
     builder: &mut ReportBuilder,
 ) -> (CampaignRunRecord, bool) {
     let power_before = PowerSource::current();
     let started = Instant::now();
-    if let Err(category) = require_power(expected_power, power_before) {
-        return (
-            CampaignRunRecord::failed(
-                spec,
-                None,
-                started.elapsed(),
-                Some(power_before),
-                None,
-                FailureDescriptor::for_spec(spec, FailureStage::PowerEndpoint, category),
-            ),
-            true,
-        );
-    }
-    let worker = Arc::new(factory.spawn());
+    let mut power_scheme = RunPowerSchemeObservations::default();
+    let worker = match observe_then(campaign_power, &mut power_scheme.before_launch, || {
+        require_power(campaign_power.expected, power_before).map(|_| Arc::new(factory.spawn()))
+    }) {
+        Err(category) => {
+            let failure =
+                FailureDescriptor::for_spec(spec, FailureStage::PowerSchemeBeforeLaunch, category);
+            return (
+                CampaignRunRecord::failed(
+                    spec,
+                    None,
+                    started.elapsed(),
+                    Some(power_before),
+                    None,
+                    failure,
+                )
+                .with_power_scheme(power_scheme),
+                true,
+            );
+        }
+        Ok(Err(category)) => {
+            return (
+                CampaignRunRecord::failed(
+                    spec,
+                    None,
+                    started.elapsed(),
+                    Some(power_before),
+                    None,
+                    FailureDescriptor::for_spec(spec, FailureStage::PowerEndpoint, category),
+                )
+                .with_power_scheme(power_scheme),
+                true,
+            );
+        }
+        Ok(Ok(worker)) => worker,
+    };
     let lease = match worker.prepare_observation() {
         Ok(lease) => lease,
         Err(_) => {
@@ -1041,7 +1209,8 @@ fn run_cold(
                 Some(power_before),
                 None,
                 failure,
-            );
+            )
+            .with_power_scheme(power_scheme);
             return (record, cleanup_worker(&worker, None));
         }
     };
@@ -1060,7 +1229,8 @@ fn run_cold(
                 Some(power_before),
                 None,
                 failure,
-            );
+            )
+            .with_power_scheme(power_scheme);
             return (record, cleanup_worker(&worker, Some(&lease)));
         }
     };
@@ -1080,7 +1250,8 @@ fn run_cold(
             Some(power_before),
             None,
             failure,
-        );
+        )
+        .with_power_scheme(power_scheme);
         return (record, cleanup_worker(&worker, Some(&lease)));
     }
     let record = observe_attempt(
@@ -1090,9 +1261,10 @@ fn run_cold(
         generation_ref,
         artifact,
         audio,
-        expected_power,
+        campaign_power,
         started,
         Some(power_before),
+        power_scheme,
         |_, _| Ok(()),
     );
     let clean = cleanup_worker(&worker, Some(&lease));
@@ -1105,7 +1277,7 @@ fn run_retained_campaign(
     gpu_factory: &CaptureObservationWorkerFactory,
     artifact: RuntimeArtifact,
     audio: &PreparedAudio,
-    expected_power: CampaignPower,
+    campaign_power: &CampaignPowerContext<'_>,
     builder: &mut ReportBuilder,
 ) {
     for (order, target) in [Target::Cpu, Target::Gpu].into_iter().enumerate() {
@@ -1126,20 +1298,49 @@ fn run_retained_campaign(
         };
         let power_before = PowerSource::current();
         let started = Instant::now();
-        if let Err(category) = require_power(expected_power, power_before) {
-            let failure = FailureDescriptor::for_spec(spec, FailureStage::PowerEndpoint, category);
-            builder.report.runs.push(CampaignRunRecord::failed(
-                spec,
-                None,
-                started.elapsed(),
-                Some(power_before),
-                None,
-                failure,
-            ));
-            builder.fail(failure);
-            break;
-        }
-        let worker = Arc::new(factory.spawn());
+        let mut power_scheme = RunPowerSchemeObservations::default();
+        let worker = match observe_then(campaign_power, &mut power_scheme.before_launch, || {
+            require_power(campaign_power.expected, power_before).map(|_| Arc::new(factory.spawn()))
+        }) {
+            Err(category) => {
+                let failure = FailureDescriptor::for_spec(
+                    spec,
+                    FailureStage::PowerSchemeBeforeLaunch,
+                    category,
+                );
+                builder.report.runs.push(
+                    CampaignRunRecord::failed(
+                        spec,
+                        None,
+                        started.elapsed(),
+                        Some(power_before),
+                        None,
+                        failure,
+                    )
+                    .with_power_scheme(power_scheme),
+                );
+                builder.fail(failure);
+                break;
+            }
+            Ok(Err(category)) => {
+                let failure =
+                    FailureDescriptor::for_spec(spec, FailureStage::PowerEndpoint, category);
+                builder.report.runs.push(
+                    CampaignRunRecord::failed(
+                        spec,
+                        None,
+                        started.elapsed(),
+                        Some(power_before),
+                        None,
+                        failure,
+                    )
+                    .with_power_scheme(power_scheme),
+                );
+                builder.fail(failure);
+                break;
+            }
+            Ok(Ok(worker)) => worker,
+        };
         let lease = match worker.prepare_observation() {
             Ok(lease) => lease,
             Err(_) => {
@@ -1148,14 +1349,17 @@ fn run_retained_campaign(
                     FailureStage::Handshake,
                     FailureCategory::WorkerUnavailable,
                 );
-                builder.report.runs.push(CampaignRunRecord::failed(
-                    spec,
-                    None,
-                    started.elapsed(),
-                    Some(power_before),
-                    None,
-                    failure,
-                ));
+                builder.report.runs.push(
+                    CampaignRunRecord::failed(
+                        spec,
+                        None,
+                        started.elapsed(),
+                        Some(power_before),
+                        None,
+                        failure,
+                    )
+                    .with_power_scheme(power_scheme),
+                );
                 builder.fail(failure);
                 if !cleanup_worker(&worker, None) {
                     builder.cleanup_failed(Some(target), Some(Phase::Prime));
@@ -1171,14 +1375,17 @@ fn run_retained_campaign(
                     FailureStage::Handshake,
                     FailureCategory::HandshakeInvalid,
                 );
-                builder.report.runs.push(CampaignRunRecord::failed(
-                    spec,
-                    None,
-                    started.elapsed(),
-                    Some(power_before),
-                    None,
-                    failure,
-                ));
+                builder.report.runs.push(
+                    CampaignRunRecord::failed(
+                        spec,
+                        None,
+                        started.elapsed(),
+                        Some(power_before),
+                        None,
+                        failure,
+                    )
+                    .with_power_scheme(power_scheme),
+                );
                 builder.fail(failure);
                 if !cleanup_worker(&worker, Some(&lease)) {
                     builder.cleanup_failed(Some(target), Some(Phase::Prime));
@@ -1195,14 +1402,17 @@ fn run_retained_campaign(
                 FailureStage::ObservationNegotiation,
                 FailureCategory::ObservationUnsupported,
             );
-            builder.report.runs.push(CampaignRunRecord::failed(
-                spec,
-                Some(generation_ref),
-                started.elapsed(),
-                Some(power_before),
-                None,
-                failure,
-            ));
+            builder.report.runs.push(
+                CampaignRunRecord::failed(
+                    spec,
+                    Some(generation_ref),
+                    started.elapsed(),
+                    Some(power_before),
+                    None,
+                    failure,
+                )
+                .with_power_scheme(power_scheme),
+            );
             builder.fail(failure);
             if !cleanup_worker(&worker, Some(&lease)) {
                 builder.cleanup_failed(Some(target), Some(Phase::Prime));
@@ -1216,14 +1426,17 @@ fn run_retained_campaign(
                 FailureStage::WarmModelTtl,
                 FailureCategory::TtlExpired,
             );
-            builder.report.runs.push(CampaignRunRecord::failed(
-                spec,
-                Some(generation_ref),
-                started.elapsed(),
-                Some(power_before),
-                None,
-                failure,
-            ));
+            builder.report.runs.push(
+                CampaignRunRecord::failed(
+                    spec,
+                    Some(generation_ref),
+                    started.elapsed(),
+                    Some(power_before),
+                    None,
+                    failure,
+                )
+                .with_power_scheme(power_scheme),
+            );
             if !cleanup_worker(&worker, Some(&lease)) {
                 builder.cleanup_failed(Some(target), Some(Phase::Prime));
             }
@@ -1239,9 +1452,10 @@ fn run_retained_campaign(
             generation_ref,
             artifact.clone(),
             audio,
-            expected_power,
+            campaign_power,
             started,
             Some(power_before),
+            power_scheme,
             |result_at, succeeded| {
                 if succeeded {
                     pool.install(
@@ -1310,9 +1524,10 @@ fn run_retained_campaign(
                 generation_ref,
                 artifact.clone(),
                 audio,
-                expected_power,
+                campaign_power,
                 started,
                 None,
+                RunPowerSchemeObservations::default(),
                 |result_at, succeeded| pool.finish(spec.target, result_at, succeeded),
             );
             let failure = record.failure;
@@ -1361,10 +1576,6 @@ fn require_power(
     }
 }
 
-fn power_now(expected: CampaignPower) -> std::result::Result<PowerSource, FailureCategory> {
-    require_power(expected, PowerSource::current())
-}
-
 fn validate_diagnostics(
     phase: Phase,
     warm_reused: bool,
@@ -1375,6 +1586,35 @@ fn validate_diagnostics(
         bail!("campaign model reuse does not match its measured phase")
     }
     Ok((u64::try_from(model_load_ms)?, u64::try_from(backend_ms)?))
+}
+
+fn settle_then_observe_after_result(
+    result_at: Instant,
+    correlated_success: bool,
+    settled: impl FnOnce(Instant, bool) -> Result<()>,
+    campaign_power: &CampaignPowerContext<'_>,
+    power_scheme: &mut RunPowerSchemeObservations,
+) -> (Result<()>, Option<std::result::Result<(), FailureCategory>>) {
+    let lifecycle = settled(result_at, correlated_success);
+    let post_result_scheme = correlated_success
+        .then(|| observe_then(campaign_power, &mut power_scheme.after_result, || ()));
+    (lifecycle, post_result_scheme)
+}
+
+fn completion_failure(
+    lifecycle: &Result<()>,
+    post_result_scheme: Option<&std::result::Result<(), FailureCategory>>,
+) -> Option<(FailureStage, FailureCategory)> {
+    if let Some(Err(category)) = post_result_scheme {
+        Some((FailureStage::PowerSchemeAfterResult, *category))
+    } else if lifecycle.is_err() {
+        Some((
+            FailureStage::WarmModelTtl,
+            FailureCategory::InvariantViolation,
+        ))
+    } else {
+        None
+    }
 }
 
 #[allow(
@@ -1388,9 +1628,10 @@ fn observe_attempt(
     generation_ref: String,
     artifact: RuntimeArtifact,
     audio: &PreparedAudio,
-    expected_power: CampaignPower,
+    campaign_power: &CampaignPowerContext<'_>,
     started: Instant,
     initial_power: Option<PowerSource>,
+    mut power_scheme: RunPowerSchemeObservations,
     settled: impl FnOnce(Instant, bool) -> Result<()>,
 ) -> CampaignRunRecord {
     let mut power_before = initial_power;
@@ -1404,7 +1645,7 @@ fn observe_attempt(
         })?;
         let before = PowerSource::current();
         power_before.get_or_insert(before);
-        require_power(expected_power, before)
+        require_power(campaign_power.expected, before)
             .map_err(|category| (FailureStage::PowerEndpoint, category))?;
         sampler = Some(
             match spec.target {
@@ -1424,9 +1665,15 @@ fn observe_attempt(
                 )
             })?,
         );
-        worker
-            .transcribe_observed_retained(lease, artifact, spec.target.preference(), audio)
-            .map_err(|_| (FailureStage::Inference, FailureCategory::ObservationFailed))
+        // Sampling setup may touch native telemetry. Observe immediately
+        // before dispatch so a scheme change during that setup is not hidden;
+        // if setup fails, this boundary remains unvisited.
+        observe_then(campaign_power, &mut power_scheme.before_dispatch, || {
+            worker
+                .transcribe_observed_retained(lease, artifact, spec.target.preference(), audio)
+                .map_err(|_| (FailureStage::Inference, FailureCategory::ObservationFailed))
+        })
+        .map_err(|category| (FailureStage::PowerSchemeBeforeDispatch, category))?
     })();
     // The correlated response timestamp precedes sampler joining, endpoint
     // checks, validation, transcript hashing and report work. Notify the TTL
@@ -1435,7 +1682,15 @@ fn observe_attempt(
         .as_ref()
         .map_or_else(|_| Instant::now(), |result| result.result_at);
     let elapsed = result_at.saturating_duration_since(started);
-    let lifecycle = settled(result_at, execution.is_ok());
+    // This query intentionally follows both the exact correlated result time
+    // and the TTL settlement. It is outside the measured request interval.
+    let (lifecycle, post_result_scheme) = settle_then_observe_after_result(
+        result_at,
+        execution.is_ok(),
+        settled,
+        campaign_power,
+        &mut power_scheme,
+    );
     let power_after = sampler.as_ref().map(|_| PowerSource::current());
     let telemetry = sampler.map(SamplingSession::finish);
     let failed = |stage, category| {
@@ -1447,20 +1702,18 @@ fn observe_attempt(
             power_after,
             FailureDescriptor::for_spec(spec, stage, category),
         )
+        .with_power_scheme(power_scheme.clone())
     };
     let observed = match execution {
         Ok(observed) => observed,
         Err((stage, category)) => return failed(stage, category),
     };
-    if lifecycle.is_err() {
-        return failed(
-            FailureStage::WarmModelTtl,
-            FailureCategory::InvariantViolation,
-        );
+    if let Some((stage, category)) = completion_failure(&lifecycle, post_result_scheme.as_ref()) {
+        return failed(stage, category);
     }
     let before = power_before.expect("successful request captured its initial power");
     let after = power_after.expect("successful request started its sampler");
-    if let Err(category) = require_power(expected_power, after) {
+    if let Err(category) = require_power(campaign_power.expected, after) {
         let category = if after != PowerSource::Unknown && after != before {
             FailureCategory::PowerChanged
         } else {
@@ -1535,6 +1788,7 @@ fn observe_attempt(
         target: spec.target,
         generation_ref: Some(generation_ref),
         status: RecordStatus::Succeeded,
+        power_scheme,
         power_source_before: Some(before),
         power_source_after: Some(after),
         end_to_end_ms: report.elapsed_ms,
@@ -1580,6 +1834,87 @@ fn campaign_specs() -> Vec<RunSpec> {
     specs
 }
 
+fn validate_run_power_scheme(record: &CampaignRunRecord, baseline: &str) -> Result<()> {
+    let observations = [
+        (
+            FailureStage::PowerSchemeBeforeLaunch,
+            record.power_scheme.before_launch.as_ref(),
+        ),
+        (
+            FailureStage::PowerSchemeBeforeDispatch,
+            record.power_scheme.before_dispatch.as_ref(),
+        ),
+        (
+            FailureStage::PowerSchemeAfterResult,
+            record.power_scheme.after_result.as_ref(),
+        ),
+    ];
+    if observations
+        .iter()
+        .filter_map(|(_, observation)| *observation)
+        .any(|observation| !observation.is_valid())
+        || (record.phase == Phase::Warm && record.power_scheme.before_launch.is_some())
+        || (record.phase != Phase::Warm
+            && (record.power_scheme.before_dispatch.is_some()
+                || record.power_scheme.after_result.is_some())
+            && record.power_scheme.before_launch.is_none())
+        || (record.power_scheme.after_result.is_some()
+            && record.power_scheme.before_dispatch.is_none())
+    {
+        bail!("campaign request contains inconsistent power-scheme observations")
+    }
+
+    for &(stage, observation) in &observations {
+        let Some(observation) = observation else {
+            continue;
+        };
+        let category = match observation.scheme_guid() {
+            None => Some(FailureCategory::PowerSchemeUnavailable),
+            Some(scheme_guid) if scheme_guid != baseline => {
+                Some(FailureCategory::PowerSchemeChanged)
+            }
+            Some(_) => None,
+        };
+        if let Some(category) = category
+            && (record.status != RecordStatus::Failed
+                || record
+                    .failure
+                    .map(|failure| (failure.stage, failure.category))
+                    != Some((stage, category)))
+        {
+            bail!("campaign request power-scheme failure does not match its boundary")
+        }
+    }
+
+    if record.status == RecordStatus::Failed
+        && let Some(failure) = record.failure
+        && matches!(
+            failure.stage,
+            FailureStage::PowerSchemeBeforeLaunch
+                | FailureStage::PowerSchemeBeforeDispatch
+                | FailureStage::PowerSchemeAfterResult
+        )
+    {
+        let observation = observations
+            .iter()
+            .find(|(stage, _)| *stage == failure.stage)
+            .and_then(|(_, observation)| *observation)
+            .ok_or_else(|| anyhow!("campaign request omitted its claimed power-scheme failure"))?;
+        if require_stable_power_scheme(baseline, observation).err() != Some(failure.category) {
+            bail!("campaign request claimed a power-scheme failure not present at its boundary")
+        }
+    }
+
+    if record.status == RecordStatus::Succeeded
+        && (record.power_scheme.before_dispatch.is_none()
+            || record.power_scheme.after_result.is_none()
+            || (record.phase != Phase::Warm && record.power_scheme.before_launch.is_none()))
+    {
+        bail!("campaign successful request omitted power-scheme observations")
+    }
+    Ok(())
+}
+
 fn validate_report(report: &CampaignReport) -> Result<()> {
     if report.captures.len() > MAX_CAPTURES || report.runs.len() > MAX_RECORDS {
         bail!("campaign report exceeds its record bounds")
@@ -1589,6 +1924,29 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
     {
         bail!("campaign report has inconsistent failure state")
     }
+    if !report.active_power_scheme.is_valid() {
+        bail!("campaign report contains an invalid active power-scheme observation")
+    }
+    let baseline_power_scheme = match report.active_power_scheme.scheme_guid() {
+        Some(scheme_guid) => scheme_guid,
+        None => {
+            if !report.incomplete
+                || !report.runs.is_empty()
+                || !report.captures.is_empty()
+                || report.gpu_identity.is_some()
+                || report
+                    .failure
+                    .map(|failure| (failure.stage, failure.category))
+                    != Some((
+                        FailureStage::PowerSchemeBaseline,
+                        FailureCategory::PowerSchemeUnavailable,
+                    ))
+            {
+                bail!("campaign unavailable power-scheme baseline has inconsistent state")
+            }
+            return Ok(());
+        }
+    };
     let expected_captures = [
         (Target::Cpu, CapturePurpose::Preflight),
         (Target::Gpu, CapturePurpose::Preflight),
@@ -1652,6 +2010,7 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
         ) {
             bail!("campaign request order is not a prefix of the fixed sequence")
         }
+        validate_run_power_scheme(record, baseline_power_scheme)?;
         let capture = record
             .generation_ref
             .as_ref()
@@ -1692,7 +2051,19 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
             }
         }
         if record.status == RecordStatus::Failed {
-            if record.failure.is_none() || !report.incomplete || index + 1 != report.runs.len() {
+            if record.failure.is_none()
+                || !report.incomplete
+                || index + 1 != report.runs.len()
+                || record.backend_ms.is_some()
+                || record.model_load_ms.is_some()
+                || record.warm_reused.is_some()
+                || record.sampled_max_private_usage_bytes.is_some()
+                || record.telemetry_sample_count.is_some()
+                || record.video_memory.is_some()
+                || record.raw_provider_memory.is_some()
+                || record.memory_availability.is_some()
+                || record.normalized_transcript_sha256.is_some()
+            {
                 bail!("campaign failed request is missing its terminal failure")
             }
             continue;
@@ -1750,6 +2121,10 @@ fn publish_campaign(report: CampaignReport, output: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
     use super::*;
     use crate::onnx_worker::{
         ProviderMemoryNotApplicableReason, ProviderMemoryObservation, WorkerMemoryAvailability,
@@ -1758,6 +2133,7 @@ mod tests {
     fn builder() -> ReportBuilder {
         ReportBuilder::new(
             CampaignPower::Ac,
+            observed_power_scheme(),
             InputReport {
                 model_sha256: "a".repeat(64),
                 wav_sha256: "b".repeat(64),
@@ -1777,6 +2153,70 @@ mod tests {
                 runtime_abi: 1,
             }),
         )
+    }
+
+    fn observed_power_scheme() -> ActivePowerSchemeObservation {
+        ActivePowerSchemeObservation::Observed {
+            source: super::super::power_scheme::SOURCE,
+            scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".to_owned(),
+        }
+    }
+
+    fn changed_power_scheme() -> ActivePowerSchemeObservation {
+        ActivePowerSchemeObservation::Observed {
+            source: super::super::power_scheme::SOURCE,
+            scheme_guid: "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c".to_owned(),
+        }
+    }
+
+    fn unavailable_power_scheme() -> ActivePowerSchemeObservation {
+        ActivePowerSchemeObservation::Unavailable {
+            reason: "query_failed",
+        }
+    }
+
+    struct ScriptedPowerSchemeReader {
+        observations: RefCell<VecDeque<ActivePowerSchemeObservation>>,
+        calls: Cell<usize>,
+    }
+
+    impl ScriptedPowerSchemeReader {
+        fn new(observations: impl IntoIterator<Item = ActivePowerSchemeObservation>) -> Self {
+            Self {
+                observations: RefCell::new(observations.into_iter().collect()),
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl ActivePowerSchemeReader for ScriptedPowerSchemeReader {
+        fn observe_active_scheme(&self) -> ActivePowerSchemeObservation {
+            self.calls.set(self.calls.get() + 1);
+            self.observations
+                .borrow_mut()
+                .pop_front()
+                .expect("campaign requested no more power-scheme observations than scripted")
+        }
+    }
+
+    struct TracingPowerSchemeReader {
+        observation: ActivePowerSchemeObservation,
+        trace: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl ActivePowerSchemeReader for TracingPowerSchemeReader {
+        fn observe_active_scheme(&self) -> ActivePowerSchemeObservation {
+            self.trace.borrow_mut().push("after_result_query");
+            self.observation.clone()
+        }
+    }
+
+    fn successful_run_power_scheme(phase: Phase) -> RunPowerSchemeObservations {
+        RunPowerSchemeObservations {
+            before_launch: (phase != Phase::Warm).then(observed_power_scheme),
+            before_dispatch: Some(observed_power_scheme()),
+            after_result: Some(observed_power_scheme()),
+        }
     }
 
     fn capture(report: &mut CampaignReport, target: Target, purpose: CapturePurpose) -> String {
@@ -1851,6 +2291,7 @@ mod tests {
                 target: spec.target,
                 generation_ref: Some(reference),
                 status: RecordStatus::Succeeded,
+                power_scheme: successful_run_power_scheme(spec.phase),
                 power_source_before: Some(PowerSource::Ac),
                 power_source_after: Some(PowerSource::Ac),
                 end_to_end_ms: 0,
@@ -1873,6 +2314,104 @@ mod tests {
             });
         }
         report
+    }
+
+    fn failed_scheme_report(
+        index: usize,
+        stage: FailureStage,
+        observation: ActivePowerSchemeObservation,
+    ) -> CampaignReport {
+        let mut report = complete_report();
+        let spec = campaign_specs()[index];
+        let generation_ref = report.runs[index].generation_ref.clone();
+        report.runs.truncate(index);
+        let mut power_scheme = RunPowerSchemeObservations::default();
+        let category = require_stable_power_scheme(
+            report
+                .active_power_scheme
+                .scheme_guid()
+                .expect("complete report has an observed baseline"),
+            &observation,
+        )
+        .expect_err("failed fixture observation differs from the baseline");
+        match stage {
+            FailureStage::PowerSchemeBeforeLaunch => {
+                assert_ne!(spec.phase, Phase::Warm);
+                power_scheme.before_launch = Some(observation);
+            }
+            FailureStage::PowerSchemeBeforeDispatch => {
+                power_scheme.before_launch =
+                    (spec.phase != Phase::Warm).then(observed_power_scheme);
+                power_scheme.before_dispatch = Some(observation);
+            }
+            FailureStage::PowerSchemeAfterResult => {
+                power_scheme.before_launch =
+                    (spec.phase != Phase::Warm).then(observed_power_scheme);
+                power_scheme.before_dispatch = Some(observed_power_scheme());
+                power_scheme.after_result = Some(observation);
+            }
+            _ => panic!("test fixture requires a request power-scheme stage"),
+        }
+        let generation_ref = match stage {
+            FailureStage::PowerSchemeBeforeLaunch => None,
+            FailureStage::PowerSchemeBeforeDispatch | FailureStage::PowerSchemeAfterResult => {
+                generation_ref
+            }
+            _ => unreachable!(),
+        };
+        let failure = FailureDescriptor::for_spec(spec, stage, category);
+        report.runs.push(
+            CampaignRunRecord::failed(
+                spec,
+                generation_ref,
+                Duration::ZERO,
+                Some(PowerSource::Ac),
+                None,
+                failure,
+            )
+            .with_power_scheme(power_scheme),
+        );
+        report.incomplete = true;
+        report.failure = Some(failure);
+        report
+    }
+
+    fn unavailable_baseline_report() -> CampaignReport {
+        let mut report = builder().report;
+        report.active_power_scheme = unavailable_power_scheme();
+        report.gpu_identity = None;
+        report.incomplete = true;
+        report.failure = Some(FailureDescriptor::global(
+            FailureStage::PowerSchemeBaseline,
+            FailureCategory::PowerSchemeUnavailable,
+        ));
+        report
+    }
+
+    fn write_tiny_verified_inputs() -> (CommandOptions, std::path::PathBuf) {
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).expect("test nonce is available");
+        let directory =
+            std::env::temp_dir().join(format!("scribe-campaign-inputs-{}", hex(&nonce)));
+        std::fs::create_dir(&directory).expect("test input directory is created");
+        let model = directory.join("model.gguf");
+        let wav = directory.join("audio.wav");
+        let model_bytes = b"not-reached-model";
+        let wav_bytes = b"not-reached-wav";
+        std::fs::write(&model, model_bytes).expect("test model is written");
+        std::fs::write(&wav, wav_bytes).expect("test WAV is written");
+        let options = CommandOptions {
+            model,
+            model_sha256: format!("{:x}", Sha256::digest(model_bytes)),
+            wav,
+            wav_sha256: format!("{:x}", Sha256::digest(wav_bytes)),
+            gpu_pack_id: "not-reached-pack".to_owned(),
+            gpu_backend: "not-reached-backend".to_owned(),
+            gpu_device: "not-reached-device".to_owned(),
+            output: directory.join("report.json"),
+            campaign_power: Some(CampaignPower::Ac),
+        };
+        (options, directory)
     }
 
     #[test]
@@ -2026,6 +2565,279 @@ mod tests {
     }
 
     #[test]
+    fn production_boundary_recorder_uses_the_injected_reader_in_boundary_order() {
+        let reader = ScriptedPowerSchemeReader::new([
+            observed_power_scheme(),
+            observed_power_scheme(),
+            changed_power_scheme(),
+        ]);
+        let baseline = observed_power_scheme();
+        let baseline_guid = baseline.scheme_guid().unwrap();
+        let campaign_power = CampaignPowerContext {
+            expected: CampaignPower::Ac,
+            baseline_scheme: baseline_guid,
+            reader: &reader,
+        };
+        let mut boundaries = RunPowerSchemeObservations::default();
+
+        assert_eq!(
+            observe_then(&campaign_power, &mut boundaries.before_launch, || ()),
+            Ok(())
+        );
+        assert_eq!(
+            observe_then(&campaign_power, &mut boundaries.before_dispatch, || ()),
+            Ok(())
+        );
+        assert_eq!(
+            observe_then(&campaign_power, &mut boundaries.after_result, || ()),
+            Err(FailureCategory::PowerSchemeChanged)
+        );
+        assert_eq!(reader.calls.get(), 3);
+        assert!(boundaries.before_launch.is_some());
+        assert!(boundaries.before_dispatch.is_some());
+        assert_eq!(boundaries.after_result, Some(changed_power_scheme()));
+    }
+
+    #[test]
+    fn settlement_precedes_postresult_query_and_postresult_failure_wins() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let reader = TracingPowerSchemeReader {
+            observation: changed_power_scheme(),
+            trace: Rc::clone(&trace),
+        };
+        let baseline = observed_power_scheme();
+        let campaign_power = CampaignPowerContext {
+            expected: CampaignPower::Ac,
+            baseline_scheme: baseline.scheme_guid().unwrap(),
+            reader: &reader,
+        };
+        let mut observations = RunPowerSchemeObservations::default();
+        let (lifecycle, post_result_scheme) = settle_then_observe_after_result(
+            Instant::now(),
+            true,
+            |_, succeeded| {
+                assert!(succeeded);
+                trace.borrow_mut().push("settled");
+                Err(anyhow!("simultaneous lifecycle failure"))
+            },
+            &campaign_power,
+            &mut observations,
+        );
+
+        assert_eq!(
+            trace.borrow().as_slice(),
+            &["settled", "after_result_query"]
+        );
+        assert_eq!(observations.after_result, Some(changed_power_scheme()));
+        assert_eq!(
+            completion_failure(&lifecycle, post_result_scheme.as_ref()),
+            Some((
+                FailureStage::PowerSchemeAfterResult,
+                FailureCategory::PowerSchemeChanged,
+            ))
+        );
+
+        trace.borrow_mut().clear();
+        let mut unsuccessful_observations = RunPowerSchemeObservations::default();
+        let (lifecycle, post_result_scheme) = settle_then_observe_after_result(
+            Instant::now(),
+            false,
+            |_, succeeded| {
+                assert!(!succeeded);
+                trace.borrow_mut().push("settled");
+                Ok(())
+            },
+            &campaign_power,
+            &mut unsuccessful_observations,
+        );
+        assert!(lifecycle.is_ok());
+        assert!(post_result_scheme.is_none());
+        assert!(unsuccessful_observations.after_result.is_none());
+        assert_eq!(trace.borrow().as_slice(), &["settled"]);
+    }
+
+    #[test]
+    fn unavailable_baseline_stops_the_real_campaign_before_worker_preflight() {
+        let (options, directory) = write_tiny_verified_inputs();
+        let output = options.output.clone();
+        let reader = ScriptedPowerSchemeReader::new([unavailable_power_scheme()]);
+
+        assert!(run_with_power_scheme_reader(options, &reader).is_err());
+        assert_eq!(reader.calls.get(), 1);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).expect("baseline report is published"))
+                .expect("baseline report is JSON");
+        assert!(
+            report["captures"]
+                .as_array()
+                .expect("captures is an array")
+                .is_empty()
+        );
+        assert!(report.get("gpu_identity").is_none());
+        assert_eq!(
+            report["failure"]["stage"],
+            serde_json::Value::String("power_scheme_baseline".to_owned())
+        );
+        assert_eq!(
+            report["failure"]["category"],
+            serde_json::Value::String("power_scheme_unavailable".to_owned())
+        );
+        std::fs::remove_file(output).expect("test report is removed");
+        std::fs::remove_file(directory.join("model.gguf")).expect("test model is removed");
+        std::fs::remove_file(directory.join("audio.wav")).expect("test WAV is removed");
+        std::fs::remove_dir(directory).expect("test input directory is removed");
+    }
+
+    #[test]
+    fn run_cold_stops_before_cpu_worker_launch_when_the_scheme_is_unavailable() {
+        let reader = ScriptedPowerSchemeReader::new([unavailable_power_scheme()]);
+        let baseline = observed_power_scheme();
+        let campaign_power = CampaignPowerContext {
+            expected: CampaignPower::Ac,
+            baseline_scheme: baseline
+                .scheme_guid()
+                .expect("fixture baseline is observed"),
+            reader: &reader,
+        };
+        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("campaign-test-artifact"),
+            path: std::env::temp_dir().join("not-launched.gguf"),
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: "a".repeat(64),
+        });
+        let audio = PreparedAudio {
+            samples: vec![0.0],
+            sample_rate: 16_000,
+            source_sample_rate: 16_000,
+            source_channels: 1,
+            source_frames: 1,
+        };
+        let mut report_builder = builder();
+        let (record, cleanup_complete) = run_cold(
+            campaign_specs()[0],
+            &CaptureObservationWorkerFactory::cpu(),
+            artifact,
+            &audio,
+            &campaign_power,
+            &mut report_builder,
+        );
+
+        assert!(cleanup_complete);
+        assert_eq!(reader.calls.get(), 1);
+        assert_eq!(record.status, RecordStatus::Failed);
+        assert_eq!(record.generation_ref, None);
+        assert_eq!(
+            record.failure,
+            Some(FailureDescriptor::for_spec(
+                campaign_specs()[0],
+                FailureStage::PowerSchemeBeforeLaunch,
+                FailureCategory::PowerSchemeUnavailable,
+            ))
+        );
+        assert_eq!(
+            record.power_scheme.before_launch,
+            Some(unavailable_power_scheme())
+        );
+        assert!(record.power_scheme.before_dispatch.is_none());
+        assert!(record.power_scheme.after_result.is_none());
+    }
+
+    #[test]
+    fn preflight_scheme_failures_are_target_specific_and_prevent_further_launches() {
+        for target in [Target::Cpu, Target::Gpu] {
+            assert_eq!(
+                power_scheme_preflight_failure(target, FailureCategory::PowerSchemeUnavailable),
+                FailureDescriptor {
+                    stage: FailureStage::PowerSchemePreflight,
+                    category: FailureCategory::PowerSchemeUnavailable,
+                    target: Some(target),
+                    phase: None,
+                    pair_index: None,
+                    order_in_pair: None,
+                }
+            );
+        }
+        let reader =
+            ScriptedPowerSchemeReader::new([observed_power_scheme(), unavailable_power_scheme()]);
+        let baseline = observed_power_scheme();
+        let campaign_power = CampaignPowerContext {
+            expected: CampaignPower::Ac,
+            baseline_scheme: baseline.scheme_guid().unwrap(),
+            reader: &reader,
+        };
+        let mut cpu_launch_scheme = None;
+        let mut gpu_launch_scheme = None;
+        let cpu_launches = Cell::new(0);
+        let gpu_launches = Cell::new(0);
+        assert_eq!(
+            observe_then(&campaign_power, &mut cpu_launch_scheme, || {
+                cpu_launches.set(cpu_launches.get() + 1);
+                Target::Cpu
+            }),
+            Ok(Target::Cpu)
+        );
+        assert_eq!(
+            observe_then(&campaign_power, &mut gpu_launch_scheme, || {
+                gpu_launches.set(gpu_launches.get() + 1);
+                Target::Gpu
+            }),
+            Err(FailureCategory::PowerSchemeUnavailable)
+        );
+        assert_eq!(cpu_launches.get(), 1);
+        assert_eq!(gpu_launches.get(), 0);
+        assert_eq!(cpu_launch_scheme, Some(observed_power_scheme()));
+        assert_eq!(gpu_launch_scheme, Some(unavailable_power_scheme()));
+        assert_eq!(reader.calls.get(), 2);
+    }
+
+    #[test]
+    fn validator_accepts_terminal_scheme_failure_prefixes() {
+        for (index, stages) in [
+            (
+                0,
+                [
+                    FailureStage::PowerSchemeBeforeLaunch,
+                    FailureStage::PowerSchemeBeforeDispatch,
+                    FailureStage::PowerSchemeAfterResult,
+                ],
+            ),
+            (
+                10,
+                [
+                    FailureStage::PowerSchemeBeforeLaunch,
+                    FailureStage::PowerSchemeBeforeDispatch,
+                    FailureStage::PowerSchemeAfterResult,
+                ],
+            ),
+            (
+                12,
+                [
+                    FailureStage::PowerSchemeBeforeDispatch,
+                    FailureStage::PowerSchemeAfterResult,
+                    FailureStage::PowerSchemeAfterResult,
+                ],
+            ),
+        ] {
+            for stage in stages {
+                let report = failed_scheme_report(index, stage, unavailable_power_scheme());
+                assert_eq!(report.runs.len(), index + 1);
+                assert!(validate_report(&report).is_ok());
+            }
+        }
+
+        for (index, stage) in [
+            (0, FailureStage::PowerSchemeAfterResult),
+            (10, FailureStage::PowerSchemeBeforeDispatch),
+            (12, FailureStage::PowerSchemeAfterResult),
+        ] {
+            let report = failed_scheme_report(index, stage, changed_power_scheme());
+            assert_eq!(report.runs.len(), index + 1);
+            assert!(validate_report(&report).is_ok());
+        }
+    }
+
+    #[test]
     fn diagnostics_preserve_real_zero_and_reject_reload_or_integer_overflow() {
         assert_eq!(
             validate_diagnostics(Phase::Cold, false, 0, 0).unwrap(),
@@ -2053,7 +2865,7 @@ mod tests {
         let bytes = serialize_report(&report).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["kind"], KIND);
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["unsigned"], true);
         assert_eq!(value["unqualified"], true);
         assert_eq!(value["auto_eligible"], false);
@@ -2062,6 +2874,20 @@ mod tests {
         assert_eq!(value["runs"].as_array().unwrap().len(), 52);
         assert_eq!(value["runs"][0]["end_to_end_ms"], 0);
         assert_eq!(value["runs"][0]["backend_ms"], 0);
+        assert_eq!(
+            value["active_power_scheme"]["scheme_guid"],
+            "381b4222-f694-41f0-9685-ff5bb260df2e"
+        );
+        assert!(
+            value["runs"][0]["power_scheme"]
+                .get("before_launch")
+                .is_some()
+        );
+        assert!(
+            value["runs"][12]["power_scheme"]
+                .get("before_launch")
+                .is_none()
+        );
         for field in [
             "background_load",
             "host_control",
@@ -2078,6 +2904,73 @@ mod tests {
             "not_observed"
         );
         assert!(bytes.len() < MAX_CAMPAIGN_REPORT_BYTES);
+    }
+
+    #[test]
+    fn validator_rejects_power_scheme_omissions_and_inconsistent_observations() {
+        let mut missing_after_result = complete_report();
+        missing_after_result.runs[0].power_scheme.after_result = None;
+        assert!(validate_report(&missing_after_result).is_err());
+
+        let mut warm_launch = complete_report();
+        warm_launch.runs[12].power_scheme.before_launch = Some(observed_power_scheme());
+        assert!(validate_report(&warm_launch).is_err());
+
+        let mut changed_success = complete_report();
+        changed_success.runs[0].power_scheme.after_result = Some(changed_power_scheme());
+        assert!(validate_report(&changed_success).is_err());
+
+        let unavailable_baseline = unavailable_baseline_report();
+        assert!(validate_report(&unavailable_baseline).is_ok());
+
+        let mut unavailable_baseline_capture = unavailable_baseline_report();
+        capture(
+            &mut unavailable_baseline_capture,
+            Target::Cpu,
+            CapturePurpose::Preflight,
+        );
+        assert!(validate_report(&unavailable_baseline_capture).is_err());
+
+        let mut unavailable_baseline_gpu = unavailable_baseline_report();
+        unavailable_baseline_gpu.gpu_identity = builder().report.gpu_identity;
+        assert!(validate_report(&unavailable_baseline_gpu).is_err());
+
+        let mut fabricated_failed_values = failed_scheme_report(
+            0,
+            FailureStage::PowerSchemeBeforeLaunch,
+            unavailable_power_scheme(),
+        );
+        fabricated_failed_values.runs[0].backend_ms = Some(0);
+        assert!(validate_report(&fabricated_failed_values).is_err());
+
+        let mut omitted_claimed_failure = failed_scheme_report(
+            0,
+            FailureStage::PowerSchemeBeforeLaunch,
+            unavailable_power_scheme(),
+        );
+        omitted_claimed_failure.runs[0].power_scheme.before_launch = None;
+        assert!(validate_report(&omitted_claimed_failure).is_err());
+
+        let mut stable_claimed_failure = failed_scheme_report(
+            0,
+            FailureStage::PowerSchemeBeforeLaunch,
+            unavailable_power_scheme(),
+        );
+        stable_claimed_failure.runs[0].power_scheme.before_launch = Some(observed_power_scheme());
+        assert!(validate_report(&stable_claimed_failure).is_err());
+
+        let mut wrong_claimed_category = failed_scheme_report(
+            0,
+            FailureStage::PowerSchemeBeforeLaunch,
+            changed_power_scheme(),
+        );
+        wrong_claimed_category.runs[0]
+            .failure
+            .as_mut()
+            .expect("failed record has a failure")
+            .category = FailureCategory::PowerSchemeUnavailable;
+        wrong_claimed_category.failure = wrong_claimed_category.runs[0].failure;
+        assert!(validate_report(&wrong_claimed_category).is_err());
     }
 
     #[test]
