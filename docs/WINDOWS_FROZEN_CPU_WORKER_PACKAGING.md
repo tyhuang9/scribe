@@ -158,6 +158,81 @@ actual testing is CPU-only. The unchanged production release verifier continues
 to reject the local-only marker; there is no flag or manifest rewrite that
 admits it to a production release.
 
+## Installed single-pair GPU observations
+
+To include the existing diagnostic collector, add `-LocalFrozenGpuObservation`
+when building the frozen bundle. The switch is rejected without
+`-FrozenCpuWorkerRecordPath` and retains the local-only CI restrictions. It adds
+only `windows-gpu-capture-observation` to the desktop's `ui-harness` features;
+it does not link a CUDA/Vulkan provider into the desktop or rebuild either
+worker. Without the switch, desktop build arguments remain unchanged.
+The collector's existing `GetProcessMemoryInfo` telemetry imports the Windows
+system `psapi.dll`, which is explicitly reviewed by the PE import allowlist.
+This does not permit bundling a loose `psapi.dll` or matching DLL name prefixes.
+
+```powershell
+pwsh -NoProfile -File scripts/build-windows-release.ps1 `
+  -ModelSource C:\ScribeLocal\inputs\whisper-base.en-Q8_0.gguf `
+  -BundlePath C:\ScribeLocal\local-observer-bundle `
+  -FrozenCpuWorkerRecordPath C:\ScribeLocal\worker-freeze\windows-frozen-cpu-worker-record.json `
+  -WorkerPackRoot C:\ScribeLocal\verified-packs\cuda `
+  -LocalFrozenGpuObservation
+```
+
+The pack root must contain an already signed, compatible pack accepted by the
+existing compiled trust policy. A caller-supplied path or digest is not trust.
+Building this option with an empty catalog is allowed for CPU-only testing,
+but requesting an installed GPU observation without the selected verified pack
+fails before installation. The option neither provisions production keys nor
+substitutes fixture packs. A positive CUDA run still needs approved trusted
+pack artifacts; an unsigned Windows installer does not change that requirement.
+
+Build the LOCAL installer from this bundle with
+`scripts/build-windows-frozen-test-installer.ps1`, as shown in the local installer
+section above, using this observer bundle as `-BundlePath`. Then
+append all six observation arguments to the ordinary installer-verification
+command, using its matching bundle, freeze, installer and installer record:
+
+```powershell
+  -ObservationWavPath C:\ScribeLocal\inputs\sample.wav `
+  -ObservationWavSha256 <lowercase-sha256-of-sample.wav> `
+  -ObservationGpuPackId scribe-cuda-windows-x64 `
+  -ObservationGpuBackend cuda `
+  -ObservationGpuDevice <exact-stable-device-id> `
+  -ObservationReportPath C:\ScribeLocal\reports\installed-cuda.json
+```
+
+The six arguments are all-or-none. The report's parent directory must already
+exist, and the destination must be new and outside the source, bundle, frozen
+worker, installer, installation and verifier scratch directories. No collector,
+model or worker path override is accepted: the collector and bundled model
+paths, sizes and hashes come from the parity-verified installed inventory.
+
+After installed payload parity and the CPU smoke pass, the verifier invokes
+the installed collector once for one CPU/GPU pair, with individual arguments
+and a fifteen-minute process deadline. It checks the bounded (1 MiB), UTF-8
+schema-3 report envelope, nonqualification flags, collector revision, input
+digests and selected pack/backend/stable-device identity. Worker record fields
+and the transcript-digest/parity relationship are checked; embedded handshake
+frames and nested telemetry are not independently authenticated or fully
+revalidated by this PowerShell adapter. The existing native collector remains
+responsible for its worker protocol and provider observations.
+
+`transcript_parity: false` is preserved as a diagnostic result when consistent
+with the two transcript digests; it is not a passing correctness qualification.
+The report remains `unsigned:true`, `unqualified:true`, `auto_eligible:false`
+and `release_approved:false`. This mode does not run the five-cold/twenty-warm
+campaign or establish ordinary application latency, power-scheme qualification,
+capture authorization, GPU Auto eligibility or release approval.
+
+The verifier retains report bytes only after validation, uninstalls the trusted
+test payload, verifies removal and source identity, and cleans its owned
+scratch before publishing the report through a same-directory, no-replace
+rename. Observer, report-validation or cleanup failure must not publish a final
+report or replay inference. An existing or race-created destination is left
+unchanged. As with ordinary verification, an installation whose payload parity
+was not established is retained rather than executing its untrusted contents.
+
 ## Local validation versus release acceptance
 
 A successful local bundle must pass the builder's exact file inventory, PE and
@@ -210,6 +285,8 @@ actual-installer qualification, and explicit unchanged-artifact promotion.
 Those stages must preserve the exact measured worker artifacts rather than
 silently rebuilding them.
 
-Disablement is simply to omit `-FrozenCpuWorkerRecordPath` and use the unchanged
-normal builder. Preserve frozen artifacts while they are needed; cleanup is an
+To omit only observation support, leave out `-LocalFrozenGpuObservation` and
+the verifier's six observation arguments. To disable frozen packaging entirely,
+omit `-FrozenCpuWorkerRecordPath` and use the unchanged normal builder.
+Preserve frozen artifacts while they are needed; cleanup is an
 explicit local decision, not part of fallback or validation failure handling.

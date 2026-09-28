@@ -8,6 +8,7 @@ $packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
 $gpuReleasePolicyScript = Join-Path $PSScriptRoot "resolve-windows-gpu-release-policy.ps1"
 $InstallerPackAllowlistPath = $null
 $FrozenCpuWorkerRecordPath = $null
+$LocalFrozenGpuObservation = $false
 $modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
@@ -143,13 +144,14 @@ function Assert-OrderedWorkflowTokens(
 }
 
 function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
-    $expectedDesktopBuild = '& cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
+    $expectedDesktopBuild = '& cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join '','') --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
     $expectedWorkerBuild = '& cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
     $cargoBuilds = @([regex]::Matches($ReleaseSource, '(?m)^\s*& cargo build\b'))
     if ($cargoBuilds.Count -ne 2 -or
         -not $ReleaseSource.Contains($expectedDesktopBuild) -or
         -not $ReleaseSource.Contains($expectedWorkerBuild) -or
         $ReleaseSource.Contains('--all-features') -or
+        $ReleaseSource.Contains('cuda-acceleration') -or
         $ReleaseSource.Contains('vulkan-acceleration')) {
         throw 'Windows release packaging must build the desktop and CPU inference worker independently without enabling GPU or every Cargo feature.'
     }
@@ -166,6 +168,9 @@ function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
         $expectedWorkerBuild,
         '$env:SCRIBE_BUILDING_WORKER = $null',
         '$env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker)',
+        '$desktopFeatures = @(''ui-harness'')',
+        'if ($LocalFrozenGpuObservation) {',
+        '$desktopFeatures += ''windows-gpu-capture-observation''',
         $expectedDesktopBuild
     ) 'bundled worker trust-anchor build order'
 }
@@ -602,6 +607,22 @@ try {
     }
     Assert-AllowedPayloadFile "LOCAL-TRANSCRIBER.EXE"
     Assert-AllowedPayloadFile "SCRIBE-INFERENCE-WORKER.EXE"
+    $collectorImports = Join-Path $testRoot 'collector-system-imports.exe'
+    Write-TestPe $collectorImports 0x8664 'PSAPI.DLL' 'PsApi.DlL'
+    $collectorImportReport = Assert-ReviewedWindowsPe $collectorImports
+    if ($collectorImportReport.NormalImports -cnotcontains 'psapi.dll' -or
+        $collectorImportReport.DelayImports -cnotcontains 'psapi.dll') {
+        throw 'Collector process-memory telemetry must accept the exact Windows PSAPI import in both directories.'
+    }
+    foreach ($relativeDll in @('psapi.dll', 'PSAPI.DLL', 'nested/psapi.dll')) {
+        Invoke-ExpectedFailure { Assert-AllowedPayloadFile $relativeDll } 'unallowlisted executable or DLL'
+    }
+    $unreviewedCollectorNormal = Join-Path $testRoot 'unreviewed-collector-normal.exe'
+    Write-TestPe $unreviewedCollectorNormal 0x8664 'psapi-helper.dll' 'user32.dll'
+    Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $unreviewedCollectorNormal } 'unreviewed normal import DLL: psapi-helper.dll'
+    $unreviewedCollectorDelay = Join-Path $testRoot 'unreviewed-collector-delay.exe'
+    Write-TestPe $unreviewedCollectorDelay 0x8664 'kernel32.dll' 'psapi-helper.dll'
+    Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $unreviewedCollectorDelay } 'unreviewed delay import DLL: psapi-helper.dll'
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
     Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3
@@ -922,6 +943,17 @@ try {
 
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     Assert-ReleaseCargoFeatureContract $source
+    foreach ($mutation in @(
+        @{ Old = '$desktopFeatures = @(''ui-harness'')'; New = '$desktopFeatures = @(''ui-harness'', ''windows-gpu-capture-observation'')' },
+        @{ Old = 'if ($LocalFrozenGpuObservation) {'; New = 'if ($true) {' },
+        @{ Old = '$desktopFeatures += ''windows-gpu-capture-observation'''; New = '$desktopFeatures += ''cuda-acceleration''' },
+        @{ Old = '$desktopFeatures += ''windows-gpu-capture-observation'''; New = '$desktopFeatures += ''vulkan-acceleration''' }
+    )) {
+        $mutatedBuild = Replace-FirstExact $source $mutation.Old $mutation.New
+        Invoke-ExpectedFailure {
+            Assert-ReleaseCargoFeatureContract $mutatedBuild
+        } $(if ($mutation.New.Contains('-acceleration')) { 'without enabling GPU' } else { 'missing or reorders required control' })
+    }
     Assert-VulkanSdkWorkflowContract $workflow
     foreach ($replacement in @('', ' -GpuProviderCheck Cuda', ' -GpuProviderCheck Vulkan -ScriptOnly')) {
         $mutatedObservationWorkflow = $workflow.Replace(' -GpuProviderCheck Vulkan', $replacement)

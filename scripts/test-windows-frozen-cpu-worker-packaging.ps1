@@ -96,6 +96,18 @@ function Reset-TestCalls {
     $global:WindowsFrozenCpuWorkerTestNativeCalls = [System.Collections.Generic.List[object]]::new()
 }
 
+function Assert-DesktopCargoArguments([psobject]$Call, [string]$Features, [string]$Description) {
+    $expected = @(
+        'build', '--locked', '--offline', '--release', '--bin', 'local-transcriber',
+        '--features', $Features, '--target', 'x86_64-pc-windows-msvc',
+        '--manifest-path', (Join-Path $fixtureRoot 'Cargo.toml')
+    )
+    # Compare the complete argv, not a feature substring: additional feature
+    # flags or worker/provider features must not slip into the desktop build.
+    Assert-Equal (ConvertTo-Json -InputObject @($Call.Arguments) -Compress) `
+        (ConvertTo-Json -InputObject $expected -Compress) $Description
+}
+
 function Write-CanonicalFrozenRecord([string]$Root, [psobject]$Context, [int64]$Size, [string]$Sha256) {
     $record = New-WindowsFrozenCpuWorkerRecord $Context $Size $Sha256
     $recordPath = Join-Path $Root (Get-WindowsFrozenCpuWorkerRecordFileName)
@@ -343,6 +355,14 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    $nonFrozenObservationBundle = Join-Path $testRoot 'rejected-non-frozen-observation'
+    Invoke-ExpectedFailure {
+        & $fixtureBuilder -ModelSource $modelSource -BundlePath $nonFrozenObservationBundle `
+            -InstallerPackAllowlistPath $installerAllowlist -LocalFrozenGpuObservation
+    } 'available only with a local frozen CPU worker record'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Non-frozen GPU observation invoked Cargo'
+    Assert-True (-not (Test-Path -LiteralPath $nonFrozenObservationBundle)) 'Non-frozen GPU observation rejection left an output.'
+
     $normalBundle = Join-Path $testRoot 'normal-bundle'
     & $fixtureBuilder `
         -ModelSource $modelSource `
@@ -351,6 +371,7 @@ try {
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 2 'Normal packaging Cargo call count'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Normal packaging worker-first order'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].Binary 'local-transcriber' 'Normal packaging desktop-second order'
+    Assert-DesktopCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[1] 'ui-harness' 'Normal desktop exact feature argv'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].BuildingWorker '1' 'Normal packaging worker build marker'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest)) 'Normal worker build inherited a desktop digest.'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[1].BuildingWorker)) 'Normal desktop build inherited the worker build marker.'
@@ -402,6 +423,13 @@ try {
             Invoke-ExpectedFailure {
                 Invoke-FrozenConsumer $producerRecordPath (Join-Path $testRoot "hosted-consumer-$name")
             } 'local-only'
+            $hostedObservationBundle = Join-Path $testRoot "hosted-observation-$name"
+            Invoke-ExpectedFailure {
+                & $fixtureBuilder -ModelSource $modelSource -BundlePath $hostedObservationBundle `
+                    -InstallerPackAllowlistPath $installerAllowlist `
+                    -FrozenCpuWorkerRecordPath $producerRecordPath -LocalFrozenGpuObservation
+            } 'local-only'
+            Assert-True (-not (Test-Path -LiteralPath $hostedObservationBundle)) 'Hosted GPU observation rejection left an output.'
             Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count $producerCallsBeforeExistingOutput 'Hosted frozen entry point invoked Cargo'
             Assert-Equal ([Environment]::GetEnvironmentVariable($name)) 'true' 'Hosted-entry rejection changed caller environment'
         }
@@ -580,6 +608,7 @@ try {
     Invoke-FrozenConsumer $producerRecordPath $frozenBundle
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Frozen consumer Cargo call count'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'local-transcriber' 'Frozen consumer desktop-only build'
+    Assert-DesktopCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'ui-harness' 'Frozen default desktop exact feature argv'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Frozen consumer exact build revision'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].BuildingWorker $null 'Frozen consumer worker marker clearing'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest $record.worker_sha256 'Frozen consumer exact worker anchor'
@@ -589,6 +618,24 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $frozenBundle (Get-WindowsFrozenCpuWorkerMarkerFileName))) 'Frozen bundle omitted its local-only marker.'
     $stagedWorker = Join-Path $frozenBundle (Get-WindowsFrozenCpuWorkerExecutableRelativePath)
     Assert-Equal (Get-WindowsFrozenCpuWorkerFileSha256 $stagedWorker) $record.worker_sha256 'Frozen consumer staged exact worker bytes'
+
+    Reset-TestCalls
+    $observationBundle = Join-Path $testRoot 'frozen-observation-bundle'
+    & $fixtureBuilder -ModelSource $modelSource -BundlePath $observationBundle `
+        -InstallerPackAllowlistPath $installerAllowlist `
+        -FrozenCpuWorkerRecordPath $producerRecordPath -LocalFrozenGpuObservation
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Frozen observation must not rebuild the CPU worker'
+    $observationCall = $global:WindowsFrozenCpuWorkerTestCargoCalls[0]
+    Assert-Equal $observationCall.Binary 'local-transcriber' 'Frozen observation desktop-only build'
+    Assert-DesktopCargoArguments $observationCall 'ui-harness,windows-gpu-capture-observation' 'Frozen observation exact desktop-only feature argv'
+    Assert-Equal $observationCall.WorkerDigest $record.worker_sha256 'Frozen observation exact CPU worker anchor'
+    Assert-Equal $observationCall.Revision $fixtureContext.SourceRevision 'Frozen observation exact build revision'
+    Assert-Equal $observationCall.BuildingWorker $null 'Frozen observation clears the worker build marker'
+    $observedWorker = Join-Path $observationBundle (Get-WindowsFrozenCpuWorkerExecutableRelativePath)
+    Assert-Equal (Get-WindowsFrozenCpuWorkerFileSha256 $observedWorker) $record.worker_sha256 'Frozen observation stages unchanged CPU worker bytes'
+    Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Frozen observation revision environment restoration'
+    Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64 -join '') 'Frozen observation digest environment restoration'
+    Assert-Equal $env:SCRIBE_BUILDING_WORKER 'inherited-worker-flag' 'Frozen observation worker marker environment restoration'
 
     Reset-TestCalls
     $defaultAllowlistBundle = Join-Path $testRoot 'default-allowlist-bundle'
@@ -674,6 +721,15 @@ try {
             -FrozenCpuWorkerRecordPath ' '
     } 'explicitly supplied'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Explicit blank frozen record path invoked Cargo.'
+
+    $blankObservationBundle = Join-Path $testRoot 'blank-observation-frozen-path'
+    Invoke-ExpectedFailure {
+        & $fixtureBuilder -ModelSource $modelSource -BundlePath $blankObservationBundle `
+            -InstallerPackAllowlistPath $installerAllowlist `
+            -FrozenCpuWorkerRecordPath ' ' -LocalFrozenGpuObservation
+    } 'explicitly supplied'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Observation with a blank frozen record invoked Cargo.'
+    Assert-True (-not (Test-Path -LiteralPath $blankObservationBundle)) 'Observation with a blank frozen record left an output.'
 
     $global:WindowsFrozenCpuWorkerTestRaceBundleOutput = Join-Path $testRoot 'raced-bundle'
     Reset-TestCalls
