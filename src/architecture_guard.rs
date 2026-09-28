@@ -770,11 +770,36 @@ fn windows_gpu_capture_stays_opt_in_and_out_of_release_builds() {
     assert!(observer < startup, "observer must not initialize the UI");
 
     let builder = fs::read_to_string(repository.join("scripts/build-windows-release.ps1")).unwrap();
-    assert!(
-        !builder.contains("windows-gpu-capture-observation"),
-        "ordinary releases must not enable the development observer"
+    // Local frozen test installers can opt in; ordinary release builds cannot.
+    // The packaging suite also executes both paths and rejects unsafe feature mutations.
+    let build_commands = builder
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for required in [
+        "[switch]$LocalFrozenGpuObservation\n)",
+        "if ($frozenCpuWorkerRequested) {\nAssert-WindowsFrozenCpuWorkerLocalOnlyEnvironment\n}",
+        "if ($LocalFrozenGpuObservation -and -not $frozenCpuWorkerRequested) {\nthrow 'LocalFrozenGpuObservation is available only with a local frozen CPU worker record.'\n}",
+        "$desktopFeatures = @('ui-harness')\nif ($LocalFrozenGpuObservation) {\n$desktopFeatures += 'windows-gpu-capture-observation'\n}\n& cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple --manifest-path (Join-Path $repositoryRoot \"Cargo.toml\")",
+    ] {
+        assert!(
+            build_commands.contains(required),
+            "local observer opt-in must preserve release boundary {required:?}"
+        );
+    }
+    assert_eq!(
+        builder.matches("windows-gpu-capture-observation").count(),
+        1
     );
+    assert_eq!(builder.matches("$desktopFeatures").count(), 3);
     let workflow = fs::read_to_string(repository.join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        !workflow.contains("LocalFrozenGpuObservation")
+            && !workflow.contains("FrozenCpuWorkerRecordPath"),
+        "ordinary release CI must not opt into local frozen observer builds"
+    );
     assert!(workflow.contains(
         "run: pwsh -NoProfile -File .\\scripts\\test-windows-gpu-capture-observation.ps1"
     ));
