@@ -74,6 +74,84 @@ its owned staging directory, so this local operation does not create a sidecar
 in the clean source checkout. Explicit output paths must not overlap the freeze
 directory. The normal builder's default installer-allowlist output is unchanged.
 
+## Fixed-artifact LOCAL test installer
+
+`build-windows-frozen-test-installer.ps1` consumes a completed frozen bundle;
+it never invokes Cargo or rebuilds the desktop, CPU worker, model, or worker
+packs. It accepts only the repository-pinned Inno Setup provenance and rejects
+an `ISCC.exe` whose filename, size, or SHA-256 differs from that record. The
+builder validates the frozen record, exact CPU-worker bytes, bundle inventory,
+model manifest/model, legal files, PE imports, worker-pack layout, and all
+paths before copying to a private staging directory. It keeps read handles over
+the staged payload while Inno runs, validates staging and the original bundle
+again afterward, then publishes exactly two sibling files: the installer and
+`windows-local-frozen-test-installer-record.json`.
+
+Use a new, non-existent output directory outside the checkout, bundle, and
+freeze. The freeze record binds the current clean source revision, so a source
+change requires a new freeze and a new bundle; do not rebind a previously
+captured PR artifact to a later checkout.
+
+```powershell
+pwsh -NoProfile -File scripts/build-windows-frozen-test-installer.ps1 `
+  -BundlePath C:\ScribeLocal\local-frozen-bundle `
+  -FrozenCpuWorkerRecordPath C:\ScribeLocal\worker-freeze\windows-frozen-cpu-worker-record.json `
+  -InnoCompilerPath C:\Users\you\AppData\Local\ScribeDev\inno-6.7.1\ISCC.exe `
+  -OutputDirectory C:\ScribeLocal\local-frozen-installer
+```
+
+The compiler path is an input location, not a trust override: it must match
+`installer/inno-setup-6.7.1-provenance.json`. The builder rejects output that
+already exists, overlaps an input or source root, has a stale sibling staging
+directory, or traverses a reparse point. It never overwrites or removes a
+caller-selected output.
+
+The generated installer has a separate local-only AppId and an immutable,
+token-bound default location:
+
+```text
+%LOCALAPPDATA%\Scribe\LOCAL-Frozen-Test\<generated-lowercase-token>
+```
+
+It rejects `/DIR`, an existing destination, and any reparse-point destination
+ancestor. It does not maintain, repair, update, or overwrite a stable Scribe
+installation. It has no shortcuts, auto-launch, program-group entry, shared
+uninstall registration, or `CloseApplications` behavior, so it does not close
+unrelated Scribe instances. This distinguishes program files only: it does
+**not** prove that runtime user-data settings, logs, or other per-user state are
+isolated from the normal application.
+
+After an actual local build, pass the two sibling outputs to the separate
+verifier:
+
+```powershell
+pwsh -NoProfile -File scripts/verify-windows-local-frozen-test-installer.ps1 `
+  -BundlePath C:\ScribeLocal\local-frozen-bundle `
+  -FrozenCpuWorkerRecordPath C:\ScribeLocal\worker-freeze\windows-frozen-cpu-worker-record.json `
+  -InstallerPath C:\ScribeLocal\local-frozen-installer\Scribe-LOCAL-Frozen-Test-<token>.exe `
+  -InstallerRecordPath C:\ScribeLocal\local-frozen-installer\windows-local-frozen-test-installer-record.json
+```
+
+The verifier derives the installation path from the validated local record;
+there is no caller-selected stable installation root. It installs silently,
+checks exact installed payload parity, runs the installed CPU worker's normal
+offline handshake/cancellation smoke, and only then invokes the expected
+uninstaller. Inno may finish its foreground uninstaller before its second-phase
+directory cleanup, so the verifier polls the derived token-bound root with a
+five-second monotonic deadline instead of treating that short delay as a
+failure. If parity was not established, it deliberately retains the token-bound
+installation for inspection rather than executing an untrusted uninstaller.
+Its own bounded temporary log directory is cleaned after use. The real manual
+gate must also record refusal of `/DIR`, an existing destination, and a
+reparse-point destination before relying on this test installer.
+
+This is a LOCAL test format, not a release format. It adds no new GPU-pack
+trust path: a bundle that contains already-verified signed GPU packs must still
+pass the existing catalog, inventory, and compiled-descriptor checks. Current
+actual testing is CPU-only. The unchanged production release verifier continues
+to reject the local-only marker; there is no flag or manifest rewrite that
+admits it to a production release.
+
 ## Local validation versus release acceptance
 
 A successful local bundle must pass the builder's exact file inventory, PE and
@@ -109,7 +187,13 @@ they are not evidence that a real worker or installer was built. A real local
 freeze, desktop build, staged smoke and byte comparison must be recorded
 separately. No real GPU inference, hardware performance qualification,
 candidate-policy embedding, production signing, or publication is established
-by this slice.
+by this slice. `test-windows-local-frozen-test-installer.ps1` uses a small
+locally compiled `ISCC.exe` process seam (requiring the built-in Windows .NET
+Framework C# compiler) to test input binding, output transactions, compiler
+failure, staged mutation, source revalidation, bounded process timeout,
+local-record binding, payload parity, cancellation diagnostics, delayed removal,
+and unchanged production rejection. It does not replace the pinned Inno
+build/install/uninstall gate.
 
 The [performance-candidate roadmap](WINDOWS_GPU_PERFORMANCE_CANDIDATES.md)
 still requires qualified acquisition controls and admission semantics,

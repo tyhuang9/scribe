@@ -1682,6 +1682,7 @@ Set-StrictMode -Version Latest
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-frozen-cpu-worker-packaging.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-local-frozen-test-installer.ps1')
     Write-Output "Windows release packaging fail-closed tests passed."
 }
 finally {
