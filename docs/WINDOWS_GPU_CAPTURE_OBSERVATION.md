@@ -286,6 +286,21 @@ Cold and priming requests retain their initial power reading from before worker
 launch and check power again before dispatch; a change during startup must not
 be hidden by a later pre-inference reading.
 
+The campaign also reads the active Windows power-scheme GUID using the read-only
+[PowerGetActiveScheme API](https://learn.microsoft.com/en-us/windows/win32/api/powersetting/nf-powersetting-powergetactivescheme).
+It records a baseline after input validation and
+before worker preflight, checks it before each worker launch (including
+preflight), immediately before every cold/priming/warm dispatch, and after each
+correlated result. An unavailable query or changed identity makes the campaign
+incomplete and stops subsequent work without retry, replacement or replay. The
+collector never changes the scheme or its settings.
+
+These are boundary snapshots, not proof of continuously stable settings. A
+scheme GUID does not establish its complete configuration, effective power
+mode, thermal state or background load. `environmental_controls.power_plan`
+therefore remains unavailable; the GUID must not become an evaluator
+`power_plan_sha256` or other successful qualification control.
+
 The fixed sequence is:
 
 1. Resolve and retain the verified model/WAV and exact GPU pack/device binding.
@@ -322,18 +337,33 @@ window**, not ordinary-application end-to-end latency:
   includes handshake, observation negotiation, model loading and the request.
 - Warm timing begins before the per-request observation/sampling setup.
 - Both stop when the correlated observed result returns. Sampler finalization,
-  transcript hashing, report serialization/publication and shutdown are outside
-  the window. Discovery, input hashing and audio preparation are also outside.
+  the postresult power-scheme query, transcript hashing, report
+  serialization/publication and shutdown are outside the window. Discovery,
+  input hashing and audio preparation are also outside.
+  Prelaunch and predispatch power-scheme queries remain inside the existing
+  request windows. Idle-TTL settlement is recorded before the postresult query.
 - Record `backend_ms` from the runtime's reported processing duration, plus
   `model_load_ms` and `warm_reused`. Never subtract an estimated instrumentation
   overhead or replace a measured zero duration with a fabricated positive value.
 
-Campaigns use a distinct `windows_gpu_capture_campaign` schema-1 report, bounded
+Campaigns use a distinct `windows_gpu_capture_campaign` schema-2 report, bounded
 to 32 MiB, at most 14 captured worker handshakes and 52 request records. A
 successful sequence has 50 measured records and two separately identified
 priming records. Deduplicate actual validated Hello/Ready bytes by their bound
 generation; retain timing, memory, power and transcript digests without raw
 audio, transcript text, user paths or native error messages.
+
+`active_power_scheme` contains the baseline. Each run's `power_scheme` records
+optional `before_launch`, `before_dispatch` and `after_result` observations;
+unvisited boundaries are absent, not fabricated unavailable readings. Successful
+cold and priming runs require all three, while warm runs have no launch reading.
+Each successful reading must match the observed baseline. Observed values carry
+`status:observed`, `source:windows_power_get_active_scheme` and a canonical
+lowercase `scheme_guid`; unavailable values carry only `status:unavailable` and
+the categorical reason `query_failed` or `invalid_result`. Failed runs retain
+their partial observations. Neither scheme names nor native diagnostics are
+recorded. Scheme-change and query-failure categories distinguish the failing
+preflight, prelaunch, predispatch or postresult stage.
 
 Handled acquisition failures retain categorized failed records and publish an
 incomplete report after cleanup attempts. Do not drop a failure or fabricate
@@ -360,16 +390,34 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and six test groups: collector, native telemetry, paired campaigns,
-supervisor observation controls/leases, provider-memory snapshots and architecture
-guards.
+discovery and seven test groups: collector, native telemetry, active power
+scheme, paired campaigns, supervisor observation controls/leases,
+provider-memory snapshots and architecture guards.
+The active-scheme tests inject native results and campaign boundary readings;
+the canonical command never switches Windows power settings. The optional
+host-service check is ignored by default. With the same provisioned toolchain
+and native archive, run it explicitly:
+
+```powershell
+powercfg /getactivescheme
+cargo test --locked --offline --bin local-transcriber --features windows-gpu-capture-observation windows_gpu_capture::power_scheme::tests::native_query_requires_an_observed_active_scheme -- --exact --ignored --nocapture --test-threads=1
+powercfg /getactivescheme
+```
+
+Require exactly one passing test and an observed GUID matching both `powercfg`
+readings. An unavailable reading is a failure, not a skipped successful check.
+This is a read-only host API comparison, not continuous stability or GPU
+qualification evidence; do not include it in deterministic PR verification.
+
 `-ScriptOnly` provides the fast inner-loop check: script parsing and
 nineteen prelaunch argument/file-rejection cases without invoking any
 executable. The three tiny owned fixture files are removed after use.
 Both modes also run fifteen in-memory general runner contracts covering exact
 feature arguments, locked/offline execution, list-before-run discovery, empty
-or wrong test groups and nonzero discovery/execution exits. A further 114
-in-memory provider-runner contracts exercise the parsed provider helper for
+or wrong test groups and nonzero discovery/execution exits. Two additional
+wiring contracts require all seven collector groups and reject removal of the
+power-scheme group. A further 114 in-memory provider-runner contracts exercise
+the parsed provider helper for
 CUDA and Vulkan in title, lowercase and uppercase spellings accepted by
 PowerShell parameter validation: every fake Cargo call must have the worker link context
 (`SCRIBE_BUILDING_WORKER=1` with the desktop worker digest absent), the exact

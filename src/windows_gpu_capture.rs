@@ -5,6 +5,7 @@
 //! bytes plus bounded native telemetry, and publishes an unqualified report.
 
 mod campaign;
+mod power_scheme;
 mod telemetry;
 
 use std::ffi::{OsStr, OsString};
