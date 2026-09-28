@@ -226,14 +226,15 @@ try {
     New-Item -ItemType Directory -Path $compilerOutput | Out-Null
     $token = [guid]::NewGuid().ToString('N')
     $installerName = "Scribe-LOCAL-Frozen-Test-$token.exe"
-    & $compiler `
-        "/DLocalFrozenBundleRoot=$payloadStaging" `
-        "/DLocalFrozenInstallerOutputRoot=$compilerOutput" `
-        "/DLocalFrozenTestToken=$token" `
-        "/DAppVersion=$($frozenCpuWorker.Record.app_version)" `
+    $compilation = Invoke-WindowsLocalFrozenBoundedProcess -Executable $compiler -Arguments @(
+        "/DLocalFrozenBundleRoot=$payloadStaging",
+        "/DLocalFrozenInstallerOutputRoot=$compilerOutput",
+        "/DLocalFrozenTestToken=$token",
+        "/DAppVersion=$($frozenCpuWorker.Record.app_version)",
         $templatePath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Pinned Inno Setup compilation failed with exit code $LASTEXITCODE."
+    ) -Description 'Pinned Inno Setup compilation' -TimeoutMilliseconds 900000
+    if ($compilation.ExitCode -ne 0) {
+        throw "Pinned Inno Setup compilation failed with exit code $($compilation.ExitCode): $($compilation.Stderr.Trim())"
     }
     $installer = Assert-WindowsLocalFrozenCompilerOutput $compilerOutput $installerName
     try {

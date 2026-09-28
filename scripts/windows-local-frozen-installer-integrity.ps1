@@ -100,15 +100,10 @@ function Assert-WindowsLocalFrozenExactProperties(
 }
 
 function Assert-WindowsLocalFrozenInt64([object]$Value, [string]$Description) {
-    if ($Value -is [double] -or $Value -is [single] -or $Value -is [decimal]) {
+    if ($Value -isnot [int32] -and $Value -isnot [int64]) {
         throw "$Description must be an integer."
     }
-    try {
-        return [int64]$Value
-    }
-    catch {
-        throw "$Description must be an integer."
-    }
+    return [int64]$Value
 }
 
 function Stop-WindowsLocalFrozenProcessTree(
@@ -144,7 +139,7 @@ function Invoke-WindowsLocalFrozenBoundedProcess(
     [int]$TimeoutMilliseconds = 30000,
     [int]$StreamDrainMilliseconds = 5000
 ) {
-    if ($TimeoutMilliseconds -lt 1 -or $TimeoutMilliseconds -gt 120000 -or
+    if ($TimeoutMilliseconds -lt 1 -or $TimeoutMilliseconds -gt 900000 -or
         $StreamDrainMilliseconds -lt 1 -or $StreamDrainMilliseconds -gt 30000) {
         throw 'Local frozen process timeout configuration is outside the supported bounds.'
     }

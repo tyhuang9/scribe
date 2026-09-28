@@ -159,6 +159,14 @@ try {
         'native/whisper-f049fff/PROVENANCE.md', 'native/sherpa-onnx-v1.13.5/PROVENANCE.md',
         'resources/silero-vad/LICENSE', 'resources/silero-vad/PROVENANCE.md'
     )) { Copy-FixtureSource $path }
+    # Shorten only the copied builder's fixed compiler deadline. This runs the
+    # real builder/launcher/cleanup path without a production test override or
+    # waiting fifteen minutes for a deliberately hung fixture compiler.
+    $fixtureBuilder = Join-Path $fixtureRoot 'scripts\build-windows-frozen-test-installer.ps1'
+    $fixtureBuilderSource = Get-Content -LiteralPath $fixtureBuilder -Raw
+    $compilerDeadline = '-TimeoutMilliseconds 900000'
+    Assert-Equal ([regex]::Matches($fixtureBuilderSource, [regex]::Escape($compilerDeadline)).Count) 1 'Production compiler deadline occurrence count'
+    Write-Utf8 $fixtureBuilder ($fixtureBuilderSource.Replace($compilerDeadline, '-TimeoutMilliseconds 1000'))
     $modelBytes = [byte[]](1, 2, 3, 4, 5)
     $modelSha256 = [Security.Cryptography.SHA256]::Create()
     try {
@@ -232,6 +240,12 @@ public static class FakeIscc {
 
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
     . (Join-Path $fixtureRoot 'scripts\windows-local-frozen-installer-integrity.ps1')
+    foreach ($invalidInteger in @($null, $true, $false, '1024', '', [double]1, [single]1, [decimal]1, [uint64]::MaxValue)) {
+        Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInt64 $invalidInteger 'Fixture size' } 'must be an integer'
+    }
+    foreach ($validInteger in @([int32]0, [int32]1, [int64]2147483648, [int64]::MaxValue)) {
+        Assert-Equal (Assert-WindowsLocalFrozenInt64 $validInteger 'Fixture size') $validInteger 'Exact integer scalar'
+    }
     # Use the complete pinned manifest and the production argument builder;
     # PowerShell argument-mode parsing must not turn a cast into path text.
     $smokeManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'runtime-manifests\whisper-base-en-q8_0-windows-x64.json') -Raw | ConvertFrom-Json
@@ -356,6 +370,11 @@ public static class FakeIscc {
     [IO.File]::WriteAllBytes($result.InstallerPath, $originalInstallerBytes)
 
     $originalInstallerRecordText = Get-Content -LiteralPath $result.RecordPath -Raw
+    $coercedInstallerRecord = $originalInstallerRecordText | ConvertFrom-Json
+    $coercedInstallerRecord.installer_size_bytes = [string]$coercedInstallerRecord.installer_size_bytes
+    Write-Utf8 $result.RecordPath ($coercedInstallerRecord | ConvertTo-Json -Depth 5)
+    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath } 'must be an integer'
+    Write-Utf8 $result.RecordPath $originalInstallerRecordText
     $tamperedInstallerRecord = $originalInstallerRecordText | ConvertFrom-Json
     $tamperedInstallerRecord.bundle_inventory_sha256 = ('0' * 64)
     Write-Utf8 $result.RecordPath ($tamperedInstallerRecord | ConvertTo-Json -Depth 5)
@@ -484,6 +503,17 @@ public static class FakeIscc {
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'fail'
     Invoke-ExpectedFailure { Invoke-Builder $bundleRoot (Join-Path $testRoot 'compiler-failure-output') $fakeCompiler } 'compilation failed'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $testRoot 'compiler-failure-output'))) 'Failed local frozen compiler run left final output.'
+
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'hang'
+    $hungOutput = Join-Path $testRoot 'compiler-hang-output'
+    Invoke-ExpectedFailure { Invoke-Builder $bundleRoot $hungOutput $fakeCompiler } 'Pinned Inno Setup compilation timed out after 1000 milliseconds'
+    Assert-True (-not (Test-Path -LiteralPath $hungOutput)) 'Hung local compiler left final output.'
+    Assert-Equal (@(Get-ChildItem -LiteralPath $testRoot -Directory -Filter 'compiler-hang-output.staging-*').Count) 0 'Hung compiler staging cleanup'
+    # Reusing the same destination also proves cleanup released retained input
+    # handles and did not leave a stale staging sibling blocking retry.
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = ''
+    $afterHang = @(Invoke-Builder $bundleRoot $hungOutput $fakeCompiler)[0]
+    Assert-True (Test-Path -LiteralPath $afterHang.InstallerPath -PathType Leaf) 'Normal build after compiler timeout did not succeed.'
 
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'mutate-staged'
     $stagedCapture = Join-Path $testRoot 'staged-mutation-arguments.txt'

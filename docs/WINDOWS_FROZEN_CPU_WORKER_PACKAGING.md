@@ -87,6 +87,12 @@ the staged payload while Inno runs, validates staging and the original bundle
 again afterward, then publishes exactly two sibling files: the installer and
 `windows-local-frozen-test-installer-record.json`.
 
+Compilation has a fifteen-minute deadline with process-tree termination and
+bounded stream draining. A timeout publishes no output and cleans owned staging;
+the caller can retry with the same unused output directory. Installer and smoke
+processes keep their separate one-minute deadlines. Numeric integrity fields
+require actual JSON integer scalars rather than coercible strings or booleans.
+
 Use a new, non-existent output directory outside the checkout, bundle, and
 freeze. The freeze record binds the current clean source revision, so a source
 change requires a new freeze and a new bundle; do not rebind a previously
@@ -191,6 +197,7 @@ by this slice. `test-windows-local-frozen-test-installer.ps1` uses a small
 locally compiled `ISCC.exe` process seam (requiring the built-in Windows .NET
 Framework C# compiler) to test input binding, output transactions, compiler
 failure, staged mutation, source revalidation, bounded process timeout,
+actual builder compiler-timeout cleanup/retry (with a shorter fixture-only deadline),
 local-record binding, payload parity, exact installed-smoke arguments (including
 spaces and Unicode through a real child process), cancellation diagnostics, delayed removal,
 and unchanged production rejection. It does not replace the pinned Inno
