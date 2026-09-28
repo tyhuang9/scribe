@@ -3216,7 +3216,11 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
     for required in [
-        "cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple",
+        "cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple",
+        "$desktopFeatures = @('ui-harness')",
+        "if ($LocalFrozenGpuObservation) {",
+        "$desktopFeatures += 'windows-gpu-capture-observation'",
+        "if ($LocalFrozenGpuObservation -and -not $frozenCpuWorkerRequested)",
         "cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple",
         "Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker",
         "SCRIBE_BUNDLED_WORKER_SHA256",
@@ -3784,6 +3788,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "unreviewed delay import DLL",
         "api-ms-win-core-path-l1-1-0.dll",
         "kernel32.dll",
+        "psapi.dll",
         "user32.dll",
     ] {
         assert!(

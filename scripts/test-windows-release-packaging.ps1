@@ -607,6 +607,22 @@ try {
     }
     Assert-AllowedPayloadFile "LOCAL-TRANSCRIBER.EXE"
     Assert-AllowedPayloadFile "SCRIBE-INFERENCE-WORKER.EXE"
+    $collectorImports = Join-Path $testRoot 'collector-system-imports.exe'
+    Write-TestPe $collectorImports 0x8664 'PSAPI.DLL' 'PsApi.DlL'
+    $collectorImportReport = Assert-ReviewedWindowsPe $collectorImports
+    if ($collectorImportReport.NormalImports -cnotcontains 'psapi.dll' -or
+        $collectorImportReport.DelayImports -cnotcontains 'psapi.dll') {
+        throw 'Collector process-memory telemetry must accept the exact Windows PSAPI import in both directories.'
+    }
+    foreach ($relativeDll in @('psapi.dll', 'PSAPI.DLL', 'nested/psapi.dll')) {
+        Invoke-ExpectedFailure { Assert-AllowedPayloadFile $relativeDll } 'unallowlisted executable or DLL'
+    }
+    $unreviewedCollectorNormal = Join-Path $testRoot 'unreviewed-collector-normal.exe'
+    Write-TestPe $unreviewedCollectorNormal 0x8664 'psapi-helper.dll' 'user32.dll'
+    Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $unreviewedCollectorNormal } 'unreviewed normal import DLL: psapi-helper.dll'
+    $unreviewedCollectorDelay = Join-Path $testRoot 'unreviewed-collector-delay.exe'
+    Write-TestPe $unreviewedCollectorDelay 0x8664 'kernel32.dll' 'psapi-helper.dll'
+    Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $unreviewedCollectorDelay } 'unreviewed delay import DLL: psapi-helper.dll'
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
     Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3

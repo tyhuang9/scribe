@@ -19,6 +19,8 @@ $ReviewedWindowsSystemDlls = @(
     "ole32.dll",
     "oleaut32.dll",
     "opengl32.dll",
+    # Windows Process Status API; collector GetProcessMemoryInfo telemetry.
+    "psapi.dll",
     "setupapi.dll",
     "shell32.dll",
     "shlwapi.dll",

@@ -166,6 +166,9 @@ when building the frozen bundle. The switch is rejected without
 only `windows-gpu-capture-observation` to the desktop's `ui-harness` features;
 it does not link a CUDA/Vulkan provider into the desktop or rebuild either
 worker. Without the switch, desktop build arguments remain unchanged.
+The collector's existing `GetProcessMemoryInfo` telemetry imports the Windows
+system `psapi.dll`, which is explicitly reviewed by the PE import allowlist.
+This does not permit bundling a loose `psapi.dll` or matching DLL name prefixes.
 
 ```powershell
 pwsh -NoProfile -File scripts/build-windows-release.ps1 `
