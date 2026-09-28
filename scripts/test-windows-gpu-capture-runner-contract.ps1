@@ -121,6 +121,12 @@ try {
 
         function New-CaptureProviderExpectedCalls([string]$ProviderFeature) {
             $testFeatures = "ui-harness,$ProviderFeature"
+            $providerTestFeatures = if ($ProviderFeature -ceq 'cuda-acceleration') {
+                "$testFeatures,cuda-test-harness"
+            }
+            else {
+                $testFeatures
+            }
             $calls = @()
             $calls += [pscustomobject]@{
                 Kind = 'check'
@@ -136,12 +142,12 @@ try {
                 $calls += [pscustomobject]@{
                     Kind = 'list'
                     Filter = $filter
-                    Arguments = @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $testFeatures, $filter, '--list')
+                    Arguments = @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $providerTestFeatures, $filter, '--list')
                 }
                 $calls += [pscustomobject]@{
                     Kind = 'test'
                     Filter = $filter
-                    Arguments = @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $testFeatures, $filter, '--', '--test-threads=1')
+                    Arguments = @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $providerTestFeatures, $filter, '--', '--test-threads=1')
                 }
             }
             return $calls
@@ -195,6 +201,21 @@ try {
             }
             if ($null -ne [Environment]::GetEnvironmentVariable('SCRIBE_BUNDLED_WORKER_SHA256', 'Process')) {
                 throw 'Capture provider helper did not clear the desktop worker digest for every Cargo invocation.'
+            }
+            $featureIndex = [Array]::IndexOf($actual, '--features')
+            if ($featureIndex -lt 0 -or $featureIndex + 1 -ge $actual.Count) {
+                throw 'Capture provider helper omitted its exact feature set.'
+            }
+            $features = @($actual[$featureIndex + 1] -csplit ',')
+            $hasCudaTestHarness = $features -ccontains 'cuda-test-harness'
+            if ($expected.Kind -in @('list', 'test')) {
+                $hasCudaProvider = $features -ccontains 'cuda-acceleration'
+                if ($hasCudaTestHarness -ne $hasCudaProvider) {
+                    throw 'Only CUDA provider unit-test invocations may enable cuda-test-harness.'
+                }
+            }
+            elseif ($hasCudaTestHarness) {
+                throw 'Worker checks and all-target lint must omit cuda-test-harness.'
             }
             $global:LASTEXITCODE = 0
             if ($callIndex -eq $state.FailureCall) {
@@ -282,7 +303,7 @@ try {
             }
         )
         $caseCount = 0
-        foreach ($provider in @('Cuda', 'Vulkan')) {
+        foreach ($provider in @('Cuda', 'cuda', 'CUDA', 'Vulkan', 'vulkan', 'VULKAN')) {
             foreach ($environmentState in $environmentStates) {
                 Invoke-CaptureProviderFixtureCase $provider 'success' -1 $environmentState.BuildingWorker $environmentState.WorkerDigest
                 $caseCount++
@@ -303,7 +324,7 @@ try {
                 }
             }
         }
-        if ($caseCount -ne 38) { throw 'Capture provider runner contract case count changed unexpectedly.' }
+        if ($caseCount -ne 114) { throw 'Capture provider runner contract case count changed unexpectedly.' }
     } -Definitions $definitions
 }
 finally {
@@ -319,7 +340,7 @@ finally {
     if (-not $hadProviderExitCode) { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
     else { Set-Variable LASTEXITCODE -Scope Global -Value $originalProviderExitCode }
 }
-Write-Output 'Capture provider runner contracts passed (38 mocked cases); no Cargo process was launched.'
+Write-Output 'Capture provider runner contracts passed (114 mocked cases); no Cargo process was launched.'
 
 # Test the actual argument builder without running a collector, accessing
 # inputs, or composing a shell command. Keep spaces/metacharacters as values.

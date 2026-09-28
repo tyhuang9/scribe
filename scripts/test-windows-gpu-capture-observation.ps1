@@ -58,10 +58,17 @@ function Invoke-CaptureProviderCheck(
         # Include test-only code in the provider configuration, matching the
         # release lint. A production-only check cannot catch unused test helpers.
         Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$providerFeature", '--', '-D', 'warnings')
+        $providerTestFeatures = "ui-harness,$providerFeature"
+        if ($providerFeature -ceq 'cuda-acceleration') {
+            # Cargo classifies a binary's unit-test harness as that named binary.
+            # This non-shipping feature supplies CUDA link inputs only for the
+            # local-transcriber test harness; src/main.rs rejects normal builds.
+            $providerTestFeatures += ',cuda-test-harness'
+        }
         foreach ($filter in @('onnx_worker::tests::capture_observation',
                 'onnx_worker::tests::vulkan_identity_catalog_',
                 'embedded_runtime::tests::provider_memory_observation')) {
-            Invoke-CaptureTests "ui-harness,$providerFeature" $filter
+            Invoke-CaptureTests $providerTestFeatures $filter
         }
         Write-Output "$Provider worker compilation and deterministic observation tests passed; hardware qualification not run."
     }

@@ -6,6 +6,9 @@
 #[cfg(feature = "metal-acceleration")]
 compile_error!("metal-acceleration is worker-only and must not be linked into the desktop");
 
+#[cfg(all(feature = "cuda-test-harness", not(test)))]
+compile_error!("cuda-test-harness is test-only and must not produce a normal desktop binary");
+
 #[cfg(all(
     feature = "windows-gpu-capture-observation",
     any(

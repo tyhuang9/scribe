@@ -121,6 +121,7 @@ fn prepare_windows_cuda_static_link() {
         target_env: &target_env,
         building_worker: building_worker.as_deref(),
         cuda_path: cuda_path.as_deref(),
+        link_cuda_test_harness: cfg!(feature = "cuda-test-harness"),
     })
     .unwrap_or_else(|error| panic!("{error}"));
 
