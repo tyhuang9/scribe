@@ -191,7 +191,8 @@ by this slice. `test-windows-local-frozen-test-installer.ps1` uses a small
 locally compiled `ISCC.exe` process seam (requiring the built-in Windows .NET
 Framework C# compiler) to test input binding, output transactions, compiler
 failure, staged mutation, source revalidation, bounded process timeout,
-local-record binding, payload parity, cancellation diagnostics, delayed removal,
+local-record binding, payload parity, exact installed-smoke arguments (including
+spaces and Unicode through a real child process), cancellation diagnostics, delayed removal,
 and unchanged production rejection. It does not replace the pinned Inno
 build/install/uninstall gate.
 

@@ -89,15 +89,8 @@ try {
     try {
         $env:HF_HUB_OFFLINE = '1'
         $env:TRANSFORMERS_OFFLINE = '1'
-        $smoke = Invoke-WindowsLocalFrozenInstallerProcess (Join-Path $installedRoot 'local-transcriber.exe') @(
-            '--scribe-install-smoke-parent',
-            [string]$modelManifest.model_id,
-            (Join-Path $installedRoot [string]$modelManifest.artifact_filename),
-            'gguf',
-            [string]$modelManifest.size_bytes,
-            [string]$modelManifest.sha256,
-            'cpu'
-        ) 'installed local frozen CPU smoke'
+        $smokeArguments = Get-WindowsLocalFrozenSmokeArguments $installedRoot $modelManifest
+        $smoke = Invoke-WindowsLocalFrozenInstallerProcess (Join-Path $installedRoot 'local-transcriber.exe') $smokeArguments 'installed local frozen CPU smoke'
     }
     finally {
         $env:HF_HUB_OFFLINE = $previousHubOffline

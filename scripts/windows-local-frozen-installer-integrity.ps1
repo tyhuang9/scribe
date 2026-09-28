@@ -231,6 +231,18 @@ function Assert-WindowsLocalFrozenInstallerRecord(
     return $record
 }
 
+function Get-WindowsLocalFrozenSmokeArguments([string]$InstalledRoot, [psobject]$ModelManifest) {
+    return @(
+        '--scribe-install-smoke-parent',
+        [string]$ModelManifest.model_id,
+        (Join-Path -Path $InstalledRoot -ChildPath ([string]$ModelManifest.artifact_filename)),
+        'gguf',
+        [string]$ModelManifest.size_bytes,
+        [string]$ModelManifest.sha256,
+        'cpu'
+    )
+}
+
 function Assert-WindowsLocalFrozenSmokeDiagnostics([psobject]$Smoke) {
     if ($null -eq $Smoke) {
         throw 'Installed local frozen CPU smoke did not verify the expected worker cancellation contract.'

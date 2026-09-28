@@ -184,6 +184,10 @@ using System.Threading;
 public static class FakeIscc {
   static string Arg(string[] args, string name) { var value = args.FirstOrDefault(x => x.StartsWith(name, StringComparison.Ordinal)); return value == null ? null : value.Substring(name.Length); }
   public static int Main(string[] args) {
+    if (args.Length > 0 && args[0] == "--scribe-install-smoke-parent") {
+      foreach (string arg in args) Console.WriteLine(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(arg)));
+      return 0;
+    }
     string output = Arg(args, "/DLocalFrozenInstallerOutputRoot=");
     string token = Arg(args, "/DLocalFrozenTestToken=");
     string payload = Arg(args, "/DLocalFrozenBundleRoot=");
@@ -228,6 +232,38 @@ public static class FakeIscc {
 
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
     . (Join-Path $fixtureRoot 'scripts\windows-local-frozen-installer-integrity.ps1')
+    # Use the complete pinned manifest and the production argument builder;
+    # PowerShell argument-mode parsing must not turn a cast into path text.
+    $smokeManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'runtime-manifests\whisper-base-en-q8_0-windows-x64.json') -Raw | ConvertFrom-Json
+    foreach ($smokeRoot in @(
+        (Join-Path $testRoot 'installed'),
+        (Join-Path $testRoot 'installed smoke [β] & (literal)')
+    )) {
+        $smokeArguments = @(Get-WindowsLocalFrozenSmokeArguments $smokeRoot $smokeManifest)
+        $expectedSmokeArguments = @(
+            '--scribe-install-smoke-parent',
+            [string]$smokeManifest.model_id,
+            [IO.Path]::Combine($smokeRoot, 'whisper-base.en-Q8_0.gguf'),
+            'gguf',
+            [string]$smokeManifest.size_bytes,
+            [string]$smokeManifest.sha256,
+            'cpu'
+        )
+        Assert-Equal $smokeArguments.Count 7 'Installed smoke argument count'
+        for ($index = 0; $index -lt $expectedSmokeArguments.Count; $index++) {
+            Assert-Equal $smokeArguments[$index] $expectedSmokeArguments[$index] "Installed smoke argument $index"
+        }
+        $echo = Invoke-WindowsLocalFrozenBoundedProcess -Executable $fakeCompiler -Arguments $smokeArguments -Description 'fixture installed smoke argument echo'
+        Assert-Equal $echo.ExitCode 0 'Installed smoke argument echo exit code'
+        Assert-Equal $echo.Stderr '' 'Installed smoke argument echo stderr'
+        $receivedArguments = @($echo.Stdout.TrimEnd([char[]]@("`r", "`n")) -split '\r?\n' | ForEach-Object {
+            [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_))
+        })
+        Assert-Equal $receivedArguments.Count 7 'Installed smoke child argument count'
+        for ($index = 0; $index -lt $expectedSmokeArguments.Count; $index++) {
+            Assert-Equal $receivedArguments[$index] $expectedSmokeArguments[$index] "Installed smoke child argument $index"
+        }
+    }
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'hang'
     $timeoutStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Invoke-ExpectedFailure {
