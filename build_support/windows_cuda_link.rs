@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const WORKER_BINARY: &str = "scribe-inference-worker";
+const CUDA_TEST_BINARY: &str = "local-transcriber";
 const CUDA_LIBRARIES: [&str; 4] = [
     "cudart_static.lib",
     "cublas.lib",
@@ -15,6 +16,7 @@ pub(crate) struct WindowsCudaLinkInputs<'a> {
     pub(crate) target_env: &'a str,
     pub(crate) building_worker: Option<&'a str>,
     pub(crate) cuda_path: Option<&'a OsStr>,
+    pub(crate) link_cuda_test_harness: bool,
 }
 
 pub(crate) fn is_windows_cuda_build(cuda_enabled: bool, target_os: &str) -> bool {
@@ -65,15 +67,27 @@ pub(crate) fn resolve_windows_cuda_link_args(
         libraries.push(library);
     }
 
-    Ok(libraries
-        .into_iter()
-        .map(|library| {
-            format!(
-                "cargo:rustc-link-arg-bin={WORKER_BINARY}={}",
+    let mut directives =
+        Vec::with_capacity(libraries.len() * if inputs.link_cuda_test_harness { 2 } else { 1 });
+    for library in &libraries {
+        directives.push(format!(
+            "cargo:rustc-link-arg-bin={WORKER_BINARY}={}",
+            library.display()
+        ));
+    }
+    // Cargo treats a binary target's unit-test harness as that named binary,
+    // not as a `rustc-link-arg-tests` target. Keep this extra link surface
+    // behind the non-shipping cuda-test-harness feature; src/main.rs rejects
+    // the same feature for every normal desktop compilation.
+    if inputs.link_cuda_test_harness {
+        for library in &libraries {
+            directives.push(format!(
+                "cargo:rustc-link-arg-bin={CUDA_TEST_BINARY}={}",
                 library.display()
-            )
-        })
-        .collect())
+            ));
+        }
+    }
+    Ok(directives)
 }
 
 fn validate_physical_directory_with_ancestors(path: &Path, label: &str) -> Result<(), String> {
@@ -165,6 +179,10 @@ mod tests {
         fn resolve(&self) -> Result<Vec<String>, String> {
             resolve_with_path(Some(self.root.as_os_str()))
         }
+
+        fn resolve_cuda_test_harness(&self) -> Result<Vec<String>, String> {
+            resolve_with_options(Some(self.root.as_os_str()), true)
+        }
     }
 
     impl Drop for Fixture {
@@ -174,11 +192,19 @@ mod tests {
     }
 
     fn resolve_with_path(cuda_path: Option<&OsStr>) -> Result<Vec<String>, String> {
+        resolve_with_options(cuda_path, false)
+    }
+
+    fn resolve_with_options(
+        cuda_path: Option<&OsStr>,
+        link_cuda_test_harness: bool,
+    ) -> Result<Vec<String>, String> {
         resolve_windows_cuda_link_args(WindowsCudaLinkInputs {
             target_arch: "x86_64",
             target_env: "msvc",
             building_worker: Some("1"),
             cuda_path,
+            link_cuda_test_harness,
         })
     }
 
@@ -202,6 +228,84 @@ mod tests {
                 .iter()
                 .all(|line| !line.contains("rustc-link-search"))
         );
+    }
+
+    #[test]
+    fn cuda_test_harness_adds_only_the_exact_desktop_test_binary_args() {
+        let fixture = Fixture::new("test harness space path");
+        let library_directory = fixture.root.join("lib").join("x64");
+        let mut expected = CUDA_LIBRARIES
+            .map(|library| {
+                format!(
+                    "cargo:rustc-link-arg-bin={WORKER_BINARY}={}",
+                    library_directory.join(library).display()
+                )
+            })
+            .to_vec();
+        expected.extend(CUDA_LIBRARIES.map(|library| {
+            format!(
+                "cargo:rustc-link-arg-bin={CUDA_TEST_BINARY}={}",
+                library_directory.join(library).display()
+            )
+        }));
+
+        let actual = fixture.resolve_cuda_test_harness().unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), CUDA_LIBRARIES.len() * 2);
+        assert!(actual.iter().all(|line| !line.contains("rustc-link-lib")));
+        assert!(
+            actual
+                .iter()
+                .all(|line| !line.contains("rustc-link-search"))
+        );
+    }
+
+    #[test]
+    fn cuda_test_harness_does_not_bypass_target_worker_or_sdk_gates() {
+        let fixture = Fixture::new("test-harness-gates");
+        for (target_arch, target_env) in [("aarch64", "msvc"), ("x86_64", "gnu")] {
+            let error = resolve_windows_cuda_link_args(WindowsCudaLinkInputs {
+                target_arch,
+                target_env,
+                building_worker: Some("1"),
+                cuda_path: Some(fixture.root.as_os_str()),
+                link_cuda_test_harness: true,
+            })
+            .unwrap_err();
+            assert!(error.contains("x86_64-pc-windows-msvc"));
+        }
+        for building_worker in [None, Some(""), Some("0"), Some("true")] {
+            let error = resolve_windows_cuda_link_args(WindowsCudaLinkInputs {
+                target_arch: "x86_64",
+                target_env: "msvc",
+                building_worker,
+                cuda_path: Some(fixture.root.as_os_str()),
+                link_cuda_test_harness: true,
+            })
+            .unwrap_err();
+            assert!(error.contains("exactly 1"));
+        }
+        assert!(
+            resolve_with_options(None, true)
+                .unwrap_err()
+                .contains("explicit CUDA_PATH")
+        );
+        assert!(
+            resolve_with_options(Some(OsStr::new("relative-cuda")), true)
+                .unwrap_err()
+                .contains("absolute")
+        );
+
+        let missing_library = Fixture::new("test-harness-missing-library");
+        fs::remove_file(
+            missing_library
+                .root
+                .join("lib")
+                .join("x64")
+                .join("cublas.lib"),
+        )
+        .unwrap();
+        assert!(missing_library.resolve_cuda_test_harness().is_err());
     }
 
     #[cfg(unix)]
@@ -254,6 +358,7 @@ mod tests {
                 target_env: env,
                 building_worker: Some("1"),
                 cuda_path: Some(fixture.root.as_os_str()),
+                link_cuda_test_harness: false,
             });
             assert!(result.unwrap_err().contains("x86_64-pc-windows-msvc"));
         }
@@ -263,6 +368,7 @@ mod tests {
                 target_env: "msvc",
                 building_worker: marker,
                 cuda_path: Some(fixture.root.as_os_str()),
+                link_cuda_test_harness: false,
             });
             assert!(result.unwrap_err().contains("exactly 1"));
         }

@@ -366,10 +366,17 @@ guards.
 `-ScriptOnly` provides the fast inner-loop check: script parsing and
 nineteen prelaunch argument/file-rejection cases without invoking any
 executable. The three tiny owned fixture files are removed after use.
-Both modes also run fifteen in-memory runner contracts covering exact feature
-arguments, locked/offline execution, list-before-run discovery, empty or wrong
-test groups and nonzero discovery/execution exits. These use a fake Cargo
-command and cannot substitute for native verification.
+Both modes also run fifteen in-memory general runner contracts covering exact
+feature arguments, locked/offline execution, list-before-run discovery, empty
+or wrong test groups and nonzero discovery/execution exits. A further 114
+in-memory provider-runner contracts exercise the parsed provider helper for
+CUDA and Vulkan in title, lowercase and uppercase spellings accepted by
+PowerShell parameter validation: every fake Cargo call must have the worker link context
+(`SCRIBE_BUILDING_WORKER=1` with the desktop worker digest absent), the exact
+provider-only arguments, and no collector feature. They cover absent, empty and
+preexisting caller state; check/lint/list/test failures; and empty or wrong
+positive discovery for each provider test group. Both contract sets use a fake
+Cargo command and cannot substitute for native verification.
 Six in-memory forwarding cases additionally cover both GPU backends with the
 campaign option omitted, on AC, or on battery, preserving individual argument
 values containing spaces and shell metacharacters. They exercise the actual
@@ -385,8 +392,18 @@ For a provider-enabled worker check, use the same command with
 `-GpuProviderCheck Vulkan` or `-GpuProviderCheck Cuda` after provisioning the
 reviewed backend SDK and compiler. This additionally checks the independent
 worker, strictly lints all targets in the provider-enabled test configuration,
-and runs the deterministic worker-observation/provider test groups in that
-configuration. It never enables a GPU provider on the collector.
+and runs the deterministic capture-observation, Vulkan identity-catalog and
+provider-memory test groups in that configuration. The identity catalog stays
+test-only for CUDA; native Vulkan discovery remains Vulkan-only. The helper
+adds the non-shipping `cuda-test-harness` feature only to CUDA test discovery
+and execution. Cargo treats a binary target's unit-test harness as that named
+binary rather than as a standalone test target, so this feature supplies the
+authenticated CUDA link inputs to that exact harness. A compile-time guard
+rejects the feature for normal desktop builds. Worker checks, strict all-target
+lint, Vulkan tests and production pack builds omit it.
+It sets the worker link context only around these provider commands, clearing the
+desktop worker digest required by `build.rs`, then restores both caller
+variables exactly. It never enables a GPU provider on the collector.
 `-ScriptOnly` rejects a simultaneous provider check rather than silently
 skipping it. The command does not install or authenticate a toolchain itself;
 toolchain provenance remains a separate prerequisite.
