@@ -4,7 +4,8 @@ param(
     [string]$BundlePath,
     [string[]]$WorkerPackRoot = @(),
     [string]$InstallerPackAllowlistPath,
-    [string]$FrozenCpuWorkerRecordPath
+    [string]$FrozenCpuWorkerRecordPath,
+    [switch]$LocalFrozenGpuObservation
 )
 
 $ErrorActionPreference = "Stop"
@@ -357,6 +358,9 @@ if ($frozenCpuWorkerRequested -and [string]::IsNullOrWhiteSpace($FrozenCpuWorker
 if ($frozenCpuWorkerRequested) {
     Assert-WindowsFrozenCpuWorkerLocalOnlyEnvironment
 }
+if ($LocalFrozenGpuObservation -and -not $frozenCpuWorkerRequested) {
+    throw 'LocalFrozenGpuObservation is available only with a local frozen CPU worker record.'
+}
 if (-not $frozenCpuWorkerRequested -and [string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)) {
     $InstallerPackAllowlistPath = Join-Path $repositoryRoot "dist\worker-pack-allowlist.iss"
 }
@@ -493,7 +497,13 @@ try {
                 throw "The CPU inference worker did not produce a valid SHA-256 trust anchor."
             }
         }
-        & cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+        $desktopFeatures = @('ui-harness')
+        if ($LocalFrozenGpuObservation) {
+            # The observer is a local, unsigned collector surface.  It does
+            # not select a provider or alter normal desktop feature argv.
+            $desktopFeatures += 'windows-gpu-capture-observation'
+        }
+        & cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
         if ($LASTEXITCODE -ne 0) {
             throw "The locked offline Windows x64 desktop release build failed."
         }

@@ -106,6 +106,273 @@ function Assert-WindowsLocalFrozenInt64([object]$Value, [string]$Description) {
     return [int64]$Value
 }
 
+function Get-WindowsLocalFrozenCaptureObservationRequest([Collections.IDictionary]$BoundParameters) {
+    $names = @(
+        'ObservationWavPath', 'ObservationWavSha256',
+        'ObservationGpuPackId', 'ObservationGpuBackend',
+        'ObservationGpuDevice', 'ObservationReportPath'
+    )
+    $present = @($names | Where-Object { @($BoundParameters.Keys) -ccontains $_ })
+    if ($present.Count -eq 0) {
+        return $null
+    }
+    if ($present.Count -ne $names.Count) {
+        throw 'Installed GPU observation arguments must be supplied together as one single-pair request.'
+    }
+
+    $wavPath = [string]$BoundParameters['ObservationWavPath']
+    $wavSha256 = [string]$BoundParameters['ObservationWavSha256']
+    $packId = [string]$BoundParameters['ObservationGpuPackId']
+    $backend = [string]$BoundParameters['ObservationGpuBackend']
+    $device = [string]$BoundParameters['ObservationGpuDevice']
+    $reportPath = [string]$BoundParameters['ObservationReportPath']
+    if (-not [IO.Path]::IsPathFullyQualified($wavPath) -or
+        -not [IO.Path]::IsPathFullyQualified($reportPath)) {
+        throw 'Installed GPU observation WAV and report paths must be absolute.'
+    }
+    if ($wavSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Installed GPU observation WAV SHA-256 must be canonical lowercase hexadecimal.'
+    }
+    if ($packId -cnotmatch '^[A-Za-z0-9._:-]{1,96}$') {
+        throw 'Installed GPU observation pack ID is not canonical.'
+    }
+    if ($backend -cnotin @('cuda', 'vulkan')) {
+        throw 'Installed GPU observation backend must be cuda or vulkan.'
+    }
+    $deviceHasControl = @($device.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -gt 0
+    if ([string]::IsNullOrWhiteSpace($device) -or $device.Length -gt 256 -or
+        $device -cne $device.Trim() -or $deviceHasControl) {
+        throw 'Installed GPU observation stable device selector is not canonical.'
+    }
+    return [pscustomobject]@{
+        WavPath = Get-WindowsLocalFrozenNormalizedFullPath $wavPath
+        WavSha256 = $wavSha256
+        GpuPackId = $packId
+        GpuBackend = $backend
+        GpuDevice = $device
+        ReportPath = Get-WindowsLocalFrozenNormalizedFullPath $reportPath
+    }
+}
+
+function Get-WindowsLocalFrozenVerifiedInventoryFile(
+    [psobject]$Bundle,
+    [string]$RelativePath
+) {
+    if ($null -eq $Bundle -or $null -eq $Bundle.PSObject.Properties['InventoryEntries']) {
+        throw 'Local frozen installer bundle has no verified inventory entries.'
+    }
+    Assert-WindowsLocalFrozenSafeRelativePath $RelativePath
+    $matches = @($Bundle.InventoryEntries | Where-Object {
+        [string]::Equals([string]$_.path, $RelativePath, [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($matches.Count -ne 1) {
+        throw "Local frozen installer verified inventory has no unique entry for $RelativePath."
+    }
+    $entry = $matches[0]
+    $size = Assert-WindowsLocalFrozenInt64 $entry.size_bytes "Local frozen installer inventory size for $RelativePath"
+    if ($size -lt 0 -or $entry.sha256 -isnot [string] -or $entry.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "Local frozen installer verified inventory entry for $RelativePath is malformed."
+    }
+    return [pscustomobject]@{
+        RelativePath = [string]$entry.path
+        SizeBytes = $size
+        Sha256 = [string]$entry.sha256
+    }
+}
+
+function Get-WindowsLocalFrozenCapturePackBinding(
+    [psobject]$Bundle,
+    [string]$PackId,
+    [string]$Backend
+) {
+    if ($null -eq $Bundle -or $null -eq $Bundle.PSObject.Properties['Root']) {
+        throw 'Installed GPU observation requires a verified local frozen bundle.'
+    }
+    $catalogPath = Join-Path $Bundle.Root 'worker-pack-catalog.json'
+    $catalogText = Read-WindowsFrozenCpuWorkerBoundedUtf8File $catalogPath (4MB)
+    try {
+        $catalog = $catalogText.Text | ConvertFrom-Json -Depth 10
+    }
+    catch {
+        throw "Installed GPU observation worker-pack catalog is not valid JSON: $($_.Exception.Message)"
+    }
+    Assert-WindowsLocalFrozenExactProperties $catalog @('schema_version', 'packs') 'Installed GPU observation worker-pack catalog'
+    if (($catalog.schema_version -isnot [int32] -and $catalog.schema_version -isnot [int64]) -or [int]$catalog.schema_version -ne 1) {
+        throw 'Installed GPU observation worker-pack catalog has an unsupported schema.'
+    }
+    $matches = @($catalog.packs | Where-Object {
+        [string]$_.pack_id -ceq $PackId -and [string]$_.backend -ceq $Backend
+    })
+    if ($matches.Count -ne 1) {
+        throw 'Installed GPU observation requested pack is absent or ambiguous in the verified bundle catalog.'
+    }
+    $pack = $matches[0]
+    Assert-WindowsLocalFrozenExactProperties $pack @(
+        'pack_id', 'pack_version', 'pack_digest', 'security_epoch',
+        'runtime_abi_version', 'backend', 'provider', 'target_os',
+        'target_arch', 'worker_relative_path', 'root',
+        'installed_size_bytes', 'compressed_size_bytes', 'files'
+    ) 'Installed GPU observation worker-pack catalog entry'
+    foreach ($property in @('pack_id', 'pack_version', 'provider')) {
+        if ($pack.$property -isnot [string] -or [string]$pack.$property -cnotmatch '^[A-Za-z0-9._:-]{1,96}$') {
+            throw "Installed GPU observation worker-pack catalog has an invalid $property."
+        }
+    }
+    if ($pack.pack_digest -isnot [string] -or $pack.pack_digest -cnotmatch '^[0-9a-f]{64}$' -or
+        $pack.backend -isnot [string] -or [string]$pack.backend -cne $Backend -or
+        [string]$pack.pack_id -cne $PackId -or [string]$pack.target_os -cne 'windows' -or
+        [string]$pack.target_arch -cne 'x86_64') {
+        throw 'Installed GPU observation worker-pack catalog identity is invalid.'
+    }
+    $securityEpoch = Assert-WindowsLocalFrozenInt64 $pack.security_epoch 'Installed GPU observation pack security epoch'
+    $runtimeAbi = Assert-WindowsLocalFrozenInt64 $pack.runtime_abi_version 'Installed GPU observation pack runtime ABI'
+    if ($securityEpoch -lt 0 -or $runtimeAbi -lt 0 -or $runtimeAbi -gt [uint16]::MaxValue) {
+        throw 'Installed GPU observation worker-pack catalog numeric identity is invalid.'
+    }
+    return [pscustomobject]@{
+        PackId = [string]$pack.pack_id
+        PackVersion = [string]$pack.pack_version
+        PackSha256 = [string]$pack.pack_digest
+        PackSecurityEpoch = $securityEpoch
+        RuntimeAbi = $runtimeAbi
+        Backend = [string]$pack.backend
+        Provider = [string]$pack.provider
+    }
+}
+
+function Assert-WindowsLocalFrozenCaptureWorkerReport([psobject]$Worker, [string]$Description) {
+    Assert-WindowsLocalFrozenExactProperties $Worker @(
+        'hello_frame_hex', 'ready_frame_hex', 'power_source_before', 'power_source_after',
+        'elapsed_ms', 'sampled_max_private_usage_bytes', 'telemetry_sample_count',
+        'video_memory', 'provider_memory', 'memory_availability', 'normalized_transcript_sha256'
+    ) $Description
+    foreach ($frame in @('hello_frame_hex', 'ready_frame_hex')) {
+        $value = [string]$Worker.$frame
+        if ($value -cnotmatch '^[0-9a-f]{52,524340}$' -or $value.Length % 2 -ne 0) {
+            throw "$Description has an invalid $frame."
+        }
+    }
+    foreach ($power in @('power_source_before', 'power_source_after')) {
+        if ([string]$Worker.$power -cnotin @('ac', 'battery')) {
+            throw "$Description has an unsupported $power."
+        }
+    }
+    foreach ($number in @('elapsed_ms', 'sampled_max_private_usage_bytes', 'telemetry_sample_count')) {
+        if ((Assert-WindowsLocalFrozenInt64 $Worker.$number "$Description $number") -lt 0) {
+            throw "$Description has a negative $number."
+        }
+    }
+    if ($Worker.normalized_transcript_sha256 -isnot [string] -or
+        $Worker.normalized_transcript_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "$Description has an invalid normalized transcript SHA-256."
+    }
+}
+
+function Read-WindowsLocalFrozenCaptureObservationReport(
+    [string]$ReportPath,
+    [psobject]$Expected
+) {
+    if (-not (Test-Path -LiteralPath $ReportPath -PathType Leaf)) {
+        throw 'Installed GPU observation report file is missing.'
+    }
+    $serialized = Read-WindowsFrozenCpuWorkerBoundedUtf8File $ReportPath (1MB)
+    try {
+        $report = $serialized.Text | ConvertFrom-Json -Depth 12
+    }
+    catch {
+        throw "Installed GPU observation report is not valid JSON: $($_.Exception.Message)"
+    }
+    Assert-WindowsLocalFrozenExactProperties $report @(
+        'schema_version', 'kind', 'unsigned', 'unqualified', 'auto_eligible',
+        'release_approved', 'collector_build_revision', 'inputs', 'gpu_identity',
+        'cpu', 'gpu', 'transcript_parity', 'unavailable'
+    ) 'Installed GPU observation report'
+    if (($report.schema_version -isnot [int32] -and $report.schema_version -isnot [int64]) -or
+        [int]$report.schema_version -ne 3 -or
+        [string]$report.kind -cne 'windows_gpu_capture_observation' -or
+        $report.unsigned -isnot [bool] -or -not $report.unsigned -or
+        $report.unqualified -isnot [bool] -or -not $report.unqualified -or
+        $report.auto_eligible -isnot [bool] -or $report.auto_eligible -or
+        $report.release_approved -isnot [bool] -or $report.release_approved -or
+        [string]$report.collector_build_revision -cne [string]$Expected.CollectorBuildRevision) {
+        throw 'Installed GPU observation report has invalid local-only qualification flags or collector identity.'
+    }
+    Assert-WindowsLocalFrozenExactProperties $report.inputs @('model_sha256', 'wav_sha256') 'Installed GPU observation report inputs'
+    if ([string]$report.inputs.model_sha256 -cne [string]$Expected.ModelSha256 -or
+        [string]$report.inputs.wav_sha256 -cne [string]$Expected.WavSha256) {
+        throw 'Installed GPU observation report does not bind the installed model and requested WAV identities.'
+    }
+    Assert-WindowsLocalFrozenExactProperties $report.gpu_identity @(
+        'backend', 'provider', 'stable_device', 'driver', 'device_class', 'vendor',
+        'memory_total_bytes', 'pack_id', 'pack_version', 'pack_sha256',
+        'pack_security_epoch', 'runtime_abi'
+    ) 'Installed GPU observation GPU identity'
+    foreach ($property in @('backend', 'provider', 'stable_device', 'driver', 'device_class', 'vendor', 'pack_id', 'pack_version', 'pack_sha256')) {
+        if ($report.gpu_identity.$property -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$report.gpu_identity.$property)) {
+            throw "Installed GPU observation GPU identity has an invalid $property."
+        }
+    }
+    if ([string]$report.gpu_identity.backend -cne [string]$Expected.Backend -or
+        [string]$report.gpu_identity.provider -cne [string]$Expected.Provider -or
+        [string]$report.gpu_identity.stable_device -cne [string]$Expected.StableDevice -or
+        [string]$report.gpu_identity.pack_id -cne [string]$Expected.PackId -or
+        [string]$report.gpu_identity.pack_version -cne [string]$Expected.PackVersion -or
+        [string]$report.gpu_identity.pack_sha256 -cne [string]$Expected.PackSha256 -or
+        (Assert-WindowsLocalFrozenInt64 $report.gpu_identity.pack_security_epoch 'Installed GPU observation report pack security epoch') -ne [int64]$Expected.PackSecurityEpoch -or
+        (Assert-WindowsLocalFrozenInt64 $report.gpu_identity.runtime_abi 'Installed GPU observation report runtime ABI') -ne [int64]$Expected.RuntimeAbi -or
+        (Assert-WindowsLocalFrozenInt64 $report.gpu_identity.memory_total_bytes 'Installed GPU observation report memory total') -le 0) {
+        throw 'Installed GPU observation report does not bind the requested verified pack/backend/stable device.'
+    }
+    Assert-WindowsLocalFrozenCaptureWorkerReport $report.cpu 'Installed GPU observation CPU worker report'
+    Assert-WindowsLocalFrozenCaptureWorkerReport $report.gpu 'Installed GPU observation GPU worker report'
+    if ($report.transcript_parity -isnot [bool] -or
+        $report.transcript_parity -ne ([string]$report.cpu.normalized_transcript_sha256 -ceq [string]$report.gpu.normalized_transcript_sha256)) {
+        throw 'Installed GPU observation report transcript parity is inconsistent with its transcript digests.'
+    }
+    return [pscustomobject]@{
+        Report = $report
+        Bytes = $serialized.Bytes
+    }
+}
+
+function Publish-WindowsLocalFrozenNewReport([string]$OutputPath, [byte[]]$Bytes) {
+    if ($null -eq $Bytes -or $Bytes.Length -le 0 -or $Bytes.Length -gt 1MB) {
+        throw 'Installed GPU observation publication bytes are outside the supported bound.'
+    }
+    $final = Get-WindowsLocalFrozenNormalizedFullPath $OutputPath
+    Assert-WindowsFrozenCpuWorkerNoReparseAncestors $final
+    if (Test-Path -LiteralPath $final) {
+        throw 'Installed GPU observation report output already exists; refusing to replace it.'
+    }
+    $parent = Split-Path -Parent $final
+    $null = Assert-WindowsLocalFrozenRegularDirectory $parent 'Installed GPU observation report parent'
+    $staging = Join-Path $parent ".$([IO.Path]::GetFileName($final)).staging-$PID-$([guid]::NewGuid().ToString('N'))"
+    if (Test-Path -LiteralPath $staging) {
+        throw 'Installed GPU observation report staging path unexpectedly exists.'
+    }
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($staging, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        Assert-WindowsFrozenCpuWorkerNoReparseAncestors $staging
+        if (Test-Path -LiteralPath $final) {
+            throw 'Installed GPU observation report output appeared during publication; refusing to replace it.'
+        }
+        [IO.File]::Move($staging, $final)
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if (Test-Path -LiteralPath $staging) {
+            Assert-WindowsFrozenCpuWorkerNoReparseAncestors $staging
+            Remove-Item -LiteralPath $staging -Force
+        }
+    }
+    return $final
+}
+
 function Stop-WindowsLocalFrozenProcessTree(
     [System.Diagnostics.Process]$Process,
     [string]$Description,
@@ -542,6 +809,7 @@ function Assert-WindowsLocalFrozenBundle(
     return [pscustomobject]@{
         Root = $root
         InventorySha256 = $inventoryText.Sha256
+        InventoryEntries = @($inventoryEntries)
         Files = @($expectedFiles | Sort-Object)
         PackFiles = $packFiles
     }
@@ -567,5 +835,16 @@ function Assert-WindowsLocalFrozenPayloadParity(
             (Get-WindowsFrozenCpuWorkerFileSha256 $installedPath) -cne (Get-WindowsFrozenCpuWorkerFileSha256 $referencePath)) {
             throw "Local frozen installer payload parity mismatch for $path."
         }
+    }
+    # The metadata was parity-verified against the reference bundle, but all
+    # subsequent reads must resolve inside the installed payload.  Returning
+    # the reference root here would let post-install observation inspect the
+    # source catalog instead of the installed catalog it is about to use.
+    return [pscustomobject]@{
+        Root = $installed
+        InventorySha256 = $reference.InventorySha256
+        InventoryEntries = $reference.InventoryEntries
+        Files = $reference.Files
+        PackFiles = $reference.PackFiles
     }
 }
