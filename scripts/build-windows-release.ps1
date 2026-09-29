@@ -253,7 +253,34 @@ function Assert-SafeRelativePayloadPath([string]$RelativePath) {
     }
 }
 
-function Assert-AllowedPayloadFile([string]$RelativePath) {
+function Test-ImmutableVerifiedPackNativeFile([string]$RelativePath) {
+    $segments = @($RelativePath.Split('/'))
+    if ($segments.Count -lt 6 -or
+        -not [string]::Equals($segments[0], 'workers', [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($segments[1], 'packs', [System.StringComparison]::OrdinalIgnoreCase) -or
+        $segments[2] -cnotmatch '^[A-Za-z0-9._:-]+$' -or
+        $segments[3] -cnotmatch '^[A-Za-z0-9._:-]+$' -or
+        $segments[4] -cnotmatch '^[0-9a-f]{64}$') {
+        return $false
+    }
+    return [System.IO.Path]::GetExtension($segments[-1]) -in @('.dll', '.exe')
+}
+
+function Test-AllowedVerifiedPackNativeFile([string]$RelativePath, [string[]]$VerifiedPackFiles) {
+    if (-not (Test-ImmutableVerifiedPackNativeFile $RelativePath)) {
+        return $false
+    }
+    foreach ($verifiedPackFile in $VerifiedPackFiles) {
+        Assert-SafeRelativePayloadPath $verifiedPackFile
+        if ([string]::Equals($verifiedPackFile, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase) -and
+            (Test-ImmutableVerifiedPackNativeFile $verifiedPackFile)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Assert-AllowedPayloadFile([string]$RelativePath, [string[]]$VerifiedPackFiles = @()) {
     Assert-SafeRelativePayloadPath $RelativePath
     $lower = $RelativePath.ToLowerInvariant()
     $segments = @($lower.Split('/'))
@@ -270,16 +297,17 @@ function Assert-AllowedPayloadFile([string]$RelativePath) {
     $allowedExecutable = @(@('local-transcriber.exe', 'scribe-inference-worker.exe') | Where-Object {
         [string]::Equals($_, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase)
     })
-    if ($extension -in @('.dll', '.exe') -and $allowedExecutable.Count -eq 0) {
+    $allowedVerifiedPackNativeFile = Test-AllowedVerifiedPackNativeFile $RelativePath $VerifiedPackFiles
+    if ($extension -in @('.dll', '.exe') -and $allowedExecutable.Count -eq 0 -and -not $allowedVerifiedPackNativeFile) {
         throw "Release payload contains an unallowlisted executable or DLL: $RelativePath"
     }
 }
 
-function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
+function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths, [string[]]$VerifiedPackFiles = @()) {
     Assert-TreeHasNoReparsePoints $Root
     $expectedCaseFolded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($path in $ExpectedPaths) {
-        Assert-AllowedPayloadFile $path
+        Assert-AllowedPayloadFile $path $VerifiedPackFiles
         if (-not $expectedCaseFolded.Add($path)) {
             throw "Release allowlist contains duplicate case-insensitive paths: $path"
         }
@@ -289,7 +317,7 @@ function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
     } | Sort-Object)
     $actualCaseFolded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($path in $actual) {
-        Assert-AllowedPayloadFile $path
+        Assert-AllowedPayloadFile $path $VerifiedPackFiles
         if (-not $actualCaseFolded.Add($path)) {
             throw "Release payload contains duplicate case-insensitive paths: $path"
         }
@@ -658,7 +686,10 @@ try {
     foreach ($packFile in @($packStage.PackFiles)) {
         $null = $expectedPaths.Add([string]$packFile)
     }
-    Assert-ExactAllowlist $stagingBundle $expectedPaths.ToArray()
+    Assert-ExactAllowlist `
+        -Root $stagingBundle `
+        -ExpectedPaths $expectedPaths.ToArray() `
+        -VerifiedPackFiles @($packStage.PackFiles)
 
     $previousHubOffline = $env:HF_HUB_OFFLINE
     $previousTransformersOffline = $env:TRANSFORMERS_OFFLINE
@@ -711,7 +742,10 @@ try {
     $inventoryJson = $inventory | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($inventoryPath, $inventoryJson, [System.Text.UTF8Encoding]::new($false))
     $expectedWithInventory = @($expectedPaths.ToArray()) + @("bundle-inventory.json")
-    Assert-ExactAllowlist $stagingBundle $expectedWithInventory
+    Assert-ExactAllowlist `
+        -Root $stagingBundle `
+        -ExpectedPaths $expectedWithInventory `
+        -VerifiedPackFiles @($packStage.PackFiles)
     foreach ($entry in $inventoryEntries) {
         Assert-ExactFile (Join-Path $stagingBundle ($entry.path -replace '/', '\')) $entry.size_bytes $entry.sha256
     }
