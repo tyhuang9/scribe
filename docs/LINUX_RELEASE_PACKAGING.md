@@ -8,10 +8,14 @@ inference dependencies. The package installs the desktop at
 under `/usr/lib/scribe/workers/packs/<id>/<version>/<digest>/`.
 
 The checked-in release contract and package catalog are canonical JSON. The
-catalog is exactly `{"schema_version":1,"packs":[]}`. Production Linux trust
-contains no public key, so every nonempty CUDA or Vulkan pack input is verified
-with `ProductionTrustRoot` and rejected before publication. Fixture signing is
-available only to tests and size-report evidence; production assembly and
+catalog is exactly `{"schema_version":1,"packs":[]}`. The shared project public
+key can authenticate compatible CUDA/Vulkan packs with `ProductionTrustRoot`,
+but the key bootstrap supplies no Linux packs or release qualification. The
+assembler still rejects every nonempty GPU pack set, including one that passes
+signature verification. Its unchanged release contract's
+`"production_trust":"empty"` field is a legacy CPU-only stage marker, not the
+shared key inventory. Fixture signing is available only to tests and size-report
+evidence; production assembly and
 production size reporting never accept it. Linux GPU discovery, the runtime
 registry, and Auto qualification remain empty/default-deny.
 

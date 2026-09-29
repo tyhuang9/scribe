@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "policy_id": "scribe-windows-gpu-github-signing-v1",
-  "key_id": "",
-  "public_key_sha256": "",
+  "key_id": "scribe-pack-ed25519-20260929-v1",
+  "public_key_sha256": "0f4a6638632a5f8b81e9802738e31cc05ec46c31339274ed0bd210444c7672ad",
   "source_repository": "tyhuang9/scribe",
   "source_ref": "refs/heads/main",
   "app_version": "0.1.0",
