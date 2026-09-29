@@ -18,7 +18,8 @@ if ($helpersStart -lt 0 -or $helpersEnd -le $helpersStart) {
     throw "Could not isolate Windows release helper functions for testing."
 }
 $expectedPeMachine = 0x8664
-Invoke-Expression $source.Substring($helpersStart, $helpersEnd - $helpersStart)
+$builderHelperSource = $source.Substring($helpersStart, $helpersEnd - $helpersStart)
+Invoke-Expression $builderHelperSource
 
 $verifierSource = Get-Content -LiteralPath $packageVerifier -Raw
 $verifierPreambleStart = $verifierSource.IndexOf("`$targetTriple =")
@@ -753,6 +754,95 @@ try {
     Invoke-ExpectedFailure {
         Assert-ExactAllowlist $allowlist @("one.bin", "nested/two.bin")
     } "outside the explicit allowlist"
+
+    # Run the builder helpers in their own scope: the package verifier helpers
+    # loaded above intentionally use several of the same function names.
+    $builderVerifiedPackAllowlist = Join-Path $testRoot "builder-verified-pack-allowlist"
+    $builderVerifiedPackFiles = @(
+        ("workers/packs/fixture-cuda/1.0.0/{0}/bin/worker.exe" -f ('a' * 64)),
+        ("workers/packs/fixture-vulkan/2.0.0/{0}/providers/provider.dll" -f ('b' * 64))
+    )
+    foreach ($relativePath in $builderVerifiedPackFiles) {
+        $path = Join-Path $builderVerifiedPackAllowlist ($relativePath -replace '/', '\\')
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($path, [byte[]](1))
+    }
+    & {
+        param(
+            [string]$BuilderHelperSource,
+            [string]$Root,
+            [string[]]$ExpectedPaths
+        )
+        Invoke-Expression $BuilderHelperSource
+        function Assert-ExpectedBuilderFailure([scriptblock]$Action, [string]$ExpectedText) {
+            try {
+                & $Action
+            }
+            catch {
+                if (-not $_.Exception.Message.Contains($ExpectedText)) {
+                    throw "Expected builder failure containing '$ExpectedText', got: $($_.Exception.Message)"
+                }
+                return
+            }
+            throw "Expected builder failure containing '$ExpectedText', but the action succeeded."
+        }
+
+        Assert-ExactAllowlist -Root $Root -ExpectedPaths $ExpectedPaths -VerifiedPackFiles $ExpectedPaths
+        Assert-ExpectedBuilderFailure {
+            Assert-ExactAllowlist -Root $Root -ExpectedPaths $ExpectedPaths
+        } 'unallowlisted executable or DLL'
+
+        foreach ($unlistedNativePath in @(
+            ($ExpectedPaths[0] -replace 'worker\.exe$', 'sibling.dll'),
+            'unexpected-root.dll',
+            ("workers/packs/foreign-pack/1.0.0/{0}/bin/worker.exe" -f ('c' * 64)),
+            ("workers/packs/fixture-cuda/1.0.0/{0}/bin/worker.exe" -f ('d' * 64))
+        )) {
+            Assert-ExpectedBuilderFailure {
+                Assert-AllowedPayloadFile $unlistedNativePath $ExpectedPaths
+            } 'unallowlisted executable or DLL'
+        }
+
+        foreach ($forbiddenPath in @(
+            ($ExpectedPaths[0] -replace 'bin/worker\.exe$', 'runtimes/provider.dll'),
+            ($ExpectedPaths[0] -replace 'bin/worker\.exe$', 'python/runner.exe'),
+            ($ExpectedPaths[0] -replace 'bin/worker\.exe$', 'models/model.onnx')
+        )) {
+            Assert-ExpectedBuilderFailure {
+                Assert-AllowedPayloadFile $forbiddenPath @($ExpectedPaths + $forbiddenPath)
+            } 'forbidden runtime, Python, runner, or loose ONNX artifact'
+        }
+        $traversalPath = $ExpectedPaths[0] -replace 'bin/worker\.exe$', 'bin/../worker.exe'
+        Assert-ExpectedBuilderFailure {
+            Assert-AllowedPayloadFile $traversalPath @($ExpectedPaths + $traversalPath)
+        } 'unsafe path segment'
+
+        $caseFoldDuplicatePath = $ExpectedPaths[0] -replace 'worker\.exe$', 'WORKER.EXE'
+        Assert-ExpectedBuilderFailure {
+            Assert-ExactAllowlist `
+                -Root $Root `
+                -ExpectedPaths @($ExpectedPaths[0], $caseFoldDuplicatePath, $ExpectedPaths[1]) `
+                -VerifiedPackFiles $ExpectedPaths
+        } 'duplicate case-insensitive paths'
+
+        $unexpectedDirectory = Join-Path $Root 'unexpected-empty-directory'
+        New-Item -ItemType Directory -Path $unexpectedDirectory | Out-Null
+        Assert-ExpectedBuilderFailure {
+            Assert-ExactAllowlist -Root $Root -ExpectedPaths $ExpectedPaths -VerifiedPackFiles $ExpectedPaths
+        } 'directories outside the explicit allowlist'
+    } $builderHelperSource $builderVerifiedPackAllowlist $builderVerifiedPackFiles
+
+    $preInventoryVerifiedPackSeam = @([regex]::Matches(
+        $source,
+        'Assert-ExactAllowlist\s+`\s*\r?\n\s*-Root \$stagingBundle\s+`\s*\r?\n\s*-ExpectedPaths \$expectedPaths\.ToArray\(\)\s+`\s*\r?\n\s*-VerifiedPackFiles @\(\$packStage\.PackFiles\)'
+    ))
+    $postInventoryVerifiedPackSeam = @([regex]::Matches(
+        $source,
+        'Assert-ExactAllowlist\s+`\s*\r?\n\s*-Root \$stagingBundle\s+`\s*\r?\n\s*-ExpectedPaths \$expectedWithInventory\s+`\s*\r?\n\s*-VerifiedPackFiles @\(\$packStage\.PackFiles\)'
+    ))
+    if ($preInventoryVerifiedPackSeam.Count -ne 1 -or $postInventoryVerifiedPackSeam.Count -ne 1) {
+        throw 'Verified worker-pack native allowance must be threaded through both final builder allowlist seams.'
+    }
 
     $inventoryFile = Join-Path $allowlist "one.bin"
     $inventoryItem = Get-Item -LiteralPath $inventoryFile
