@@ -6,10 +6,10 @@ after signed catalog discovery, retained no-follow verification, a bounded
 provider probe, challenge-bound SCIF Hello reconciliation, and authoritative
 per-device Windows driver mapping. `Auto` is governed by Stage 5 release
 qualification evidence and remains default-denied to GPU until an approved
-entry is added. The checked-in production trust
-root is still empty, so ordinary releases remain CPU-only and a requested
-nonempty GPU release fails closed until a separately reviewed public key and
-protected trusted signing workflow are provisioned. The candidate-ref release
+entry is added. The checked-in production trust root contains the project-wide
+reviewed public key documented in `WINDOWS_GPU_PACK_SIGNING.md`; its private key is outside
+Git. Ordinary releases remain CPU-only until verified signed packs and the
+separately protected trusted signing workflow are provisioned. The candidate-ref release
 workflow never receives signing authority. Official releases additionally require the
 reviewed `SCRIBE_GPU_PACK_RELEASE_POLICY` repository variable. Its temporary
 Stage 4 value is `temporary_cpu_only_stage4`; once production trust is
@@ -241,10 +241,10 @@ idle probes atomically replace that state and restore availability.
 
 Linux x86_64 uses the same Rust manifest verifier and immutable `PackStore` as
 the other platforms. `scripts/build-linux-release-package.sh` accepts prebuilt
-CPU executables and optional pre-signed pack roots, but the production Linux
-trust root is empty. Consequently CPU-only `.deb` assembly succeeds with an
-exact empty catalog while every nonempty CUDA/Vulkan input fails before
-publication. Fixture keys are confined to author/verifier tests and explicitly
+CPU executables and optional pre-signed pack roots. The shared project public key
+can authenticate compatible Linux packs, but no Linux pack is provisioned by this
+key bootstrap. CPU-only `.deb` assembly retains its exact empty catalog;
+Linux GPU release qualification remains separate. Fixture keys are confined to author/verifier tests and explicitly
 labeled size evidence. The package verifier requires the canonical FHS tree,
 exact inventory, desktop-to-CPU-worker digest binding, and an empty immutable
 pack directory. See `docs/LINUX_RELEASE_PACKAGING.md`.
@@ -254,8 +254,8 @@ roots. It invokes the compiled production verifier before and after copying,
 stages the immutable layout, writes the bounded catalog, reports installed and
 compressed sizes, and generates the installer preflight allowlist. Every pack
 file is also included in the top-level bundle inventory, preserving portable
-and installer parity. The normal catalog is empty until production trust is
-provisioned. When a release includes packs, the same catalog is inside the
+and installer parity. The normal catalog remains empty until verified signed
+packs are explicitly supplied. When a release includes packs, the same catalog is inside the
 portable payload and the installer copies that exact tree; CI emits a separate
 per-pack installed and compressed size report from the verified catalog.
 
@@ -274,8 +274,8 @@ installer inclusion. That separate protected signer must verify the
 approved source/revision and complete unsigned-artifact digests before receiving
 authority; candidate-ref scripts must not run with the key. The authoring tool
 still verifies that a supplied key's public half exactly matches the separately
-reviewed key embedded in `ProductionTrustRoot`. Because no production public key
-has been provisioned today, every nonempty production release fails closed.
+reviewed key embedded in `ProductionTrustRoot`. Provisioning that public key
+does not supply signed packs or grant release/Auto approval.
 The deterministic seed and key ID used by tooling tests and local hardware smoke
 are fixture-only and cannot verify under production trust.
 
@@ -664,18 +664,19 @@ allowed to finish rather than being migrated.
 
 The hosted pull-request lane is deliberately credential-free and builds only
 the epoch-zero empty catalog. The protected official lane is also CPU-only at
-epoch zero today because the production Metal trust root and provisioning inputs
-have not been provisioned. Before enabling a positive-epoch release, the
+epoch zero today because Metal packs and protected provisioning inputs have not
+been supplied. Shared project trust can authenticate compatible Metal packs.
+Before enabling a positive-epoch release, the
 protected environment must supply the reviewed Developer-ID identity, stable
 group, authorized profile path, positive release epoch, and (for Metal) the
 reviewed pack-signing key material. These inputs are requirements for a future
-protected run, not evidence that production Metal trust exists now.
+protected run, not evidence of Metal hardware or release qualification.
 
-The production authoring CLI must accept `--backend metal --target-os macos
---target-arch <aarch64|x86_64>` and bind those facts in its signed manifest.
-Until that reviewed CLI extension and a persistent production trust root exist,
-the build fails closed for non-empty packs and produces the canonical empty
-catalog. The checked-in macOS Auto manifests are both canonical zero-entry
+The production authoring CLI accepts `--backend metal --target-os macos
+--target-arch <aarch64|x86_64>` and binds those facts in its signed manifest.
+Non-empty packs still require compatible project signatures and the protected
+release inputs; the default build produces the canonical empty catalog.
+The checked-in macOS Auto manifests are both canonical zero-entry
 `default_deny` documents. No runtime calibration occurs: Auto remains CPU-only
 until a separately reviewed release qualification provides five cold runs,
 twenty warm runs, parity/reliability evidence, and GPU end-to-end p95 no more

@@ -382,9 +382,9 @@ struct ParsedProductionTrustKey {
     public_key: Vec<u8>,
 }
 
-/// The reviewed production trust root is compiled into every verifier. It is
-/// intentionally empty until a public key completes a separate release-
-/// security review. Private keys are never stored in this manifest.
+/// The reviewed production trust root is compiled into every verifier. Its
+/// project-wide key authenticates compatible packs, not Auto qualification or
+/// release inclusion. Private keys are never stored in this manifest.
 pub(crate) struct ProductionTrustRoot;
 
 impl TrustRoot for ProductionTrustRoot {
@@ -422,6 +422,10 @@ fn parse_production_trust_manifest_bytes(bytes: &[u8]) -> Option<Vec<ParsedProdu
     for key in manifest.keys {
         if validate_identifier(&key.key_id, "production trust key ID").is_err()
             || !key_ids.insert(key.key_id.clone())
+            || key
+                .public_key_hex
+                .bytes()
+                .any(|byte| byte.is_ascii_uppercase())
         {
             return None;
         }
@@ -1719,6 +1723,24 @@ pub(crate) mod test_support {
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
+    fn compiled_project_trust_is_canonical_and_excludes_fixture_authority() {
+        let keys = parse_production_trust_manifest().expect("canonical public-only trust");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "scribe-pack-ed25519-20260929-v1");
+        let public = ProductionTrustRoot.public_key(&keys[0].key_id).unwrap();
+        assert_eq!(public, keys[0].public_key);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(public)),
+            "0f4a6638632a5f8b81e9802738e31cc05ec46c31339274ed0bd210444c7672ad"
+        );
+        let fixture = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
+        assert_ne!(public, fixture.public_key().as_ref());
+        for key_id in ["fixture-ed25519-v1", "scribe-test-production-v1", "unknown"] {
+            assert!(ProductionTrustRoot.public_key(key_id).is_none());
+        }
+    }
+
+    #[test]
     fn production_trust_manifest_rejects_malformed_duplicate_and_fixture_entries() {
         assert!(
             parse_production_trust_manifest_bytes(br#"{"schema_version":1,"keys":[]}"#).is_some()
@@ -1734,6 +1756,31 @@ pub(crate) mod test_support {
         );
         let duplicate = br#"{"schema_version":1,"keys":[{"key_id":"release-v1","public_key_hex":"0000000000000000000000000000000000000000000000000000000000000000"},{"key_id":"release-v1","public_key_hex":"1111111111111111111111111111111111111111111111111111111111111111"}]}"#;
         assert!(parse_production_trust_manifest_bytes(duplicate).is_none());
+        let valid = include_bytes!("../../runtime-manifests/worker-pack-production-trust.json");
+        for (field, invalid) in [
+            ("key_id", "../escape"),
+            ("public_key_hex", "short"),
+            (
+                "public_key_hex",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+        ] {
+            let mut value: ProductionTrustManifest = serde_json::from_slice(valid).unwrap();
+            if field == "key_id" {
+                value.keys[0].key_id = invalid.to_owned();
+            } else {
+                value.keys[0].public_key_hex = invalid.to_owned();
+            }
+            assert!(
+                parse_production_trust_manifest_bytes(&serde_json::to_vec(&value).unwrap())
+                    .is_none()
+            );
+        }
+        let parsed: ProductionTrustManifest = serde_json::from_slice(valid).unwrap();
+        assert!(
+            parse_production_trust_manifest_bytes(&serde_json::to_vec_pretty(&parsed).unwrap())
+                .is_none()
+        );
         assert!(TrustRoot::public_key(&ProductionTrustRoot, "fixture-ed25519-v1").is_none());
     }
     use std::time::{SystemTime, UNIX_EPOCH};

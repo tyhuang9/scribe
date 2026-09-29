@@ -266,9 +266,8 @@ fn production_pack_provisioning_allowed(
             && !unix_launch_bodies.contains("Command::spawn")
             && !unix_launch_bodies.contains("Command::new"));
     (registry_is_empty && trust_root_is_empty)
-        || (!registry_is_empty
-            && !trust_root_is_empty
-            && registry_routes_concrete_bridge
+        || (!trust_root_is_empty
+            && (registry_is_empty || registry_routes_concrete_bridge)
             && concrete_resolver_hello_flow
             && unix_fd_launch_flow)
 }
@@ -370,6 +369,47 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         "",
         true,
         true,
+    ));
+    // Public trust enables catalog discovery independently of the legacy empty
+    // constructor. It still requires the real resolver/Hello and safe launch flow.
+    let empty_registry = "{ ProductionPackRegistry::empty() ";
+    for registry in [empty_registry, populated_registry] {
+        assert!(!production_pack_provisioning_allowed(
+            registry,
+            dead_declarations,
+            false,
+            false,
+        ));
+        assert!(production_pack_provisioning_allowed(
+            registry,
+            concrete_flow,
+            false,
+            false,
+        ));
+        assert!(!production_pack_provisioning_allowed(
+            registry,
+            &raw_path_spawn_flow,
+            false,
+            true,
+        ));
+        assert!(production_pack_provisioning_allowed(
+            registry,
+            &unix_fd_flow,
+            false,
+            true,
+        ));
+    }
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        concrete_flow,
+        true,
+        false,
+    ));
+    assert!(!production_pack_provisioning_allowed(
+        "{ ProductionPackRegistry::from_launch_bindings(unverified) ",
+        concrete_flow,
+        false,
+        false,
     ));
 }
 
@@ -1120,7 +1160,11 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
         assert!(desktop.contains(module_lint_reason));
     }
     assert!(registry_body.contains("ProductionPackRegistry::empty()"));
-    assert!(trust_root_is_empty);
+    assert_eq!(production_trust["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        production_trust["keys"][0]["key_id"],
+        "scribe-pack-ed25519-20260929-v1"
+    );
     for source in [desktop, module, health, manifest, store] {
         assert!(
             !source.contains("#![allow"),

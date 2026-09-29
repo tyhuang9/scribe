@@ -1,8 +1,8 @@
 //! Verified GPU worker-pack infrastructure.
 //!
 //! Stage 4/6 discovers verified Windows and macOS packs and turns only challenge-bound
-//! resolver/Hello results into explicit-GPU candidates. Production trust is
-//! deliberately empty until a separate public-key review is complete, and
+//! resolver/Hello results into explicit-GPU candidates. Project-wide public trust
+//! authenticates compatible packs; it does not supply a pack or release authority.
 //! Auto remains default-denied to every GPU pack.
 
 mod device_release_epoch;
@@ -1448,9 +1448,9 @@ fn read_bounded_catalog(
     })
 }
 
-/// Private packaging entrypoint. Stage 4's empty production trust root means a
-/// non-empty release pack declaration always fails until key provisioning is
-/// deliberately completed in a later stage.
+/// Private packaging entrypoint. Non-empty declarations require a compatible
+/// pack signed by the embedded project key and an exact verified inventory.
+/// This does not admit a backend to Auto or authorize release publication.
 pub(crate) fn maybe_run_pack_verifier() -> Option<i32> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let private_flag = std::ffi::OsStr::new("--scribe-verify-worker-pack");
@@ -1920,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_four_production_trust_root_and_legacy_registry_are_empty() {
+    fn legacy_registry_stays_empty_and_production_trust_rejects_fixture_keys() {
         assert!(super::production_registry().is_empty());
         assert!(
             super::manifest::TrustRoot::public_key(

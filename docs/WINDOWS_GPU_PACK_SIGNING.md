@@ -29,17 +29,48 @@ signer identity, and policy digest. The signer derives the application/worker
 build IDs from the approved app version and source revision; it does not require
 the separately pinned tool to have been built from the candidate revision.
 
-## Initial setup (maintainer action, not performed by the PR)
+## Key bootstrap and protected release setup
+
+### Public-key bootstrap (2026-09-29)
+
+The approved project pack key is `scribe-pack-ed25519-20260929-v1`. Its raw
+32-byte public-key SHA-256 is
+`0f4a6638632a5f8b81e9802738e31cc05ec46c31339274ed0bd210444c7672ad`.
+The canonical trust manifest contains only its public key; the Windows signing
+policy pins the same ID and digest. A unique PKCS#8 v2 key was generated offline
+using `ring` and Windows OS randomness. The private file is outside Git in a
+fresh physical directory restricted to the maintainer account and SYSTEM;
+generation refuses to replace an existing file. No private bytes are logged.
+
+This is **project-wide pack trust**, not a Windows-only key. A compatible pack
+signed with it can authenticate through the shared verifier on other supported
+platforms too. Runtime compatibility, retained inventory verification, device
+discovery/Hello validation, release authority, and Auto qualification still apply.
+The legacy empty registry is not the only discovery path; provisioning trust is
+therefore a security-relevant change even while no GPU pack is bundled.
+
+This bootstrap does not configure GitHub environments/secrets, sign a pack or
+installer, dispatch a workflow, publish a release, or enable Auto. Maintainers
+must arrange a protected offline backup; this change does not create one.
+Follow the remaining setup below after separate review/merge authorization.
+Rebuild the tool, then verify the local key without exposing it:
+
+```powershell
+scribe-worker-pack-tool check-production-key --key-id scribe-pack-ed25519-20260929-v1 --private-key '<protected-external-pkcs8-path>'
+```
+
+### Protected release setup
 
 1. Review and merge the necessary implementation stack through normal PRs. This
    document is not merge approval. Keep the ordinary release CPU-only and Auto's
    qualification manifest empty during bootstrap.
-2. Generate a unique Ed25519 key using a trusted offline utility which emits the
+2. For initial generation or deliberate rotation, generate a unique Ed25519 key
+   using a trusted offline utility which emits the
    PKCS#8 v2 DER format accepted by `ring::signature::Ed25519KeyPair`. Record the
    public key and its SHA-256 separately. Do not use the deterministic test key.
    Never paste private key bytes into an issue, PR, chat, terminal transcript,
    build log, repository file, or artifact.
-3. Add only the public key and key ID to
+3. For a new key or rotation, add only the public key and key ID to
    `runtime-manifests/worker-pack-production-trust.json`, and bind the same key
    in `runtime-manifests/windows-gpu-signing-policy.json`, through a reviewed PR.
    The trust file is minified canonical JSON; one final LF is accepted. Its

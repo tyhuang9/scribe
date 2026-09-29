@@ -1187,6 +1187,22 @@ mod tests {
     const SIGNER_REVISION: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const KEY_ID: &str = "scribe-test-production-v1";
 
+    #[test]
+    fn checked_in_policy_binds_the_compiled_project_key() {
+        let mut policy: WindowsSigningPolicy = serde_json::from_slice(include_bytes!(
+            "../runtime-manifests/windows-gpu-signing-policy.json"
+        ))
+        .unwrap();
+        validate_policy(&policy, &ProductionTrustRoot).unwrap();
+        assert_eq!(policy.key_id, "scribe-pack-ed25519-20260929-v1");
+        let digest = policy.public_key_sha256.clone();
+        policy.public_key_sha256 = "0".repeat(64);
+        assert!(validate_policy(&policy, &ProductionTrustRoot).is_err());
+        policy.public_key_sha256 = digest;
+        policy.key_id = KEY_ID.to_owned();
+        assert!(validate_policy(&policy, &ProductionTrustRoot).is_err());
+    }
+
     struct TestTrust {
         public_key: Vec<u8>,
     }
