@@ -185,8 +185,13 @@ function Remove-TestRootSafely([string]$Path) {
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Refused frozen worker test cleanup containing a reparse point: $($item.FullName)"
         }
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+            $item.Attributes = $item.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+        }
     }
-    Remove-Item -LiteralPath $resolved -Recurse -Force
+    # The fixture deliberately creates literal trailing-dot entries. Remove the
+    # already-validated exact root verbatim so cleanup does not normalize them.
+    [System.IO.Directory]::Delete("\\?\$resolved", $true)
 }
 
 function Get-CommandIdentity([string]$Name) {
@@ -286,6 +291,134 @@ try {
     $fixtureBuilder = Join-Path $fixtureRoot 'scripts\build-windows-release.ps1'
     $fixtureProducer = Join-Path $fixtureRoot 'scripts\new-windows-frozen-cpu-worker.ps1'
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
+
+    # Use verbatim creation only to make a test-owned physical path that exceeds
+    # MAX_PATH. The helper itself receives its ordinary absolute identity.
+    $longStreamDirectory = $testRoot
+    $nonBmpPathComponent = [char]::ConvertFromUtf32(0x1F9EA)
+    foreach ($component in @(
+        "stream-path-路径-$('a' * 52)",
+        "stream-path-$nonBmpPathComponent-$('b' * 52)",
+        "stream-path-данные-$('c' * 52)",
+        "stream-path-δοκιμή-$('d' * 52)"
+    )) {
+        $longStreamDirectory = Join-Path $longStreamDirectory $component
+        [System.IO.Directory]::CreateDirectory("\\?\$longStreamDirectory") | Out-Null
+    }
+    $longStreamFile = Join-Path $longStreamDirectory 'scribe-inference-worker-長い.exe'
+    [System.IO.File]::WriteAllText(
+        "\\?\$longStreamFile",
+        'long stream enumeration fixture',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Assert-True (([System.Text.Encoding]::Unicode.GetByteCount($longStreamDirectory) / 2) -gt 260) `
+        'Long stream directory did not exceed 260 UTF-16 code units.'
+    Assert-True (([System.Text.Encoding]::Unicode.GetByteCount($longStreamFile) / 2) -gt 260) `
+        'Long stream file did not exceed 260 UTF-16 code units.'
+    Assert-True $longStreamDirectory.Contains($nonBmpPathComponent) `
+        'Long stream fixture did not include its non-BMP component.'
+    Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $longStreamDirectory
+    Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $longStreamFile
+    $longStreamDirectoryVerbatim = "\\?\$longStreamDirectory"
+    $longStreamFileVerbatim = "\\?\$longStreamFile"
+    [System.IO.File]::WriteAllText("$longStreamDirectoryVerbatim`:frozen-test", 'directory ads')
+    try {
+        Invoke-ExpectedFailure { Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $longStreamDirectory } 'alternate data stream'
+    }
+    finally {
+        [System.IO.File]::Delete("$longStreamDirectoryVerbatim`:frozen-test")
+    }
+    [System.IO.File]::WriteAllText("$longStreamFileVerbatim`:frozen-test", 'file ads')
+    try {
+        Invoke-ExpectedFailure { Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $longStreamFile } 'alternate data stream'
+        Invoke-ExpectedFailure { Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams "$longStreamFileVerbatim`:frozen-test" } 'alternate data stream'
+    }
+    finally {
+        [System.IO.File]::Delete("$longStreamFileVerbatim`:frozen-test")
+    }
+
+    # Trailing-dot spelling resolves to a clean normalized neighbor in the
+    # ordinary parser; trailing-space spelling varies by Windows API. Both
+    # have distinct literal verbatim targets carrying ADSs, so the helper must
+    # inspect the explicit object or fail closed for the ordinary spelling.
+    $normalizationDecoyRoot = Join-Path $testRoot 'stream-normalization-decoy'
+    foreach ($decoy in @(
+        [pscustomobject]@{ NormalizedComponent = 'dotted-target'; LiteralComponent = 'dotted-target.'; Label = 'trailing-dot'; OrdinaryReadsNormalized = $true },
+        [pscustomobject]@{ NormalizedComponent = 'spaced-target'; LiteralComponent = 'spaced-target '; Label = 'trailing-space'; OrdinaryReadsNormalized = $false }
+    )) {
+        $normalizedDirectory = Join-Path $normalizationDecoyRoot $decoy.NormalizedComponent
+        [System.IO.Directory]::CreateDirectory($normalizedDirectory) | Out-Null
+        $normalizedFile = Join-Path $normalizedDirectory 'marker'
+        [System.IO.File]::WriteAllText($normalizedFile, "normalized $($decoy.Label) neighbor")
+        $literalDirectory = "$normalizationDecoyRoot\$($decoy.LiteralComponent)"
+        $literalDirectoryVerbatim = "\\?\$literalDirectory"
+        [System.IO.Directory]::CreateDirectory($literalDirectoryVerbatim) | Out-Null
+        $literalFile = "$literalDirectory\marker"
+        $literalFileVerbatim = "\\?\$literalFile"
+        [System.IO.File]::WriteAllText($literalFileVerbatim, "literal $($decoy.Label) target")
+        Assert-Equal ([System.IO.File]::ReadAllText($normalizedFile)) "normalized $($decoy.Label) neighbor" `
+            "Normalized $($decoy.Label) neighbor did not retain its physical identity."
+        if ($decoy.OrdinaryReadsNormalized) {
+            Assert-Equal ([System.IO.File]::ReadAllText($literalFile)) "normalized $($decoy.Label) neighbor" `
+                "Ordinary $($decoy.Label) path did not resolve to its normalized neighbor."
+        }
+        Assert-Equal ([System.IO.File]::ReadAllText($literalFileVerbatim)) "literal $($decoy.Label) target" `
+            "Verbatim $($decoy.Label) path did not retain its physical identity."
+        [System.IO.File]::WriteAllText("$literalFileVerbatim`:frozen-test", "$($decoy.Label) ads")
+        try {
+            Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $normalizedFile
+            Invoke-ExpectedFailure { Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $literalFileVerbatim } 'alternate data stream'
+            Invoke-ExpectedFailure { Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams $literalFile } 'safe absolute Windows stream-enumeration path'
+        }
+        finally {
+            [System.IO.File]::Delete("$literalFileVerbatim`:frozen-test")
+        }
+    }
+
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath 'C:\') `
+        '\\?\C:\' 'Ordinary drive-root stream enumeration path'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath 'C:\workers\packs\worker.exe') `
+        '\\?\C:\workers\packs\worker.exe' 'Ordinary drive stream enumeration path'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath 'C:/workers/packs/worker.exe') `
+        '\\?\C:\workers\packs\worker.exe' 'Slash-separated drive stream enumeration path'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath '\\server\share\packs\worker.exe') `
+        '\\?\UNC\server\share\packs\worker.exe' 'Ordinary UNC stream enumeration path'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath '\\server\share') `
+        '\\?\UNC\server\share' 'Ordinary UNC-root stream enumeration path'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath '\\?\C:\workers\victim.\marker') `
+        '\\?\C:\workers\victim.\marker' 'Explicit drive stream identity preservation'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath '\\?\UNC\server\share\victim.\marker') `
+        '\\?\UNC\server\share\victim.\marker' 'Explicit UNC stream identity preservation'
+    Assert-Equal (ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath '\\?\UNC\server\share') `
+        '\\?\UNC\server\share' 'Explicit UNC-root stream identity preservation'
+    foreach ($unsafePath in @(
+        'packs\worker.exe',
+        'C:packs\worker.exe',
+        '\packs\worker.exe',
+        'C:\workers\.\worker.exe',
+        'C:\workers\..\worker.exe',
+        'C:\workers\victim.\marker',
+        'C:\workers\victim \marker',
+        'C:\workers\CON\marker',
+        'C:\workers\com1.txt\marker',
+        '\\server..\share\worker.exe',
+        '\\server\share.\worker.exe',
+        '\\server\share\\worker.exe',
+        '\\.\C:\workers\packs\worker.exe',
+        '\\?\GLOBALROOT\Device\HarddiskVolume1\worker.exe',
+        '\\?\C:/workers/packs/worker.exe'
+    )) {
+        Invoke-ExpectedFailure { ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath $unsafePath } 'safe absolute Windows stream-enumeration path'
+    }
+    foreach ($adsPath in @(
+        'C:\workers\marker:untrusted',
+        '\\server\share\marker:untrusted',
+        '\\?\C:\workers\marker:untrusted',
+        '\\?\UNC\server\share\marker:untrusted'
+    )) {
+        Invoke-ExpectedFailure { ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath $adsPath } 'alternate data stream'
+    }
+
     $fixtureContext = Get-WindowsFrozenCpuWorkerSourceContext $fixtureRoot
     $env:CARGO_TARGET_DIR = $fixtureTarget
     $env:SCRIBE_BUILD_REVISION = 'inherited-test-revision'
