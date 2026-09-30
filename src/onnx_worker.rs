@@ -1739,11 +1739,23 @@ impl Drop for VulkanInstanceGuard {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VulkanMemoryDeviceSnapshot {
     stable_device_identity: Option<String>,
+    pci_location: Option<(u32, u32, u32)>,
     device_class: DeviceClass,
     linked_nodes: bool,
     memory_budget_supported: bool,
     heaps: Vec<VulkanMemoryHeapObservation>,
     unused_budget_or_usage_nonzero: bool,
+}
+
+#[cfg(any(test, all(windows, feature = "vulkan-acceleration")))]
+fn bounded_vulkan_pci_location(
+    domain: u32,
+    bus: u32,
+    device: u32,
+    function: u32,
+) -> Option<(u32, u32, u32)> {
+    (domain == 0 && bus <= 0xff && device <= 0x1f && function <= 7)
+        .then_some((bus, device, function))
 }
 
 #[cfg(any(test, all(windows, feature = "vulkan-acceleration")))]
@@ -1753,9 +1765,15 @@ fn derive_vulkan_memory_availability(
     stable_device: &str,
     expected_class: DeviceClass,
 ) -> WorkerMemoryAvailability {
+    let expected_pci_location = parse_native_pci_location(stable_device);
     let matching = snapshots
         .iter()
-        .filter(|snapshot| snapshot.stable_device_identity.as_deref() == Some(stable_device))
+        .filter(|snapshot| {
+            snapshot.stable_device_identity.as_deref() == Some(stable_device)
+                || expected_pci_location
+                    .map(|expected| snapshot.pci_location == Some(expected))
+                    .unwrap_or(false)
+        })
         .collect::<Vec<_>>();
     let [snapshot] = matching.as_slice() else {
         return WorkerMemoryAvailability::Unavailable {
@@ -1885,12 +1903,35 @@ fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> 
 
     let mut snapshots = Vec::with_capacity(physical_devices.len());
     for physical_device in physical_devices {
+        // SAFETY: the physical device belongs to this live instance and the
+        // returned fixed-size extension names are inspected before drop.
+        let extensions = unsafe {
+            instance
+                .0
+                .enumerate_device_extension_properties(physical_device)
+        }
+        .context("could not enumerate Vulkan memory-budget support")?;
+        let memory_budget_supported = extensions.iter().any(|extension| {
+            // SAFETY: Vulkan guarantees each extensionName array is NUL
+            // terminated within its fixed-size storage.
+            (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+                == vk::ExtMemoryBudgetFn::name()
+        });
+        let pci_bus_info_supported = extensions.iter().any(|extension| {
+            // SAFETY: Vulkan guarantees each extensionName array is NUL
+            // terminated within its fixed-size storage.
+            (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+                == vk::ExtPciBusInfoFn::name()
+        });
         let mut id = vk::PhysicalDeviceIDProperties::default();
-        let mut properties = vk::PhysicalDeviceProperties2::builder()
-            .push_next(&mut id)
-            .build();
-        // SAFETY: the pNext structure and output remain initialized and live
-        // for the synchronous identity query.
+        let mut pci_bus_info = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceProperties2::builder().push_next(&mut id);
+        if pci_bus_info_supported {
+            properties = properties.push_next(&mut pci_bus_info);
+        }
+        let mut properties = properties.build();
+        // SAFETY: the pNext chain and outputs remain initialized and live for
+        // the synchronous identity and PCI query.
         unsafe {
             instance
                 .0
@@ -1911,20 +1952,15 @@ fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> 
             };
         let linked_nodes =
             id.device_luid_valid == vk::TRUE && id.device_node_mask.count_ones() != 1;
-        // SAFETY: the physical device belongs to this live instance and the
-        // returned fixed-size extension names are inspected before drop.
-        let extensions = unsafe {
-            instance
-                .0
-                .enumerate_device_extension_properties(physical_device)
-        }
-        .context("could not enumerate Vulkan memory-budget support")?;
-        let memory_budget_supported = extensions.iter().any(|extension| {
-            // SAFETY: Vulkan guarantees each extensionName array is NUL
-            // terminated within its fixed-size storage.
-            (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
-                == vk::ExtMemoryBudgetFn::name()
+        let pci_location = pci_bus_info_supported.then(|| {
+            bounded_vulkan_pci_location(
+                pci_bus_info.pci_domain,
+                pci_bus_info.pci_bus,
+                pci_bus_info.pci_device,
+                pci_bus_info.pci_function,
+            )
         });
+        let pci_location = pci_location.flatten();
         let (heaps, unused_budget_or_usage_nonzero) = if memory_budget_supported {
             let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
             let mut memory = vk::PhysicalDeviceMemoryProperties2::builder()
@@ -1965,6 +2001,7 @@ fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> 
         };
         snapshots.push(VulkanMemoryDeviceSnapshot {
             stable_device_identity,
+            pci_location,
             device_class,
             linked_nodes,
             memory_budget_supported,
@@ -19094,6 +19131,7 @@ mod tests {
     ) -> VulkanMemoryDeviceSnapshot {
         VulkanMemoryDeviceSnapshot {
             stable_device_identity: Some(stable_device_identity.to_owned()),
+            pci_location: None,
             device_class,
             linked_nodes: false,
             memory_budget_supported: true,
@@ -19189,6 +19227,266 @@ mod tests {
             }
         ));
         exhausted.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_matches_authenticated_pci_identity() {
+        let authenticated_pci = "native:0000:01:00.0";
+        let mut snapshot = vulkan_memory_snapshot(
+            "native:luid:0102030405060708",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        snapshot.pci_location = Some((1, 0, 0));
+
+        let availability = derive_vulkan_memory_availability(
+            &[snapshot],
+            "transcribe-cpp-ggml-vulkan",
+            authenticated_pci,
+            DeviceClass::DiscreteGpu,
+        );
+
+        assert!(matches!(
+            availability,
+            WorkerMemoryAvailability::Observed {
+                stable_device,
+                memory_total_bytes: 100,
+                available_memory_bytes: 60,
+                source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                    heap_selection: VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                    ..
+                },
+                ..
+            } if stable_device == authenticated_pci
+        ));
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_matches_zero_domain_pci_spellings() {
+        let mut snapshot = vulkan_memory_snapshot(
+            "native:luid:0102030405060708",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        snapshot.pci_location = Some((0, 0, 0));
+
+        for authenticated_pci in ["native:0000:00:00.0", "native:pci:00000000:00:00.0"] {
+            let availability = derive_vulkan_memory_availability(
+                std::slice::from_ref(&snapshot),
+                "transcribe-cpp-ggml-vulkan",
+                authenticated_pci,
+                DeviceClass::DiscreteGpu,
+            );
+            assert!(matches!(
+                availability,
+                WorkerMemoryAvailability::Observed { stable_device, .. }
+                    if stable_device == authenticated_pci
+            ));
+        }
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_selects_exact_pci_snapshot_in_reordered_catalog() {
+        let mut target = vulkan_memory_snapshot(
+            "native:luid:0102030405060708",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        target.pci_location = Some((1, 0, 0));
+        let mut unrelated = vulkan_memory_snapshot(
+            "native:uuid:00112233445566778899aabbccddeeff",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 200, 1, 160, 20)],
+        );
+        unrelated.pci_location = Some((2, 0, 0));
+
+        for snapshots in [
+            vec![unrelated.clone(), target.clone()],
+            vec![target.clone(), unrelated.clone()],
+        ] {
+            let availability = derive_vulkan_memory_availability(
+                &snapshots,
+                "transcribe-cpp-ggml-vulkan",
+                "native:0000:01:00.0",
+                DeviceClass::DiscreteGpu,
+            );
+            assert!(matches!(
+                availability,
+                WorkerMemoryAvailability::Observed {
+                    stable_device,
+                    memory_total_bytes: 100,
+                    available_memory_bytes: 60,
+                    ..
+                } if stable_device == "native:0000:01:00.0"
+            ));
+        }
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_rejects_duplicate_pci_physical_devices() {
+        let mut luid = vulkan_memory_snapshot(
+            "native:luid:0102030405060708",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        luid.pci_location = Some((1, 0, 0));
+        let mut uuid = vulkan_memory_snapshot(
+            "native:uuid:00112233445566778899aabbccddeeff",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        uuid.pci_location = Some((1, 0, 0));
+
+        assert!(matches!(
+            derive_vulkan_memory_availability(
+                &[luid, uuid],
+                "transcribe-cpp-ggml-vulkan",
+                "native:0000:01:00.0",
+                DeviceClass::DiscreteGpu,
+            ),
+            WorkerMemoryAvailability::Unavailable {
+                reason: WorkerMemoryUnavailableReason::StableDeviceAmbiguous
+            }
+        ));
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_rejects_unmatched_pci_aliases_and_no_identity() {
+        let mut unmatched_alias = vulkan_memory_snapshot(
+            "native:uuid:00112233445566778899aabbccddeeff",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        unmatched_alias.pci_location = Some((2, 0, 0));
+        let mut no_identity = unmatched_alias.clone();
+        no_identity.stable_device_identity = None;
+        no_identity.pci_location = None;
+        let luid_without_pci = vulkan_memory_snapshot(
+            "native:luid:0102030405060708",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+        let uuid_without_pci = vulkan_memory_snapshot(
+            "native:uuid:00112233445566778899aabbccddeeff",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 1, 80, 20)],
+        );
+
+        for snapshot in [
+            unmatched_alias,
+            no_identity,
+            luid_without_pci,
+            uuid_without_pci,
+        ] {
+            assert!(matches!(
+                derive_vulkan_memory_availability(
+                    &[snapshot],
+                    "transcribe-cpp-ggml-vulkan",
+                    "native:0000:01:00.0",
+                    DeviceClass::DiscreteGpu,
+                ),
+                WorkerMemoryAvailability::Unavailable {
+                    reason: WorkerMemoryUnavailableReason::StableDeviceMissing
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_bounds_extension_pci_locations() {
+        assert_eq!(bounded_vulkan_pci_location(0, 0, 0, 0), Some((0, 0, 0)));
+        assert_eq!(
+            bounded_vulkan_pci_location(0, 0xff, 0x1f, 7),
+            Some((0xff, 0x1f, 7))
+        );
+        for location in [
+            (1, 0, 0, 0),
+            (0, 0x100, 0, 0),
+            (0, 0, 0x20, 0),
+            (0, 0, 0, 8),
+        ] {
+            assert_eq!(
+                bounded_vulkan_pci_location(location.0, location.1, location.2, location.3),
+                None,
+                "{location:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_preserves_exact_luid_and_uuid_matching() {
+        for stable in [
+            "native:luid:0102030405060708",
+            "native:uuid:00112233445566778899aabbccddeeff",
+        ] {
+            let availability = derive_vulkan_memory_availability(
+                &[vulkan_memory_snapshot(
+                    stable,
+                    DeviceClass::DiscreteGpu,
+                    vec![vulkan_heap(0, 100, 1, 80, 20)],
+                )],
+                "transcribe-cpp-ggml-vulkan",
+                stable,
+                DeviceClass::DiscreteGpu,
+            );
+            assert!(matches!(
+                availability,
+                WorkerMemoryAvailability::Observed { stable_device, .. } if stable_device == stable
+            ));
+        }
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_pci_selection_preserves_snapshot_validation() {
+        let selected = || {
+            let mut snapshot = vulkan_memory_snapshot(
+                "native:luid:0102030405060708",
+                DeviceClass::DiscreteGpu,
+                vec![vulkan_heap(0, 100, 1, 80, 20)],
+            );
+            snapshot.pci_location = Some((1, 0, 0));
+            snapshot
+        };
+        let unavailable_reason = |snapshot| match derive_vulkan_memory_availability(
+            &[snapshot],
+            "transcribe-cpp-ggml-vulkan",
+            "native:0000:01:00.0",
+            DeviceClass::DiscreteGpu,
+        ) {
+            WorkerMemoryAvailability::Unavailable { reason } => reason,
+            other => panic!("expected unavailable Vulkan observation, got {other:?}"),
+        };
+
+        let mut invalid_budget = selected();
+        invalid_budget.heaps[0].budget_bytes = 0;
+        assert_eq!(
+            unavailable_reason(invalid_budget),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let mut missing_budget_extension = selected();
+        missing_budget_extension.memory_budget_supported = false;
+        assert_eq!(
+            unavailable_reason(missing_budget_extension),
+            WorkerMemoryUnavailableReason::MemoryBudgetExtensionUnavailable
+        );
+        let mut wrong_class = selected();
+        wrong_class.device_class = DeviceClass::IntegratedGpu;
+        assert_eq!(
+            unavailable_reason(wrong_class),
+            WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+        );
+        let mut linked_nodes = selected();
+        linked_nodes.linked_nodes = true;
+        assert_eq!(
+            unavailable_reason(linked_nodes),
+            WorkerMemoryUnavailableReason::MultiInstanceUnsupported
+        );
+        let mut multi_instance_heap = selected();
+        multi_instance_heap.heaps[0].flags = 0b11;
+        assert_eq!(
+            unavailable_reason(multi_instance_heap),
+            WorkerMemoryUnavailableReason::MultiInstanceUnsupported
+        );
     }
 
     #[test]
