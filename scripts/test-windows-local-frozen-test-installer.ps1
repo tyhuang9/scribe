@@ -505,14 +505,13 @@ public static class FakeIscc {
     $fakeCompilerItem = Get-Item -LiteralPath $fakeCompiler
     $fakeCompilerHash = (Get-FileHash -LiteralPath $fakeCompiler -Algorithm SHA256).Hash.ToLowerInvariant()
     $provenance = [ordered]@{
-        schema_version = 1; product = 'Inno Setup'; product_version = '6.7.1'; reviewed_utc_date = '2000-01-01';
-        package_url = 'https://fixture.invalid/inno'; package_size_bytes = 1; package_sha256 = ('0' * 64);
-        embedded_installer_path = 'tools/innosetup.exe'; embedded_installer_size_bytes = 1; embedded_installer_sha256 = ('0' * 64);
+        schema_version = 2; product = 'Inno Setup'; product_version = '7.1.0'; reviewed_utc_date = '2026-09-30';
+        upstream_installer_url = 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe';
+        installer_size_bytes = [int64]14304168; installer_sha256 = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f';
         compiler_relative_path = 'ISCC.exe'; compiler_size_bytes = [int64]$fakeCompilerItem.Length; compiler_sha256 = $fakeCompilerHash;
-        embedded_package_verification_path = 'legal/VERIFICATION.txt'; upstream_installer_url = 'https://fixture.invalid/inno.exe';
         verification_method = 'fixture only'; trust_scope = 'fixture only'
     }
-    Write-Utf8 (Join-Path $fixtureRoot 'installer\inno-setup-6.7.1-provenance.json') ($provenance | ConvertTo-Json -Depth 4)
+    Write-Utf8 (Join-Path $fixtureRoot 'installer\inno-setup-7.1.0-provenance.json') ($provenance | ConvertTo-Json -Depth 4)
     Set-FixtureVerifierSeams `
         (Join-Path $fixtureRoot 'scripts\verify-windows-local-frozen-test-installer.ps1') `
         (Join-Path $fixtureRoot 'scripts\windows-local-frozen-installer-integrity.ps1')
@@ -646,7 +645,7 @@ public static class FakeIscc {
     try { $fixtureBundle = Assert-WindowsLocalFrozenBundle $bundleRoot $openedFrozen } finally { $openedFrozen.WorkerStream.Dispose() }
 
     $template = Get-Content -LiteralPath (Join-Path $repositoryRoot 'installer\scribe-local-frozen.iss') -Raw
-    foreach ($required in @('CloseApplications=no', 'CreateUninstallRegKey=no', 'UsePreviousAppDir=no', 'DisableDirPage=yes', 'ArchitecturesAllowed=x64compatible', 'ArchitecturesInstallIn64BitMode=x64compatible', "ExpandConstant('{param:DIR|}')", 'HasNoReparseAncestors', 'RejectLocalFrozenWizardDestination')) {
+    foreach ($required in @('CloseApplications=no', 'CreateUninstallRegKey=no', 'UsePreviousAppDir=no', 'DisableDirPage=yes', 'SetupArchitecture=x86', 'ArchitecturesAllowed=x64compatible', 'ArchitecturesInstallIn64BitMode=x64compatible', "ExpandConstant('{param:DIR|}')", 'HasNoReparseAncestors', 'RejectLocalFrozenWizardDestination')) {
         Assert-True $template.Contains($required) "Local frozen installer template omitted $required."
     }
     foreach ($forbidden in @('[Icons]', '[Run]', '[Tasks]', 'CloseApplications=yes', 'StableAppIdGuid')) {
@@ -654,9 +653,48 @@ public static class FakeIscc {
     }
     $builderSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\build-windows-frozen-test-installer.ps1') -Raw
     Assert-True (-not $builderSource.Contains('InnoProvenancePath')) 'Local frozen builder accepted a caller-provided Inno provenance path.'
-    Assert-True $builderSource.Contains("Join-Path `$repositoryRoot 'installer\inno-setup-6.7.1-provenance.json'") 'Local frozen builder did not use the repository-pinned Inno provenance.'
+    Assert-True $builderSource.Contains("Join-Path `$repositoryRoot 'installer\inno-setup-7.1.0-provenance.json'") 'Local frozen builder did not use the repository-pinned Inno provenance.'
     $productionVerifierSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\verify-windows-release-package.ps1') -Raw
     Assert-True (-not $productionVerifierSource.Contains('LocalFrozen')) 'Production package verifier was changed to admit local frozen markers.'
+
+    $fixtureProvenancePath = Join-Path $fixtureRoot 'installer\inno-setup-7.1.0-provenance.json'
+    $validProvenanceJson = Get-Content -LiteralPath $fixtureProvenancePath -Raw
+    foreach ($mutation in @(
+        @{ Name = 'legacy schema1 record'; Expected = 'reviewed 7.1.0 compiler'; Action = { param($record) $record.schema_version = [int64]1 } },
+        @{
+            Name = 'legacy schema1 package-wrapper record'; Expected = 'unexpected or missing'; Action = {
+                param($record)
+                $record.schema_version = [int64]1
+                $record.PSObject.Properties.Remove('installer_size_bytes')
+                $record.PSObject.Properties.Remove('installer_sha256')
+                foreach ($field in @{
+                    package_url = 'https://fixture.invalid/inno'; package_size_bytes = [int64]1; package_sha256 = ('0' * 64);
+                    embedded_installer_path = 'tools/innosetup.exe'; embedded_installer_size_bytes = [int64]1;
+                    embedded_installer_sha256 = ('0' * 64); embedded_package_verification_path = 'legal/VERIFICATION.txt'
+                }.GetEnumerator()) {
+                    $record | Add-Member -NotePropertyName $field.Key -NotePropertyValue $field.Value
+                }
+            }
+        },
+        @{ Name = 'unsupported schema'; Expected = 'reviewed 7.1.0 compiler'; Action = { param($record) $record.schema_version = [int64]3 } },
+        @{ Name = 'wrong product version'; Expected = 'reviewed 7.1.0 compiler'; Action = { param($record) $record.product_version = '7.0.0' } },
+        @{ Name = 'unknown field'; Expected = 'unexpected or missing'; Action = { param($record) $record | Add-Member -NotePropertyName unexpected -NotePropertyValue $true } },
+        @{ Name = 'missing required installer digest'; Expected = 'unexpected or missing'; Action = { param($record) $record.PSObject.Properties.Remove('installer_sha256') } },
+        @{ Name = 'wrong installer size'; Expected = 'reviewed 7.1.0 compiler'; Action = { param($record) $record.installer_size_bytes = [int64]1 } },
+        @{ Name = 'wrong installer digest'; Expected = 'reviewed 7.1.0 compiler'; Action = { param($record) $record.installer_sha256 = ('0' * 64) } }
+    )) {
+        $mutatedProvenance = $validProvenanceJson | ConvertFrom-Json
+        & $mutation.Action $mutatedProvenance
+        Write-Utf8 $fixtureProvenancePath ($mutatedProvenance | ConvertTo-Json -Depth 4)
+        try {
+            Invoke-ExpectedFailure {
+                Invoke-Builder $bundleRoot (Join-Path $testRoot "invalid-provenance-$($mutation.Name -replace ' ', '-')") $fakeCompiler
+            } $mutation.Expected
+        }
+        finally {
+            Write-Utf8 $fixtureProvenancePath $validProvenanceJson
+        }
+    }
 
     $capture = Join-Path $testRoot 'compiler-arguments.txt'
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = ''

@@ -40,6 +40,7 @@ OutputDir={#LocalFrozenInstallerOutputRoot}
 OutputBaseFilename=Scribe-LOCAL-Frozen-Test-{#LocalFrozenTestToken}
 Compression=lzma2
 SolidCompression=yes
+SetupArchitecture=x86
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 PrivilegesRequired=lowest

@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "product": "Inno Setup",
+  "product_version": "7.1.0",
+  "reviewed_utc_date": "2026-09-30",
+  "upstream_installer_url": "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe",
+  "installer_size_bytes": 14304168,
+  "installer_sha256": "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
+  "compiler_relative_path": "ISCC.exe",
+  "compiler_size_bytes": 2135968,
+  "compiler_sha256": "d06ebd38f38e3cee60a3c50cc45bd449d77e0bc6a5cabc607ea9886808e4de1a",
+  "verification_method": "Review recomputed the official installer and portable-installed ISCC.exe byte lengths and SHA-256 values; verified installer Authenticode publisher Pyrsys B.V.; and used the existing 6.7.1 ISSigTool to verify installer ECDSA against exact tag is-7_1_0 definition def02. Installed native DLL, e32, and e64 ECDSA material was checked separately. The x64 compiler supports an explicitly selected x86 Setup output, so both templates set SetupArchitecture=x86. CI downloads the exact URL, verifies installer length and SHA-256, requires Valid Authenticode with simple-name publisher Pyrsys B.V. before execution, waits for portable installation, then verifies ISCC.exe length and SHA-256.",
+  "trust_scope": "These pins identify the exact reviewed compiler-installer and ISCC.exe bytes and require the expected publisher check before CI executes the installer. They do not independently reproduce upstream review, authenticate every installed native component, or qualify a Scribe release."
+}

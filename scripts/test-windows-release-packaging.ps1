@@ -410,6 +410,10 @@ function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
     $acquire = Get-WorkflowStepBlock $Workflow 'Acquire digest-pinned Inno Setup' 'Build and normalize Windows installer'
     $build = Get-WorkflowStepBlock $Workflow 'Build and normalize Windows installer' 'Package portable ZIP'
     $quotedDirectoryArgument = '(''"/DIR={0}"'' -f $installRoot)'
+    if ($acquire.Contains('INNO_NUPKG_') -or $acquire.Contains('Expand-Archive') -or
+        $acquire.Contains('community.chocolatey.org')) {
+        throw 'Inno Setup acquisition must download the reviewed official installer directly, without a package wrapper.'
+    }
     if (-not $acquire.Contains($quotedDirectoryArgument)) {
         throw 'Inno Setup /DIR must remain an explicitly quoted argument so workspace paths with spaces are preserved.'
     }
@@ -419,7 +423,26 @@ function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
         throw 'Inno Setup /DIR quoting does not preserve a workspace path containing spaces.'
     }
     Assert-OrderedWorkflowTokens $acquire @(
+        '$toolRoot = Join-Path $env:GITHUB_WORKSPACE ''.ci-tools\inno-setup-7.1.0''',
+        '$installRoot = Join-Path $toolRoot ''portable''',
+        '$installerPath = Join-Path $toolRoot ''innosetup-7.1.0-x64.exe''',
+        'if (Test-Path -LiteralPath $toolRoot)',
+        'if (Test-Path -LiteralPath $installRoot)',
+        'curl.exe --fail --location --retry 3 --retry-delay 2',
+        '$env:INNO_INSTALLER_URL',
+        '$installer = Get-Item -LiteralPath $installerPath',
+        '$installer.Length -ne [int64]$env:INNO_INSTALLER_SIZE',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath',
+        '$installerHash -cne $env:INNO_INSTALLER_SHA256',
+        '$signature = Get-AuthenticodeSignature -LiteralPath $installerPath',
+        'X509NameType]::SimpleName',
+        '$signature.Status -ne ''Valid''',
+        '$publisher -cne ''Pyrsys B.V.''',
         '$installArguments = @(',
+        '''/NOICONS''',
+        '''/CURRENTUSER''',
+        '''/PORTABLE=1''',
+        '''/TASKS=""''',
         $quotedDirectoryArgument,
         'Start-Process -FilePath $installerPath',
         '-ArgumentList $installArguments',
@@ -1055,8 +1078,8 @@ try {
     Assert-GpuReleasePolicyScriptContract $gpuReleasePolicyScript $testRoot
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
-        $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or
-        $workflow -notmatch "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0" -or
+        $workflow -notmatch "INNO_INSTALLER_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f" -or
+        $workflow -notmatch "INNO_COMPILER_SHA256: d06ebd38f38e3cee60a3c50cc45bd449d77e0bc6a5cabc607ea9886808e4de1a" -or
         $workflow -match "choco install innosetup" -or
         $workflow -notmatch "-PortableZipPath dist\\Scribe-windows-x64\.zip" -or
         $workflow -match "-RuntimeSource" -or
@@ -1294,27 +1317,36 @@ Set-StrictMode -Version Latest
         $workflow -notmatch '(?ms)name: Upload installer verification evidence\s+if: always\(\).*?name: windows-installer-verification-logs') {
         throw "Windows release workflow must pin Rust, exercise compiled installer contracts, and retain their logs."
     }
-    $innoProvenancePath = Join-Path $repositoryRoot 'installer\inno-setup-6.7.1-provenance.json'
+    $innoProvenancePath = Join-Path $repositoryRoot 'installer\inno-setup-7.1.0-provenance.json'
+    if (Test-Path -LiteralPath (Join-Path $repositoryRoot 'installer\inno-setup-6.7.1-provenance.json')) {
+        throw 'Obsolete Inno Setup 6.7.1 provenance must not remain beside the direct-official 7.1.0 record.'
+    }
     $innoProvenance = Get-Content -LiteralPath $innoProvenancePath -Raw | ConvertFrom-Json
-    if ($innoProvenance.schema_version -ne 1 -or
-        $innoProvenance.product_version -cne '6.7.1' -or
-        $innoProvenance.package_url -cne 'https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1' -or
-        $innoProvenance.package_size_bytes -ne 10017031 -or
-        $innoProvenance.package_sha256 -cne 'a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950' -or
-        $innoProvenance.embedded_installer_path -cne 'tools/innosetup-6.7.1.exe' -or
-        $innoProvenance.embedded_installer_size_bytes -ne 10619024 -or
-        $innoProvenance.embedded_installer_sha256 -cne '4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0' -or
+    Assert-ExactObjectProperties $innoProvenance @(
+        'schema_version', 'product', 'product_version', 'reviewed_utc_date',
+        'upstream_installer_url', 'installer_size_bytes', 'installer_sha256',
+        'compiler_relative_path', 'compiler_size_bytes', 'compiler_sha256',
+        'verification_method', 'trust_scope'
+    ) 'Inno Setup provenance'
+    if ($innoProvenance.schema_version -ne 2 -or
+        $innoProvenance.product -cne 'Inno Setup' -or
+        $innoProvenance.product_version -cne '7.1.0' -or
+        $innoProvenance.reviewed_utc_date -cne '2026-09-30' -or
+        $innoProvenance.upstream_installer_url -cne 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -or
+        $innoProvenance.installer_size_bytes -ne 14304168 -or
+        $innoProvenance.installer_sha256 -cne '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f' -or
         $innoProvenance.compiler_relative_path -cne 'ISCC.exe' -or
-        $innoProvenance.compiler_size_bytes -ne 1455248 -or
-        $innoProvenance.compiler_sha256 -cne 'eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb' -or
-        $innoProvenance.upstream_installer_url -cne 'https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe') {
+        $innoProvenance.compiler_size_bytes -ne 2135968 -or
+        $innoProvenance.compiler_sha256 -cne 'd06ebd38f38e3cee60a3c50cc45bd449d77e0bc6a5cabc607ea9886808e4de1a' -or
+        $innoProvenance.verification_method -cnotmatch 'Pyrsys B\.V\.' -or
+        $innoProvenance.verification_method -cnotmatch 'SetupArchitecture=x86' -or
+        $innoProvenance.trust_scope -cnotmatch 'do not independently reproduce upstream review') {
         throw "Inno Setup provenance must retain the reviewed source, version, sizes, and digests."
     }
     foreach ($pinnedInnoValue in @(
-        "INNO_NUPKG_SHA256: $($innoProvenance.package_sha256)",
-        "INNO_NUPKG_SIZE: '$($innoProvenance.package_size_bytes)'",
-        "INNO_INSTALLER_SHA256: $($innoProvenance.embedded_installer_sha256)",
-        "INNO_INSTALLER_SIZE: '$($innoProvenance.embedded_installer_size_bytes)'",
+        "INNO_INSTALLER_URL: $($innoProvenance.upstream_installer_url)",
+        "INNO_INSTALLER_SHA256: $($innoProvenance.installer_sha256)",
+        "INNO_INSTALLER_SIZE: '$($innoProvenance.installer_size_bytes)'",
         "INNO_COMPILER_SHA256: $($innoProvenance.compiler_sha256)",
         "INNO_COMPILER_SIZE: '$($innoProvenance.compiler_size_bytes)'"
     )) {
@@ -1333,6 +1365,70 @@ Set-StrictMode -Version Latest
             installer\scribe.iss
 '@
     foreach ($mutation in @(
+        @{
+            Name = 'missing installer size pin'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '$installer.Length -ne [int64]$env:INNO_INSTALLER_SIZE' '$false'
+            }
+        },
+        @{
+            Name = 'wrong installer hash source'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor 'Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath' 'Get-FileHash -Algorithm SHA256 -LiteralPath $installRoot'
+            }
+        },
+        @{
+            Name = 'missing installer Authenticode validation'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor '$signature = Get-AuthenticodeSignature -LiteralPath $installerPath' '$signature = $null'
+            }
+        },
+        @{
+            Name = 'wrong Authenticode publisher'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor '$publisher -cne ''Pyrsys B.V.''' '$publisher -cne ''Untrusted Publisher'''
+            }
+        },
+        @{
+            Name = 'missing no-icons installer flag'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor '''/NOICONS''' '''/ICONS'''
+            }
+        },
+        @{
+            Name = 'missing current-user installer flag'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor '''/CURRENTUSER''' '''/ALLUSERS'''
+            }
+        },
+        @{
+            Name = 'missing portable installer flag'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor '''/PORTABLE=1''' '''/PORTABLE=0'''
+            }
+        },
+        @{
+            Name = 'missing absent portable-root guard'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-ExactAfter $text $acquireStepAnchor 'if (Test-Path -LiteralPath $installRoot)' 'if ($false)'
+            }
+        },
         @{
             Name = 'missing installer wait'
             Expected = 'acquisition'
@@ -1388,6 +1484,7 @@ Set-StrictMode -Version Latest
         $installer -notmatch '#define StableAppIdGuid "8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A"' -or
         $installer -notmatch 'DefaultDirName=\{code:ResolveDefaultDir\}' -or
         $installer -notmatch '\{localappdata\}\\Programs\\Scribe' -or
+        $installer -notmatch 'SetupArchitecture=x86' -or
         $installer -notmatch 'AppId=\{code:ResolveAppId\}' -or
         $installer -notmatch "ReadBoundedToken\('SCRIBEVERIFY'\)" -or
         $installer -notmatch 'function PrepareToInstall' -or

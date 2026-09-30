@@ -78,9 +78,12 @@ directory. The normal builder's default installer-allowlist output is unchanged.
 
 `build-windows-frozen-test-installer.ps1` consumes a completed frozen bundle;
 it never invokes Cargo or rebuilds the desktop, CPU worker, model, or worker
-packs. It accepts only the repository-pinned Inno Setup provenance and rejects
-an `ISCC.exe` whose filename, size, or SHA-256 differs from that record. The
-builder validates the frozen record, exact CPU-worker bytes, bundle inventory,
+packs. It accepts only the repository-pinned Inno Setup 7.1.0 provenance and
+rejects an `ISCC.exe` whose filename, size, or SHA-256 differs from that
+record. The reviewed x64 compiler removes the previous source-path length
+ceiling; both installer templates explicitly select its x86 Setup output to
+preserve the current Win32 Pascal ABI. The builder validates the frozen record,
+exact CPU-worker bytes, bundle inventory,
 model manifest/model, legal files, PE imports, worker-pack layout, and all
 paths before copying to a private staging directory. It keeps read handles over
 the staged payload while Inno runs, validates staging and the original bundle
@@ -102,15 +105,25 @@ captured PR artifact to a later checkout.
 pwsh -NoProfile -File scripts/build-windows-frozen-test-installer.ps1 `
   -BundlePath C:\ScribeLocal\local-frozen-bundle `
   -FrozenCpuWorkerRecordPath C:\ScribeLocal\worker-freeze\windows-frozen-cpu-worker-record.json `
-  -InnoCompilerPath C:\Users\you\AppData\Local\ScribeDev\inno-6.7.1\ISCC.exe `
+  -InnoCompilerPath C:\Users\you\AppData\Local\ScribeDev\inno-7.1.0\ISCC.exe `
   -OutputDirectory C:\ScribeLocal\local-frozen-installer
 ```
 
 The compiler path is an input location, not a trust override: it must match
-`installer/inno-setup-6.7.1-provenance.json`. The builder rejects output that
+`installer/inno-setup-7.1.0-provenance.json`. The builder rejects output that
 already exists, overlaps an input or source root, has a stale sibling staging
 directory, or traverses a reparse point. It never overwrites or removes a
 caller-selected output.
+
+The local pre-use guard authenticates only the pinned `ISCC.exe` bytes; it does
+not inventory or authenticate every native file installed alongside the
+compiler. That upstream native-component review is separate from this local
+compiler-path validation.
+
+The frozen record remains bound to its captured source revision. Updating the
+Inno compiler does not rebind a previously captured frozen record, bundle, or
+installer output to a later checkout; create a new freeze and bundle whenever
+the source identity changes.
 
 The generated installer has a separate local-only AppId and an immutable,
 token-bound default location:
