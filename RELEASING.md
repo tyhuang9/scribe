@@ -38,162 +38,55 @@ include the complete staged payload, with both executables adjacent.
 The scripts download the exact pinned runtime/model sources and verify their
 sizes and SHA-256 values before they are staged.
 
-Every Stage 3 package contains `worker-pack-catalog.json` with an empty `packs`
-array. No CUDA, Vulkan, or Metal production pack is shipped. The release builder
-accepts future prebuilt, pre-signed roots through `-WorkerPackRoot`, but it runs
-the compiled production verifier before and after staging each root into
-`workers/packs/<pack-id>/<version>/<digest>/`. Because no production pack public
-key is provisioned yet, every non-empty declaration currently fails closed.
-Signing is not performed by repository release scripts. Future private signing
-material must remain inside a separately reviewed signer or HSM, must never be
-passed to source-checkout code, and must match a separately reviewed persistent
-public key.
+Local builds without GPU roots and ordinary CI runs without GPU artifact inputs
+remain CPU-only, with an empty `packs` array in `worker-pack-catalog.json`.
+The protected installer workflow includes GPU packs only when an exact, complete
+signed pair is supplied; a GPU-required release with missing inputs fails closed.
+The release builder accepts prebuilt roots through `-WorkerPackRoot` and runs
+the compiled verifier before and after staging each root into
+`workers/packs/<pack-id>/<version>/<digest>/`.
 
-`Promote Windows GPU worker packs` is the fail-closed contract for that future
-path. Run it manually from the default branch with `promote` enabled and a
-canonical pack version. The unprivileged builder produces exactly one prepared
-CUDA pack and one prepared Vulkan pack with no signatures, then uploads a
-one-day handoff artifact. The handoff binds repository/ref/source SHA, workflow
-ref, run ID and attempt, pack version, pinned toolchain-manifest SHA-256, both
-manifest and pack digests, and a release-set digest. GitHub's artifact upload
-returns an artifact ID and digest; the digest-pinned download action validates
-the transfer before the protected boundary, and the future privileged broker
-must bind both values as part of its authorization context.
+The shared project-owned Ed25519 public trust root is now provisioned as
+`scribe-pack-ed25519-20260929-v1` (the policy pins public-key SHA-256
+`0f4a6638632a5f8b81e9802738e31cc05ec46c31339274ed0bd210444c7672ad`). This
+bootstrap enables verification only: it does not configure the protected
+GitHub environment, reviewer, signer pins, or secret; trigger a signing run;
+sign an installer; publish a release; or enable Auto. No production signing
+run is claimed here.
 
-The serializable authority message is a canonical, path-free
-`PromotionIntent`. It includes the fixed `scribe-windows-gpu-production-v1`
-policy namespace and the complete provenance, artifact, digest, pack-version,
-minimum-security-epoch, and mandatory replay-rejection policy. Its identity is
-the domain-separated SHA-256 of those exact canonical bytes. Intake and local
-publication paths remain only in a non-serializable client invocation wrapper;
-changing either path cannot change replay identity. The legacy `--handoff-root`
-and `--output-root` flags remain accepted, but neither value may cross the
-future authority boundary. In the fixture, `--output-root` is only a local
-publication parent and the broker derives both `.staging-<release-set-digest>`
-and `<release-set-digest>` itself.
+Follow the [canonical Windows GPU pack signing guide](docs/WINDOWS_GPU_PACK_SIGNING.md)
+for the protected setup and exact commands. The selected path is:
 
-The protected job requires approval through the
-`windows-gpu-pack-signing` environment and a fresh
-`scribe-gpu-pack-signer-ephemeral` runner using Actions Runner 2.327.1 or later
-(required by the pinned Node 24 artifact action). It performs no checkout or
-compile, runs no repository script, and receives no raw private key. The
-independently installed executable is an unprivileged broker client, not a
-signer. Its digest is pinned in protected environment configuration and the
-workflow holds a read-only, no-write/delete handle from hashing through child
-exit. This narrows direct leaf-file replacement only: the standard .NET open
-does not provide `FILE_FLAG_OPEN_REPARSE_POINT`, pin ancestor handles, prove the
-installation DACL, or constrain import-time loader search. The client has no
-key, ledger, state path, configurable broker endpoint, or fixture mode. It
-connects only to `\\.\pipe\ScribeGpuPromotionBroker.v1`, authenticates the
-connected Session 0 server as the restricted LocalService
-`ScribeGpuPromotionBroker` service, and sends only the canonical path-free
-intent. A separately privileged Windows service or remote HSM broker must copy
-hostile input into broker-owned storage, enforce the approved toolchain,
-version, and security epoch, reject replay with independently durable state,
-sign and verify both packs, and publish only
-the complete CUDA+Vulkan pair plus a protected receipt. The
-resulting artifact is not activated or included in the normal release
-automatically.
+1. Dispatch `windows-gpu-pack-promotion.yml` on `main` with
+   `operation=prepare` and the immutable pack version. After the whole run
+   succeeds, dispatch it again on `main` with `operation=sign`, the completed
+   producer run ID and attempt, and its exact unsigned artifact ID. Unsigned
+   and signed pair artifacts are retained for seven days.
+2. Preflight and protected signing use an independently pinned GPU-free signer
+   bundle. The sign job runs on a fresh GitHub-hosted Windows runner and waits
+   for approval through the `windows-gpu-pack-signing` environment. The key is
+   supplied only to the trusted signer; the builder never receives it, and the
+   protected job does not check out, compile, or execute candidate code.
+3. The handoff, approval, and signed receipt bind the exact repository/ref/source
+   revision, workflow/run/attempt, artifact IDs and digests, pack version,
+   toolchain, manifests, signer pins, and policy. Mismatched, stale, partial,
+   or expired inputs fail closed.
+4. A signed pair is still only a candidate. Installer inclusion requires the
+   exact three GPU inputs to `release.yml`, the reviewed `gpu_packs_required`
+   policy, and complete pair re-verification. Start with `publish_release=false`
+   to validate the installer without creating a GitHub Release. Publication
+   remains a separately authorized action subject to the existing release gates.
+   Windows GPU Auto remains separately gated by offline qualification
+   evidence and its checked-in default-deny manifest.
 
-The independently locked `tools/windows-gpu-promotion-broker` workspace defines
-the exact intent/invocation schema, the fixed bounded transport, an SCM-only
-Windows service stub, and a test-only hostile-input state-machine
-proof. Its fixture implementation uses retained no-write/delete file handles,
-no-follow final opens, exact bounded inventories, a domain-separated signed
-receipt, a hash-chained reserve/ready/published ledger, and write-through atomic pair
-publication. The fixture seed and ledger code are compiled only under
-`cfg(test)` and are absent from the normal client artifact. Windows does not
-provide a stable handle-relative traversal API through Rust's standard library;
-because this proof cannot establish service ACLs or full NT handle-relative
-traversal, it is not production authority.
+Local diagnostic signing under exact approval grants no production signing,
+merge, release-publication, or Auto authority.
 
-The fixture receipt and ledger are schema/domain v2. Receipts embed the complete
-path-free intent plus its recomputed intent digest; ledger transitions bind only
-that digest and the validated release-set digest, with staging/output names
-derived during use and recovery. This test-only ledger is initialized fresh. A
-real v2 broker migration must preserve all earlier used-release reservations and
-security-epoch high-water marks; no production migration is implemented in this
-stage.
-
-The checked-in service transport is deliberately authority-free. The service
-refuses to listen unless SCM starts it as restricted LocalService with the exact
-service SID. Before creating its first pipe it verifies and snapshots the fixed
-Registry64 policy at
-`HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization`. That protected,
-SYSTEM-owned key contains exactly DWORD `SchemaVersion=1` and one canonical
-dedicated-account `AuthorizedClientSid`; its only ACEs are SYSTEM and
-Administrators full control plus service-SID read. The pipe DACL contains
-exactly service-SID generic-all and configured-client `0x00100183`.
-
-After a bounded request read, the service impersonates at
-`SecurityIdentification`, compares exact `TokenUser`, and reverts before decode
-or reply. Group membership and elevation do not authorize. It retains its first
-pipe handle across clients and timeouts and can return only correlated
-`NotProvisioned`. The client authenticates the server process and service token
-before writing, validates that result, and returns a correlated bounded
-acknowledgement before disconnect. Neither side serializes or accesses the
-handoff/output paths. Policy mutation applies only after service restart; a
-valid orphan SID can lock out all clients but cannot widen access.
-
-On a disposable elevated host, the create-new provisioner accepts an explicit
-canonical `S-1-5-21` account SID (RID 1000 or greater), never an account name:
-
-```powershell
-$nonceBytes = [byte[]]::new(32)
-[Security.Cryptography.RandomNumberGenerator]::Fill($nonceBytes)
-$nonce = [Convert]::ToHexString($nonceBytes).ToLowerInvariant()
-pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000' -InvocationNonce $nonce
-```
-
-It refuses broad, built-in, reserved, NetworkService/other service principals,
-the broker service SID, or any pre-existing policy and leaves interrupted work
-unusable via an incomplete marker. The final SYSTEM-owned protected descriptor
-is supplied atomically at key creation and verified before the first value
-write, so inherited writers have no pre-lockdown handle window. Every fixed
-64-bit ancestor is opened without following registry links and refused if an
-untrusted principal can mutate it; missing Scribe-specific ancestors are born
-with the same protected descriptor. Ancestor validation enumerates the complete
-raw DACL rather than projected `RegistryAccessRule` entries: non-qualified and
-non-Allow/Deny ACEs fail closed, denies remain non-granting, and raw Allow ACEs
-with no mutation bits remain acceptable. Every mutating raw Allow requires an
-exact trusted SID except for at most one standard explicit, non-callback
-`CommonAce` on the exact case-sensitive `SOFTWARE` root: AceType and qualifier
-AccessAllowed, SID `S-1-3-0`, mask `0x000f003f`, AceFlags exactly
-ContainerInherit, and no opaque bytes. It does not rewrite that root ACL. The
-exception does not apply to descendants, case/path variants, inherited,
-callback, object, or duplicate template ACEs, actual account principals, or any
-altered mask or flags; untrusted mutating forms still fail closed.
-The sole success output is a versioned JSON
-record bound to the caller's
-lowercase 32-byte correlation nonce. It reports only fixed ancestors whose
-create call returned `REG_CREATED_NEW_KEY`; the nonce is not secret or
-authorization material. Test automation validates that exact record before it
-claims cleanup ownership, then validates and deletes through the same no-follow
-`DELETE` handle with `NtDeleteKey` so path replacement cannot retarget cleanup.
-The provisioner captures the exact prior `SeRestorePrivilege` token state and
-restores it before removing the incomplete commit marker. The scope retains its
-token and captured state after any restore or handle-close failure. Its outer
-`finally` boundary retries a failed restoration and terminates the process with
-`Environment.FailFast` if the retry also fails, so dot-sourced use cannot return
-to a long-lived elevated host with uncertain privilege state. A successful
-retry preserves the original provisioning exception, and success output occurs
-only after restoration and token closure succeed. Test cleanup relinquishes each policy/ancestor ownership
-entry immediately after its exact delete succeeds and before checking whether a
-same-name path has reappeared.
-Policy provisioning does not provision a key, trust root, ledger, signer, pack
-intake/publication, or activation.
-Production service installation is not part of the application installer, the
-`SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED` gate remains closed, and an
-endpoint or policy path supplied by CLI/environment is never accepted. The
-protected runner separately compares its current SID with
-`SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID`, but the service policy remains the
-authorization authority.
-
-This path is currently a NO-GO: `ProductionTrustRoot`, the privileged broker or
-HSM, its independently durable epoch/replay authority, and the CUDA production
-inventory are not provisioned. The protected job checks that state and stops
-before invoking the client, so a failed run cannot access broker or signing
-authority. Validate the fixture and transport contracts locally with:
+The previous `tools/windows-gpu-promotion-broker` implementation and
+fixture-only `scripts/promote-windows-gpu-worker-packs.ps1` path are
+regression fixtures only. Do not provision them or treat their service,
+ledger, receipt, or output as production authority. Their existing contract
+checks are:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
@@ -223,11 +116,11 @@ process indexes. Enumeration index `0` is never persisted as identity.
 A future hardware decision is non-authoritative until its exact reviewed plan
 and capture public key are approved, a protected capture signer and nonce
 ledger exist, its projected runtime bucket has representative coverage, its
-Auto entries are separately reviewed and checked in one-for-one, and production
-pack trust/signing is provisioned. Those protected capture services are not
-built in this stage, so real production qualification remains a NO-GO. Do not
-treat fixture output, a one-machine projection, or successful explicit-GPU
-smoke as release qualification.
+Auto entries are separately reviewed and checked in one-for-one, and protected
+production pack signing has completed successfully. Those protected capture
+services are not built in this stage, so real production qualification remains
+a NO-GO. Do not treat fixture output, a one-machine projection, or successful
+explicit-GPU smoke as release qualification.
 
 ## Publish a version from a tag
 
@@ -342,9 +235,10 @@ until a real code-signing identity and secret-management process are approved.
 - **Installer payload verification fails:** rebuild the staged `dist\portable`
   directory; the installer must include every item from `bundle-inventory.json`.
 - **A declared GPU worker pack is rejected:** do not bypass verification or add
-  a fixture key to production. Confirm the pack was externally signed by a
-  provisioned production key, then review its canonical manifest, detached
-  signature, target/build compatibility, and complete payload inventory.
+  a fixture key to production. Confirm the pack was signed through the approved
+  signing path by a provisioned project pack key, then review its canonical
+  manifest, detached signature, target/build compatibility, and complete payload
+  inventory.
 - **Manual publication is skipped:** rerun from the repository default branch
   and explicitly enable `publish_release`; disabled dispatches only validate.
 - **Tag or release already exists:** do not overwrite it. Confirm the existing
@@ -389,7 +283,9 @@ bash scripts/sign-notarize-macos-release.sh \
 
 Do not use `codesign --deep`. A Metal pack manifest is generated from the final
 Developer-ID-signed worker bytes and must be signed by a separately reviewed
-Ed25519 production key matching the desktop trust root. There is no provisioned
-production key or qualification evidence in this repository, so an ordinary
-release must retain the canonical empty catalog and Auto remains CPU-only.
+Ed25519 production key matching the shared desktop trust root. The shared public
+trust root is provisioned, but macOS signing, pack release authority, and Metal
+qualification remain separately gated; `gpu-pack-release-authority-macos-empty.json`
+is still empty, so an ordinary release must retain the canonical empty catalog
+and Auto remains CPU-only.
 No macOS artifact is added to the existing Windows release publication contract.
