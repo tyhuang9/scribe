@@ -3479,8 +3479,15 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
         "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
         "dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e",
-        "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
-        "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+        "INNO_INSTALLER_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe",
+        "INNO_INSTALLER_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
+        "INNO_COMPILER_SHA256: d06ebd38f38e3cee60a3c50cc45bd449d77e0bc6a5cabc607ea9886808e4de1a",
+        "Get-AuthenticodeSignature -LiteralPath $installerPath",
+        "X509NameType]::SimpleName",
+        "Pyrsys B.V.",
+        "'/PORTABLE=1'",
+        "'/TASKS=\"\"'",
+        "Pinned Inno Setup portable root must be absent before acquisition",
         "-ExerciseStableUpgrade",
         "-EvidenceDirectory dist\\installer-verification-logs",
         "name: windows-installer-verification-logs",
@@ -3517,6 +3524,20 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         !workflow.contains("choco install innosetup"),
         "Inno Setup acquisition must not trust a mutable network-only Chocolatey install"
     );
+    let inno_acquire_start = workflow
+        .find("      - name: Acquire digest-pinned Inno Setup")
+        .expect("Inno Setup acquisition step must exist");
+    let inno_acquire_end = workflow[inno_acquire_start..]
+        .find("      - name: Build and normalize Windows installer")
+        .map(|offset| inno_acquire_start + offset)
+        .expect("Inno Setup compiler build step must follow acquisition");
+    let inno_acquire = &workflow[inno_acquire_start..inno_acquire_end];
+    assert!(
+        !inno_acquire.contains("INNO_NUPKG_")
+            && !inno_acquire.contains("community.chocolatey.org")
+            && !inno_acquire.contains("Expand-Archive"),
+        "Inno Setup acquisition must not retain Chocolatey package-wrapper provenance"
+    );
     assert!(
         !workflow.contains("Copy-Item target\\release\\local-transcriber.exe"),
         "Windows release workflow must not publish a bare executable"
@@ -3525,23 +3546,45 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let inno_provenance = fs::read_to_string(
         repository
             .join("installer")
-            .join("inno-setup-6.7.1-provenance.json"),
+            .join("inno-setup-7.1.0-provenance.json"),
     )
     .expect("Inno Setup provenance must be readable");
     for required in [
-        "\"product_version\": \"6.7.1\"",
-        "https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1",
-        "\"package_size_bytes\": 10017031",
-        "a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
-        "\"embedded_installer_path\": \"tools/innosetup-6.7.1.exe\"",
-        "\"embedded_installer_size_bytes\": 10619024",
-        "4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
-        "https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe",
-        "do not independently prove publisher identity",
+        "\"schema_version\": 2",
+        "\"product_version\": \"7.1.0\"",
+        "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe",
+        "\"installer_size_bytes\": 14304168",
+        "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
+        "\"compiler_size_bytes\": 2135968",
+        "d06ebd38f38e3cee60a3c50cc45bd449d77e0bc6a5cabc607ea9886808e4de1a",
+        "Pyrsys B.V.",
+        "SetupArchitecture=x86",
+        "do not independently reproduce upstream review",
     ] {
         assert!(
             inno_provenance.contains(required),
             "Inno Setup provenance must retain {required}"
+        );
+    }
+    assert!(
+        !repository
+            .join("installer")
+            .join("inno-setup-6.7.1-provenance.json")
+            .exists(),
+        "obsolete Inno Setup provenance must not remain beside the direct-official record"
+    );
+    for forbidden in [
+        "\"package_url\"",
+        "\"package_size_bytes\"",
+        "\"package_sha256\"",
+        "\"embedded_installer_path\"",
+        "\"embedded_installer_size_bytes\"",
+        "\"embedded_installer_sha256\"",
+        "\"embedded_package_verification_path\"",
+    ] {
+        assert!(
+            !inno_provenance.contains(forbidden),
+            "Inno Setup provenance must not retain obsolete package-wrapper field {forbidden}"
         );
     }
 
@@ -3555,6 +3598,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && installer.contains("StableAppIdGuid \"8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A\"")
             && installer.contains("DefaultDirName={code:ResolveDefaultDir}")
             && installer.contains("{localappdata}\\Programs\\Scribe")
+            && installer.contains("SetupArchitecture=x86")
             && installer.contains("AppId={code:ResolveAppId}")
             && installer.contains("ReadBoundedToken('SCRIBEVERIFY')")
             && installer.contains("function PrepareToInstall")
@@ -3594,6 +3638,15 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         installer.matches("GetFileAttributesW(").count(),
         2,
         "every installer attribute query must use the fail-closed error-classifying helper"
+    );
+    let local_frozen_installer =
+        fs::read_to_string(repository.join("installer").join("scribe-local-frozen.iss"))
+            .expect("local frozen installer script must be readable");
+    assert!(
+        local_frozen_installer.contains("SetupArchitecture=x86")
+            && local_frozen_installer.contains("ArchitecturesInstallIn64BitMode=x64compatible")
+            && local_frozen_installer.contains("ArchitecturesAllowed=x64compatible"),
+        "both installer templates must preserve the x64 payload contract with an explicit x86 Setup output"
     );
     let directory_probe_start = installer
         .find("function BindDirectory")

@@ -26,6 +26,7 @@ OutputBaseFilename=Scribe-Setup-{#AppVersion}
 Compression=lzma2
 CreateUninstallRegKey=IsNormalInstall
 SolidCompression=yes
+SetupArchitecture=x86
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#AppExeName}

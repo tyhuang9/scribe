@@ -497,45 +497,51 @@ jobs:
 
       - name: Acquire digest-pinned Inno Setup
         shell: pwsh
-        # Reviewed source, size, digest, embedded-installer digest, and trust
-        # scope are recorded in installer/inno-setup-6.7.1-provenance.json.
+        # Reviewed source, size, digest, publisher check, and trust scope are
+        # recorded in installer/inno-setup-7.1.0-provenance.json.
         env:
-          INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950
-          INNO_NUPKG_SIZE: '10017031'
-          INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0
-          INNO_INSTALLER_SIZE: '10619024'
-          INNO_COMPILER_SHA256: eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb
-          INNO_COMPILER_SIZE: '1455248'
+          INNO_INSTALLER_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
+          INNO_INSTALLER_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+          INNO_INSTALLER_SIZE: '14304168'
+          INNO_COMPILER_SHA256: d06ebd38f38e3cee60a3c50cc45bd449d77e0bc6a5cabc607ea9886808e4de1a
+          INNO_COMPILER_SIZE: '2135968'
         run: |
-          $packageRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-package'
-          $installRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-setup'
-          $packagePath = Join-Path $packageRoot 'InnoSetup.6.7.1.nupkg'
-          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          $toolRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-setup-7.1.0'
+          $installRoot = Join-Path $toolRoot 'portable'
+          $installerPath = Join-Path $toolRoot 'innosetup-7.1.0-x64.exe'
+          if (Test-Path -LiteralPath $toolRoot) {
+            throw "Pinned Inno Setup tool root must be absent before acquisition: $toolRoot"
+          }
+          if (Test-Path -LiteralPath $installRoot) {
+            throw "Pinned Inno Setup portable root must be absent before acquisition: $installRoot"
+          }
+          New-Item -ItemType Directory -Path $toolRoot | Out-Null
           curl.exe --fail --location --retry 3 --retry-delay 2 `
-            --output $packagePath `
-            'https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1'
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to download InnoSetup.6.7.1.nupkg' }
-          $package = Get-Item -LiteralPath $packagePath
-          if ($package.Length -ne [int64]$env:INNO_NUPKG_SIZE) {
-            throw "Unexpected Inno Setup nupkg size: $($package.Length)"
-          }
-          $packageHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagePath).Hash.ToLowerInvariant()
-          if ($packageHash -cne $env:INNO_NUPKG_SHA256) {
-            throw "Unexpected Inno Setup nupkg SHA-256: $packageHash"
-          }
-          $expandedRoot = Join-Path $packageRoot 'expanded'
-          Expand-Archive -LiteralPath $packagePath -DestinationPath $expandedRoot
-          $installerPath = Join-Path $expandedRoot 'tools\innosetup-6.7.1.exe'
+            --output $installerPath `
+            $env:INNO_INSTALLER_URL
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the pinned Inno Setup installer.' }
           $installer = Get-Item -LiteralPath $installerPath
           if ($installer.Length -ne [int64]$env:INNO_INSTALLER_SIZE) {
-            throw "Unexpected embedded Inno Setup installer size: $($installer.Length)"
+            throw "Unexpected Inno Setup installer size: $($installer.Length)"
           }
           $installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash.ToLowerInvariant()
           if ($installerHash -cne $env:INNO_INSTALLER_SHA256) {
-            throw "Unexpected embedded Inno Setup installer SHA-256: $installerHash"
+            throw "Unexpected Inno Setup installer SHA-256: $installerHash"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+          $publisher = if ($null -eq $signature.SignerCertificate) {
+            $null
+          } else {
+            $signature.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false
+            )
+          }
+          if ($signature.Status -ne 'Valid' -or $publisher -cne 'Pyrsys B.V.') {
+            throw "Pinned Inno Setup installer Authenticode validation failed: status=$($signature.Status), publisher=$publisher"
           }
           $installArguments = @(
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', '/CURRENTUSER',
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', '/CURRENTUSER', '/PORTABLE=1', '/TASKS=""',
             ('"/DIR={0}"' -f $installRoot)
           )
           $installProcess = Start-Process -FilePath $installerPath `

@@ -28,19 +28,20 @@ function Assert-WindowsLocalFrozenInnoCompiler(
     }
     Assert-WindowsLocalFrozenExactProperties $value @(
         'schema_version', 'product', 'product_version', 'reviewed_utc_date',
-        'package_url', 'package_size_bytes', 'package_sha256',
-        'embedded_installer_path', 'embedded_installer_size_bytes',
-        'embedded_installer_sha256', 'compiler_relative_path',
-        'compiler_size_bytes', 'compiler_sha256',
-        'embedded_package_verification_path', 'upstream_installer_url',
+        'upstream_installer_url', 'installer_size_bytes', 'installer_sha256',
+        'compiler_relative_path', 'compiler_size_bytes', 'compiler_sha256',
         'verification_method', 'trust_scope'
     ) 'Pinned Inno Setup provenance'
     if ((($value.schema_version -isnot [int64] -and $value.schema_version -isnot [int32]) -or
-        [int]$value.schema_version -ne 1 -or
-        $value.product -cne 'Inno Setup' -or $value.product_version -cne '6.7.1' -or
+        [int]$value.schema_version -ne 2 -or
+        $value.product -cne 'Inno Setup' -or $value.product_version -cne '7.1.0' -or
+        $value.reviewed_utc_date -cne '2026-09-30' -or
+        $value.upstream_installer_url -cne 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -or
+        (Assert-WindowsLocalFrozenInt64 $value.installer_size_bytes 'Pinned Inno Setup installer size') -ne 14304168 -or
+        $value.installer_sha256 -cne '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f' -or
         $value.compiler_relative_path -cne 'ISCC.exe' -or
         $value.compiler_sha256 -isnot [string] -or $value.compiler_sha256 -cnotmatch '^[0-9a-f]{64}$')) {
-        throw 'Pinned Inno Setup provenance does not describe the reviewed 6.7.1 compiler.'
+        throw 'Pinned Inno Setup provenance does not describe the reviewed 7.1.0 compiler.'
     }
     $compiler = Get-WindowsLocalFrozenNormalizedFullPath $Path
     if ((Split-Path -Leaf $compiler) -cne $value.compiler_relative_path) {
@@ -180,7 +181,7 @@ function New-WindowsLocalFrozenInstallerRecord(
 Assert-WindowsFrozenCpuWorkerLocalOnlyEnvironment
 $repositoryRoot = Get-WindowsLocalFrozenNormalizedFullPath (Split-Path -Parent $PSScriptRoot)
 $templatePath = Join-Path $repositoryRoot 'installer\scribe-local-frozen.iss'
-$provenance = Join-Path $repositoryRoot 'installer\inno-setup-6.7.1-provenance.json'
+$provenance = Join-Path $repositoryRoot 'installer\inno-setup-7.1.0-provenance.json'
 $null = Assert-WindowsFrozenCpuWorkerRegularFile $templatePath
 $compiler = Assert-WindowsLocalFrozenInnoCompiler $InnoCompilerPath $provenance
 $frozenCpuWorker = $null
