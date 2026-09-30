@@ -87,13 +87,97 @@ function Assert-WindowsFrozenCpuWorkerNoReparseAncestors([string]$Path) {
     }
 }
 
-function Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams([string]$Path) {
-    $full = Get-WindowsFrozenCpuWorkerNormalizedFullPath $Path
-    $root = [System.IO.Path]::GetPathRoot($full)
-    if ($full.Substring($root.Length).Contains(':')) {
+function Test-WindowsFrozenCpuWorkerSafeStreamPathComponent([string]$Component) {
+    if ([string]::IsNullOrEmpty($Component) -or $Component -ceq '.' -or $Component -ceq '..' -or
+        $Component.EndsWith(' ') -or $Component.EndsWith('.') -or
+        $Component -match '[\x00-\x1f"*:<>?|]') {
+        return $false
+    }
+    $stem = $Component.Split('.')[0].TrimEnd(' ').ToUpperInvariant()
+    return $stem -notmatch '^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]|CONIN\$|CONOUT\$)$'
+}
+
+function ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.IndexOf([char]0) -ge 0) {
+        throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+    }
+
+    # Do not call GetFullPath here: it can normalize ordinary dotted or
+    # space-suffixed components to a different physical object before stream
+    # enumeration. Explicit verbatim paths retain their caller-supplied identity.
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {
+        if ($Path.Contains('/')) {
+            throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+        }
+        $suffix = $Path.Substring(4)
+        if ($suffix.Length -ge 3 -and $suffix[0] -match '^[A-Za-z]$' -and
+            $suffix[1] -eq ':' -and $suffix[2] -eq '\') {
+            if ($suffix.Substring(2).Contains(':')) {
+                throw "Frozen CPU worker paths cannot name an alternate data stream: $Path"
+            }
+            return $Path
+        }
+        if ($suffix.StartsWith('UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($suffix.Contains(':')) {
+                throw "Frozen CPU worker paths cannot name an alternate data stream: $Path"
+            }
+            $parts = @($suffix.Substring(4).Split('\'))
+            if ($parts.Count -lt 2 -or
+                -not (Test-WindowsFrozenCpuWorkerSafeStreamPathComponent $parts[0]) -or
+                $parts[0] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$' -or
+                $parts[0].Contains('..') -or
+                -not (Test-WindowsFrozenCpuWorkerSafeStreamPathComponent $parts[1])) {
+                throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+            }
+            return $Path
+        }
+        throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+    }
+
+    if ($Path.StartsWith('\\', [System.StringComparison]::Ordinal)) {
+        if ($Path.StartsWith('\\.\', [System.StringComparison]::Ordinal)) {
+            throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+        }
+        $suffix = $Path.Substring(2)
+        if ($suffix.Contains(':')) {
+            throw "Frozen CPU worker paths cannot name an alternate data stream: $Path"
+        }
+        $parts = @($suffix -split '[\\/]')
+        if ($parts.Count -lt 2 -or
+            -not (Test-WindowsFrozenCpuWorkerSafeStreamPathComponent $parts[0]) -or
+            $parts[0] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$' -or
+            $parts[0].Contains('..') -or
+            -not (Test-WindowsFrozenCpuWorkerSafeStreamPathComponent $parts[1])) {
+            throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+        }
+        foreach ($component in @($parts | Select-Object -Skip 2)) {
+            if (-not (Test-WindowsFrozenCpuWorkerSafeStreamPathComponent $component)) {
+                throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+            }
+        }
+        return "\\?\UNC\$($parts -join '\')"
+    }
+
+    if ($Path.Length -lt 3 -or $Path[0] -notmatch '^[A-Za-z]$' -or $Path[1] -ne ':' -or
+        ($Path[2] -ne '\' -and $Path[2] -ne '/')) {
+        throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+    }
+    $suffix = $Path.Substring(3)
+    if ($suffix.Contains(':')) {
         throw "Frozen CPU worker paths cannot name an alternate data stream: $Path"
     }
-    $streams = @(Get-Item -LiteralPath $full -Stream * -ErrorAction Stop)
+    $parts = if ($suffix.Length -eq 0) { @() } else { @($suffix -split '[\\/]') }
+    foreach ($component in $parts) {
+        if (-not (Test-WindowsFrozenCpuWorkerSafeStreamPathComponent $component)) {
+            throw "Frozen CPU worker paths must use a safe absolute Windows stream-enumeration path: $Path"
+        }
+    }
+    return "\\?\$($Path[0]):\$($parts -join '\')"
+}
+
+function Assert-WindowsFrozenCpuWorkerNoAlternateDataStreams([string]$Path) {
+    $streamPath = ConvertTo-WindowsFrozenCpuWorkerStreamEnumerationPath $Path
+    $streams = @(Get-Item -LiteralPath $streamPath -Stream * -ErrorAction Stop)
     foreach ($stream in $streams) {
         if ($stream.Stream -cne ':$DATA') {
             throw "Frozen CPU worker inputs cannot contain an alternate data stream: $Path"
