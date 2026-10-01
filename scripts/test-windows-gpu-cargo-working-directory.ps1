@@ -27,6 +27,7 @@ $bootstrapScript = Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.p
 $builderScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
 $runnerScript = Join-Path $PSScriptRoot 'run-windows-vulkan-evidence.ps1'
 . $bootstrapScript
+. (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1')
 
 $builderTokens = $null
 $builderParseErrors = $null
@@ -73,6 +74,30 @@ Assert-True (
         $Ast.Extent.Text.Contains('-WorkingDirectory $repositoryRoot')
     }, $true)).Count -eq 2
 ) 'Both evidence Cargo attempts must use the verified repository-root working directory.'
+$runnerLiveEvidenceFunctions = @($runnerAst.FindAll({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Invoke-ScribeEvidence'
+}, $true))
+Assert-True ($runnerLiveEvidenceFunctions.Count -eq 1) 'Windows Vulkan evidence runner has an ambiguous live evidence process helper.'
+$runnerLiveEvidenceFunction = $runnerLiveEvidenceFunctions[0]
+Assert-True (
+    $runnerLiveEvidenceFunction.Extent.Text.Contains('Get-ScribeEvidencePhysicalDirectory') -and
+    $runnerLiveEvidenceFunction.Extent.Text.Contains('RedirectStandardOutput = $true') -and
+    $runnerLiveEvidenceFunction.Extent.Text.Contains('RedirectStandardError = $true') -and
+    $runnerLiveEvidenceFunction.Extent.Text.Contains('BaseStream.CopyToAsync([Console]::OpenStandardOutput())') -and
+    $runnerLiveEvidenceFunction.Extent.Text.Contains('BaseStream.CopyToAsync([Console]::OpenStandardError())') -and
+    $runnerLiveEvidenceFunction.Extent.Text.Contains('$process.WaitForExit()') -and
+    -not $runnerLiveEvidenceFunction.Extent.Text.Contains('Invoke-ScribeGpuWorkerBoundedNativeProcess')
+) 'Live evidence process helper must forward both streams without bounded capture or retry plumbing.'
+Assert-True (
+    @($runnerAst.FindAll({
+        param($Ast)
+        $Ast -is [System.Management.Automation.Language.CommandAst] -and
+        $Ast.GetCommandName() -ceq 'Invoke-ScribeEvidence' -and
+        $Ast.Extent.Text.Contains('-WorkingDirectory $repositoryRoot')
+    }, $true)).Count -eq 1
+) 'The exact ignored evidence test is not structurally bound to the verified repository-root working directory.'
 
 # Evaluate only the actual retry function extracted above. This avoids running
 # the evidence runner or its GPU/SDK preflight while exercising its real retry
@@ -82,6 +107,8 @@ Invoke-Expression $runnerRetryFunction.Extent.Text
 $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-cargo-working-directory-$([guid]::NewGuid().ToString('N'))"
 $previousPowerShellLocation = (Get-Location).Path
 $previousDotNetDirectory = [Environment]::CurrentDirectory
+$previousLastExitCode = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+$previousLastExitCodeValue = if ($null -ne $previousLastExitCode) { $previousLastExitCode.Value } else { $null }
 $environmentNames = @(
     'SCRIBE_GPU_CARGO_WD_RECORD',
     'SCRIBE_GPU_CARGO_WD_COUNTER',
@@ -108,7 +135,7 @@ try {
 
     $child = Join-Path $fixtureRoot 'fake-cargo.ps1'
     [IO.File]::WriteAllText($child, @'
-param([switch]$RequireSourceSentinel, [switch]$RetryContract)
+param([switch]$RequireSourceSentinel, [switch]$RetryContract, [switch]$FailLiveEvidence, [switch]$WriteLiveDiagnostics)
 $cwd = (Get-Location).Path.TrimEnd([char[]]@('\', '/'))
 $sentinel = Join-Path $cwd 'source-relative-sentinel.txt'
 if ($RequireSourceSentinel -and -not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {
@@ -117,6 +144,14 @@ if ($RequireSourceSentinel -and -not (Test-Path -LiteralPath $sentinel -PathType
 }
 $sentinelValue = if ($RequireSourceSentinel) { [IO.File]::ReadAllText($sentinel) } else { 'omitted' }
 [IO.File]::AppendAllText($env:SCRIBE_GPU_CARGO_WD_RECORD, ("{0}|{1}" -f $cwd, $sentinelValue) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+if ($WriteLiveDiagnostics) {
+    [Console]::Out.WriteLine('live evidence stdout streaming sentinel')
+    [Console]::Error.WriteLine('live evidence stderr streaming sentinel')
+}
+if ($FailLiveEvidence) {
+    [Console]::Error.WriteLine('live evidence child diagnostic')
+    exit 73
+}
 if (-not $RetryContract) { exit 0 }
 $attempt = 0
 if (Test-Path -LiteralPath $env:SCRIBE_GPU_CARGO_WD_COUNTER -PathType Leaf) {
@@ -216,6 +251,89 @@ exit 0
     ) 'Actual builder native-process wrapper changed omitted working-directory inheritance.'
     $env:SCRIBE_GPU_CARGO_WD_RECORD = $directRecord
 
+    $liveEvidenceRecord = Join-Path $fixtureRoot 'live-evidence-record.txt'
+    $env:SCRIBE_GPU_CARGO_WD_RECORD = $liveEvidenceRecord
+    & {
+        param(
+            [string]$HelperSource,
+            [string]$Executable,
+            [string]$Child,
+            [string]$Source,
+            [string]$ExpectedPowerShell,
+            [string]$ExpectedDotNet
+        )
+        # Like the builder wrapper test above, this executes only the exact
+        # AST-extracted runner helper against the real trusted path validator.
+        Invoke-Expression $HelperSource
+        Invoke-ScribeEvidence `
+            $Executable `
+            @('-NoProfile', '-File', $Child, '-RequireSourceSentinel', '-WriteLiveDiagnostics') `
+            'Live evidence success child failed.' `
+            -WorkingDirectory $Source
+        Assert-True ($global:LASTEXITCODE -eq 0) 'Live evidence helper did not retain the direct native success exit code.'
+        Assert-CallerLocations $ExpectedPowerShell $ExpectedDotNet
+        $failure = $null
+        try {
+            Invoke-ScribeEvidence `
+                $Executable `
+                @('-NoProfile', '-File', $Child, '-RequireSourceSentinel', '-FailLiveEvidence') `
+                'Live evidence failure child failed.' `
+                -WorkingDirectory $Source
+        }
+        catch {
+            $failure = $_.Exception
+        }
+        Assert-True (
+            $null -ne $failure -and
+            $failure.Message -ceq 'Live evidence failure child failed.' -and
+            -not $failure.Message.Contains('live evidence child diagnostic')
+        ) 'Live evidence nonzero exit did not retain its clear sanitized failure.'
+        Assert-True ($global:LASTEXITCODE -eq 73) 'Live evidence helper did not retain the direct native nonzero exit code.'
+        Assert-CallerLocations $ExpectedPowerShell $ExpectedDotNet
+    } $runnerLiveEvidenceFunction.Extent.Text `
+        $pwsh `
+        $child `
+        $source `
+        $expectedPowerShellLocation `
+        $expectedDotNetDirectory
+    Assert-CallerLocations $expectedPowerShellLocation $expectedDotNetDirectory
+    $liveEvidenceLines = @(Get-RecordLines $liveEvidenceRecord)
+    $expectedLiveEvidenceLine = (Get-Item -LiteralPath $source -Force).FullName.TrimEnd([char[]]@('\', '/')) + '|source-relative-sentinel'
+    Assert-True (
+        $liveEvidenceLines.Count -eq 2 -and
+        @($liveEvidenceLines | Where-Object { $_ -cne $expectedLiveEvidenceLine }).Count -eq 0
+    ) 'Actual live evidence helper did not start both source-bound children or preserve their relative sentinel access.'
+
+    # A non-console host catches lost inherited handles: capture only this
+    # harmless outer host, while its actual live helper forwards both streams.
+    $liveHost = Join-Path $fixtureRoot 'live-evidence-host.ps1'
+    [IO.File]::WriteAllText($liveHost, @'
+param([string]$Preflight, [string]$HelperSource, [string]$Executable, [string]$Child, [string]$Source)
+. $Preflight
+Invoke-Expression $HelperSource
+Invoke-ScribeEvidence $Executable @('-NoProfile', '-File', $Child, '-RequireSourceSentinel', '-WriteLiveDiagnostics') 'Nested live evidence failed.' -WorkingDirectory $Source
+'@, [Text.UTF8Encoding]::new($false))
+    $liveStreams = Invoke-ScribeGpuWorkerBoundedNativeProcess `
+        $pwsh `
+        @(
+            '-NoProfile', '-File', $liveHost,
+            '-Preflight', (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1'),
+            '-HelperSource', $runnerLiveEvidenceFunction.Extent.Text,
+            '-Executable', $pwsh, '-Child', $child, '-Source', $source
+        ) `
+        'Live evidence stream-forwarding host failed.'
+    Assert-True (
+        $liveStreams.Stdout.Trim() -ceq 'live evidence stdout streaming sentinel' -and
+        $liveStreams.Stderr.Trim() -ceq 'live evidence stderr streaming sentinel'
+    ) 'Live evidence lost or combined stdout/stderr in a non-console host.'
+    $liveEvidenceLines = @(Get-RecordLines $liveEvidenceRecord)
+    Assert-True (
+        $liveEvidenceLines.Count -eq 3 -and
+        $liveEvidenceLines[2] -ceq $expectedLiveEvidenceLine
+    ) 'Nested live evidence stream test did not use the source working directory.'
+    Assert-CallerLocations $expectedPowerShellLocation $expectedDotNetDirectory
+    $env:SCRIBE_GPU_CARGO_WD_RECORD = $directRecord
+
     $fileWorkingDirectory = Join-Path $fixtureRoot 'not-a-directory.txt'
     [IO.File]::WriteAllText($fileWorkingDirectory, 'not a directory', [Text.UTF8Encoding]::new($false))
     $junctionWorkingDirectory = Join-Path $fixtureRoot 'source-junction'
@@ -254,6 +372,43 @@ exit 0
         Assert-True (@(Get-RecordLines $directRecord).Count -eq $before) "Explicit $($invalid.Label) working directory launched the child before rejection."
         Assert-CallerLocations $expectedPowerShellLocation $expectedDotNetDirectory
     }
+
+    & {
+        param(
+            [string]$HelperSource,
+            [object[]]$InvalidDirectories,
+            [string]$Executable,
+            [string]$Child,
+            [string]$Record,
+            [string]$ExpectedPowerShell,
+            [string]$ExpectedDotNet
+        )
+        Invoke-Expression $HelperSource
+        foreach ($invalid in $InvalidDirectories) {
+            $before = @(Get-RecordLines $Record).Count
+            $rejected = $false
+            try {
+                # No source sentinel: any accidental launch must record itself.
+                Invoke-ScribeEvidence `
+                    $Executable `
+                    @('-NoProfile', '-File', $Child) `
+                    'Invalid live evidence working directory unexpectedly started.' `
+                    -WorkingDirectory $invalid.Value
+            }
+            catch {
+                $rejected = $true
+            }
+            Assert-True $rejected "Live evidence accepted an explicit $($invalid.Label) working directory."
+            Assert-True (@(Get-RecordLines $Record).Count -eq $before) "Live evidence launched a child before rejecting its $($invalid.Label) working directory."
+            Assert-CallerLocations $ExpectedPowerShell $ExpectedDotNet
+        }
+    } $runnerLiveEvidenceFunction.Extent.Text `
+        $invalidWorkingDirectories `
+        $pwsh `
+        $child `
+        $directRecord `
+        $expectedPowerShellLocation `
+        $expectedDotNetDirectory
 
     $crateHash = '0123456789abcdef'
     $outDirectory = Join-Path $target "release\build\transcribe-cpp-sys-$crateHash\out"
@@ -310,6 +465,12 @@ exit 0
 finally {
     Set-Location $previousPowerShellLocation
     [Environment]::CurrentDirectory = $previousDotNetDirectory
+    if ($null -eq $previousLastExitCode) {
+        Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    }
+    else {
+        $global:LASTEXITCODE = $previousLastExitCodeValue
+    }
     foreach ($name in $environmentNames) {
         [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process')
     }
