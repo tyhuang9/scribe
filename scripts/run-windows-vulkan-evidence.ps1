@@ -227,7 +227,11 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
 
 function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]$Failure, [string]$CargoTarget, [string]$BuildEnvironment) {
     try {
-        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess $cargo $Arguments $Failure
+        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess `
+            $cargo `
+            $Arguments `
+            $Failure `
+            -WorkingDirectory $repositoryRoot
         return
     }
     catch {
@@ -241,7 +245,11 @@ function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]
     }
     Enable-ScribeEvidenceCmakeBootstrap $CargoTarget $BuildEnvironment
     try {
-        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess $cargo $Arguments "$Failure after validated CMake bootstrap retry."
+        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess `
+            $cargo `
+            $Arguments `
+            "$Failure after validated CMake bootstrap retry." `
+            -WorkingDirectory $repositoryRoot
     }
     catch {
         throw "$Failure after validated CMake bootstrap retry."

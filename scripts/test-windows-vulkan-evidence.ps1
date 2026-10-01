@@ -762,6 +762,12 @@ $retryRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-$([gui
 $previousState = $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
 try {
     New-Item -ItemType Directory -Path $retryRoot | Out-Null
+    # The extracted runner retry function now intentionally binds Cargo to a
+    # verified source root. This harness has no checkout, so use its isolated
+    # physical fixture root and prove the caller locations remain unchanged.
+    $repositoryRoot = $retryRoot
+    $callerPowerShellLocation = (Get-Location).Path
+    $callerDotNetDirectory = [Environment]::CurrentDirectory
     $cargoTarget = Join-Path $retryRoot 'target'
     $buildEnvironment = Join-Path $retryRoot 'environment'
     $wrongCargoTarget = Join-Path $retryRoot 'wrong-target'
@@ -792,6 +798,10 @@ exit 17
     Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' $cargoTarget $buildEnvironment
     if ($script:BootstrapCount -ne 1 -or -not (Test-Path -LiteralPath $state)) {
         throw 'Runner did not perform exactly one eligible high-volume split-stream retry.'
+    }
+    if ((Get-Location).Path -cne $callerPowerShellLocation -or
+        [Environment]::CurrentDirectory -cne $callerDotNetDirectory) {
+        throw 'Runner retry changed its caller working-directory state.'
     }
 
     foreach ($malformed in @(

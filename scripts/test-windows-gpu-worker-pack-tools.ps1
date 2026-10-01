@@ -725,6 +725,26 @@ $retryDiagnosticFunction = $builderAst.Find({
     $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
 }, $true)
 Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
+$nativeProcessParameterNames = @($nativeProcessFunction.Parameters | ForEach-Object {
+    $_.Name.VariablePath.UserPath
+})
+Assert-True ($nativeProcessParameterNames -contains 'WorkingDirectory') 'Builder native-process wrapper lost its optional working-directory parameter.'
+$builderCargoCalls = @($builderAst.FindAll({
+    param($Ast)
+    if ($Ast -isnot [System.Management.Automation.Language.CommandAst] -or
+        $Ast.GetCommandName() -cne 'Invoke-NativeProcess') {
+        return $false
+    }
+    return @($Ast.CommandElements | Where-Object {
+        $_.Extent.Text -ceq '$cargo'
+    }).Count -eq 1
+}, $true))
+Assert-True ($builderCargoCalls.Count -eq 3) 'Builder no longer has exactly the three source-bound Cargo invocations.'
+foreach ($builderCargoCall in $builderCargoCalls) {
+    Assert-True (
+        $builderCargoCall.Extent.Text.Contains('-WorkingDirectory $repositoryRoot')
+    ) 'A GPU worker Cargo invocation is not bound to the verified repository root.'
+}
 $captureOverflowOptIn = 'AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput'
 $captureOverflowOptInCalls = @($builderAst.FindAll({
     param($Ast)
@@ -758,19 +778,23 @@ function Invoke-WorkerBuildRetryHarness(
     [bool]$FailRetry,
     [string]$CargoTarget,
     [string]$BuildEnvironment,
-    [string]$HarnessSigningMode = 'Production'
+    [string]$HarnessSigningMode = 'Production',
+    [string]$RepositoryRoot = $CargoTarget
 ) {
     $state = [pscustomobject]@{
         NativeInvocations = 0
         JunctionInvocations = 0
+        WorkingDirectories = [System.Collections.Generic.List[string]]::new()
         Warnings = [System.Collections.Generic.List[string]]::new()
     }
     function Invoke-NativeProcess(
         [string]$Executable,
         [string[]]$Arguments,
-        [string]$FailureMessage
+        [string]$FailureMessage,
+        [string]$WorkingDirectory
     ) {
         $state.NativeInvocations += 1
+        $state.WorkingDirectories.Add($WorkingDirectory)
         if ($state.NativeInvocations -eq 1) {
             throw [ScribeGpuWorkerNativeProcessFailure]::new(
                 'synthetic initial worker build failure',
@@ -801,6 +825,7 @@ function Invoke-WorkerBuildRetryHarness(
     $SigningMode = $HarnessSigningMode
     $shortBuild = [pscustomobject]@{ BuildEnvironment = $BuildEnvironment }
     $cargoTarget = $CargoTarget
+    $repositoryRoot = $RepositoryRoot
     $failure = $null
     $previousWarningPreference = $WarningPreference
     try {
@@ -816,6 +841,7 @@ function Invoke-WorkerBuildRetryHarness(
     return [pscustomobject]@{
         NativeInvocations = $state.NativeInvocations
         JunctionInvocations = $state.JunctionInvocations
+        WorkingDirectories = $state.WorkingDirectories.ToArray()
         Failure = $failure
         Warnings = $state.Warnings.ToArray()
     }
@@ -842,6 +868,10 @@ try {
     Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
         $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
         $null -eq $acceptedRetrySuccess.Failure) 'Accepted canonical Cargo-target signature did not invoke exactly one isolated retry.'
+    Assert-True (
+        $acceptedRetrySuccess.WorkingDirectories.Count -eq 2 -and
+        @($acceptedRetrySuccess.WorkingDirectories | Where-Object { $_ -cne $builderRetryTarget }).Count -eq 0
+    ) 'Initial or retry worker Cargo invocation lost its explicit source-root working directory.'
     Assert-True (@($acceptedRetrySuccess.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 0) 'Production retry success emitted a fixture assessment warning.'
     $acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`n") $true $builderRetryTarget $builderRetryEnvironment
     Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and

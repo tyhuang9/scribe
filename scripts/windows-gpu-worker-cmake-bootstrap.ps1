@@ -523,7 +523,8 @@ function Invoke-ScribeGpuWorkerBoundedNativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
     [string]$FailureMessage,
-    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput,
+    [string]$WorkingDirectory
 ) {
     # Each stream is independently bounded. Both pipes continue to be drained
     # after overflow so a noisy child cannot deadlock while exiting.
@@ -537,6 +538,30 @@ function Invoke-ScribeGpuWorkerBoundedNativeProcess(
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    if ($PSBoundParameters.ContainsKey('WorkingDirectory')) {
+        # The distinction between omitted and explicitly supplied is deliberate:
+        # callers that do not opt in retain ProcessStartInfo's inherited working
+        # directory behavior, while Cargo callers must use a verified source root.
+        if ([string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            throw 'Native process working directory must be a nonempty absolute physical directory.'
+        }
+        if (-not [IO.Path]::IsPathFullyQualified($WorkingDirectory)) {
+            throw 'Native process working directory must be an absolute physical directory.'
+        }
+        $workingDirectoryItem = Get-ScribeGpuWorkerPhysicalDirectory `
+            $WorkingDirectory `
+            'Native process working directory'
+        $canonicalWorkingDirectory = $workingDirectoryItem.FullName
+        $workingDirectoryRoot = [IO.Path]::GetPathRoot($canonicalWorkingDirectory)
+        if (-not [string]::Equals(
+            $canonicalWorkingDirectory,
+            $workingDirectoryRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            $canonicalWorkingDirectory = $canonicalWorkingDirectory.TrimEnd([char[]]@('\', '/'))
+        }
+        $startInfo.WorkingDirectory = $canonicalWorkingDirectory
+    }
     foreach ($argument in $Arguments) {
         $startInfo.ArgumentList.Add($argument)
     }

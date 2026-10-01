@@ -150,8 +150,17 @@ function Invoke-NativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
     [string]$FailureMessage,
-    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput,
+    [string]$WorkingDirectory
 ) {
+    if ($PSBoundParameters.ContainsKey('WorkingDirectory')) {
+        return Invoke-ScribeGpuWorkerBoundedNativeProcess `
+            $Executable `
+            $Arguments `
+            $FailureMessage `
+            -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput:$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput `
+            -WorkingDirectory $WorkingDirectory
+    }
     return Invoke-ScribeGpuWorkerBoundedNativeProcess `
         $Executable `
         $Arguments `
@@ -1338,6 +1347,7 @@ try {
         '--bin', 'scribe-worker-pack-tool',
         '--manifest-path', $authoringManifestPath
     ) 'Worker-pack authoring tool build failed.' `
+        -WorkingDirectory $repositoryRoot `
         -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
     $authoringTool = Join-Path $cargoTarget 'release\scribe-worker-pack-tool.exe'
     $null = Assert-RegularNonReparseFile $authoringTool 'Worker-pack authoring tool'
@@ -1357,7 +1367,11 @@ try {
         '--manifest-path', $manifestPath
     )
     try {
-        $null = Invoke-NativeProcess $cargo $workerBuildArguments "$Backend inference worker build failed."
+        $null = Invoke-NativeProcess `
+            $cargo `
+            $workerBuildArguments `
+            "$Backend inference worker build failed." `
+            -WorkingDirectory $repositoryRoot
     }
     catch {
         $diagnostic = Get-NativeProcessRetryDiagnostic $_.Exception
@@ -1386,7 +1400,11 @@ try {
         }
         Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
         Write-Warning 'Retrying the pinned native build through its validated isolated CMake build junction.'
-        $null = Invoke-NativeProcess $cargo $workerBuildArguments "$Backend inference worker build failed after short-path bootstrap."
+        $null = Invoke-NativeProcess `
+            $cargo `
+            $workerBuildArguments `
+            "$Backend inference worker build failed after short-path bootstrap." `
+            -WorkingDirectory $repositoryRoot
     }
     $worker = Join-Path $cargoTarget 'release\scribe-inference-worker.exe'
     $null = Assert-RegularNonReparseFile $worker "$Backend inference worker"
