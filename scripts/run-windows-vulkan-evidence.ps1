@@ -73,9 +73,57 @@ function New-ScribeEvidenceShortCargoTarget([string]$Label) {
     return $target
 }
 
-function Invoke-ScribeEvidence([string]$Exe, [string[]]$Arguments, [string]$Failure) {
-    & $Exe @Arguments
-    if ($LASTEXITCODE -ne 0) { throw $Failure }
+function Invoke-ScribeEvidence(
+    [string]$Exe,
+    [string[]]$Arguments,
+    [string]$Failure,
+    [string]$WorkingDirectory
+) {
+    if ([string]::IsNullOrWhiteSpace($WorkingDirectory) -or
+        -not [IO.Path]::IsPathFullyQualified($WorkingDirectory)) {
+        throw 'Evidence process working directory must be a nonempty absolute physical directory.'
+    }
+    $workingDirectoryItem = Get-ScribeEvidencePhysicalDirectory `
+        $WorkingDirectory `
+        'Evidence process working directory'
+    $canonicalWorkingDirectory = $workingDirectoryItem.FullName
+    $workingDirectoryRoot = [IO.Path]::GetPathRoot($canonicalWorkingDirectory)
+    if (-not [string]::Equals(
+        $canonicalWorkingDirectory,
+        $workingDirectoryRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        $canonicalWorkingDirectory = $canonicalWorkingDirectory.TrimEnd([char[]]@('\', '/'))
+    }
+
+    # Forward both streams concurrently instead of collecting bounded build
+    # diagnostics. Explicit pipes also preserve output in non-console hosts.
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Exe
+    $startInfo.WorkingDirectory = $canonicalWorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw $Failure }
+        $stdoutForwarding = $process.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())
+        $stderrForwarding = $process.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())
+        $process.WaitForExit()
+        [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($stdoutForwarding, $stderrForwarding)).GetAwaiter().GetResult()
+        # Preserve the direct native-invocation observable exit-code behavior
+        # while still keeping the terminal evidence test unbuffered.
+        $global:LASTEXITCODE = $process.ExitCode
+        if ($process.ExitCode -ne 0) { throw $Failure }
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 function Get-ScribeEvidencePinnedMsvcEnvironment([string]$Builder, [string]$NativeArchive, [string]$UnusedOutput) {
@@ -227,7 +275,11 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
 
 function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]$Failure, [string]$CargoTarget, [string]$BuildEnvironment) {
     try {
-        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess $cargo $Arguments $Failure
+        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess `
+            $cargo `
+            $Arguments `
+            $Failure `
+            -WorkingDirectory $repositoryRoot
         return
     }
     catch {
@@ -241,7 +293,11 @@ function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]
     }
     Enable-ScribeEvidenceCmakeBootstrap $CargoTarget $BuildEnvironment
     try {
-        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess $cargo $Arguments "$Failure after validated CMake bootstrap retry."
+        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess `
+            $cargo `
+            $Arguments `
+            "$Failure after validated CMake bootstrap retry." `
+            -WorkingDirectory $repositoryRoot
     }
     catch {
         throw "$Failure after validated CMake bootstrap retry."
@@ -377,7 +433,7 @@ try {
     $env:SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON = $baseline | ConvertTo-Json -Compress
     Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
         Set-ScribeEvidenceWorkerBuildMode $false
-        Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
+        Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.' -WorkingDirectory $repositoryRoot
     }
 }
 catch {

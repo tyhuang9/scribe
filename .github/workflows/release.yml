@@ -382,6 +382,7 @@ jobs:
         run: |
           & .\scripts\test-windows-gpu-worker-pack-tools.ps1 `
             -CargoTargetDirectory target-gpu-pack-contract-tests
+          & .\scripts\test-windows-gpu-cargo-working-directory.ps1
 
       - name: Check formatting
         run: cargo fmt --all -- --check
