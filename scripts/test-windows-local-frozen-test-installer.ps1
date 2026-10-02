@@ -34,6 +34,19 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
 }
 
+function Assert-FixtureRemovalMetadataScannedAncestors([string]$Path, [string[]]$ObservedPaths) {
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($true) {
+        Assert-True ($ObservedPaths -contains $current) "Removal metadata observer skipped ancestor: $current"
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrEmpty($parent) -or
+            [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+        $current = $parent
+    }
+}
+
 function Copy-FixtureSource([string]$RelativePath) {
     $source = Join-Path $repositoryRoot ($RelativePath -replace '/', '\')
     $destination = Join-Path $fixtureRoot ($RelativePath -replace '/', '\')
@@ -995,6 +1008,194 @@ public static class FakeIscc {
             detected_architecture = 'whisper'
         })
     } 'cancellation contract'
+
+    # This fixture deterministically recreates deletion at the production
+    # metadata-observation boundary. The one-call reader must classify that
+    # disappearance and still scan every surviving ancestor.
+    $removalRaceRoot = Join-Path $testRoot 'metadata-disappearance-race'
+    New-Item -ItemType Directory -Path $removalRaceRoot | Out-Null
+    $savedRemovalPathMetadata = (Get-Command Get-WindowsLocalFrozenRemovalPathMetadata -CommandType Function).ScriptBlock
+    $script:RemovalRacePath = $removalRaceRoot
+    $script:RemovalRaceInjected = $false
+    $script:RemovalRaceObservedPaths = [System.Collections.Generic.List[string]]::new()
+    try {
+        function Get-WindowsLocalFrozenRemovalPathMetadata([string]$Path) {
+            $script:RemovalRaceObservedPaths.Add($Path)
+            if (-not $script:RemovalRaceInjected -and
+                [string]::Equals($Path, $script:RemovalRacePath, [StringComparison]::OrdinalIgnoreCase)) {
+                $script:RemovalRaceInjected = $true
+                Remove-Item -LiteralPath $Path -Force
+            }
+            return [IO.File]::GetAttributes($Path)
+        }
+        Wait-WindowsLocalFrozenInstallRootRemoved $removalRaceRoot 1000
+        Assert-True $script:RemovalRaceInjected 'Removal-race fixture did not reach the metadata disappearance boundary.'
+        Assert-True (-not (Test-Path -LiteralPath $removalRaceRoot)) 'Removal-race fixture did not remove the installation leaf.'
+        Assert-FixtureRemovalMetadataScannedAncestors $removalRaceRoot @($script:RemovalRaceObservedPaths)
+    }
+    finally {
+        Set-Item -Path Function:Get-WindowsLocalFrozenRemovalPathMetadata -Value $savedRemovalPathMetadata
+    }
+
+    foreach ($timeout in @(0, -1, 30001)) {
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $removalRaceRoot $timeout } 'timeout is outside the supported bounds'
+    }
+
+    $alreadyAbsentRemovalRoot = Join-Path $testRoot 'already-absent-uninstall-removal'
+    Wait-WindowsLocalFrozenInstallRootRemoved $alreadyAbsentRemovalRoot 1000
+    Assert-True (-not (Test-Path -LiteralPath $alreadyAbsentRemovalRoot)) 'Already-absent installation leaf was unexpectedly recreated.'
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+public sealed class FixtureRemovalFileNotFoundException : FileNotFoundException {
+    public FixtureRemovalFileNotFoundException(int hresult) : base("fixture missing file") { HResult = hresult; }
+}
+public sealed class FixtureRemovalDirectoryNotFoundException : DirectoryNotFoundException {
+    public FixtureRemovalDirectoryNotFoundException(int hresult) : base("fixture missing directory") { HResult = hresult; }
+}
+public sealed class FixtureRemovalIOException : IOException {
+    public FixtureRemovalIOException(int hresult) : base("fixture unrelated IO failure") { HResult = hresult; }
+}
+public sealed class FixtureRemovalUnauthorizedAccessException : UnauthorizedAccessException {
+    public FixtureRemovalUnauthorizedAccessException(int hresult) : base("fixture access denied") { HResult = hresult; }
+}
+'@
+
+    $savedRemovalPathMetadata = (Get-Command Get-WindowsLocalFrozenRemovalPathMetadata -CommandType Function).ScriptBlock
+    $script:FixtureRemovalMetadataOutcomes = @{}
+    $script:FixtureRemovalMetadataObserved = [System.Collections.Generic.List[string]]::new()
+    try {
+        function Get-WindowsLocalFrozenRemovalPathMetadata([string]$Path) {
+            $script:FixtureRemovalMetadataObserved.Add($Path)
+            if ($script:FixtureRemovalMetadataOutcomes.ContainsKey($Path)) {
+                $outcome = $script:FixtureRemovalMetadataOutcomes[$Path]
+                if ($outcome -is [System.Exception]) {
+                    throw $outcome
+                }
+                return [System.IO.FileAttributes]$outcome
+            }
+            return [System.IO.FileAttributes]::Directory
+        }
+
+        $syntheticLeaf = Join-Path $testRoot 'metadata-synthetic-leaf'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $syntheticLeaf = [FixtureRemovalFileNotFoundException]::new(-2147024894)
+        }
+        $script:FixtureRemovalMetadataObserved.Clear()
+        Wait-WindowsLocalFrozenInstallRootRemoved $syntheticLeaf 1000
+        Assert-FixtureRemovalMetadataScannedAncestors $syntheticLeaf @($script:FixtureRemovalMetadataObserved)
+
+        $missingIntermediate = Join-Path $testRoot 'metadata-missing-intermediate'
+        $missingIntermediateLeaf = Join-Path $missingIntermediate 'leaf'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $missingIntermediateLeaf = [FixtureRemovalDirectoryNotFoundException]::new(-2147024893)
+            $missingIntermediate = [FixtureRemovalFileNotFoundException]::new(-2147024894)
+        }
+        $script:FixtureRemovalMetadataObserved.Clear()
+        Wait-WindowsLocalFrozenInstallRootRemoved $missingIntermediateLeaf 1000
+        Assert-FixtureRemovalMetadataScannedAncestors $missingIntermediateLeaf @($script:FixtureRemovalMetadataObserved)
+
+        $persistentRemovalRoot = Join-Path $testRoot 'persistent-uninstall-removal'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $persistentRemovalRoot = [System.IO.FileAttributes]::Directory
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $persistentRemovalRoot 40 } 'left its token-bound program directory'
+
+        $noSurvivorRoot = Join-Path $testRoot 'missing-without-surviving-ancestor'
+        $noSurvivorOutcomes = @{}
+        $noSurvivorCurrent = [IO.Path]::GetFullPath($noSurvivorRoot)
+        while ($true) {
+            $noSurvivorOutcomes[$noSurvivorCurrent] = [FixtureRemovalFileNotFoundException]::new(-2147024894)
+            $noSurvivorParent = Split-Path -Parent $noSurvivorCurrent
+            if ([string]::IsNullOrEmpty($noSurvivorParent) -or
+                [string]::Equals($noSurvivorParent, $noSurvivorCurrent, [StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+            $noSurvivorCurrent = $noSurvivorParent
+        }
+        $script:FixtureRemovalMetadataOutcomes = $noSurvivorOutcomes
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $noSurvivorRoot 40 } 'left its token-bound program directory'
+
+        $fileReplacement = Join-Path $testRoot 'metadata-file-replacement'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $fileReplacement = [System.IO.FileAttributes]::Archive
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $fileReplacement 1000 } 'non-directory replacement'
+
+        $missingWithFileAncestor = Join-Path $testRoot 'metadata-file-ancestor'
+        $missingWithFileLeaf = Join-Path $missingWithFileAncestor 'leaf'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $missingWithFileLeaf = [FixtureRemovalDirectoryNotFoundException]::new(-2147024893)
+            $missingWithFileAncestor = [System.IO.FileAttributes]::Archive
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $missingWithFileLeaf 1000 } 'non-directory replacement'
+
+        $missingWithReparseAncestor = Join-Path $testRoot 'metadata-reparse-ancestor'
+        $missingWithReparseLeaf = Join-Path $missingWithReparseAncestor 'leaf'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $missingWithReparseLeaf = [FixtureRemovalDirectoryNotFoundException]::new(-2147024893)
+            $missingWithReparseAncestor = [System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $missingWithReparseLeaf 1000 } 'cannot cross a symbolic link or reparse point'
+
+        $accessDeniedRoot = Join-Path $testRoot 'metadata-access-denied'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $accessDeniedRoot = [FixtureRemovalUnauthorizedAccessException]::new(-2147024891)
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $accessDeniedRoot 1000 } 'metadata inspection failed'
+
+        $unrelatedIoRoot = Join-Path $testRoot 'metadata-unrelated-io'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $unrelatedIoRoot = [FixtureRemovalIOException]::new(-2147024894)
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $unrelatedIoRoot 1000 } 'metadata inspection failed'
+
+        $wrongMissingCodeRoot = Join-Path $testRoot 'metadata-wrong-missing-code'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $wrongMissingCodeRoot = [FixtureRemovalFileNotFoundException]::new(-2147024893)
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $wrongMissingCodeRoot 1000 } 'metadata inspection failed'
+
+        $wrongFacilityMissingRoot = Join-Path $testRoot 'metadata-wrong-facility-missing'
+        $script:FixtureRemovalMetadataOutcomes = @{
+            $wrongFacilityMissingRoot = [FixtureRemovalFileNotFoundException]::new(-1878589438)
+        }
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $wrongFacilityMissingRoot 1000 } 'metadata inspection failed'
+    }
+    finally {
+        Set-Item -Path Function:Get-WindowsLocalFrozenRemovalPathMetadata -Value $savedRemovalPathMetadata
+    }
+
+    $junctionFixtureRoot = Join-Path $testRoot 'removal-junctions'
+    $junctionTarget = Join-Path $junctionFixtureRoot 'target'
+    $junctionTargetLeaf = Join-Path $junctionTarget 'leaf'
+    $junctionLeaf = Join-Path $junctionFixtureRoot 'leaf-junction'
+    $junctionAncestor = Join-Path $junctionFixtureRoot 'ancestor-junction'
+    $junctionAncestorLeaf = Join-Path $junctionAncestor 'leaf'
+    $danglingJunction = Join-Path $junctionFixtureRoot 'dangling-junction'
+    New-Item -ItemType Directory -Path $junctionTarget | Out-Null
+    try {
+        New-Item -ItemType Junction -Path $junctionLeaf -Target $junctionTarget | Out-Null
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $junctionLeaf 1000 } 'cannot cross a symbolic link or reparse point'
+        Remove-Item -LiteralPath $junctionLeaf -Force
+
+        New-Item -ItemType Junction -Path $junctionAncestor -Target $junctionTarget | Out-Null
+        New-Item -ItemType Directory -Path $junctionAncestorLeaf | Out-Null
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $junctionAncestorLeaf 1000 } 'cannot cross a symbolic link or reparse point'
+        Remove-Item -LiteralPath $junctionAncestor -Force
+
+        Remove-Item -LiteralPath $junctionTargetLeaf -Force
+        New-Item -ItemType Junction -Path $danglingJunction -Target $junctionTarget | Out-Null
+        Remove-Item -LiteralPath $junctionTarget -Force
+        Invoke-ExpectedFailure { Wait-WindowsLocalFrozenInstallRootRemoved $danglingJunction 1000 } 'cannot cross a symbolic link or reparse point'
+    }
+    finally {
+        Remove-Item -LiteralPath $junctionLeaf -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $junctionAncestor -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $danglingJunction -Force -ErrorAction SilentlyContinue
+    }
+
     $delayedRemovalRoot = Join-Path $testRoot 'delayed-uninstall-removal'
     $delayedRemovalReady = Join-Path $testRoot 'delayed-uninstall-ready'
     New-Item -ItemType Directory -Path $delayedRemovalRoot | Out-Null

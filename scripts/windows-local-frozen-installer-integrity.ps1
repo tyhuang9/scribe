@@ -525,6 +525,73 @@ function Assert-WindowsLocalFrozenSmokeDiagnostics([psobject]$Smoke) {
     }
 }
 
+function Get-WindowsLocalFrozenRemovalPathMetadata([string]$Path) {
+    # Keep this as one metadata observation. The fixture suite shadows this
+    # private seam to reproduce deletion exactly at the observation boundary.
+    return [System.IO.File]::GetAttributes($Path)
+}
+
+function Get-WindowsLocalFrozenRemovalPathUnderlyingException([System.Exception]$Exception) {
+    $current = $Exception
+    while ($null -ne $current.InnerException -and
+        ($current -is [System.Management.Automation.MethodInvocationException] -or
+            $current -is [System.Management.Automation.RuntimeException])) {
+        $current = $current.InnerException
+    }
+    return $current
+}
+
+function Test-WindowsLocalFrozenRemovalPathIsAbsent([System.Exception]$Exception) {
+    $underlying = Get-WindowsLocalFrozenRemovalPathUnderlyingException $Exception
+    return ($underlying -is [System.IO.FileNotFoundException] -and
+        $underlying.HResult -eq -2147024894) -or
+        ($underlying -is [System.IO.DirectoryNotFoundException] -and
+            $underlying.HResult -eq -2147024893)
+}
+
+function Test-WindowsLocalFrozenInstallRootRemovalObserved([string]$Path) {
+    $current = Get-WindowsLocalFrozenNormalizedFullPath $Path
+    $missingPathObserved = $false
+    $survivingRegularAncestorObserved = $false
+
+    while ($true) {
+        $attributes = $null
+        try {
+            $attributes = Get-WindowsLocalFrozenRemovalPathMetadata $current
+        }
+        catch {
+            $metadataException = Get-WindowsLocalFrozenRemovalPathUnderlyingException $_.Exception
+            if (Test-WindowsLocalFrozenRemovalPathIsAbsent $metadataException) {
+                $missingPathObserved = $true
+            }
+            else {
+                throw "Local frozen installer removal metadata inspection failed at '$current': $($metadataException.Message)"
+            }
+        }
+
+        if ($null -ne $attributes) {
+            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Local frozen installer removal path cannot cross a symbolic link or reparse point: $current"
+            }
+            if (($attributes -band [System.IO.FileAttributes]::Directory) -eq 0) {
+                throw "Local frozen installer removal path has a non-directory replacement: $current"
+            }
+            if ($missingPathObserved) {
+                $survivingRegularAncestorObserved = $true
+            }
+        }
+
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrEmpty($parent) -or
+            [string]::Equals($parent, $current, [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $current = $parent
+    }
+
+    return $missingPathObserved -and $survivingRegularAncestorObserved
+}
+
 function Wait-WindowsLocalFrozenInstallRootRemoved(
     [string]$Path,
     [int]$TimeoutMilliseconds = 5000
@@ -534,8 +601,7 @@ function Wait-WindowsLocalFrozenInstallRootRemoved(
     }
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($true) {
-        Assert-WindowsFrozenCpuWorkerNoReparseAncestors $Path
-        if (-not (Test-Path -LiteralPath $Path)) {
+        if (Test-WindowsLocalFrozenInstallRootRemovalObserved $Path) {
             return
         }
         $remaining = $TimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds
