@@ -440,7 +440,9 @@ try {
     $env:GIT_TEMPLATE_DIR = $isolatedGitTemplate
     New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
     foreach ($path in @(
-        'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs', 'src/worker_identity.rs',
+        'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'build.rs', 'src/worker_identity.rs',
+        'scripts/windows-cpu-worker-native-baseline.ps1',
+        'scripts/new-windows-frozen-cpu-worker.ps1', 'scripts/build-windows-release.ps1',
         'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-pe-imports.ps1',
         'scripts/windows-local-frozen-installer-integrity.ps1', 'scripts/build-windows-frozen-test-installer.ps1',
         'scripts/verify-windows-local-frozen-test-installer.ps1',

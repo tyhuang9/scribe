@@ -10,6 +10,7 @@ $modelSource = Join-Path $testRoot 'fixture-model.gguf'
 $producerOutput = Join-Path $testRoot 'frozen-worker'
 $installerAllowlist = Join-Path $testRoot 'worker-pack-allowlist.iss'
 $script:FocusedFrozenCpuWorkerAssertions = 0
+$global:WindowsFrozenCpuWorkerTestBaselineTargetRoots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     $script:FocusedFrozenCpuWorkerAssertions++
@@ -106,6 +107,50 @@ function Assert-DesktopCargoArguments([psobject]$Call, [string]$Features, [strin
     # flags or worker/provider features must not slip into the desktop build.
     Assert-Equal (ConvertTo-Json -InputObject @($Call.Arguments) -Compress) `
         (ConvertTo-Json -InputObject $expected -Compress) $Description
+}
+
+function Assert-WorkerCargoArguments([psobject]$Call, [string]$Description) {
+    $expected = @(
+        'build', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker',
+        '--features', 'inference-worker', '--target', 'x86_64-pc-windows-msvc',
+        '--manifest-path', (Join-Path $fixtureRoot 'Cargo.toml')
+    )
+    Assert-Equal (ConvertTo-Json -InputObject @($Call.Arguments) -Compress) `
+        (ConvertTo-Json -InputObject $expected -Compress) $Description
+}
+
+function Write-TestCpuWorkerBaselineEvidence(
+    [string]$TargetRoot,
+    [string]$Flags = "C_FLAGS = /O2`nCXX_FLAGS = /O2"
+) {
+    $nativeEvidenceRoot = Join-Path $TargetRoot 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build'
+    $flagsPath = Join-Path $nativeEvidenceRoot 'ggml\src\CMakeFiles\ggml-cpu.dir\flags.make'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $flagsPath) -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $nativeEvidenceRoot 'CMakeCache.txt'), @'
+TRANSCRIBE_X86_CONSERVATIVE:BOOL=ON
+TRANSCRIBE_GGML_BACKEND_DL:BOOL=OFF
+GGML_NATIVE:BOOL=OFF
+GGML_BACKEND_DL:BOOL=OFF
+GGML_OPENMP:BOOL=OFF
+GGML_CPU_ALL_VARIANTS:BOOL=OFF
+GGML_SSE42:BOOL=OFF
+GGML_AVX:BOOL=OFF
+GGML_AVX_VNNI:BOOL=OFF
+GGML_AVX2:BOOL=OFF
+GGML_BMI2:BOOL=OFF
+GGML_FMA:BOOL=OFF
+GGML_F16C:BOOL=OFF
+GGML_AVX512:BOOL=OFF
+GGML_AVX512_VBMI:BOOL=OFF
+GGML_AVX512_VNNI:BOOL=OFF
+GGML_AVX512_BF16:BOOL=OFF
+CMAKE_C_FLAGS:STRING=
+CMAKE_CXX_FLAGS:STRING=
+CMAKE_C_FLAGS_RELEASE:STRING=/O2 /Ob2 /DNDEBUG
+CMAKE_CXX_FLAGS_RELEASE:STRING=/O2 /Ob2 /DNDEBUG
+CMAKE_GENERATOR:INTERNAL=NMake Makefiles
+'@, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($flagsPath, $Flags, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Write-CanonicalFrozenRecord([string]$Root, [psobject]$Context, [int64]$Size, [string]$Sha256) {
@@ -205,6 +250,40 @@ $previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 $previousGitHubActions = $env:GITHUB_ACTIONS
 $previousCi = $env:CI
+$cpuBaselineAmbientNamePattern = '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|CMAKE_TOOLCHAIN_FILE(?:_.+)?|HOST_CMAKE_TOOLCHAIN_FILE|CMAKE_X86_64_PC_WINDOWS_MSVC(?:_.+)?|(?:C|CXX|CPP)FLAGS(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$'
+$previousCpuBaselineAmbient = @{}
+foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+    if ([string]$entry.Key -match $cpuBaselineAmbientNamePattern) {
+        $previousCpuBaselineAmbient[[string]$entry.Key] = [string]$entry.Value
+    }
+}
+
+function Remove-TestCpuWorkerBaselineTarget([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $resolved = [System.IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([char[]]@('\', '/'))
+    if (-not $resolved.StartsWith($temporaryRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Leaf $resolved) -cnotmatch '^scribe-windows-cpu-worker-baseline-[0-9]+-[0-9a-f]{32}$') {
+        throw "Refused CPU baseline test cleanup outside its exact temporary target: $resolved"
+    }
+    $current = $resolved
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refused CPU baseline test cleanup through a reparse point: $current"
+        }
+        if ([string]::Equals($current, $temporaryRoot, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { throw 'Could not prove CPU baseline test cleanup ancestry.' }
+        $current = $parent
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $resolved -Recurse -Force)) {
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refused CPU baseline test cleanup containing a reparse point: $($item.FullName)"
+        }
+    }
+    [System.IO.Directory]::Delete("\\?\$resolved", $true)
+}
 $previousGitEnvironment = @{}
 foreach ($entry in @(Get-ChildItem Env:GIT_*)) {
     $previousGitEnvironment[$entry.Name] = $entry.Value
@@ -248,9 +327,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Could not configure isolated fixture Git settings.' }
     }
     foreach ($relativePath in @(
-        'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs', 'src/worker_identity.rs',
+        'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'build.rs', 'src/worker_identity.rs',
         'scripts/build-windows-release.ps1', 'scripts/new-windows-frozen-cpu-worker.ps1',
-        'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-pe-imports.ps1',
+        'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1',
+        'scripts/windows-pe-imports.ps1',
         'scripts/stage-verified-worker-packs.ps1',
         'resources/licenses/Apache-2.0.txt', 'resources/licenses/OpenAI-Whisper-MIT.txt',
         'resources/licenses/Whisper-Base-En-NOTICE.txt', 'resources/licenses/THIRD-PARTY-NOTICES.txt',
@@ -291,6 +371,145 @@ try {
     $fixtureBuilder = Join-Path $fixtureRoot 'scripts\build-windows-release.ps1'
     $fixtureProducer = Join-Path $fixtureRoot 'scripts\new-windows-frozen-cpu-worker.ps1'
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
+    . (Join-Path $fixtureRoot 'scripts\windows-cpu-worker-native-baseline.ps1')
+
+    $baselineEvidenceTarget = Join-Path $testRoot 'baseline-evidence'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
+    $baselineEvidence = [pscustomobject]@{ TargetRoot = $baselineEvidenceTarget; TargetTriple = 'x86_64-pc-windows-msvc' }
+    Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence
+    $baselineCache = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\CMakeCache.txt'
+    $baselineCacheText = Get-Content -LiteralPath $baselineCache -Raw
+    [System.IO.File]::WriteAllText($baselineCache, $baselineCacheText.Replace('GGML_AVX2:BOOL=OFF', 'GGML_AVX2:BOOL=ON'), [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'GGML_AVX2=OFF'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
+    [System.IO.File]::WriteAllText($baselineCache, $baselineCacheText.Replace('CMAKE_C_FLAGS_RELEASE:STRING=/O2 /Ob2 /DNDEBUG', 'CMAKE_C_FLAGS_RELEASE:STRING=/O2 /arch:AVX2'), [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'CMake compiler flags contain a native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
+    $extraCache = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-e1f2a3b4\out\build\CMakeCache.txt'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $extraCache) -Force | Out-Null
+    [System.IO.File]::WriteAllText($extraCache, 'GGML_NATIVE:BOOL=OFF', [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'exactly one transcribe-cpp-sys Cargo build directory'
+    Remove-Item -LiteralPath (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $extraCache))) -Recurse -Force
+    $baselineFlags = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\ggml\src\CMakeFiles\ggml-cpu.dir\flags.make'
+    Remove-Item -LiteralPath $baselineFlags -Force
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'evidence file is missing'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'C_FLAGS = /arch:AVX2'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'C_FLAGS = /arch:AVX10.1'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = -msse4.2'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = GGML_AVX2'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = @hidden.rsp'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = @hidden.txt'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = -arch:AVX10.1'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = -DGGML_AVX2'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = /DGGML_AVX2=1'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
+    $visualStudioProject = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\ggml\src\ggml-cpu.vcxproj'
+    $visualStudioTlog = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\ggml\src\ggml-cpu.dir\Release\ggml-cpu.tlog\CL.command.1.tlog'
+    [System.IO.File]::WriteAllText($baselineCache, $baselineCacheText.Replace('CMAKE_GENERATOR:INTERNAL=NMake Makefiles', 'CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022'), [System.Text.UTF8Encoding]::new($false))
+    $safeVisualStudioProject = '<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003"><ItemDefinitionGroup><ClCompile><AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><PreprocessorDefinitions>%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions><ObjectFileName>$(IntDir)</ObjectFileName><AdditionalOptions>/O2 %(AdditionalOptions)</AdditionalOptions><EnableEnhancedInstructionSet>NotSet</EnableEnhancedInstructionSet></ClCompile></ItemDefinitionGroup></Project>'
+    [System.IO.File]::WriteAllText($visualStudioProject, $safeVisualStudioProject, [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'evidence file is missing'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $visualStudioTlog) -Force | Out-Null
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /O2", [System.Text.Encoding]::Unicode)
+    Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /O2", [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'UTF-16 with a byte-order mark'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /arch:AVX10.1", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c %(AdditionalOptions)", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c @hidden.txt", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /O2", [System.Text.Encoding]::Unicode)
+    [System.IO.File]::WriteAllText($visualStudioProject, $safeVisualStudioProject.Replace('NotSet', 'AdvancedVectorExtensions2'), [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'Visual Studio ggml-cpu flags contain an unrecognized or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioProject, '<Project><ItemDefinitionGroup><ClCompile><AdditionalOptions>@hidden.rsp %(AdditionalOptions)</AdditionalOptions><EnhancedInstructionSet>NotSet</EnhancedInstructionSet></ClCompile></ItemDefinitionGroup></Project>', [System.Text.UTF8Encoding]::new($false))
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'Visual Studio ggml-cpu flags contain an unrecognized or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioProject, '<Project><ItemDefinitionGroup><ClCompile><AdditionalOptions>$(InjectedOptions)</AdditionalOptions><EnhancedInstructionSet>NotSet</EnhancedInstructionSet></ClCompile></ItemDefinitionGroup></Project>', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /arch:AVX2", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    Remove-Item -LiteralPath $visualStudioProject -Force
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
+
+    foreach ($name in $previousCpuBaselineAmbient.Keys) { Remove-Item -LiteralPath "Env:$name" }
+    $baselineEnvironmentNames = @(Get-WindowsCpuWorkerBaselineEnvironmentNames)
+    $baselineBeforeRestorationTests = [Environment]::GetEnvironmentVariables()
+    try {
+        foreach ($name in $baselineEnvironmentNames) {
+            if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+        }
+        $absentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        foreach ($attempt in @(1, 2)) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $absentEnvironmentBuild
+            foreach ($name in $baselineEnvironmentNames) {
+                Assert-True (-not (Test-Path -LiteralPath "Env:$name")) "Originally absent $name became present after restore $attempt."
+                Assert-Equal ([Environment]::GetEnvironmentVariable($name)) $null "Originally absent $name value after restore $attempt"
+            }
+            Assert-True (-not (Test-Path -LiteralPath $absentEnvironmentBuild.TargetRoot)) 'Environment-only restoration test created a target directory.'
+        }
+        foreach ($name in $baselineEnvironmentNames) { [Environment]::SetEnvironmentVariable($name, '') }
+        # Older .NET runtimes cannot create present-empty values this way.
+        # Preserve the actual supported pre-build state, never assume absence
+        # and an empty override are equivalent on runtimes that distinguish them.
+        $emptyEnvironmentBefore = [Environment]::GetEnvironmentVariables()
+        $emptyEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        foreach ($attempt in @(1, 2)) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $emptyEnvironmentBuild
+            $after = [Environment]::GetEnvironmentVariables()
+            foreach ($name in $baselineEnvironmentNames) {
+                Assert-Equal (Test-Path -LiteralPath "Env:$name") ($emptyEnvironmentBefore.Contains($name)) "Empty-state $name presence after restore $attempt"
+                Assert-Equal ($after[$name]) ($emptyEnvironmentBefore[$name]) "Empty-state $name value after restore $attempt"
+            }
+            Assert-True (-not (Test-Path -LiteralPath $emptyEnvironmentBuild.TargetRoot)) 'Empty-state restoration test created a target directory.'
+        }
+        $env:CARGO_TARGET_DIR = 'C:\fixture\original-target'
+        $env:TRANSCRIBE_CMAKE_ARGS = ' '
+        $env:RUSTFLAGS = ' '
+        $presentEnvironmentBefore = [Environment]::GetEnvironmentVariables()
+        $presentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        foreach ($attempt in @(1, 2)) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $presentEnvironmentBuild
+            $after = [Environment]::GetEnvironmentVariables()
+            foreach ($name in $baselineEnvironmentNames) {
+                Assert-True (Test-Path -LiteralPath "Env:$name") "Present $name disappeared after restore $attempt."
+                Assert-Equal ($after[$name]) ($presentEnvironmentBefore[$name]) "Present $name value after restore $attempt"
+            }
+            Assert-True (-not (Test-Path -LiteralPath $presentEnvironmentBuild.TargetRoot)) 'Present-state restoration test created a target directory.'
+        }
+    }
+    finally {
+        foreach ($name in $baselineEnvironmentNames) {
+            if ($baselineBeforeRestorationTests.Contains($name)) {
+                [Environment]::SetEnvironmentVariable($name, [string]$baselineBeforeRestorationTests[$name])
+            }
+            elseif (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+        }
+    }
+    $env:CMAKE_ARGS = '-DGGML_AVX2=ON'
+    Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient CMake arguments'
+    Remove-Item Env:CMAKE_ARGS
+    foreach ($name in @('CMAKE_TOOLCHAIN_FILE', 'CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc', 'HOST_CMAKE_TOOLCHAIN_FILE', 'CMAKE_X86_64_PC_WINDOWS_MSVC_TOOLCHAIN_FILE')) {
+        [Environment]::SetEnvironmentVariable($name, 'C:\fixture\toolchain.cmake')
+        try {
+            Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } "does not accept ambient CMake toolchain overrides: $name"
+        }
+        finally { if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop } }
+    }
+    $env:CL = '/arch:AVX2'
+    Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: CL'
+    Remove-Item Env:CL
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-cpu=native'
+    Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'
+    Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS
 
     # Use verbatim creation only to make a test-owned physical path that exceeds
     # MAX_PATH. The helper itself receives its ordinary absolute identity.
@@ -448,6 +667,9 @@ try {
             Revision = $env:SCRIBE_BUILD_REVISION
             WorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
             BuildingWorker = $env:SCRIBE_BUILDING_WORKER
+            CargoTargetDirectory = $env:CARGO_TARGET_DIR
+            TranscribeCmakeArgs = $env:TRANSCRIBE_CMAKE_ARGS
+            RustFlags = $env:RUSTFLAGS
         })
         if (($global:WindowsFrozenCpuWorkerTestFailWorkerBuild -and $binary -ceq 'scribe-inference-worker') -or
             ($global:WindowsFrozenCpuWorkerTestFailDesktopBuild -and $binary -ceq 'local-transcriber')) {
@@ -456,7 +678,9 @@ try {
         }
         $output = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\$binary.exe"
         if ($binary -ceq 'scribe-inference-worker') {
+            $null = $global:WindowsFrozenCpuWorkerTestBaselineTargetRoots.Add($env:CARGO_TARGET_DIR)
             New-TestReviewedPe $output 3
+            Write-TestCpuWorkerBaselineEvidence $env:CARGO_TARGET_DIR
             if ($global:WindowsFrozenCpuWorkerTestRaceFreezeOutput) {
                 New-Item -ItemType Directory -Path $global:WindowsFrozenCpuWorkerTestRaceFreezeOutput | Out-Null
             }
@@ -504,8 +728,12 @@ try {
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 2 'Normal packaging Cargo call count'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Normal packaging worker-first order'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].Binary 'local-transcriber' 'Normal packaging desktop-second order'
+    Assert-WorkerCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'Normal CPU worker exact Cargo argv'
     Assert-DesktopCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[1] 'ui-harness' 'Normal desktop exact feature argv'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].BuildingWorker '1' 'Normal packaging worker build marker'
+    Assert-True ($global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory -cne $fixtureTarget) 'Normal CPU worker did not use a fresh isolated Cargo target.'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].TranscribeCmakeArgs (Get-WindowsCpuWorkerBaselineCmakeArgs) 'Normal CPU worker exact native CMake baseline'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].RustFlags '-C target-feature=+crt-static' 'Normal CPU worker exact Rust ISA baseline'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest)) 'Normal worker build inherited a desktop digest.'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[1].BuildingWorker)) 'Normal desktop build inherited the worker build marker.'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].WorkerDigest (Get-FileHash -LiteralPath (Join-Path $normalBundle 'scribe-inference-worker.exe') -Algorithm SHA256).Hash.ToLowerInvariant() 'Normal desktop embeds the exact packaged worker digest'
@@ -518,8 +746,12 @@ try {
     & $fixtureProducer -OutputDirectory $producerOutput
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Freeze producer Cargo call count'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Freeze producer worker-only build'
+    Assert-WorkerCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'Freeze producer exact CPU worker Cargo argv'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Freeze producer exact build revision'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].BuildingWorker '1' 'Freeze producer worker build marker'
+    Assert-True ($global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory -cne $fixtureTarget) 'Freeze producer did not use a fresh isolated Cargo target.'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].TranscribeCmakeArgs (Get-WindowsCpuWorkerBaselineCmakeArgs) 'Freeze producer exact native CMake baseline'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].RustFlags '-C target-feature=+crt-static' 'Freeze producer exact Rust ISA baseline'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest)) 'Freeze producer did not clear the desktop worker digest.'
     Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Freeze producer revision environment restoration'
     Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64 -join '') 'Freeze producer digest environment restoration'
@@ -888,6 +1120,14 @@ finally {
     $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
     $env:GITHUB_ACTIONS = $previousGitHubActions
     $env:CI = $previousCi
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        if ([string]$entry.Key -match $cpuBaselineAmbientNamePattern) {
+            Remove-Item -LiteralPath "Env:$($entry.Key)"
+        }
+    }
+    foreach ($name in $previousCpuBaselineAmbient.Keys) {
+        Set-Item -LiteralPath "Env:$name" -Value $previousCpuBaselineAmbient[$name]
+    }
     foreach ($entry in @(Get-ChildItem Env:GIT_*)) {
         Remove-Item -LiteralPath "Env:$($entry.Name)"
     }
@@ -898,6 +1138,10 @@ finally {
         Assert-Equal (Get-CommandIdentity 'cargo') $originalCargoCommandIdentity 'Synthetic Cargo seam command restoration'
     }
     finally {
+        foreach ($targetRoot in $global:WindowsFrozenCpuWorkerTestBaselineTargetRoots) {
+            Remove-TestCpuWorkerBaselineTarget $targetRoot
+        }
+        $global:WindowsFrozenCpuWorkerTestBaselineTargetRoots = $null
         Remove-TestRootSafely $testRoot
     }
 }

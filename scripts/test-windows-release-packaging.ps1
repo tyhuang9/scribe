@@ -1900,7 +1900,47 @@ Set-StrictMode -Version Latest
 
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
-    & (Join-Path $PSScriptRoot 'test-windows-frozen-cpu-worker-packaging.ps1')
+    # The nested fixture runs in this process: it must clear its own overrides
+    # temporarily without losing a caller's native-toolchain environment.
+    $cpuFixtureToolchainSentinels = [ordered]@{
+        CMAKE_TOOLCHAIN_FILE = 'C:\fixture\sentinel-global.cmake'
+        'CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc' = 'C:\fixture\sentinel-target.cmake'
+        HOST_CMAKE_TOOLCHAIN_FILE = 'C:\fixture\sentinel-host.cmake'
+        CMAKE_X86_64_PC_WINDOWS_MSVC_TOOLCHAIN_FILE = 'C:\fixture\sentinel-alias.cmake'
+    }
+    $previousCpuFixtureToolchainEnvironment = @{}
+    $cpuFixtureOriginalEnvironment = [Environment]::GetEnvironmentVariables()
+    foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+        $previousCpuFixtureToolchainEnvironment[$name] = if ($cpuFixtureOriginalEnvironment.Contains($name)) { [string]$cpuFixtureOriginalEnvironment[$name] } else { $null }
+    }
+    try {
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $cpuFixtureToolchainSentinels[$name])
+        }
+        & (Join-Path $PSScriptRoot 'test-windows-frozen-cpu-worker-packaging.ps1')
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            if ([Environment]::GetEnvironmentVariable($name) -cne $cpuFixtureToolchainSentinels[$name]) {
+                throw "Frozen CPU fixture did not preserve the caller's $name."
+            }
+        }
+        Write-Output 'Frozen CPU fixture preserved all four caller toolchain sentinels.'
+    }
+    finally {
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            if ($null -eq $previousCpuFixtureToolchainEnvironment[$name]) {
+                if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+            }
+            else { [Environment]::SetEnvironmentVariable($name, $previousCpuFixtureToolchainEnvironment[$name]) }
+        }
+        $cpuFixtureRestoredEnvironment = [Environment]::GetEnvironmentVariables()
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            if ((Test-Path -LiteralPath "Env:$name") -ne $cpuFixtureOriginalEnvironment.Contains($name) -or
+                $cpuFixtureRestoredEnvironment[$name] -cne $cpuFixtureOriginalEnvironment[$name]) {
+                throw "Frozen CPU integration test did not restore the original presence and value of $name."
+            }
+        }
+        Write-Output 'Frozen CPU integration test restored all four original toolchain environment states.'
+    }
     & (Join-Path $PSScriptRoot 'test-windows-local-frozen-test-installer.ps1')
     Write-Output "Windows release packaging fail-closed tests passed."
 }

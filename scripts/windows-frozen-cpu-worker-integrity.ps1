@@ -322,7 +322,12 @@ function Get-WindowsFrozenCpuWorkerSourceContext([string]$RepositoryRoot) {
         -not [string]::Equals((Get-WindowsFrozenCpuWorkerNormalizedFullPath $topLevelLines[0]), $root, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Frozen CPU worker Git top-level does not match the source checkout.'
     }
-    foreach ($path in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs', 'src/worker_identity.rs')) {
+    foreach ($path in @(
+        'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'build.rs', 'src/worker_identity.rs',
+        'scripts/windows-cpu-worker-native-baseline.ps1',
+        'scripts/new-windows-frozen-cpu-worker.ps1',
+        'scripts/build-windows-release.ps1'
+    )) {
         $null = Assert-WindowsFrozenCpuWorkerRegularFile (Join-Path $root $path)
     }
     $status = @(Invoke-WindowsFrozenCpuWorkerGit $root @('status', '--porcelain=v1', '--untracked-files=all'))
@@ -350,15 +355,24 @@ function Get-WindowsFrozenCpuWorkerSourceContext([string]$RepositoryRoot) {
     }
     $version = $versions[0].Groups[1].Value
     $digests = [ordered]@{}
-    foreach ($path in @('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'src/worker_identity.rs', 'build.rs')) {
+    foreach ($path in @(
+        'Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', '.cargo/config.toml', 'src/worker_identity.rs', 'build.rs',
+        'scripts/windows-cpu-worker-native-baseline.ps1',
+        'scripts/new-windows-frozen-cpu-worker.ps1',
+        'scripts/build-windows-release.ps1'
+    )) {
         $relative = $path.Replace('\', '/')
         $digests[$relative] = Get-WindowsFrozenCpuWorkerFileSha256 (Join-Path $root $path)
     }
     $contractBytes = [System.Text.Encoding]::UTF8.GetBytes((@(
         'windows-frozen-cpu-worker-contract-v1',
         "Cargo.toml=$($digests['Cargo.toml'])",
+        ".cargo/config.toml=$($digests['.cargo/config.toml'])",
         "build.rs=$($digests['build.rs'])",
-        "src/worker_identity.rs=$($digests['src/worker_identity.rs'])"
+        "src/worker_identity.rs=$($digests['src/worker_identity.rs'])",
+        "scripts/windows-cpu-worker-native-baseline.ps1=$($digests['scripts/windows-cpu-worker-native-baseline.ps1'])",
+        "scripts/new-windows-frozen-cpu-worker.ps1=$($digests['scripts/new-windows-frozen-cpu-worker.ps1'])",
+        "scripts/build-windows-release.ps1=$($digests['scripts/build-windows-release.ps1'])"
     ) -join "`n"))
     return [pscustomobject]@{
         RepositoryRoot = $root
