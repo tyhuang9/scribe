@@ -1324,6 +1324,7 @@ fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
     let author_entrypoint = include_str!("../tools/worker-pack-author/src/main.rs");
     let authoring = include_str!("worker_pack_authoring.rs");
     let build = include_str!("../scripts/build-windows-gpu-worker-pack.ps1");
+    let cpu_baseline = include_str!("../scripts/windows-cpu-worker-native-baseline.ps1");
     let contract = include_str!("../runtime-manifests/gpu-worker-toolchain-windows-x64.json");
 
     assert!(!root_manifest.contains("scribe-worker-pack-tool"));
@@ -1391,10 +1392,26 @@ fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
         "BuildEnvironment",
         "Enable-ValidatedCmakeBuildJunction",
         "one exact NTFS junction",
+        "windows-cpu-worker-native-baseline.ps1",
+        "Get-ValidatedGpuWorkerNativeBuildEvidenceRoot",
+        "Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $nativeBuildEvidenceRoot",
+        "Assert-WindowsCpuWorkerBaselineAmbientEnvironment",
+        "Get-ProcessEnvironmentState",
+        "target-feature=+crt-static",
     ] {
         assert!(
             build.contains(required),
             "pack build gate lost {required:?}"
+        );
+    }
+    for required in [
+        "TRANSCRIBE_X86_CONSERVATIVE=ON",
+        "GGML_NATIVE=OFF",
+        "Assert-WindowsCpuWorkerBaselineNativeBuildEvidence",
+    ] {
+        assert!(
+            cpu_baseline.contains(required),
+            "shared CPU baseline gate lost {required:?}"
         );
     }
     assert!(root_manifest.contains(
@@ -3386,6 +3403,10 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "CPU worker baseline Visual Studio ggml-cpu flags contain an unrecognized or higher ISA requirement",
         "GGML_AVX512_BF16",
         "/(?:arch)",
+        "(?:HOST|TARGET)_",
+        "AVX[A-Z0-9_]*",
+        "/FI",
+        "Assert-WindowsCpuWorkerBaselineNativeBuildEvidence",
     ] {
         assert!(
             cpu_worker_baseline.contains(required),

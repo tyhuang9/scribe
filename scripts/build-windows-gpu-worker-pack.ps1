@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
 . (Join-Path $PSScriptRoot 'windows-vulkan-policy-pack.ps1')
 . (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
+. (Join-Path $PSScriptRoot 'windows-cpu-worker-native-baseline.ps1')
 
 if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
     throw 'Pinned MSVC environment export is only available with ToolchainCheckOnly.'
@@ -269,6 +270,97 @@ function Enable-ValidatedCmakeBuildJunction(
         )) {
         throw 'Could not verify the isolated transcribe-cpp native build junction.'
     }
+}
+
+function Remove-GpuWorkerPackStaging([string]$StagingRoot, [string]$OutputRoot) {
+    if (-not (Test-Path -LiteralPath $StagingRoot)) { return }
+    $expectedParent = Get-NormalizedFullPath (Split-Path -Parent $OutputRoot)
+    $observedParent = Get-NormalizedFullPath (Split-Path -Parent $StagingRoot)
+    if ($observedParent -cne $expectedParent -or
+        -not (Split-Path -Leaf $StagingRoot).StartsWith("$(Split-Path -Leaf $OutputRoot).staging-", [System.StringComparison]::Ordinal)) {
+        throw 'Refusing to clean a staging path outside the exact GPU worker-pack output parent.'
+    }
+    Remove-Item -LiteralPath $StagingRoot -Recurse -Force
+}
+
+function Get-ValidatedGpuWorkerNativeBuildEvidenceRoot(
+    [string]$BuildEnvironment,
+    [string]$CargoTarget
+) {
+    $cargoTargetItem = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The exact fresh Cargo target'
+    $buildEnvironmentItem = Get-ScribeGpuWorkerPhysicalDirectory $BuildEnvironment 'The isolated native build environment'
+    $canonicalCargoTarget = $cargoTargetItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $canonicalBuildEnvironment = $buildEnvironmentItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $buildParent = Join-Path $canonicalCargoTarget 'release\build'
+    $buildParentItem = Get-ScribeGpuWorkerPhysicalDirectory $buildParent 'The Cargo native-build parent'
+    $candidates = @(Get-ChildItem -LiteralPath $buildParentItem.FullName -Force | Where-Object {
+            $_.Name -cmatch '^transcribe-cpp-sys-[0-9a-f]{16}$'
+        })
+    if ($candidates.Count -ne 2) {
+        throw "GPU worker CPU baseline requires exactly two transcribe-cpp-sys Cargo build directories; found $($candidates.Count)."
+    }
+    $runOutputOwners = [System.Collections.Generic.List[IO.DirectoryInfo]]::new()
+    $scriptArtifactOwners = [System.Collections.Generic.List[IO.DirectoryInfo]]::new()
+    foreach ($candidate in $candidates) {
+        if (-not $candidate.PSIsContainer -or
+            ($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'GPU worker CPU baseline transcribe-cpp-sys Cargo build directory must be physical.'
+        }
+        $outPath = Join-Path $candidate.FullName 'out'
+        if (-not (Test-Path -LiteralPath $outPath)) {
+            $scriptArtifactOwners.Add($candidate)
+            continue
+        }
+        $outItem = Get-ScribeGpuWorkerPhysicalDirectory $outPath 'The transcribe-cpp OUT_DIR'
+        if ((Split-Path -Parent $outItem.FullName) -cne $candidate.FullName) {
+            throw 'GPU worker CPU baseline OUT_DIR escaped the exact transcribe-cpp Cargo build directory.'
+        }
+        $runOutputOwners.Add($candidate)
+    }
+    if ($runOutputOwners.Count -ne 1 -or $scriptArtifactOwners.Count -ne 1) {
+        throw "GPU worker CPU baseline requires one transcribe-cpp-sys run-output directory and one script-artifact directory; found run=$($runOutputOwners.Count), script=$($scriptArtifactOwners.Count)."
+    }
+    $outRoot = Get-ScribeGpuWorkerPhysicalDirectory (Join-Path $runOutputOwners[0].FullName 'out') 'The transcribe-cpp OUT_DIR'
+    $buildPath = Join-Path $outRoot.FullName 'build'
+    if (-not (Test-Path -LiteralPath $buildPath -PathType Container)) {
+        throw 'GPU worker CPU baseline native build directory is missing.'
+    }
+    $buildItem = Get-Item -LiteralPath $buildPath -Force
+    if (-not $buildItem.PSIsContainer -or
+        -not [string]::Equals((Split-Path -Parent $buildItem.FullName), $outRoot.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'GPU worker CPU baseline native build directory escaped the exact transcribe-cpp OUT_DIR.'
+    }
+    if (($buildItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        return (Get-ScribeGpuWorkerPhysicalDirectory $buildItem.FullName 'The transcribe-cpp native build directory').FullName
+    }
+
+    if ($buildItem.LinkType -cne 'Junction' -or @($buildItem.Target).Count -ne 1) {
+        throw 'GPU worker CPU baseline native build retry path is not one exact NTFS junction.'
+    }
+    $nativeRoot = Get-ScribeGpuWorkerPhysicalDirectory ([string]@($buildItem.Target)[0]) 'The isolated short native build directory'
+    $expectedNativeRoot = Join-Path $canonicalBuildEnvironment 'native'
+    if (-not [string]::Equals($nativeRoot.FullName, $expectedNativeRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Parent $nativeRoot.FullName) -cne $canonicalBuildEnvironment) {
+        throw 'GPU worker CPU baseline native build retry junction escaped the exact build environment.'
+    }
+    $tcsRoot = Get-ScribeGpuWorkerPhysicalDirectory (Join-Path $canonicalBuildEnvironment 'tcs') 'The isolated transcribe-cpp native-build junction root'
+    if ((Split-Path -Parent $tcsRoot.FullName) -cne $canonicalBuildEnvironment) {
+        throw 'GPU worker CPU baseline native-build junction root escaped the exact build environment.'
+    }
+    $tcsEntries = @(Get-ChildItem -LiteralPath $tcsRoot.FullName -Force)
+    if ($tcsEntries.Count -ne 1 -or
+        -not $tcsEntries[0].PSIsContainer -or
+        ($tcsEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $tcsEntries[0].LinkType -cne 'Junction' -or
+        @($tcsEntries[0].Target).Count -ne 1 -or
+        -not [string]::Equals(
+            (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($tcsEntries[0].Target)[0]) 'The transcribe-cpp OUT_DIR target').FullName,
+            $outRoot.FullName,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'GPU worker CPU baseline retry junction topology changed before evidence verification.'
+    }
+    return $nativeRoot.FullName
 }
 
 function Assert-ExactHash([string]$Path, [string]$Expected, [string]$Label) {
@@ -858,18 +950,47 @@ function Set-PinnedMsvcBuildEnvironment($Toolchain) {
 }
 
 function Restore-ProcessEnvironment([psobject[]]$Previous) {
+    $failures = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($Previous)) {
-        if ($entry.Exists) {
-            [System.Environment]::SetEnvironmentVariable(
-                [string]$entry.Name,
-                [string]$entry.Value,
-                [System.EnvironmentVariableTarget]::Process
-            )
+        try {
+            if ($entry.Exists) {
+                [System.Environment]::SetEnvironmentVariable(
+                    [string]$entry.Name,
+                    [string]$entry.Value,
+                    [System.EnvironmentVariableTarget]::Process
+                )
+            }
+            else {
+                if (Test-Path -LiteralPath "Env:$($entry.Name)") {
+                    Remove-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction Stop
+                }
+            }
+            $observed = Get-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction SilentlyContinue
+            if (($null -ne $observed) -ne [bool]$entry.Exists -or
+                ($entry.Exists -and [string]$observed.Value -cne [string]$entry.Value)) {
+                throw 'restored value did not match its recorded state'
+            }
         }
-        else {
-            Remove-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction SilentlyContinue
+        catch {
+            $failures.Add([string]$entry.Name)
         }
     }
+    if ($failures.Count -ne 0) {
+        throw 'Could not restore one or more process environment variables.'
+    }
+}
+
+function Get-ProcessEnvironmentState([string[]]$Names) {
+    $previous = [System.Collections.Generic.List[psobject]]::new()
+    foreach ($name in $Names) {
+        $current = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        $previous.Add([pscustomobject]@{
+            Name = $name
+            Exists = $null -ne $current
+            Value = if ($null -eq $current) { $null } else { [string]$current.Value }
+        })
+    }
+    return ,$previous.ToArray()
 }
 
 function Assert-ActivePinnedMsvcEnvironment($Toolchain) {
@@ -1195,6 +1316,7 @@ if ($contract.schema_version -ne 1 -or
     throw 'GPU worker-pack toolchain manifest violates the reviewed Windows x64 static-runtime contract.'
 }
 
+Assert-WindowsCpuWorkerBaselineAmbientEnvironment
 Assert-NoAmbientToolchainOverrides
 $msvcToolchain = Assert-BaseToolchain $contract $repositoryRoot
 $archiveContract = $contract.native_source.sherpa_onnx_archive
@@ -1271,20 +1393,15 @@ $null = Invoke-NativeProcess $git @('-C', $repositoryRoot, 'diff', '--cached', '
 $manifestPath = Join-Path $repositoryRoot 'Cargo.toml'
 $authoringManifestPath = Join-Path $repositoryRoot 'tools\worker-pack-author\Cargo.toml'
 $cargo = Get-CommandPath 'cargo.exe' 'Cargo is required to build GPU worker packs.'
-$previousCargoTarget = $env:CARGO_TARGET_DIR
-$previousRevision = $env:SCRIBE_BUILD_REVISION
-$previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
-$previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
-$previousVulkanSdk = $env:VULKAN_SDK
-$previousCudaPath = $env:CUDA_PATH
-$previousCmakeArguments = $env:TRANSCRIBE_CMAKE_ARGS
-$previousSherpaArchiveRoot = $env:SHERPA_ONNX_ARCHIVE_DIR
-$previousSourceDateEpoch = $env:SOURCE_DATE_EPOCH
-$previousMsvcFlags = $env:_CL_
-$previousLocalAppData = $env:LOCALAPPDATA
+$buildEnvironmentState = Get-ProcessEnvironmentState @(
+    'CARGO_TARGET_DIR', 'SCRIBE_BUILD_REVISION', 'SCRIBE_BUNDLED_WORKER_SHA256',
+    'SCRIBE_BUILDING_WORKER', 'VULKAN_SDK', 'CUDA_PATH', 'TRANSCRIBE_CMAKE_ARGS',
+    'SHERPA_ONNX_ARCHIVE_DIR', 'SOURCE_DATE_EPOCH', '_CL_', 'LOCALAPPDATA', 'RUSTFLAGS'
+)
 $previousPinnedMsvcEnvironment = $null
 $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
 $stagingCreated = $false
+$packResult = $null
 $builtVulkanLoader = $null
 $pinnedRuntimeSources = @{}
 
@@ -1332,7 +1449,10 @@ try {
     $env:SHERPA_ONNX_ARCHIVE_DIR = $nativeArchiveRoot
     $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
     $env:_CL_ = [string]$contract.msvc.reproducible_flag
-    $env:TRANSCRIBE_CMAKE_ARGS = '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DTRANSCRIBE_GGML_BACKEND_DL=OFF -DGGML_OPENMP=OFF'
+    $env:TRANSCRIBE_CMAKE_ARGS = Get-WindowsCpuWorkerBaselineCmakeArgs
+    # Cargo-level Rust flags override checked-in target configuration, keeping
+    # the reviewed static CRT while excluding host ISA tuning from this pack.
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
     if ($Backend -eq 'Vulkan') {
         $env:VULKAN_SDK = $sdkRoot
         $env:CUDA_PATH = $null
@@ -1408,6 +1528,10 @@ try {
     }
     $worker = Join-Path $cargoTarget 'release\scribe-inference-worker.exe'
     $null = Assert-RegularNonReparseFile $worker "$Backend inference worker"
+    $nativeBuildEvidenceRoot = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot `
+        $shortBuild.BuildEnvironment `
+        $cargoTarget
+    Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $nativeBuildEvidenceRoot
 
     # Resolve and authenticate every CUDA notice before creating any notice
     # destination. The subsequent copy reauthenticates each source while its
@@ -1476,9 +1600,7 @@ try {
         [string]$descriptor.pack_digest -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Worker-pack authoring returned a mismatched identity.'
     }
-    Move-Item -LiteralPath $stagingRoot -Destination $outputRoot
-    $stagingCreated = $false
-    [pscustomobject]@{
+    $packResult = [pscustomobject]@{
         Backend = $Backend
         PackRoot = $outputRoot
         PackId = [string]$descriptor.pack_id
@@ -1495,27 +1617,28 @@ try {
     }
 }
 finally {
+    $restorationFailures = [System.Collections.Generic.List[System.Exception]]::new()
     if ($null -ne $previousPinnedMsvcEnvironment) {
-        Restore-ProcessEnvironment $previousPinnedMsvcEnvironment
+        try { Restore-ProcessEnvironment $previousPinnedMsvcEnvironment }
+        catch { $restorationFailures.Add($_.Exception) }
     }
-    $env:CARGO_TARGET_DIR = $previousCargoTarget
-    $env:SCRIBE_BUILD_REVISION = $previousRevision
-    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerDigest
-    $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
-    $env:VULKAN_SDK = $previousVulkanSdk
-    $env:CUDA_PATH = $previousCudaPath
-    $env:TRANSCRIBE_CMAKE_ARGS = $previousCmakeArguments
-    $env:SHERPA_ONNX_ARCHIVE_DIR = $previousSherpaArchiveRoot
-    $env:SOURCE_DATE_EPOCH = $previousSourceDateEpoch
-    $env:_CL_ = $previousMsvcFlags
-    $env:LOCALAPPDATA = $previousLocalAppData
-    if ($stagingCreated -and (Test-Path -LiteralPath $stagingRoot)) {
-        $expectedParent = Get-NormalizedFullPath (Split-Path -Parent $outputRoot)
-        $observedParent = Get-NormalizedFullPath (Split-Path -Parent $stagingRoot)
-        if ($observedParent -cne $expectedParent -or
-            -not (Split-Path -Leaf $stagingRoot).StartsWith("$(Split-Path -Leaf $outputRoot).staging-", [System.StringComparison]::Ordinal)) {
-            throw 'Refusing to clean a staging path outside the exact GPU worker-pack output parent.'
-        }
-        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+    try { Restore-ProcessEnvironment $buildEnvironmentState }
+    catch { $restorationFailures.Add($_.Exception) }
+    if (($null -eq $packResult -or $restorationFailures.Count -ne 0) -and $stagingCreated) {
+        Remove-GpuWorkerPackStaging $stagingRoot $outputRoot
     }
+    if ($restorationFailures.Count -ne 0) {
+        throw 'GPU worker-pack build could not restore its process environment.'
+    }
+}
+try {
+    Move-Item -LiteralPath $stagingRoot -Destination $outputRoot
+    $stagingCreated = $false
+    $packResult
+}
+catch {
+    if ($stagingCreated) {
+        Remove-GpuWorkerPackStaging $stagingRoot $outputRoot
+    }
+    throw
 }
