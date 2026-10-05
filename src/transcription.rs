@@ -1106,12 +1106,10 @@ impl TranscriptionService {
         &self,
         root: &Path,
     ) -> Result<RuntimeLoadExecution> {
-        self.worker
-            .load(
-                self.onnx_artifact_from_receipt(root)?,
-                AccelerationPreference::Cpu,
-            )
-            .map_err(Into::into)
+        let artifact = self.onnx_artifact_from_receipt(root)?;
+        let preference = self.config.performance.acceleration_preference;
+        crate::onnx_worker::resolve_cpu_only_acceleration(preference)?;
+        self.worker.load(artifact, preference).map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -1413,12 +1411,12 @@ impl TranscriptionService {
                     "selected ONNX bundle path is not its canonical receipt root"
                 ));
             }
+            let artifact = self.onnx_artifact_from_receipt(&root)?;
+            let preference = self.config.performance.acceleration_preference;
+            crate::onnx_worker::resolve_cpu_only_acceleration(preference)?;
             return self
                 .worker
-                .health_check(
-                    self.onnx_artifact_from_receipt(&root)?,
-                    AccelerationPreference::Cpu,
-                )
+                .health_check(artifact, preference)
                 .map_err(Into::into);
         }
         let model = self.resolve_model(model_id, model_path)?;
@@ -1900,11 +1898,13 @@ impl TranscriptionService {
             }
             validate_default_options(&request.options)?;
             let artifact = self.onnx_artifact_from_receipt(&root)?;
+            let preference = self.config.performance.acceleration_preference;
+            crate::onnx_worker::resolve_cpu_only_acceleration(preference)?;
             let execution = self
                 .worker
                 .transcribe(
                     artifact,
-                    AccelerationPreference::Cpu,
+                    preference,
                     Arc::clone(&request.audio),
                     request.options.clone(),
                     ticket.native_generation,
@@ -3334,14 +3334,16 @@ mod tests {
     }
 
     fn test_load_execution() -> RuntimeLoadExecution {
+        test_load_execution_for(AccelerationPreference::Cpu)
+    }
+
+    fn test_load_execution_for(preference: AccelerationPreference) -> RuntimeLoadExecution {
         RuntimeLoadExecution {
             diagnostics: NativeRuntimeDiagnostics {
-                resolved_acceleration: ResolvedAcceleration {
-                    requested: AccelerationPreference::Cpu,
-                    resolved: ComputeDevice::Cpu,
-                    diagnostic: None,
-                    selection: None,
-                },
+                resolved_acceleration: crate::onnx_worker::resolve_cpu_only_acceleration(
+                    preference,
+                )
+                .unwrap(),
                 runtime_location: PathBuf::from("<test-inference-child>"),
                 warm_reused: false,
                 model_load_duration_ms: 1,
@@ -3395,8 +3397,10 @@ mod tests {
                     reply,
                 } => {
                     assert_eq!(actual, expected);
-                    assert_eq!(preference, AccelerationPreference::Cpu);
-                    reply.send(Ok(test_load_execution())).unwrap();
+                    assert_eq!(preference, AccelerationPreference::Auto);
+                    reply
+                        .send(Ok(test_load_execution_for(AccelerationPreference::Auto)))
+                        .unwrap();
                 }
                 _ => panic!("receipt preload must dispatch an ONNX load command"),
             }
@@ -3461,9 +3465,198 @@ mod tests {
 
     #[test]
     fn public_moonshine_operations_verify_each_receipt_once_before_dispatch() {
+        for expected_preference in [AccelerationPreference::Auto, AccelerationPreference::Cpu] {
+            let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+            let (fixture_root, mut spec) = service_onnx_spec_with(
+                "public-receipt-observer",
+                model_id.as_str(),
+                OnnxModelFamily::Moonshine,
+                4,
+                &[
+                    OnnxFileRole::Encoder,
+                    OnnxFileRole::MergedDecoder,
+                    OnnxFileRole::Tokens,
+                ],
+            );
+            let storage = fixture_root.with_file_name(format!(
+                "scribe-service-public-receipt-storage-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let root = storage.join("onnx-bundles").join(model_id.as_str());
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            fs::rename(&fixture_root, &root).unwrap();
+            spec.root = root.clone();
+            let current_manifest =
+                crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+
+            let expected = spec.clone();
+            let worker_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let worker_dispatches_for_thread = Arc::clone(&worker_dispatches);
+            let worker = simulated_runtime_worker(move |receiver| {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        RuntimeCommand::Load {
+                            artifact: RuntimeArtifact::OnnxBundle(actual),
+                            preference,
+                            reply,
+                        } => {
+                            worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(actual, expected);
+                            assert_eq!(preference, expected_preference);
+                            reply
+                                .send(Ok(test_load_execution_for(expected_preference)))
+                                .unwrap();
+                        }
+                        RuntimeCommand::Health {
+                            artifact: RuntimeArtifact::OnnxBundle(actual),
+                            preference,
+                            reply,
+                        } => {
+                            worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(actual, expected);
+                            assert_eq!(preference, expected_preference);
+                            reply.send(Ok(())).unwrap();
+                        }
+                        RuntimeCommand::Transcribe {
+                            artifact: RuntimeArtifact::OnnxBundle(actual),
+                            preference,
+                            reply,
+                            ..
+                        } => {
+                            worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(actual, expected);
+                            assert_eq!(preference, expected_preference);
+                            reply
+                                .send(Ok(RuntimeExecution {
+                                    transcript: Transcript {
+                                        text: "public-operation".to_owned(),
+                                        segments: Vec::new(),
+                                        detected_language: None,
+                                        duration_ms: None,
+                                    },
+                                    diagnostics: test_load_execution_for(expected_preference)
+                                        .diagnostics,
+                                    processing_duration_ms: 1,
+                                }))
+                                .unwrap();
+                        }
+                        RuntimeCommand::Shutdown { reply } => {
+                            reply.send(Ok(())).unwrap();
+                            break;
+                        }
+                        _ => panic!("unexpected public ONNX command"),
+                    }
+                }
+            });
+            let mut config = AppConfig::default();
+            config.general.model_storage_dir = storage.clone();
+            config.performance.acceleration_preference = expected_preference;
+            let service = TranscriptionService {
+                config,
+                router: RuntimeRouter::new(),
+                current_receipt_manifest: None,
+                worker,
+            }
+            .with_test_current_receipt_manifest(current_manifest);
+
+            let (preload, preload_stats) =
+                crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                    service.preload_model(&model_id, None)
+                });
+            let (health, health_stats) =
+                crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                    service.health_check(&model_id, None)
+                });
+            let (transcribe, transcribe_stats) =
+                crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                    service.transcribe(TranscriptionRequest::new(
+                        SessionId(730),
+                        RequestId(731),
+                        prepared_audio(),
+                        model_id.clone(),
+                    ))
+                });
+            let preload = preload.unwrap();
+            health.unwrap();
+            let transcribe = transcribe.unwrap();
+            assert_eq!(preload.resolved_acceleration.requested, expected_preference);
+            assert_eq!(preload.resolved_acceleration.resolved, ComputeDevice::Cpu);
+            let transcribe_acceleration = transcribe.resolved_acceleration.unwrap();
+            assert_eq!(transcribe_acceleration.requested, expected_preference);
+            assert_eq!(transcribe_acceleration.resolved, ComputeDevice::Cpu);
+            for stats in [&preload_stats, &health_stats, &transcribe_stats] {
+                assert_eq!(stats.calls, 1);
+                assert!(stats.verified_bytes > 0);
+                assert_eq!(stats.durations.len(), 1);
+            }
+            assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+            fs::write(root.join(&spec.files[&OnnxFileRole::Encoder]), b"tampered").unwrap();
+            let (tampered, tampered_stats) =
+                crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                    service.preload_model(&model_id, None)
+                });
+            assert!(
+                tampered
+                    .unwrap_err()
+                    .to_string()
+                    .contains("installed ONNX bundle verification failed")
+            );
+            assert_eq!(tampered_stats.calls, 1);
+            assert_eq!(tampered_stats.verified_bytes, 0);
+            assert_eq!(tampered_stats.durations.len(), 1);
+            assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+            let (tampered_health, tampered_health_stats) =
+                crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                    service.health_check(&model_id, None)
+                });
+            assert!(
+                tampered_health
+                    .unwrap_err()
+                    .to_string()
+                    .contains("installed ONNX bundle verification failed")
+            );
+            assert_eq!(tampered_health_stats.calls, 1);
+            assert_eq!(tampered_health_stats.verified_bytes, 0);
+            assert_eq!(tampered_health_stats.durations.len(), 1);
+            assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+            let (tampered_transcribe, tampered_transcribe_stats) =
+                crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                    service.transcribe(TranscriptionRequest::new(
+                        SessionId(732),
+                        RequestId(733),
+                        prepared_audio(),
+                        model_id.clone(),
+                    ))
+                });
+            assert!(
+                tampered_transcribe
+                    .unwrap_err()
+                    .to_string()
+                    .contains("installed ONNX bundle verification failed")
+            );
+            assert_eq!(tampered_transcribe_stats.calls, 1);
+            assert_eq!(tampered_transcribe_stats.verified_bytes, 0);
+            assert_eq!(tampered_transcribe_stats.durations.len(), 1);
+            assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+            drop(service);
+            fs::remove_dir_all(storage).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_gpu_public_onnx_operations_verify_receipts_before_zero_dispatch() {
+        let _cancellation_lock = crate::stt::cancellation_test_lock();
         let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
         let (fixture_root, mut spec) = service_onnx_spec_with(
-            "public-receipt-observer",
+            "public-explicit-gpu-receipt-observer",
             model_id.as_str(),
             OnnxModelFamily::Moonshine,
             4,
@@ -3474,7 +3667,7 @@ mod tests {
             ],
         );
         let storage = fixture_root.with_file_name(format!(
-            "scribe-service-public-receipt-storage-{}-{}",
+            "scribe-service-public-explicit-gpu-storage-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3488,64 +3681,24 @@ mod tests {
         let current_manifest =
             crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
 
-        let expected = spec.clone();
-        let worker_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let worker_dispatches_for_thread = Arc::clone(&worker_dispatches);
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatches_for_thread = Arc::clone(&dispatches);
         let worker = simulated_runtime_worker(move |receiver| {
-            while let Ok(command) = receiver.recv() {
+            if let Ok(command) = receiver.recv() {
                 match command {
-                    RuntimeCommand::Load {
-                        artifact: RuntimeArtifact::OnnxBundle(actual),
-                        preference,
-                        reply,
-                    } => {
-                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(actual, expected);
-                        assert_eq!(preference, AccelerationPreference::Cpu);
-                        reply.send(Ok(test_load_execution())).unwrap();
-                    }
-                    RuntimeCommand::Health {
-                        artifact: RuntimeArtifact::OnnxBundle(actual),
-                        preference,
-                        reply,
-                    } => {
-                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(actual, expected);
-                        assert_eq!(preference, AccelerationPreference::Cpu);
-                        reply.send(Ok(())).unwrap();
-                    }
-                    RuntimeCommand::Transcribe {
-                        artifact: RuntimeArtifact::OnnxBundle(actual),
-                        preference,
-                        reply,
-                        ..
-                    } => {
-                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(actual, expected);
-                        assert_eq!(preference, AccelerationPreference::Cpu);
-                        reply
-                            .send(Ok(RuntimeExecution {
-                                transcript: Transcript {
-                                    text: "public-operation".to_owned(),
-                                    segments: Vec::new(),
-                                    detected_language: None,
-                                    duration_ms: None,
-                                },
-                                diagnostics: test_load_execution().diagnostics,
-                                processing_duration_ms: 1,
-                            }))
-                            .unwrap();
-                    }
                     RuntimeCommand::Shutdown { reply } => {
                         reply.send(Ok(())).unwrap();
-                        break;
                     }
-                    _ => panic!("unexpected public ONNX command"),
+                    _ => {
+                        dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        panic!("explicit GPU ONNX must fail before worker dispatch");
+                    }
                 }
             }
         });
         let mut config = AppConfig::default();
         config.general.model_storage_dir = storage.clone();
+        config.performance.acceleration_preference = AccelerationPreference::Gpu;
         let service = TranscriptionService {
             config,
             router: RuntimeRouter::new(),
@@ -3554,68 +3707,95 @@ mod tests {
         }
         .with_test_current_receipt_manifest(current_manifest);
 
+        let assert_gpu_rejected_after_one_receipt = |result: Result<()>, calls: usize| {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("isolated runtime is CPU-only"));
+            assert_eq!(calls, 1);
+            assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        };
         let (preload, preload_stats) =
             crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
-                service.preload_model(&model_id, None)
+                service.preload_model(&model_id, None).map(|_| ())
             });
+        assert_gpu_rejected_after_one_receipt(preload, preload_stats.calls);
         let (health, health_stats) =
             crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
                 service.health_check(&model_id, None)
             });
+        assert_gpu_rejected_after_one_receipt(health, health_stats.calls);
         let (transcribe, transcribe_stats) =
             crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
-                service.transcribe(TranscriptionRequest::new(
-                    SessionId(730),
-                    RequestId(731),
-                    prepared_audio(),
-                    model_id.clone(),
-                ))
+                service
+                    .transcribe(TranscriptionRequest::new(
+                        SessionId(741),
+                        RequestId(742),
+                        prepared_audio(),
+                        model_id.clone(),
+                    ))
+                    .map(|_| ())
             });
-        preload.unwrap();
-        health.unwrap();
-        transcribe.unwrap();
-        for stats in [&preload_stats, &health_stats, &transcribe_stats] {
-            assert_eq!(stats.calls, 1);
-            assert!(stats.verified_bytes > 0);
-            assert_eq!(stats.durations.len(), 1);
-        }
-        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+        assert_gpu_rejected_after_one_receipt(transcribe, transcribe_stats.calls);
 
         fs::write(root.join(&spec.files[&OnnxFileRole::Encoder]), b"tampered").unwrap();
         let (tampered, tampered_stats) =
             crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
                 service.preload_model(&model_id, None)
             });
-        assert!(tampered.is_err());
+        assert!(
+            tampered
+                .unwrap_err()
+                .to_string()
+                .contains("installed ONNX bundle verification failed")
+        );
         assert_eq!(tampered_stats.calls, 1);
-        assert_eq!(tampered_stats.verified_bytes, 0);
-        assert_eq!(tampered_stats.durations.len(), 1);
-        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 
-        let (tampered_health, tampered_health_stats) =
+        let (noncanonical, noncanonical_stats) =
             crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
-                service.health_check(&model_id, None)
+                service.preload_model(&model_id, Some(root.with_file_name("not-receipted")))
             });
-        assert!(tampered_health.is_err());
-        assert_eq!(tampered_health_stats.calls, 1);
-        assert_eq!(tampered_health_stats.verified_bytes, 0);
-        assert_eq!(tampered_health_stats.durations.len(), 1);
-        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
-
-        let (tampered_transcribe, tampered_transcribe_stats) =
+        assert!(
+            noncanonical
+                .unwrap_err()
+                .to_string()
+                .contains("canonical receipt root")
+        );
+        assert_eq!(noncanonical_stats.calls, 0);
+        let mut unsupported = TranscriptionRequest::new(
+            SessionId(743),
+            RequestId(744),
+            prepared_audio(),
+            model_id.clone(),
+        );
+        unsupported.options.language = Some("en".to_owned());
+        let (unsupported, unsupported_stats) =
             crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
-                service.transcribe(TranscriptionRequest::new(
-                    SessionId(732),
-                    RequestId(733),
-                    prepared_audio(),
-                    model_id.clone(),
-                ))
+                service.transcribe(unsupported)
             });
-        assert!(tampered_transcribe.is_err());
-        assert_eq!(tampered_transcribe_stats.calls, 1);
-        assert_eq!(tampered_transcribe_stats.verified_bytes, 0);
-        assert_eq!(tampered_transcribe_stats.durations.len(), 1);
-        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+        assert!(
+            unsupported
+                .unwrap_err()
+                .to_string()
+                .contains("language selection is not supported")
+        );
+        assert_eq!(unsupported_stats.calls, 0);
+        let ticket = service.transcription_ticket();
+        service.cancel_active();
+        let (cancelled, cancelled_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.transcribe_with_ticket(
+                    TranscriptionRequest::new(
+                        SessionId(745),
+                        RequestId(746),
+                        prepared_audio(),
+                        model_id.clone(),
+                    ),
+                    ticket,
+                )
+            });
+        assert!(cancelled.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(cancelled_stats.calls, 0);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 
         drop(service);
         fs::remove_dir_all(storage).unwrap();
@@ -3629,8 +3809,16 @@ mod tests {
         let worker = simulated_runtime_worker(move |receiver| {
             while let Ok(command) = receiver.recv() {
                 match command {
-                    RuntimeCommand::Health { reply, .. } => reply.send(Ok(())).unwrap(),
-                    RuntimeCommand::Load { reply, .. } => {
+                    RuntimeCommand::Health {
+                        preference, reply, ..
+                    } => {
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply.send(Ok(())).unwrap()
+                    }
+                    RuntimeCommand::Load {
+                        preference, reply, ..
+                    } => {
+                        assert_eq!(preference, AccelerationPreference::Cpu);
                         reply.send(Ok(test_load_execution())).unwrap()
                     }
                     RuntimeCommand::RetryGpu { reply, .. } => reply
@@ -3638,11 +3826,16 @@ mod tests {
                             "GPU retry is not part of this fixture".to_owned(),
                         )))
                         .unwrap(),
-                    RuntimeCommand::Transcribe { reply, .. } => reply
-                        .send(Err(RuntimeError::Engine(
-                            "deterministic service decode failure".to_owned(),
-                        )))
-                        .unwrap(),
+                    RuntimeCommand::Transcribe {
+                        preference, reply, ..
+                    } => {
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply
+                            .send(Err(RuntimeError::Engine(
+                                "deterministic service decode failure".to_owned(),
+                            )))
+                            .unwrap()
+                    }
                     RuntimeCommand::Unload { reply } => {
                         worker_unloads.fetch_add(1, Ordering::AcqRel);
                         reply.send(Ok(())).unwrap();
@@ -3654,8 +3847,10 @@ mod tests {
                 }
             }
         });
+        let mut config = AppConfig::default();
+        config.performance.acceleration_preference = AccelerationPreference::Gpu;
         let service = TranscriptionService {
-            config: AppConfig::default(),
+            config,
             router: RuntimeRouter::new(),
             current_receipt_manifest: None,
             worker,
