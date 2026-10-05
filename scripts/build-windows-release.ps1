@@ -13,6 +13,7 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 . (Join-Path $PSScriptRoot "windows-frozen-cpu-worker-integrity.ps1")
+. (Join-Path $PSScriptRoot "windows-cpu-worker-native-baseline.ps1")
 
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
@@ -487,6 +488,7 @@ $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 $sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
 $frozenCpuWorker = $null
+$cpuWorkerBaseline = $null
 try {
     if ($frozenCpuWorkerRequested) {
         if (Test-PathIsWithin $stagingBundle $frozenInputRoot) {
@@ -512,12 +514,17 @@ try {
             # The worker is built and hashed first. The desktop then embeds that exact
             # SHA-256 as its bundled-worker trust anchor; this is intentionally separate
             # from the future signed GPU pack catalog.
+            $cpuWorkerBaseline = New-WindowsCpuWorkerBaselineBuild $targetTriple
+            $sourceInferenceWorker = $cpuWorkerBaseline.WorkerPath
             $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
             $env:SCRIBE_BUILDING_WORKER = '1'
             & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
             if ($LASTEXITCODE -ne 0) {
                 throw "The locked offline Windows x64 CPU inference worker release build failed."
             }
+            Assert-WindowsCpuWorkerBaselineEvidence $cpuWorkerBaseline
+            Restore-WindowsCpuWorkerBaselineEnvironment $cpuWorkerBaseline
+            Write-Output "CPU worker native baseline evidence retained: $($cpuWorkerBaseline.TargetRoot)"
             Assert-Amd64Pe $sourceInferenceWorker
             $env:SCRIBE_BUILDING_WORKER = $null
             $env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker).Hash.ToLowerInvariant()
@@ -537,6 +544,9 @@ try {
         }
     }
     finally {
+        if ($null -ne $cpuWorkerBaseline) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $cpuWorkerBaseline
+        }
         $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerSha256
         $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
         $env:SCRIBE_BUILD_REVISION = $previousBuildRevision

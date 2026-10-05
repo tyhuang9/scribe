@@ -3284,6 +3284,18 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
 
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
+    let frozen_cpu_worker = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("new-windows-frozen-cpu-worker.ps1"),
+    )
+    .expect("frozen CPU worker script must be readable");
+    let cpu_worker_baseline = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("windows-cpu-worker-native-baseline.ps1"),
+    )
+    .expect("CPU worker native baseline script must be readable");
     for required in [
         "cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple",
         "$desktopFeatures = @('ui-harness')",
@@ -3342,6 +3354,60 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         assert!(
             !release.contains(forbidden),
             "Windows release packaging must not enable {forbidden}"
+        );
+    }
+    for source in [&release, &frozen_cpu_worker] {
+        for required in [
+            "windows-cpu-worker-native-baseline.ps1",
+            "New-WindowsCpuWorkerBaselineBuild $targetTriple",
+            "Assert-WindowsCpuWorkerBaselineEvidence $cpuWorkerBaseline",
+            "Restore-WindowsCpuWorkerBaselineEnvironment $cpuWorkerBaseline",
+            "CPU worker native baseline evidence retained:",
+        ] {
+            assert!(
+                source.contains(required),
+                "Windows CPU worker builders must retain {required:?}"
+            );
+        }
+    }
+    for required in [
+        "TRANSCRIBE_X86_CONSERVATIVE=ON",
+        "GGML_NATIVE=OFF",
+        "TRANSCRIBE_GGML_BACKEND_DL=OFF",
+        "GGML_OPENMP=OFF",
+        "target-feature=+crt-static",
+        "CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+        "Fresh CPU worker baseline target unexpectedly already exists",
+        "CMAKE_ARGS",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+        "CPU worker baseline requires exactly one transcribe-cpp-sys Cargo build directory",
+        "CPU worker baseline does not recognize the generated CMake generator",
+        "CPU worker baseline generated ggml-cpu C/C++ flags contain a native or higher ISA requirement",
+        "CPU worker baseline Visual Studio ggml-cpu flags contain an unrecognized or higher ISA requirement",
+        "GGML_AVX512_BF16",
+        "/(?:arch)",
+    ] {
+        assert!(
+            cpu_worker_baseline.contains(required),
+            "Windows CPU worker native baseline lost {required:?}"
+        );
+    }
+    let frozen_integrity = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("windows-frozen-cpu-worker-integrity.ps1"),
+    )
+    .expect("frozen CPU worker integrity helper must be readable");
+    for required in [
+        "scripts/windows-cpu-worker-native-baseline.ps1",
+        "scripts/new-windows-frozen-cpu-worker.ps1",
+        "scripts/build-windows-release.ps1",
+        ".cargo/config.toml",
+        "windows-frozen-cpu-worker-contract-v1",
+    ] {
+        assert!(
+            frozen_integrity.contains(required),
+            "frozen CPU worker build contract must bind {required:?}"
         );
     }
 

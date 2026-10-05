@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-frozen-cpu-worker-integrity.ps1')
 . (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
+. (Join-Path $PSScriptRoot 'windows-cpu-worker-native-baseline.ps1')
 
 function Assert-FrozenCpuWorkerOutputOutside([string]$OutputPath, [string]$ProtectedRoot) {
     if ([string]::Equals($OutputPath, $ProtectedRoot, [StringComparison]::OrdinalIgnoreCase) -or
@@ -84,23 +85,29 @@ if (Test-Path -LiteralPath $finalRoot) {
 
 $stagingName = "$outputName.staging-$PID-$([guid]::NewGuid().ToString('N'))"
 $stagingRoot = Join-Path $outputParent $stagingName
-$sourceWorker = Join-Path $cargoTargetRoot "$targetTriple\release\scribe-inference-worker.exe"
+$sourceWorker = $null
 $previousRevision = $env:SCRIBE_BUILD_REVISION
 $previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 $workerStream = $null
+$cpuWorkerBaseline = $null
 $stagingOwned = $false
 $locationPushed = $false
 try {
     $env:SCRIBE_BUILD_REVISION = $context.SourceRevision
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
     $env:SCRIBE_BUILDING_WORKER = '1'
+    $cpuWorkerBaseline = New-WindowsCpuWorkerBaselineBuild $targetTriple
+    $sourceWorker = $cpuWorkerBaseline.WorkerPath
     Push-Location $repositoryRoot
     $locationPushed = $true
     & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot 'Cargo.toml')
     if ($LASTEXITCODE -ne 0) {
         throw 'The locked offline Windows x64 CPU inference worker release build failed.'
     }
+    Assert-WindowsCpuWorkerBaselineEvidence $cpuWorkerBaseline
+    Restore-WindowsCpuWorkerBaselineEnvironment $cpuWorkerBaseline
+    Write-Output "CPU worker native baseline evidence retained: $($cpuWorkerBaseline.TargetRoot)"
 
     $workerStream = Open-WindowsFrozenCpuWorkerReadHandle $sourceWorker
     if ($workerStream.Length -le 0 -or $workerStream.Length -gt (Get-WindowsFrozenCpuWorkerMaximumBytes)) {
@@ -149,6 +156,7 @@ try {
 }
 finally {
     if ($null -ne $workerStream) { $workerStream.Dispose() }
+    if ($null -ne $cpuWorkerBaseline) { Restore-WindowsCpuWorkerBaselineEnvironment $cpuWorkerBaseline }
     $env:SCRIBE_BUILD_REVISION = $previousRevision
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerDigest
     $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker

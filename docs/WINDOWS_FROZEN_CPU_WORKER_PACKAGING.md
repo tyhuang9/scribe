@@ -20,9 +20,27 @@ target, worker ABI, private-protocol version, desktop and worker build IDs, and
 the worker's exact size and SHA-256. These are source/build-contract identities,
 not independently observed worker capabilities.
 
+The frozen build-contract digest also binds the shared native-baseline helper
+and both Windows CPU-worker construction scripts. Changing either normal or
+frozen CPU-worker assembly therefore requires a new freeze record.
+
 The producer and frozen consumer bind `SCRIBE_BUILD_REVISION` to the actual
 checkout revision instead of inheriting an unrelated caller override. Temporary
 build environment values are restored when the operation finishes or fails.
+
+Every bundled CPU worker is built in a new, uniquely named Cargo target below
+the system temporary directory. Its native build fixes
+`TRANSCRIBE_X86_CONSERVATIVE=ON` and `GGML_NATIVE=OFF`, rejects ambient CMake
+and compiler-flag overrides, pins Rust to the existing static CRT without host
+ISA features, and verifies the single generated transcribe CMake
+cache plus the generated `ggml-cpu` compiler flags before the worker is hashed
+or copied. This selects the conservative x86-64 CPU floor and can perform less
+well than a host-tuned SIMD build. The builder prints the exact retained target
+path after validation; it is evidence for the worker and is deliberately not
+deleted automatically. Remove it only after retaining the freeze or bundle
+record needed for local investigation. The cache/flag check establishes the
+build contract; real GGUF execution on the oldest supported Windows x64 CPU is
+still the acceptance test for hardware compatibility.
 
 The record is **unsigned local integrity data**, not authenticated producer
 provenance. A clean Git checkout, a matching hash, or a locally successful
