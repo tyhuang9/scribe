@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::telemetry::SamplingSession;
+use super::telemetry::{ProcessAffinityObservation, SamplingSession, observe_process_affinity};
 use super::{
     CampaignPower, CommandOptions, InputReport, MemoryAvailabilityReport, ProviderMemoryReport,
     UnavailableField, UnavailableReport, VideoMemoryReport, WorkerObservationMeasurements,
@@ -33,7 +33,7 @@ use crate::runtime_contract::WARM_MODEL_TTL;
 use crate::transcription::{AccelerationPreference, ModelId};
 
 const KIND: &str = "windows_gpu_capture_campaign";
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
 const COLD_PAIRS: u8 = 5;
 const WARM_PAIRS: u8 = 20;
 const MAX_CAPTURES: usize = 14;
@@ -245,9 +245,90 @@ struct CampaignRunRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     memory_availability: Option<MemoryAvailabilityReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    worker_process_affinity: Option<ProcessAffinityPair>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     normalized_transcript_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<FailureDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProcessAffinityPair {
+    before: Option<ProcessAffinityObservation>,
+    after: Option<ProcessAffinityObservation>,
+    changed: Option<bool>,
+}
+
+fn process_affinity_pair(
+    before: Option<&ProcessAffinityObservation>,
+    after: Option<&ProcessAffinityObservation>,
+) -> Option<ProcessAffinityPair> {
+    if before.is_none() && after.is_none() {
+        return None;
+    }
+    let before = before.cloned();
+    let after = after.cloned();
+    let changed = match (before.as_ref(), after.as_ref()) {
+        (
+            Some(ProcessAffinityObservation::Available { .. }),
+            Some(ProcessAffinityObservation::Available { .. }),
+        ) => Some(before != after),
+        _ => None,
+    };
+    Some(ProcessAffinityPair {
+        before,
+        after,
+        changed,
+    })
+}
+
+fn validate_process_affinity_pair(pair: &ProcessAffinityPair) -> Result<()> {
+    if pair.before.is_none() {
+        bail!("campaign affinity observation omitted its initial endpoint")
+    }
+    let validate_endpoint = |endpoint: &ProcessAffinityObservation| -> Result<()> {
+        let ProcessAffinityObservation::Available {
+            processor_group,
+            process_mask_hex,
+            system_mask_hex,
+        } = endpoint
+        else {
+            return Ok(());
+        };
+        let width = std::mem::size_of::<usize>() * 2;
+        let canonical = |mask: &str| {
+            mask.len() == width
+                && mask
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if *processor_group != 0 || !canonical(process_mask_hex) || !canonical(system_mask_hex) {
+            bail!("campaign affinity observation is not canonical")
+        }
+        let process_mask = usize::from_str_radix(process_mask_hex, 16)?;
+        let system_mask = usize::from_str_radix(system_mask_hex, 16)?;
+        if process_mask == 0 || system_mask == 0 || process_mask & !system_mask != 0 {
+            bail!("campaign affinity observation contains invalid masks")
+        }
+        Ok(())
+    };
+    if let Some(before) = &pair.before {
+        validate_endpoint(before)?;
+    }
+    if let Some(after) = &pair.after {
+        validate_endpoint(after)?;
+    }
+    let expected_changed = match (pair.before.as_ref(), pair.after.as_ref()) {
+        (
+            Some(ProcessAffinityObservation::Available { .. }),
+            Some(ProcessAffinityObservation::Available { .. }),
+        ) => Some(pair.before != pair.after),
+        _ => None,
+    };
+    if pair.changed != expected_changed {
+        bail!("campaign affinity change result is inconsistent")
+    }
+    Ok(())
 }
 
 impl CampaignRunRecord {
@@ -278,6 +359,7 @@ impl CampaignRunRecord {
             video_memory: None,
             raw_provider_memory: None,
             memory_availability: None,
+            worker_process_affinity: None,
             normalized_transcript_sha256: None,
             failure: Some(failure),
         }
@@ -1377,6 +1459,18 @@ fn validate_diagnostics(
     Ok((u64::try_from(model_load_ms)?, u64::try_from(backend_ms)?))
 }
 
+fn terminal_attempt_failure(
+    request_failure: Option<(FailureStage, FailureCategory)>,
+    affinity_lease_stale: bool,
+) -> Option<(FailureStage, FailureCategory)> {
+    request_failure.or_else(|| {
+        affinity_lease_stale.then_some((
+            FailureStage::ObservationValidation,
+            FailureCategory::IdentityMismatch,
+        ))
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one attempt carries its exact frozen worker lease, prepared inputs, timing boundary and result-time lifecycle callback"
@@ -1395,6 +1489,7 @@ fn observe_attempt(
 ) -> CampaignRunRecord {
     let mut power_before = initial_power;
     let mut sampler = None;
+    let mut affinity_before = None;
     let execution = (|| {
         lease.require_current().map_err(|_| {
             (
@@ -1406,6 +1501,12 @@ fn observe_attempt(
         power_before.get_or_insert(before);
         require_power(expected_power, before)
             .map_err(|category| (FailureStage::PowerEndpoint, category))?;
+        affinity_before = Some(observe_process_affinity(lease).map_err(|_| {
+            (
+                FailureStage::ObservationValidation,
+                FailureCategory::IdentityMismatch,
+            )
+        })?);
         sampler = Some(
             match spec.target {
                 Target::Cpu => SamplingSession::cpu(lease.clone()),
@@ -1436,22 +1537,38 @@ fn observe_attempt(
         .map_or_else(|_| Instant::now(), |result| result.result_at);
     let elapsed = result_at.saturating_duration_since(started);
     let lifecycle = settled(result_at, execution.is_ok());
+    let affinity_after = affinity_before
+        .as_ref()
+        .map(|_| observe_process_affinity(lease));
     let power_after = sampler.as_ref().map(|_| PowerSource::current());
     let telemetry = sampler.map(SamplingSession::finish);
     let failed = |stage, category| {
-        CampaignRunRecord::failed(
+        let mut record = CampaignRunRecord::failed(
             spec,
             Some(generation_ref.clone()),
             elapsed,
             power_before,
             power_after,
             FailureDescriptor::for_spec(spec, stage, category),
-        )
+        );
+        record.worker_process_affinity = process_affinity_pair(
+            affinity_before.as_ref(),
+            affinity_after
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+        );
+        record
     };
-    let observed = match execution {
-        Ok(observed) => observed,
-        Err((stage, category)) => return failed(stage, category),
-    };
+    let request_failure = execution.as_ref().err().copied();
+    if let Some((stage, category)) = terminal_attempt_failure(
+        request_failure,
+        affinity_after
+            .as_ref()
+            .is_some_and(|result| result.is_err()),
+    ) {
+        return failed(stage, category);
+    }
+    let observed = execution.expect("attempt failure was handled above");
     if lifecycle.is_err() {
         return failed(
             FailureStage::WarmModelTtl,
@@ -1546,6 +1663,12 @@ fn observe_attempt(
         video_memory: Some(report.video_memory),
         raw_provider_memory: Some(report.provider_memory),
         memory_availability: Some(report.memory_availability),
+        worker_process_affinity: process_affinity_pair(
+            affinity_before.as_ref(),
+            affinity_after
+                .as_ref()
+                .and_then(|result| result.as_ref().ok()),
+        ),
         normalized_transcript_sha256: Some(report.normalized_transcript_sha256),
         failure: None,
     }
@@ -1691,6 +1814,13 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
                 _ => {}
             }
         }
+        if record
+            .worker_process_affinity
+            .as_ref()
+            .is_some_and(|pair| validate_process_affinity_pair(pair).is_err())
+        {
+            bail!("campaign request contains invalid affinity observations")
+        }
         if record.status == RecordStatus::Failed {
             if record.failure.is_none() || !report.incomplete || index + 1 != report.runs.len() {
                 bail!("campaign failed request is missing its terminal failure")
@@ -1710,6 +1840,10 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
             || record.video_memory.is_none()
             || record.raw_provider_memory.is_none()
             || record.memory_availability.is_none()
+            || record
+                .worker_process_affinity
+                .as_ref()
+                .is_none_or(|pair| pair.before.is_none() || pair.after.is_none())
             || record
                 .normalized_transcript_sha256
                 .as_ref()
@@ -1868,6 +2002,34 @@ mod tests {
                     before: availability.clone(),
                     after: availability,
                 }),
+                worker_process_affinity: process_affinity_pair(
+                    Some(&ProcessAffinityObservation::Available {
+                        processor_group: 0,
+                        process_mask_hex: format!(
+                            "{:0width$x}",
+                            0xf,
+                            width = std::mem::size_of::<usize>() * 2
+                        ),
+                        system_mask_hex: format!(
+                            "{:0width$x}",
+                            0xff,
+                            width = std::mem::size_of::<usize>() * 2
+                        ),
+                    }),
+                    Some(&ProcessAffinityObservation::Available {
+                        processor_group: 0,
+                        process_mask_hex: format!(
+                            "{:0width$x}",
+                            0xf,
+                            width = std::mem::size_of::<usize>() * 2
+                        ),
+                        system_mask_hex: format!(
+                            "{:0width$x}",
+                            0xff,
+                            width = std::mem::size_of::<usize>() * 2
+                        ),
+                    }),
+                ),
                 normalized_transcript_sha256: Some("d".repeat(64)),
                 failure: None,
             });
@@ -2048,12 +2210,26 @@ mod tests {
     }
 
     #[test]
+    fn request_failure_precedes_post_query_stale_identity() {
+        let primary = (FailureStage::Inference, FailureCategory::ObservationFailed);
+        assert_eq!(terminal_attempt_failure(Some(primary), true), Some(primary));
+        assert_eq!(
+            terminal_attempt_failure(None, true),
+            Some((
+                FailureStage::ObservationValidation,
+                FailureCategory::IdentityMismatch
+            ))
+        );
+        assert_eq!(terminal_attempt_failure(None, false), None);
+    }
+
+    #[test]
     fn complete_report_is_bounded_unsigned_and_keeps_environment_unknown() {
         let report = complete_report();
         let bytes = serialize_report(&report).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["kind"], KIND);
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["unsigned"], true);
         assert_eq!(value["unqualified"], true);
         assert_eq!(value["auto_eligible"], false);
@@ -2062,6 +2238,10 @@ mod tests {
         assert_eq!(value["runs"].as_array().unwrap().len(), 52);
         assert_eq!(value["runs"][0]["end_to_end_ms"], 0);
         assert_eq!(value["runs"][0]["backend_ms"], 0);
+        assert_eq!(
+            value["runs"][0]["worker_process_affinity"]["changed"],
+            false
+        );
         for field in [
             "background_load",
             "host_control",
@@ -2078,6 +2258,174 @@ mod tests {
             "not_observed"
         );
         assert!(bytes.len() < MAX_CAMPAIGN_REPORT_BYTES);
+    }
+
+    #[test]
+    fn campaign_affinity_reports_changes_and_keeps_unavailable_endpoints_unknown() {
+        let mask = |value| format!("{value:0width$x}", width = std::mem::size_of::<usize>() * 2);
+        let first = ProcessAffinityObservation::Available {
+            processor_group: 0,
+            process_mask_hex: mask(0xf),
+            system_mask_hex: mask(0xff),
+        };
+        let second = ProcessAffinityObservation::Available {
+            processor_group: 0,
+            process_mask_hex: mask(0x3),
+            system_mask_hex: mask(0xff),
+        };
+        assert_eq!(
+            process_affinity_pair(Some(&first), Some(&second))
+                .expect("complete pair")
+                .changed,
+            Some(true)
+        );
+        let unavailable = ProcessAffinityObservation::Unavailable {
+            reason:
+                crate::windows_gpu_capture::telemetry::ProcessAffinityUnavailableReason::AffinityMaskQueryFailed,
+        };
+        assert_eq!(
+            process_affinity_pair(Some(&first), Some(&unavailable))
+                .expect("complete pair")
+                .changed,
+            None
+        );
+
+        let before_only = process_affinity_pair(Some(&first), None).expect("known prefix");
+        let mut partial = builder();
+        let spec = campaign_specs()[0];
+        let failure = FailureDescriptor::for_spec(
+            spec,
+            FailureStage::ObservationValidation,
+            FailureCategory::IdentityMismatch,
+        );
+        partial.fail(failure);
+        let mut failed = CampaignRunRecord::failed(
+            spec,
+            None,
+            Duration::ZERO,
+            Some(PowerSource::Ac),
+            None,
+            failure,
+        );
+        failed.worker_process_affinity = Some(before_only);
+        partial.report.runs.push(failed);
+        let serialized: serde_json::Value =
+            serde_json::from_slice(&serialize_report(&partial.report).unwrap()).unwrap();
+        let serialized = &serialized["runs"][0]["worker_process_affinity"];
+        assert_eq!(serialized["before"]["status"], "available");
+        assert!(serialized["after"].is_null());
+        assert!(serialized["changed"].is_null());
+
+        let mut invalid = complete_report();
+        invalid.runs[0]
+            .worker_process_affinity
+            .as_mut()
+            .expect("fixture affinity")
+            .changed = Some(true);
+        assert!(validate_report(&invalid).is_err());
+
+        let mut fabricated_success = complete_report();
+        fabricated_success.runs[0]
+            .worker_process_affinity
+            .as_mut()
+            .expect("fixture affinity")
+            .after = None;
+        assert!(validate_report(&fabricated_success).is_err());
+    }
+
+    #[test]
+    fn campaign_affinity_report_contains_no_process_identity_or_paths() {
+        let bytes = serialize_report(&complete_report()).unwrap();
+        let json = String::from_utf8(bytes).unwrap();
+        for forbidden in [
+            "\"process_id\"",
+            "\"pid\"",
+            "\"process_handle\"",
+            "\"model_path\"",
+            "\"wav_path\"",
+        ] {
+            assert!(!json.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn campaign_report_rejects_malformed_or_fabricated_affinity_facts() {
+        enum Mutation {
+            Uppercase,
+            NonHex,
+            WrongWidth,
+            ZeroProcess,
+            ZeroSystem,
+            ProcessOutsideSystem,
+            NonzeroGroup,
+            MissingBefore,
+            MissingAfter,
+            UnavailableWithChanged,
+        }
+
+        for mutation in [
+            Mutation::Uppercase,
+            Mutation::NonHex,
+            Mutation::WrongWidth,
+            Mutation::ZeroProcess,
+            Mutation::ZeroSystem,
+            Mutation::ProcessOutsideSystem,
+            Mutation::NonzeroGroup,
+            Mutation::MissingBefore,
+            Mutation::MissingAfter,
+            Mutation::UnavailableWithChanged,
+        ] {
+            let mut report = complete_report();
+            let pair = report.runs[0]
+                .worker_process_affinity
+                .as_mut()
+                .expect("fixture affinity");
+            match mutation {
+                Mutation::MissingBefore => pair.before = None,
+                Mutation::MissingAfter => pair.after = None,
+                Mutation::UnavailableWithChanged => {
+                    pair.before = Some(ProcessAffinityObservation::Unavailable {
+                        reason: crate::windows_gpu_capture::telemetry::ProcessAffinityUnavailableReason::AffinityMaskQueryFailed,
+                    });
+                    pair.changed = Some(false);
+                }
+                mutation => {
+                    let Some(ProcessAffinityObservation::Available {
+                        processor_group,
+                        process_mask_hex,
+                        system_mask_hex,
+                    }) = pair.before.as_mut()
+                    else {
+                        panic!("fixture affinity endpoint must be available")
+                    };
+                    match mutation {
+                        Mutation::Uppercase => {
+                            *process_mask_hex = process_mask_hex.to_ascii_uppercase()
+                        }
+                        Mutation::NonHex => process_mask_hex.replace_range(..1, "g"),
+                        Mutation::WrongWidth => {
+                            process_mask_hex.pop();
+                        }
+                        Mutation::ZeroProcess => {
+                            *process_mask_hex = "0".repeat(std::mem::size_of::<usize>() * 2)
+                        }
+                        Mutation::ZeroSystem => {
+                            *system_mask_hex = "0".repeat(std::mem::size_of::<usize>() * 2)
+                        }
+                        Mutation::ProcessOutsideSystem => {
+                            let width = std::mem::size_of::<usize>() * 2;
+                            *process_mask_hex = format!("{:0width$x}", 4);
+                            *system_mask_hex = format!("{:0width$x}", 3);
+                        }
+                        Mutation::NonzeroGroup => *processor_group = 1,
+                        Mutation::MissingBefore
+                        | Mutation::MissingAfter
+                        | Mutation::UnavailableWithChanged => unreachable!(),
+                    }
+                }
+            }
+            assert!(validate_report(&report).is_err());
+        }
     }
 
     #[test]

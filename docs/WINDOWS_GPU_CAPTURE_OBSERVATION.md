@@ -11,8 +11,11 @@ The observer consumes existing verified CPU/GPU workers and hash-pinned GGUF
 model and WAV inputs. It must not build, download, replace, activate or sign
 workers. All ordinary pack verification and the desktop's CPU-worker digest
 anchor remain required. An arbitrary path plus a supplied digest is not launch
-authority. The currently empty production trust still prevents production GPU
-pack use until the separate approved-signing setup is completed.
+authority. Production worker-pack trust contains the project's public pack key,
+but that grants only verified worker-pack launch authority. The separate
+performance authority still has no approved keys and final qualification has no
+approved plans, so neither performance evidence nor release qualification is
+authorized by pack trust.
 
 The default mode is one CPU request and one GPU request, executed serially,
 with actual handshake, request timing and native memory/power observations,
@@ -328,12 +331,33 @@ window**, not ordinary-application end-to-end latency:
   `model_load_ms` and `warm_reused`. Never subtract an estimated instrumentation
   overhead or replace a measured zero duration with a fabricated positive value.
 
-Campaigns use a distinct `windows_gpu_capture_campaign` schema-1 report, bounded
+Campaigns use a distinct `windows_gpu_capture_campaign` schema-2 report, bounded
 to 32 MiB, at most 14 captured worker handshakes and 52 request records. A
 successful sequence has 50 measured records and two separately identified
 priming records. Deduplicate actual validated Hello/Ready bytes by their bound
 generation; retain timing, memory, power and transcript digests without raw
 audio, transcript text, user paths or native error messages.
+
+Schema 2 also records the worker **process** affinity at each request endpoint.
+The observer queries the retained generation-bound process handle; it never
+looks up a PID or sets process/thread affinity. Available observations contain
+the single processor-group number and canonical fixed-width hexadecimal process
+and system masks. A host with more than one active processor group is reported
+as unsupported because current Windows versions can let processes span groups
+while `GetProcessAffinityMask` exposes only primary-group masks. Group-query
+failures, topology changes during a query and invalid or partial masks remain
+typed unavailable observations. A stale or replaced lease instead fails the run
+as an identity mismatch and is never rebound to another worker.
+
+`changed` is present as true or false only when both endpoint facts are fully
+available; if either endpoint is unavailable it is null because equality is
+unknown. A terminal failed request may retain a known `before` prefix with a
+null `after`; successful records require both endpoints. Equal endpoint masks
+are observations, not evidence that affinity was
+continuously controlled between the queries. The existing
+`environmental_controls.affinity_control` therefore remains unavailable, and
+these facts are not qualification or scheduling-control claims. Single-pair
+observation schema 3 is unchanged.
 
 Handled acquisition failures retain categorized failed records and publish an
 incomplete report after cleanup attempts. Do not drop a failure or fabricate
@@ -349,6 +373,13 @@ or enable Auto. Warm availability already includes a resident model and cannot
 establish the free memory needed to load it from cold. A separately reviewed
 qualification stage must validate instrumentation overhead, retained-model
 interference, native counters, representative hardware and capture custody.
+
+The affinity queries use Microsoft's read-only
+[`GetProcessAffinityMask`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask)
+and
+[`GetProcessGroupAffinity`](https://learn.microsoft.com/en-us/windows/win32/api/processtopologyapi/nf-processtopologyapi-getprocessgroupaffinity)
+APIs. Their endpoint results do not establish a resolved native inference-thread
+count, which remains unavailable.
 
 ## Verification
 

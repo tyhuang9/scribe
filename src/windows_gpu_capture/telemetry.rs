@@ -17,6 +17,9 @@ use windows_sys::Win32::Foundation::{HANDLE, LUID, STATUS_BUFFER_TOO_SMALL};
 use windows_sys::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
+use windows_sys::Win32::System::Threading::{
+    GetActiveProcessorGroupCount, GetProcessAffinityMask, GetProcessGroupAffinity,
+};
 
 use crate::onnx_worker::WorkerObservationLease;
 
@@ -43,6 +46,146 @@ pub(crate) struct TelemetrySummary {
     pub(crate) sampled_max_private_usage_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) video_memory: Option<VideoMemorySummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ProcessAffinityObservation {
+    Available {
+        processor_group: u16,
+        process_mask_hex: String,
+        system_mask_hex: String,
+    },
+    Unavailable {
+        reason: ProcessAffinityUnavailableReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProcessAffinityUnavailableReason {
+    UnsupportedProcessorGroupTopology,
+    ProcessorGroupQueryFailed,
+    AffinityMaskQueryFailed,
+    TopologyChangedDuringQuery,
+    InvalidAffinityMasks,
+}
+
+pub(crate) fn observe_process_affinity(
+    lease: &WorkerObservationLease,
+) -> Result<ProcessAffinityObservation> {
+    observe_process_affinity_checked(
+        || lease.require_current(),
+        || query_process_affinity(lease.process_handle()),
+    )
+}
+
+fn observe_process_affinity_checked(
+    mut require_current: impl FnMut() -> Result<()>,
+    query: impl FnOnce() -> ProcessAffinityObservation,
+) -> Result<ProcessAffinityObservation> {
+    require_current()?;
+    let observation = query();
+    require_current()?;
+    Ok(observation)
+}
+
+fn query_process_affinity(process: HANDLE) -> ProcessAffinityObservation {
+    query_process_affinity_with(
+        || {
+            // SAFETY: this read-only system topology query takes no pointers.
+            unsafe { GetActiveProcessorGroupCount() }
+        },
+        || query_single_process_group(process),
+        || {
+            let mut process_mask = 0_usize;
+            let mut system_mask = 0_usize;
+            // SAFETY: process is the retained worker handle and both masks are
+            // writable for the synchronous query.
+            if unsafe { GetProcessAffinityMask(process, &mut process_mask, &mut system_mask) } == 0
+            {
+                Err(())
+            } else {
+                Ok((process_mask, system_mask))
+            }
+        },
+    )
+}
+
+fn query_process_affinity_with(
+    mut active_group_count: impl FnMut() -> u16,
+    mut process_group: impl FnMut() -> std::result::Result<u16, ()>,
+    affinity_masks: impl FnOnce() -> std::result::Result<(usize, usize), ()>,
+) -> ProcessAffinityObservation {
+    let groups_before = active_group_count();
+    if groups_before != 1 {
+        return unavailable(ProcessAffinityUnavailableReason::UnsupportedProcessorGroupTopology);
+    }
+    let group_before = match process_group() {
+        Ok(group) => group,
+        Err(()) => {
+            return unavailable(ProcessAffinityUnavailableReason::ProcessorGroupQueryFailed);
+        }
+    };
+    let (process_mask, system_mask) = match affinity_masks() {
+        Ok(masks) => masks,
+        Err(()) => return unavailable(ProcessAffinityUnavailableReason::AffinityMaskQueryFailed),
+    };
+    let groups_after = active_group_count();
+    let group_after = process_group();
+    match validate_single_group_topology(groups_before, group_before, groups_after, group_after) {
+        Ok(group) => normalize_affinity_masks(group, process_mask, system_mask),
+        Err(reason) => unavailable(reason),
+    }
+}
+
+fn query_single_process_group(process: HANDLE) -> std::result::Result<u16, ()> {
+    let mut count = 1_u16;
+    let mut group = 0_u16;
+    // SAFETY: group points to one writable entry and count declares that exact
+    // capacity. Multi-group results fail or return a non-single count and are
+    // deliberately not enumerated.
+    let ok = unsafe { GetProcessGroupAffinity(process, &mut count, &mut group) };
+    if ok == 0 || count != 1 {
+        Err(())
+    } else {
+        Ok(group)
+    }
+}
+
+fn normalize_affinity_masks(
+    processor_group: u16,
+    process_mask: usize,
+    system_mask: usize,
+) -> ProcessAffinityObservation {
+    if process_mask == 0 || system_mask == 0 || process_mask & !system_mask != 0 {
+        return unavailable(ProcessAffinityUnavailableReason::InvalidAffinityMasks);
+    }
+    let width = size_of::<usize>() * 2;
+    ProcessAffinityObservation::Available {
+        processor_group,
+        process_mask_hex: format!("{process_mask:0width$x}"),
+        system_mask_hex: format!("{system_mask:0width$x}"),
+    }
+}
+
+fn validate_single_group_topology(
+    groups_before: u16,
+    group_before: u16,
+    groups_after: u16,
+    group_after: std::result::Result<u16, ()>,
+) -> std::result::Result<u16, ProcessAffinityUnavailableReason> {
+    if groups_before != 1 || group_before != 0 {
+        return Err(ProcessAffinityUnavailableReason::UnsupportedProcessorGroupTopology);
+    }
+    if groups_after != groups_before || group_after != Ok(group_before) {
+        return Err(ProcessAffinityUnavailableReason::TopologyChangedDuringQuery);
+    }
+    Ok(group_before)
+}
+
+const fn unavailable(reason: ProcessAffinityUnavailableReason) -> ProcessAffinityObservation {
+    ProcessAffinityObservation::Unavailable { reason }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -449,6 +592,10 @@ fn query_adapter_info<T>(adapter: u32, query_type: i32, value: &mut T) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
     use super::*;
 
     #[test]
@@ -557,5 +704,177 @@ mod tests {
         );
         assert_eq!(D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL, 0);
         assert_eq!(D3DKMT_MEMORY_SEGMENT_GROUP_NON_LOCAL, 1);
+    }
+
+    #[test]
+    fn campaign_affinity_masks_are_canonical_and_reject_invalid_values() {
+        let observation = normalize_affinity_masks(0, 0x5, 0xf);
+        let ProcessAffinityObservation::Available {
+            processor_group,
+            process_mask_hex,
+            system_mask_hex,
+        } = observation
+        else {
+            panic!("valid masks must be available")
+        };
+        assert_eq!(processor_group, 0);
+        assert_eq!(process_mask_hex.len(), size_of::<usize>() * 2);
+        assert_eq!(
+            process_mask_hex,
+            format!("{:0width$x}", 5, width = size_of::<usize>() * 2)
+        );
+        assert_eq!(
+            system_mask_hex,
+            format!("{:0width$x}", 15, width = size_of::<usize>() * 2)
+        );
+
+        for observation in [
+            normalize_affinity_masks(0, 0, 1),
+            normalize_affinity_masks(0, 1, 0),
+            normalize_affinity_masks(0, 4, 3),
+        ] {
+            assert_eq!(
+                observation,
+                ProcessAffinityObservation::Unavailable {
+                    reason: ProcessAffinityUnavailableReason::InvalidAffinityMasks
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn campaign_affinity_rejects_partial_or_changing_group_topology() {
+        assert_eq!(validate_single_group_topology(1, 0, 1, Ok(0)), Ok(0));
+        assert_eq!(
+            validate_single_group_topology(2, 0, 2, Ok(0)),
+            Err(ProcessAffinityUnavailableReason::UnsupportedProcessorGroupTopology)
+        );
+        assert_eq!(
+            validate_single_group_topology(1, 1, 1, Ok(1)),
+            Err(ProcessAffinityUnavailableReason::UnsupportedProcessorGroupTopology)
+        );
+        assert_eq!(
+            validate_single_group_topology(1, 0, 2, Ok(0)),
+            Err(ProcessAffinityUnavailableReason::TopologyChangedDuringQuery)
+        );
+        assert_eq!(
+            validate_single_group_topology(1, 0, 1, Err(())),
+            Err(ProcessAffinityUnavailableReason::TopologyChangedDuringQuery)
+        );
+        assert_eq!(
+            validate_single_group_topology(1, 0, 1, Ok(1)),
+            Err(ProcessAffinityUnavailableReason::TopologyChangedDuringQuery)
+        );
+    }
+
+    #[test]
+    fn campaign_affinity_check_query_check_rejects_stale_boundaries() {
+        let query_calls = Cell::new(0_u8);
+        let initial = observe_process_affinity_checked(
+            || Err(anyhow!("stale before query")),
+            || {
+                query_calls.set(query_calls.get() + 1);
+                normalize_affinity_masks(0, 1, 1)
+            },
+        );
+        assert!(initial.is_err());
+        assert_eq!(query_calls.get(), 0);
+
+        let checks = Cell::new(0_u8);
+        let query_time = observe_process_affinity_checked(
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    Ok(())
+                } else {
+                    Err(anyhow!("stale after query"))
+                }
+            },
+            || {
+                query_calls.set(query_calls.get() + 1);
+                normalize_affinity_masks(0, 1, 1)
+            },
+        );
+        assert!(query_time.is_err());
+        assert_eq!(checks.get(), 2);
+        assert_eq!(query_calls.get(), 1);
+    }
+
+    #[test]
+    fn campaign_affinity_unavailable_query_still_checks_lease_afterward() {
+        let checks = Cell::new(0_u8);
+        let observation = observe_process_affinity_checked(
+            || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            },
+            || unavailable(ProcessAffinityUnavailableReason::AffinityMaskQueryFailed),
+        )
+        .unwrap();
+        assert_eq!(checks.get(), 2);
+        assert_eq!(
+            observation,
+            unavailable(ProcessAffinityUnavailableReason::AffinityMaskQueryFailed)
+        );
+    }
+
+    #[test]
+    fn campaign_affinity_native_query_seam_rejects_group_and_mask_failures() {
+        assert_eq!(
+            query_process_affinity_with(|| 1, || Err(()), || Ok((1, 1))),
+            unavailable(ProcessAffinityUnavailableReason::ProcessorGroupQueryFailed)
+        );
+        assert_eq!(
+            query_process_affinity_with(|| 1, || Ok(0), || Err(())),
+            unavailable(ProcessAffinityUnavailableReason::AffinityMaskQueryFailed)
+        );
+        assert_eq!(
+            query_process_affinity_with(|| 1, || Ok(0), || Ok((0, 1))),
+            unavailable(ProcessAffinityUnavailableReason::InvalidAffinityMasks)
+        );
+        assert_eq!(
+            query_process_affinity_with(|| 2, || Ok(0), || Ok((1, 1))),
+            unavailable(ProcessAffinityUnavailableReason::UnsupportedProcessorGroupTopology)
+        );
+    }
+
+    #[test]
+    fn campaign_affinity_native_query_reads_only_the_current_test_process() {
+        // SAFETY: this read-only system topology query takes no pointers.
+        let active_groups = unsafe { GetActiveProcessorGroupCount() };
+        // SAFETY: this returns the current process pseudo-handle without
+        // opening or identifying another process.
+        let process = unsafe { GetCurrentProcess() };
+        let observation = query_process_affinity(process);
+        if active_groups == 1 {
+            let ProcessAffinityObservation::Available {
+                processor_group,
+                process_mask_hex,
+                system_mask_hex,
+            } = observation
+            else {
+                panic!("single-group current process affinity must be available")
+            };
+            let width = size_of::<usize>() * 2;
+            let canonical = |mask: &str| {
+                mask.len() == width
+                    && mask
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            };
+            assert_eq!(processor_group, 0);
+            assert!(canonical(&process_mask_hex));
+            assert!(canonical(&system_mask_hex));
+            let process_mask = usize::from_str_radix(&process_mask_hex, 16).unwrap();
+            let system_mask = usize::from_str_radix(&system_mask_hex, 16).unwrap();
+            assert_ne!(process_mask, 0);
+            assert_ne!(system_mask, 0);
+            assert_eq!(process_mask & !system_mask, 0);
+        } else {
+            assert_eq!(
+                observation,
+                unavailable(ProcessAffinityUnavailableReason::UnsupportedProcessorGroupTopology)
+            );
+        }
     }
 }
