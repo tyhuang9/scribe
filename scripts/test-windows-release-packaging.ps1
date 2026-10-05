@@ -1909,8 +1909,9 @@ Set-StrictMode -Version Latest
         CMAKE_X86_64_PC_WINDOWS_MSVC_TOOLCHAIN_FILE = 'C:\fixture\sentinel-alias.cmake'
     }
     $previousCpuFixtureToolchainEnvironment = @{}
+    $cpuFixtureOriginalEnvironment = [Environment]::GetEnvironmentVariables()
     foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
-        $previousCpuFixtureToolchainEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+        $previousCpuFixtureToolchainEnvironment[$name] = if ($cpuFixtureOriginalEnvironment.Contains($name)) { [string]$cpuFixtureOriginalEnvironment[$name] } else { $null }
     }
     try {
         foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
@@ -1926,8 +1927,19 @@ Set-StrictMode -Version Latest
     }
     finally {
         foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $previousCpuFixtureToolchainEnvironment[$name])
+            if ($null -eq $previousCpuFixtureToolchainEnvironment[$name]) {
+                if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+            }
+            else { [Environment]::SetEnvironmentVariable($name, $previousCpuFixtureToolchainEnvironment[$name]) }
         }
+        $cpuFixtureRestoredEnvironment = [Environment]::GetEnvironmentVariables()
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            if ((Test-Path -LiteralPath "Env:$name") -ne $cpuFixtureOriginalEnvironment.Contains($name) -or
+                $cpuFixtureRestoredEnvironment[$name] -cne $cpuFixtureOriginalEnvironment[$name]) {
+                throw "Frozen CPU integration test did not restore the original presence and value of $name."
+            }
+        }
+        Write-Output 'Frozen CPU integration test restored all four original toolchain environment states.'
     }
     & (Join-Path $PSScriptRoot 'test-windows-local-frozen-test-installer.ps1')
     Write-Output "Windows release packaging fail-closed tests passed."

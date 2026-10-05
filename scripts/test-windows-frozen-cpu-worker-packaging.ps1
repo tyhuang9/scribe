@@ -441,6 +441,59 @@ try {
     Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
 
     foreach ($name in $previousCpuBaselineAmbient.Keys) { Remove-Item -LiteralPath "Env:$name" }
+    $baselineEnvironmentNames = @(Get-WindowsCpuWorkerBaselineEnvironmentNames)
+    $baselineBeforeRestorationTests = [Environment]::GetEnvironmentVariables()
+    try {
+        foreach ($name in $baselineEnvironmentNames) {
+            if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+        }
+        $absentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        foreach ($attempt in @(1, 2)) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $absentEnvironmentBuild
+            foreach ($name in $baselineEnvironmentNames) {
+                Assert-True (-not (Test-Path -LiteralPath "Env:$name")) "Originally absent $name became present after restore $attempt."
+                Assert-Equal ([Environment]::GetEnvironmentVariable($name)) $null "Originally absent $name value after restore $attempt"
+            }
+            Assert-True (-not (Test-Path -LiteralPath $absentEnvironmentBuild.TargetRoot)) 'Environment-only restoration test created a target directory.'
+        }
+        foreach ($name in $baselineEnvironmentNames) { [Environment]::SetEnvironmentVariable($name, '') }
+        # Older .NET runtimes cannot create present-empty values this way.
+        # Preserve the actual supported pre-build state, never assume absence
+        # and an empty override are equivalent on runtimes that distinguish them.
+        $emptyEnvironmentBefore = [Environment]::GetEnvironmentVariables()
+        $emptyEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        foreach ($attempt in @(1, 2)) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $emptyEnvironmentBuild
+            $after = [Environment]::GetEnvironmentVariables()
+            foreach ($name in $baselineEnvironmentNames) {
+                Assert-Equal (Test-Path -LiteralPath "Env:$name") ($emptyEnvironmentBefore.Contains($name)) "Empty-state $name presence after restore $attempt"
+                Assert-Equal ($after[$name]) ($emptyEnvironmentBefore[$name]) "Empty-state $name value after restore $attempt"
+            }
+            Assert-True (-not (Test-Path -LiteralPath $emptyEnvironmentBuild.TargetRoot)) 'Empty-state restoration test created a target directory.'
+        }
+        $env:CARGO_TARGET_DIR = 'C:\fixture\original-target'
+        $env:TRANSCRIBE_CMAKE_ARGS = ' '
+        $env:RUSTFLAGS = ' '
+        $presentEnvironmentBefore = [Environment]::GetEnvironmentVariables()
+        $presentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        foreach ($attempt in @(1, 2)) {
+            Restore-WindowsCpuWorkerBaselineEnvironment $presentEnvironmentBuild
+            $after = [Environment]::GetEnvironmentVariables()
+            foreach ($name in $baselineEnvironmentNames) {
+                Assert-True (Test-Path -LiteralPath "Env:$name") "Present $name disappeared after restore $attempt."
+                Assert-Equal ($after[$name]) ($presentEnvironmentBefore[$name]) "Present $name value after restore $attempt"
+            }
+            Assert-True (-not (Test-Path -LiteralPath $presentEnvironmentBuild.TargetRoot)) 'Present-state restoration test created a target directory.'
+        }
+    }
+    finally {
+        foreach ($name in $baselineEnvironmentNames) {
+            if ($baselineBeforeRestorationTests.Contains($name)) {
+                [Environment]::SetEnvironmentVariable($name, [string]$baselineBeforeRestorationTests[$name])
+            }
+            elseif (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+        }
+    }
     $env:CMAKE_ARGS = '-DGGML_AVX2=ON'
     Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient CMake arguments'
     Remove-Item Env:CMAKE_ARGS
@@ -449,7 +502,7 @@ try {
         try {
             Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } "does not accept ambient CMake toolchain overrides: $name"
         }
-        finally { [Environment]::SetEnvironmentVariable($name, $null) }
+        finally { if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop } }
     }
     $env:CL = '/arch:AVX2'
     Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: CL'

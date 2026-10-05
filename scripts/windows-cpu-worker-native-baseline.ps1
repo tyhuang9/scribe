@@ -88,8 +88,9 @@ function New-WindowsCpuWorkerBaselineBuild([string]$TargetTriple) {
         throw "Fresh CPU worker baseline target unexpectedly already exists: $targetRoot"
     }
     $previousEnvironment = @{}
+    $ambientEnvironment = [Environment]::GetEnvironmentVariables()
     foreach ($name in Get-WindowsCpuWorkerBaselineEnvironmentNames) {
-        $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+        $previousEnvironment[$name] = if ($ambientEnvironment.Contains($name)) { [string]$ambientEnvironment[$name] } else { $null }
     }
     $env:CARGO_TARGET_DIR = $targetRoot
     $env:TRANSCRIBE_CMAKE_ARGS = Get-WindowsCpuWorkerBaselineCmakeArgs
@@ -108,7 +109,14 @@ function New-WindowsCpuWorkerBaselineBuild([string]$TargetTriple) {
 function Restore-WindowsCpuWorkerBaselineEnvironment([psobject]$Build) {
     if ($Build.Restored) { return }
     foreach ($name in Get-WindowsCpuWorkerBaselineEnvironmentNames) {
-        [Environment]::SetEnvironmentVariable($name, $Build.PreviousEnvironment[$name])
+        # PowerShell's .NET string argument binding can turn a null into an
+        # empty value. Empty RUSTFLAGS suppress Cargo's configured static CRT.
+        if ($null -eq $Build.PreviousEnvironment[$name]) {
+            if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($name, $Build.PreviousEnvironment[$name])
+        }
     }
     $Build.Restored = $true
 }
