@@ -250,9 +250,10 @@ $previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 $previousGitHubActions = $env:GITHUB_ACTIONS
 $previousCi = $env:CI
+$cpuBaselineAmbientNamePattern = '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|CMAKE_TOOLCHAIN_FILE(?:_.+)?|HOST_CMAKE_TOOLCHAIN_FILE|CMAKE_X86_64_PC_WINDOWS_MSVC(?:_.+)?|(?:C|CXX|CPP)FLAGS(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$'
 $previousCpuBaselineAmbient = @{}
 foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
-    if ([string]$entry.Key -match '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|(?:C|CXX|CPP)FLAGS(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$') {
+    if ([string]$entry.Key -match $cpuBaselineAmbientNamePattern) {
         $previousCpuBaselineAmbient[[string]$entry.Key] = [string]$entry.Value
     }
 }
@@ -443,9 +444,13 @@ try {
     $env:CMAKE_ARGS = '-DGGML_AVX2=ON'
     Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient CMake arguments'
     Remove-Item Env:CMAKE_ARGS
-    $env:HOST_CMAKE_TOOLCHAIN_FILE = 'C:\fixture\toolchain.cmake'
-    Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient CMake toolchain overrides: HOST_CMAKE_TOOLCHAIN_FILE'
-    Remove-Item Env:HOST_CMAKE_TOOLCHAIN_FILE
+    foreach ($name in @('CMAKE_TOOLCHAIN_FILE', 'CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc', 'HOST_CMAKE_TOOLCHAIN_FILE', 'CMAKE_X86_64_PC_WINDOWS_MSVC_TOOLCHAIN_FILE')) {
+        [Environment]::SetEnvironmentVariable($name, 'C:\fixture\toolchain.cmake')
+        try {
+            Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } "does not accept ambient CMake toolchain overrides: $name"
+        }
+        finally { [Environment]::SetEnvironmentVariable($name, $null) }
+    }
     $env:CL = '/arch:AVX2'
     Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: CL'
     Remove-Item Env:CL
@@ -1063,7 +1068,7 @@ finally {
     $env:GITHUB_ACTIONS = $previousGitHubActions
     $env:CI = $previousCi
     foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
-        if ([string]$entry.Key -match '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|(?:C|CXX|CPP)FLAGS(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$') {
+        if ([string]$entry.Key -match $cpuBaselineAmbientNamePattern) {
             Remove-Item -LiteralPath "Env:$($entry.Key)"
         }
     }

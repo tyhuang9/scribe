@@ -1900,7 +1900,35 @@ Set-StrictMode -Version Latest
 
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
-    & (Join-Path $PSScriptRoot 'test-windows-frozen-cpu-worker-packaging.ps1')
+    # The nested fixture runs in this process: it must clear its own overrides
+    # temporarily without losing a caller's native-toolchain environment.
+    $cpuFixtureToolchainSentinels = [ordered]@{
+        CMAKE_TOOLCHAIN_FILE = 'C:\fixture\sentinel-global.cmake'
+        'CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc' = 'C:\fixture\sentinel-target.cmake'
+        HOST_CMAKE_TOOLCHAIN_FILE = 'C:\fixture\sentinel-host.cmake'
+        CMAKE_X86_64_PC_WINDOWS_MSVC_TOOLCHAIN_FILE = 'C:\fixture\sentinel-alias.cmake'
+    }
+    $previousCpuFixtureToolchainEnvironment = @{}
+    foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+        $previousCpuFixtureToolchainEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+    try {
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $cpuFixtureToolchainSentinels[$name])
+        }
+        & (Join-Path $PSScriptRoot 'test-windows-frozen-cpu-worker-packaging.ps1')
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            if ([Environment]::GetEnvironmentVariable($name) -cne $cpuFixtureToolchainSentinels[$name]) {
+                throw "Frozen CPU fixture did not preserve the caller's $name."
+            }
+        }
+        Write-Output 'Frozen CPU fixture preserved all four caller toolchain sentinels.'
+    }
+    finally {
+        foreach ($name in $cpuFixtureToolchainSentinels.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $previousCpuFixtureToolchainEnvironment[$name])
+        }
+    }
     & (Join-Path $PSScriptRoot 'test-windows-local-frozen-test-installer.ps1')
     Write-Output "Windows release packaging fail-closed tests passed."
 }
