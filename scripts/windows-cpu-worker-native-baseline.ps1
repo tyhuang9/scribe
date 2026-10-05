@@ -44,10 +44,10 @@ function Test-WindowsCpuWorkerBaselineUnsafeIsaOption([string]$Value) {
     if ($Value -match '(?i)(?:^|[\s>"''])-arch\s*[:=]\s*[^\s"'']+') {
         return $true
     }
-    if ($Value -match '(?i)(?:^|[\s>"''])[-/]D\s*GGML_(?:NATIVE|SSE42|AVX(?:_VNNI)?|AVX2|BMI2|FMA|F16C|AVX512(?:_VBMI|_VNNI|_BF16)?)\b') {
+    if ($Value -match '(?i)(?:^|[\s>"''])[-/]D\s*(?:"\s*)?(?:GGML_(?:NATIVE|SSE42|AVX(?:_VNNI)?|AVX2|BMI2|FMA|F16C|AVX512(?:_VBMI|_VNNI|_BF16)?)|__(?:SSE3|SSSE3|SSE4_[12]|AVX[A-Z0-9_]*|FMA|F16C|BMI[0-9_]*|XOP|AES|PCLMUL(?:QDQ)?|POPCNT|LZCNT|SHA|AMX[A-Z0-9_]*)__)\b') {
         return $true
     }
-    return $Value -match '(?i)(?:\bGGML_(?:NATIVE|SSE42|AVX(?:_VNNI)?|AVX2|BMI2|FMA|F16C|AVX512(?:_VBMI|_VNNI|_BF16)?)\s*[:=]\s*(?:ON|1|TRUE)\b|\bTRANSCRIBE_X86_CONSERVATIVE\s*[:=]\s*(?:OFF|0|FALSE)\b|(?:^|[\s"''])/(?:arch)\s*[:=]\s*[^\s"'']+|(?:^|[\s"''])-m(?:sse|avx|fma|f16c|bmi|xop|aes|pclmul|popcnt|lzcnt|sha|amx|arch|tune|cpu)[A-Za-z0-9_.=-]*\b|target-cpu\s*=?\s*(?:native|haswell|skylake|znver[0-9]*)\b|target-feature\s*=?\s*[^\s]*(?:\+(?:sse4\.2|avx|avx2|avx512[^,\s]*|fma|f16c|bmi2)))'
+    return $Value -match '(?i)(?:\bGGML_(?:NATIVE|SSE42|AVX(?:_VNNI)?|AVX2|BMI2|FMA|F16C|AVX512(?:_VBMI|_VNNI|_BF16)?)\s*[:=]\s*(?:ON|1|TRUE)\b|\bTRANSCRIBE_X86_CONSERVATIVE\s*[:=]\s*(?:OFF|0|FALSE)\b|(?:^|[\s"''])/(?:arch)\s*[:=]\s*[^\s"'']+|(?:^|[\s"''])-m(?:sse|avx|fma|f16c|bmi|xop|aes|pclmul|popcnt|lzcnt|sha|amx|arch|tune|cpu)[A-Za-z0-9_.=-]*\b|(?:^|[\s>"''])(?:/FI(?:\S|\s|$)|-include(?:\s|=|$)|-imacros(?:\s|=|$))|target-cpu\s*=?\s*(?:native|haswell|skylake|znver[0-9]*)\b|target-feature\s*=?\s*[^\s]*(?:\+(?:sse4\.2|avx|avx2|avx512[^,\s]*|fma|f16c|bmi2)))'
 }
 
 function Test-WindowsCpuWorkerBaselineUnsafeGeneratedFlags([string]$Value, [switch]$AllowMsBuildProperties) {
@@ -65,15 +65,15 @@ function Assert-WindowsCpuWorkerBaselineAmbientEnvironment {
     foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
         $name = [string]$entry.Key
         $value = [string]$entry.Value
+        if ($name -match '^(?i:(?:(?:HOST|TARGET)_)?(?:C|CXX|CPP)FLAGS(?:_.+)?|(?:(?:HOST|TARGET)_)?(?:CC|CXX)(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$') {
+            throw "CPU worker baseline does not accept ambient compiler flags: $name"
+        }
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
         if ($name -match '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS)$') {
             throw "CPU worker baseline does not accept ambient CMake arguments: $name"
         }
         if ($name -match '^(?i:CMAKE_TOOLCHAIN_FILE(?:_.+)?|HOST_CMAKE_TOOLCHAIN_FILE|CMAKE_X86_64_PC_WINDOWS_MSVC(?:_.+)?)$') {
             throw "CPU worker baseline does not accept ambient CMake toolchain overrides: $name"
-        }
-        if ($name -match '^(?i:(?:C|CXX|CPP)FLAGS(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$') {
-            throw "CPU worker baseline does not accept ambient compiler flags: $name"
         }
     }
 }
@@ -210,12 +210,11 @@ function Assert-WindowsCpuWorkerBaselineVisualStudioFlags([string]$ProjectPath, 
     }
 }
 
-function Assert-WindowsCpuWorkerBaselineEvidence([psobject]$Build) {
-    if (-not (Test-Path -LiteralPath $Build.TargetRoot -PathType Container)) {
-        throw 'CPU worker baseline target is missing after the native build.'
+function Assert-WindowsCpuWorkerBaselineNativeBuildEvidence([string]$NativeBuildRoot) {
+    if (-not (Test-Path -LiteralPath $NativeBuildRoot -PathType Container)) {
+        throw 'CPU worker baseline native build directory is missing after the native build.'
     }
-    Assert-WindowsCpuWorkerBaselineNoReparseAncestors $Build.TargetRoot
-    $nativeBuildRoot = Get-WindowsCpuWorkerBaselineNativeBuildRoot $Build
+    Assert-WindowsCpuWorkerBaselineNoReparseAncestors $NativeBuildRoot
     $cachePath = Join-Path $nativeBuildRoot 'CMakeCache.txt'
     $null = Assert-WindowsCpuWorkerBaselineRegularFile $cachePath
     $cacheText = [System.IO.File]::ReadAllText($cachePath, [System.Text.UTF8Encoding]::new($false, $true))
@@ -271,4 +270,12 @@ function Assert-WindowsCpuWorkerBaselineEvidence([psobject]$Build) {
     else {
         throw "CPU worker baseline does not recognize the generated CMake generator: $generator"
     }
+}
+
+function Assert-WindowsCpuWorkerBaselineEvidence([psobject]$Build) {
+    if (-not (Test-Path -LiteralPath $Build.TargetRoot -PathType Container)) {
+        throw 'CPU worker baseline target is missing after the native build.'
+    }
+    Assert-WindowsCpuWorkerBaselineNoReparseAncestors $Build.TargetRoot
+    Assert-WindowsCpuWorkerBaselineNativeBuildEvidence (Get-WindowsCpuWorkerBaselineNativeBuildRoot $Build)
 }

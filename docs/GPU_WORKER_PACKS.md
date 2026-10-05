@@ -719,6 +719,11 @@ build-local junction and its exact Cargo OUT_DIR, replaces only that fresh
 partial `out\build` directory with an isolated short junction, and retries
 once. This keeps CMake/MSBuild paths bounded in deep worktrees and prevents
 CUDA and Vulkan feature outputs from being confused.
+Both CUDA and Vulkan workers pin transcribe.cpp's conservative x86 CPU
+scheduling baseline (`TRANSCRIBE_X86_CONSERVATIVE=ON`, `GGML_NATIVE=OFF`) and
+the static CRT Rust flags. Before any worker copy or pack authoring, the build
+requires unambiguous CMake and generated compiler-flag evidence from the exact
+fresh native root; native or higher-ISA evidence fails closed.
 
 `scripts/test-windows-gpu-worker-pack-tools.ps1` exercises deterministic
 fixture authoring plus signature, key, tamper, unexpected-file/DLL, ADS,

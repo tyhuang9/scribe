@@ -139,6 +139,7 @@ if ($env:OS -ne 'Windows_NT') {
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
 $cmakeBootstrapScript = Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1'
+$cpuBaselineScript = Join-Path $PSScriptRoot 'windows-cpu-worker-native-baseline.ps1'
 $prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
 $cudaInventoryScript = Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1'
 $cudaPackInputsTestScript = Join-Path $PSScriptRoot 'test-windows-cuda-pack-inputs.ps1'
@@ -163,6 +164,7 @@ foreach ($script in @(
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
 . $cmakeBootstrapScript
+. $cpuBaselineScript
 function New-TestCanonicalCargoTargetFailure(
     [string]$CargoTarget,
     [string]$CrateHash = '0123456789abcdef',
@@ -724,7 +726,42 @@ $retryDiagnosticFunction = $builderAst.Find({
     $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
 }, $true)
-Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
+$nativeBaselineTopologyFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Get-ValidatedGpuWorkerNativeBuildEvidenceRoot'
+}, $true)
+$environmentStateFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Get-ProcessEnvironmentState'
+}, $true)
+$restoreEnvironmentFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Restore-ProcessEnvironment'
+}, $true)
+$normalizedFullPathFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Get-NormalizedFullPath'
+}, $true)
+$removeStagingFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Remove-GpuWorkerPackStaging'
+}, $true)
+Assert-True (
+    $null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction -and
+    $null -ne $nativeBaselineTopologyFunction -and $null -ne $environmentStateFunction -and
+    $null -ne $restoreEnvironmentFunction -and $null -ne $normalizedFullPathFunction -and
+    $null -ne $removeStagingFunction
+) 'Builder lost the CPU baseline topology or environment-restoration helpers.'
+. ([scriptblock]::Create($nativeBaselineTopologyFunction.Extent.Text))
+. ([scriptblock]::Create($environmentStateFunction.Extent.Text))
+. ([scriptblock]::Create($restoreEnvironmentFunction.Extent.Text))
+. ([scriptblock]::Create($normalizedFullPathFunction.Extent.Text))
+. ([scriptblock]::Create($removeStagingFunction.Extent.Text))
 $nativeProcessParameterNames = @($nativeProcessFunction.Parameters | ForEach-Object {
     $_.Name.VariablePath.UserPath
 })
@@ -772,6 +809,376 @@ Assert-True ($workerBuildRetryStatements.Count -ge 1) 'Builder lost the validate
 $workerBuildRetryStatement = $workerBuildRetryStatements[0]
 Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
 Assert-True (-not $workerBuildRetryStatement.Extent.Text.Contains($captureOverflowOptIn)) 'Worker-build retry path gained diagnostic capture overflow tolerance.'
+
+function Write-TestGpuNativeBaselineEvidence([string]$NativeRoot, [string]$GeneratedFlags = "C_FLAGS =`r`nCXX_FLAGS =`r`n") {
+    $cache = @(
+        'TRANSCRIBE_X86_CONSERVATIVE:BOOL=ON',
+        'TRANSCRIBE_GGML_BACKEND_DL:BOOL=OFF',
+        'GGML_NATIVE:BOOL=OFF',
+        'GGML_BACKEND_DL:BOOL=OFF',
+        'GGML_OPENMP:BOOL=OFF',
+        'GGML_CPU_ALL_VARIANTS:BOOL=OFF',
+        'GGML_SSE42:BOOL=OFF',
+        'GGML_AVX:BOOL=OFF',
+        'GGML_AVX_VNNI:BOOL=OFF',
+        'GGML_AVX2:BOOL=OFF',
+        'GGML_BMI2:BOOL=OFF',
+        'GGML_FMA:BOOL=OFF',
+        'GGML_F16C:BOOL=OFF',
+        'GGML_AVX512:BOOL=OFF',
+        'GGML_AVX512_VBMI:BOOL=OFF',
+        'GGML_AVX512_VNNI:BOOL=OFF',
+        'GGML_AVX512_BF16:BOOL=OFF',
+        'CMAKE_C_FLAGS:STRING=',
+        'CMAKE_CXX_FLAGS:STRING=',
+        'CMAKE_C_FLAGS_RELEASE:STRING=',
+        'CMAKE_CXX_FLAGS_RELEASE:STRING=',
+        'CMAKE_GENERATOR:INTERNAL=NMake Makefiles'
+    ) -join "`r`n"
+    [IO.File]::WriteAllText(
+        (Join-Path $NativeRoot 'CMakeCache.txt'),
+        $cache + "`r`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $flagsPath = Join-Path $NativeRoot 'ggml\src\CMakeFiles\ggml-cpu.dir\flags.make'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $flagsPath) -Force | Out-Null
+    [IO.File]::WriteAllText($flagsPath, $GeneratedFlags, [Text.UTF8Encoding]::new($false))
+}
+
+$nativeBaselineFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-native-baseline-$([guid]::NewGuid().ToString('N'))"
+try {
+    $physicalCargoTarget = Join-Path $nativeBaselineFixtureRoot 'cargo'
+    $physicalEnvironment = Join-Path $nativeBaselineFixtureRoot 'environment'
+    $physicalNativeRoot = Join-Path $physicalCargoTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out\build'
+    $scriptOnlyCrate = Join-Path $physicalCargoTarget 'release\build\transcribe-cpp-sys-fedcba9876543210'
+    New-Item -ItemType Directory -Path $physicalNativeRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $scriptOnlyCrate -Force | Out-Null
+    New-Item -ItemType Directory -Path $physicalEnvironment | Out-Null
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot
+    $observedPhysicalRoot = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $physicalEnvironment $physicalCargoTarget
+    Assert-True ($observedPhysicalRoot -ceq (Get-Item -LiteralPath $physicalNativeRoot -Force).FullName) 'GPU CPU baseline adapter did not bind the physical native root.'
+    Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $observedPhysicalRoot
+
+    Remove-Item -LiteralPath (Join-Path $physicalNativeRoot 'CMakeCache.txt') -Force
+    $missingCacheRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $observedPhysicalRoot } catch { $missingCacheRejected = $true }
+    Assert-True $missingCacheRejected 'GPU CPU baseline accepted missing CMake evidence before pack authoring.'
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot
+    Add-Content -LiteralPath (Join-Path $physicalNativeRoot 'CMakeCache.txt') -Value 'GGML_NATIVE:BOOL=OFF' -NoNewline
+    $duplicateCacheRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $observedPhysicalRoot } catch { $duplicateCacheRejected = $true }
+    Assert-True $duplicateCacheRejected 'GPU CPU baseline accepted ambiguous CMake evidence before pack authoring.'
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot
+    $cachePath = Join-Path $physicalNativeRoot 'CMakeCache.txt'
+    $unsafeCache = [IO.File]::ReadAllText($cachePath, [Text.UTF8Encoding]::new($false, $true)).Replace(
+        'CMAKE_C_FLAGS:STRING=',
+        'CMAKE_C_FLAGS:STRING=/arch:AVX10.1'
+    )
+    [IO.File]::WriteAllText($cachePath, $unsafeCache, [Text.UTF8Encoding]::new($false))
+    $unsafeCacheRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $observedPhysicalRoot } catch { $unsafeCacheRejected = $true }
+    Assert-True $unsafeCacheRejected 'GPU CPU baseline accepted higher-ISA CMake cache flags before pack authoring.'
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot
+
+    $fakeRunOutput = Join-Path $physicalCargoTarget 'release\build\transcribe-cpp-sys-2222222222222222\out'
+    New-Item -ItemType Directory -Path $fakeRunOutput -Force | Out-Null
+    $ambiguousRunOutputRejected = $false
+    try { $null = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $physicalEnvironment $physicalCargoTarget } catch { $ambiguousRunOutputRejected = $true }
+    Assert-True $ambiguousRunOutputRejected 'GPU CPU baseline adapter accepted two transcribe-cpp-sys run-output directories.'
+    Remove-Item -LiteralPath (Split-Path -Parent $fakeRunOutput) -Recurse -Force
+
+    $missingRunCargoTarget = Join-Path $nativeBaselineFixtureRoot 'missing-run-cargo'
+    New-Item -ItemType Directory -Path (Join-Path $missingRunCargoTarget 'release\build\transcribe-cpp-sys-3333333333333333') -Force | Out-Null
+    $missingRunOutputRejected = $false
+    try { $null = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $physicalEnvironment $missingRunCargoTarget } catch { $missingRunOutputRejected = $true }
+    Assert-True $missingRunOutputRejected 'GPU CPU baseline adapter accepted only a script-artifact Cargo directory.'
+
+    $duplicateCrate = Join-Path $physicalCargoTarget 'release\build\transcribe-cpp-sys-1111111111111111'
+    New-Item -ItemType Junction -Path $duplicateCrate -Target (Split-Path -Parent (Split-Path -Parent $physicalNativeRoot)) | Out-Null
+    $ambiguousCrateRejected = $false
+    try { $null = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $physicalEnvironment $physicalCargoTarget } catch { $ambiguousCrateRejected = $true }
+    Assert-True $ambiguousCrateRejected 'GPU CPU baseline adapter accepted a reparse-point transcribe-cpp-sys duplicate.'
+    Remove-Item -LiteralPath $duplicateCrate -Force
+
+    $retryCargoTarget = Join-Path $nativeBaselineFixtureRoot 'retry-cargo'
+    $retryEnvironment = Join-Path $nativeBaselineFixtureRoot 'retry-environment'
+    $retryOut = Join-Path $retryCargoTarget 'release\build\transcribe-cpp-sys-fedcba9876543210\out'
+    $retryNativeRoot = Join-Path $retryEnvironment 'native'
+    $retryScriptOnlyCrate = Join-Path $retryCargoTarget 'release\build\transcribe-cpp-sys-0123456789abcdef'
+    New-Item -ItemType Directory -Path $retryOut -Force | Out-Null
+    New-Item -ItemType Directory -Path $retryScriptOnlyCrate -Force | Out-Null
+    New-Item -ItemType Directory -Path $retryNativeRoot -Force | Out-Null
+    Write-TestGpuNativeBaselineEvidence $retryNativeRoot
+    New-Item -ItemType Junction -Path (Join-Path $retryOut 'build') -Target $retryNativeRoot | Out-Null
+    $retryTcs = Join-Path $retryEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $retryTcs | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $retryTcs 'fedcba9876543210') -Target $retryOut | Out-Null
+    $observedRetryRoot = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $retryEnvironment $retryCargoTarget
+    Assert-True ($observedRetryRoot -ceq (Get-Item -LiteralPath $retryNativeRoot -Force).FullName) 'GPU CPU baseline adapter did not bind the validated retry junction target.'
+    Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $observedRetryRoot
+
+    $malformedRetryCargoTarget = Join-Path $nativeBaselineFixtureRoot 'malformed-retry-cargo'
+    $malformedRetryEnvironment = Join-Path $nativeBaselineFixtureRoot 'malformed-retry-environment'
+    $malformedRetryOut = Join-Path $malformedRetryCargoTarget 'release\build\transcribe-cpp-sys-aaaaaaaaaaaaaaaa\out'
+    $malformedRetryNative = Join-Path $malformedRetryEnvironment 'native'
+    $malformedRetryOutside = Join-Path $nativeBaselineFixtureRoot 'malformed-retry-outside'
+    $malformedRetryScriptOnlyCrate = Join-Path $malformedRetryCargoTarget 'release\build\transcribe-cpp-sys-bbbbbbbbbbbbbbbb'
+    New-Item -ItemType Directory -Path $malformedRetryOut -Force | Out-Null
+    New-Item -ItemType Directory -Path $malformedRetryScriptOnlyCrate -Force | Out-Null
+    New-Item -ItemType Directory -Path $malformedRetryNative -Force | Out-Null
+    New-Item -ItemType Directory -Path $malformedRetryOutside | Out-Null
+    Write-TestGpuNativeBaselineEvidence $malformedRetryNative
+    New-Item -ItemType Junction -Path (Join-Path $malformedRetryOut 'build') -Target $malformedRetryNative | Out-Null
+    $malformedRetryTcs = Join-Path $malformedRetryEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $malformedRetryTcs | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $malformedRetryTcs 'aaaaaaaaaaaaaaaa') -Target $malformedRetryOutside | Out-Null
+    $malformedRetryRejected = $false
+    try { $null = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $malformedRetryEnvironment $malformedRetryCargoTarget } catch { $malformedRetryRejected = $true }
+    Assert-True $malformedRetryRejected 'GPU CPU baseline adapter accepted a retry junction with a mismatched OUT_DIR target.'
+
+    $runOnlyCargoTarget = Join-Path $nativeBaselineFixtureRoot 'run-only-cargo'
+    $runOnlyEnvironment = Join-Path $nativeBaselineFixtureRoot 'run-only-environment'
+    $runOnlyNativeRoot = Join-Path $runOnlyCargoTarget 'release\build\transcribe-cpp-sys-4444444444444444\out\build'
+    New-Item -ItemType Directory -Path $runOnlyNativeRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $runOnlyEnvironment | Out-Null
+    Write-TestGpuNativeBaselineEvidence $runOnlyNativeRoot
+    $runOnlyRejected = $false
+    try { $null = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $runOnlyEnvironment $runOnlyCargoTarget } catch { $runOnlyRejected = $true }
+    Assert-True $runOnlyRejected 'GPU CPU baseline adapter accepted a run-output directory without its script artifact.'
+
+    $extraScriptOnlyCrate = Join-Path $physicalCargoTarget 'release\build\transcribe-cpp-sys-5555555555555555'
+    New-Item -ItemType Directory -Path $extraScriptOnlyCrate -Force | Out-Null
+    $extraScriptRejected = $false
+    try { $null = Get-ValidatedGpuWorkerNativeBuildEvidenceRoot $physicalEnvironment $physicalCargoTarget } catch { $extraScriptRejected = $true }
+    Assert-True $extraScriptRejected 'GPU CPU baseline adapter accepted more than one script artifact directory.'
+    Remove-Item -LiteralPath $extraScriptOnlyCrate -Recurse -Force
+
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot "C_FLAGS = /arch:AVX10.1`r`nCXX_FLAGS = -msse4.2`r`n"
+    $unsafeFlagsRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $physicalNativeRoot } catch { $unsafeFlagsRejected = $true }
+    Assert-True $unsafeFlagsRejected 'GPU CPU baseline accepted generated higher-ISA flags before pack authoring.'
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot "C_FLAGS = /D `"__AVX2__=0`"`r`nCXX_FLAGS = /FIhidden.h`r`n"
+    $unsafeMacroOrHeaderRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $physicalNativeRoot } catch { $unsafeMacroOrHeaderRejected = $true }
+    Assert-True $unsafeMacroOrHeaderRejected 'GPU CPU baseline accepted generated builtin ISA macros or forced headers before pack authoring.'
+    Write-TestGpuNativeBaselineEvidence $physicalNativeRoot
+
+    $visualStudioNativeRoot = Join-Path $nativeBaselineFixtureRoot 'visual-studio-native'
+    New-Item -ItemType Directory -Path $visualStudioNativeRoot | Out-Null
+    Write-TestGpuNativeBaselineEvidence $visualStudioNativeRoot
+    $vsCachePath = Join-Path $visualStudioNativeRoot 'CMakeCache.txt'
+    $vsCache = [IO.File]::ReadAllText($vsCachePath, [Text.UTF8Encoding]::new($false, $true)).Replace(
+        'CMAKE_GENERATOR:INTERNAL=NMake Makefiles',
+        'CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022'
+    )
+    [IO.File]::WriteAllText($vsCachePath, $vsCache, [Text.UTF8Encoding]::new($false))
+    $projectPath = Join-Path $visualStudioNativeRoot 'ggml\src\ggml-cpu.vcxproj'
+    [IO.File]::WriteAllText(
+        $projectPath,
+        '<Project><ItemDefinitionGroup><ClCompile><EnableEnhancedInstructionSet>NotSet</EnableEnhancedInstructionSet><AdditionalOptions>%(AdditionalOptions)</AdditionalOptions></ClCompile></ItemDefinitionGroup></Project>',
+        [Text.UTF8Encoding]::new($false)
+    )
+    $tlogPath = Join-Path $visualStudioNativeRoot 'ggml\src\ggml-cpu.dir\Release\ggml-cpu.tlog\CL.command.1.tlog'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $tlogPath) -Force | Out-Null
+    [IO.File]::WriteAllText($tlogPath, "^C:\fixture\ggml-cpu.c`r`n/c /D__SSE2__`r`n", [Text.UnicodeEncoding]::new($false, $true))
+    Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $visualStudioNativeRoot
+    [IO.File]::WriteAllText($tlogPath, "^C:\fixture\ggml-cpu.c`r`n/c /D `"__AVX512F__=1`"`r`n", [Text.UnicodeEncoding]::new($false, $true))
+    $unsafeVsMacroRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $visualStudioNativeRoot } catch { $unsafeVsMacroRejected = $true }
+    Assert-True $unsafeVsMacroRejected 'GPU CPU baseline accepted a higher-ISA macro from the evaluated Visual Studio command log.'
+    [IO.File]::WriteAllText($tlogPath, "^C:\fixture\ggml-cpu.c`r`n/c -imacros hidden.h`r`n", [Text.UnicodeEncoding]::new($false, $true))
+    $unsafeVsHeaderRejected = $false
+    try { Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $visualStudioNativeRoot } catch { $unsafeVsHeaderRejected = $true }
+    Assert-True $unsafeVsHeaderRejected 'GPU CPU baseline accepted a forced header from the evaluated Visual Studio command log.'
+}
+finally {
+    if (Test-Path -LiteralPath $nativeBaselineFixtureRoot) {
+        Remove-Item -LiteralPath $nativeBaselineFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$baselineEnvironmentNames = @(
+    'SCRIBE_GPU_BASELINE_ABSENT', 'SCRIBE_GPU_BASELINE_EMPTY', 'SCRIBE_GPU_BASELINE_VALUE'
+)
+$baselineEnvironmentBefore = Get-ProcessEnvironmentState $baselineEnvironmentNames
+try {
+    Remove-Item -LiteralPath 'Env:SCRIBE_GPU_BASELINE_ABSENT' -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('SCRIBE_GPU_BASELINE_EMPTY', '', 'Process')
+    [Environment]::SetEnvironmentVariable('SCRIBE_GPU_BASELINE_VALUE', 'original', 'Process')
+    $baselineEnvironmentSnapshot = Get-ProcessEnvironmentState $baselineEnvironmentNames
+    [Environment]::SetEnvironmentVariable('SCRIBE_GPU_BASELINE_ABSENT', 'changed', 'Process')
+    [Environment]::SetEnvironmentVariable('SCRIBE_GPU_BASELINE_EMPTY', 'changed', 'Process')
+    [Environment]::SetEnvironmentVariable('SCRIBE_GPU_BASELINE_VALUE', 'changed', 'Process')
+    Restore-ProcessEnvironment $baselineEnvironmentSnapshot
+    Assert-True (-not (Test-Path -LiteralPath 'Env:SCRIBE_GPU_BASELINE_ABSENT')) 'GPU CPU baseline environment restoration created an absent value.'
+    Assert-True ((Get-Item -LiteralPath 'Env:SCRIBE_GPU_BASELINE_EMPTY').Value -ceq '') 'GPU CPU baseline environment restoration changed an empty value.'
+    Assert-True ((Get-Item -LiteralPath 'Env:SCRIBE_GPU_BASELINE_VALUE').Value -ceq 'original') 'GPU CPU baseline environment restoration changed a populated value.'
+    Restore-ProcessEnvironment $baselineEnvironmentSnapshot
+    Assert-True (-not (Test-Path -LiteralPath 'Env:SCRIBE_GPU_BASELINE_ABSENT')) 'GPU CPU baseline environment restoration was not idempotent.'
+    [Environment]::SetEnvironmentVariable('SCRIBE_GPU_BASELINE_VALUE', 'mutated-after-invalid-entry', 'Process')
+    $aggregateFailure = $false
+    try {
+        Restore-ProcessEnvironment @(
+            [pscustomobject]@{ Name = ''; Exists = $true; Value = 'invalid' },
+            [pscustomobject]@{ Name = 'SCRIBE_GPU_BASELINE_VALUE'; Exists = $true; Value = 'restored-after-invalid-entry' }
+        )
+    }
+    catch { $aggregateFailure = $_.Exception.Message -ceq 'Could not restore one or more process environment variables.' }
+    Assert-True $aggregateFailure 'GPU environment restoration did not aggregate an invalid entry failure.'
+    Assert-True ((Get-Item -LiteralPath 'Env:SCRIBE_GPU_BASELINE_VALUE').Value -ceq 'restored-after-invalid-entry') 'GPU environment restoration stopped before a later valid entry.'
+    Restore-ProcessEnvironment $baselineEnvironmentSnapshot
+}
+finally {
+    Restore-ProcessEnvironment $baselineEnvironmentBefore
+}
+
+$ambientEnvironmentNames = @(
+    'CARGO_BUILD_RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'HOST_CFLAGS', 'TARGET_CXXFLAGS',
+    'CC_x86_64_pc_windows_msvc', 'CC_x86_64-pc-windows-msvc',
+    'CXX_x86_64_pc_windows_msvc', 'CXX_x86_64-pc-windows-msvc', 'HOST_CC'
+)
+$ambientRustFlagsBefore = Get-ProcessEnvironmentState $ambientEnvironmentNames
+try {
+    foreach ($ambientName in $ambientEnvironmentNames) {
+        $ambientValue = if ($ambientName -ceq 'CARGO_ENCODED_RUSTFLAGS') { '' } else { '-C target-cpu=native' }
+        [Environment]::SetEnvironmentVariable($ambientName, $ambientValue, 'Process')
+        $ambientRejected = $false
+        try { Assert-WindowsCpuWorkerBaselineAmbientEnvironment }
+        catch {
+            $ambientRejected = $_.Exception.Message.IndexOf(
+                "compiler flags: $ambientName",
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -ge 0
+        }
+        Assert-True $ambientRejected "GPU CPU baseline accepted ambient compiler override $ambientName."
+        if (Test-Path -LiteralPath "Env:$ambientName") {
+            Remove-Item -LiteralPath "Env:$ambientName" -ErrorAction Stop
+        }
+    }
+}
+finally {
+    Restore-ProcessEnvironment $ambientRustFlagsBefore
+}
+
+$cpuBaselineBuildSource = Get-Content -LiteralPath $buildScript -Raw
+$workerEvidenceAt = $cpuBaselineBuildSource.IndexOf('Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $nativeBuildEvidenceRoot')
+$firstWorkerCopyAt = $cpuBaselineBuildSource.IndexOf('Copy-Item -LiteralPath $worker -Destination $stagedWorker')
+$authorAt = $cpuBaselineBuildSource.IndexOf("'GPU worker-pack authoring failed.'")
+Assert-True (
+    $workerEvidenceAt -ge 0 -and $workerEvidenceAt -lt $firstWorkerCopyAt -and $workerEvidenceAt -lt $authorAt
+) 'GPU CPU baseline evidence no longer rejects unsafe native output before worker copy or pack authoring.'
+$resultAt = $cpuBaselineBuildSource.LastIndexOf('$packResult = [pscustomobject]@{')
+$restoreAt = $cpuBaselineBuildSource.LastIndexOf('Restore-ProcessEnvironment $buildEnvironmentState')
+$moveAt = $cpuBaselineBuildSource.LastIndexOf('Move-Item -LiteralPath $stagingRoot -Destination $outputRoot')
+Assert-True (
+    $resultAt -ge 0 -and $resultAt -lt $restoreAt -and $restoreAt -lt $moveAt
+) 'GPU worker-pack result publication or final move can occur before environment restoration.'
+$builderFinalizationTries = @($builderAst.FindAll({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.TryStatementAst] -and
+    $null -ne $Ast.Finally -and
+    $Ast.Finally.Extent.Text.Contains('Restore-ProcessEnvironment $buildEnvironmentState')
+}, $true))
+$builderPublicationTries = @($builderAst.FindAll({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.TryStatementAst] -and
+    $Ast.Extent.Text.Contains('Move-Item -LiteralPath $stagingRoot -Destination $outputRoot') -and
+    $Ast.Extent.Text.Contains('Remove-GpuWorkerPackStaging $stagingRoot $outputRoot')
+}, $true))
+Assert-True ($builderFinalizationTries.Count -eq 1 -and $builderPublicationTries.Count -eq 1) `
+    'Builder must retain one unique adjacent restoration and final-publication control flow.'
+$builderFinalizationTry = $builderFinalizationTries[0]
+$builderPublicationTry = $builderPublicationTries[0]
+$betweenFinalizationAndPublication = $cpuBaselineBuildSource.Substring(
+    $builderFinalizationTry.Extent.EndOffset,
+    $builderPublicationTry.Extent.StartOffset - $builderFinalizationTry.Extent.EndOffset
+)
+Assert-True ($builderPublicationTry.Extent.StartOffset -ge $builderFinalizationTry.Extent.EndOffset -and
+    [string]::IsNullOrWhiteSpace($betweenFinalizationAndPublication)) `
+    'Builder restoration and final publication control flow must remain immediately adjacent.'
+$finallyAt = $cpuBaselineBuildSource.LastIndexOf('finally', $builderFinalizationTry.Extent.EndOffset - 1, [System.StringComparison]::Ordinal)
+Assert-True ($finallyAt -ge $builderFinalizationTry.Extent.StartOffset) 'Builder restoration try no longer has extractable finally control flow.'
+$actualFinalizationSource = 'try { } ' + $cpuBaselineBuildSource.Substring(
+    $finallyAt,
+    $builderFinalizationTry.Extent.EndOffset - $finallyAt
+) + [Environment]::NewLine + $builderPublicationTry.Extent.Text
+$actualGpuPackFinalization = [scriptblock]::Create($actualFinalizationSource)
+
+function Invoke-ExtractedGpuPackFinalization {
+    & $actualGpuPackFinalization
+}
+
+$finalizationFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-finalization-$([guid]::NewGuid().ToString('N'))"
+$finalizationEnvironmentName = 'SCRIBE_GPU_FINALIZATION_FIXTURE'
+$finalizationEnvironmentBefore = Get-ProcessEnvironmentState @($finalizationEnvironmentName)
+try {
+    New-Item -ItemType Directory -Path $finalizationFixtureRoot | Out-Null
+
+    $outputRoot = Join-Path $finalizationFixtureRoot 'restore-output'
+    $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+    $stagingCreated = $true
+    $packResult = [pscustomobject]@{ PackRoot = $outputRoot; Case = 'restore-failure' }
+    [Environment]::SetEnvironmentVariable($finalizationEnvironmentName, 'mutated', 'Process')
+    $previousPinnedMsvcEnvironment = $null
+    $buildEnvironmentState = @(
+        [pscustomobject]@{ Name = ''; Exists = $true; Value = 'invalid-name' },
+        [pscustomobject]@{ Name = $finalizationEnvironmentName; Exists = $true; Value = 'restored-after-failure' }
+    )
+    $restoreFailureOutput = [System.Collections.Generic.List[object]]::new()
+    $restoreFailure = $null
+    try {
+        Invoke-ExtractedGpuPackFinalization | ForEach-Object { $restoreFailureOutput.Add($_) }
+    }
+    catch { $restoreFailure = $_.Exception }
+    Assert-True ($null -ne $restoreFailure -and
+        $restoreFailure.Message -ceq 'GPU worker-pack build could not restore its process environment.') `
+        'Actual builder restoration failure did not fail closed with its generic restoration error.'
+    Assert-True ($restoreFailureOutput.Count -eq 0 -and -not (Test-Path -LiteralPath $outputRoot) -and
+        -not (Test-Path -LiteralPath $stagingRoot)) `
+        'Actual builder restoration failure published output or retained its exact staging directory.'
+    Assert-True ([Environment]::GetEnvironmentVariable($finalizationEnvironmentName, 'Process') -ceq 'restored-after-failure') `
+        'Actual builder restoration failure did not continue to restore later environment entries.'
+
+    $outputRoot = Join-Path $finalizationFixtureRoot 'move-output'
+    [IO.File]::WriteAllText($outputRoot, 'must survive failed final move', [Text.UTF8Encoding]::new($false))
+    $outsideSentinelBytes = [IO.File]::ReadAllBytes($outputRoot)
+    $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+    $stagingCreated = $true
+    $packResult = [pscustomobject]@{ PackRoot = $outputRoot; Case = 'move-failure' }
+    $buildEnvironmentState = Get-ProcessEnvironmentState @($finalizationEnvironmentName)
+    $moveFailureOutput = [System.Collections.Generic.List[object]]::new()
+    $moveFailure = $null
+    try {
+        Invoke-ExtractedGpuPackFinalization | ForEach-Object { $moveFailureOutput.Add($_) }
+    }
+    catch { $moveFailure = $_.Exception }
+    Assert-True ($null -ne $moveFailure) 'Actual builder final move failure did not surface a move failure.'
+    Assert-True ($moveFailureOutput.Count -eq 0 -and -not (Test-Path -LiteralPath $stagingRoot) -and
+        (Test-Path -LiteralPath $outputRoot -PathType Leaf) -and
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$outsideSentinelBytes, [IO.File]::ReadAllBytes($outputRoot))) `
+        'Actual builder final move failure did not clean exact staging or preserve the output sentinel file.'
+
+    $outputRoot = Join-Path $finalizationFixtureRoot 'success-output'
+    $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+    $stagedMarker = Join-Path $stagingRoot 'marker'
+    [IO.File]::WriteAllText($stagedMarker, 'success', [Text.UTF8Encoding]::new($false))
+    $stagingCreated = $true
+    $packResult = [pscustomobject]@{ PackRoot = $outputRoot; Case = 'success' }
+    $buildEnvironmentState = Get-ProcessEnvironmentState @($finalizationEnvironmentName)
+    $successOutput = @(Invoke-ExtractedGpuPackFinalization)
+    Assert-True ($successOutput.Count -eq 1 -and $successOutput[0].Case -ceq 'success' -and
+        (Test-Path -LiteralPath (Join-Path $outputRoot 'marker')) -and -not (Test-Path -LiteralPath $stagingRoot)) `
+        'Actual builder finalization success control did not move exactly one staged result.'
+}
+finally {
+    Restore-ProcessEnvironment $finalizationEnvironmentBefore
+    if (Test-Path -LiteralPath $finalizationFixtureRoot) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $finalizationFixtureRoot -Recurse -Force
+    }
+}
 
 function Invoke-WorkerBuildRetryHarness(
     [string]$Diagnostic,

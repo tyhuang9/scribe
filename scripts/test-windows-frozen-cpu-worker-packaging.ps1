@@ -250,7 +250,7 @@ $previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 $previousGitHubActions = $env:GITHUB_ACTIONS
 $previousCi = $env:CI
-$cpuBaselineAmbientNamePattern = '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|CMAKE_TOOLCHAIN_FILE(?:_.+)?|HOST_CMAKE_TOOLCHAIN_FILE|CMAKE_X86_64_PC_WINDOWS_MSVC(?:_.+)?|(?:C|CXX|CPP)FLAGS(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$'
+$cpuBaselineAmbientNamePattern = '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|CMAKE_TOOLCHAIN_FILE(?:_.+)?|HOST_CMAKE_TOOLCHAIN_FILE|CMAKE_X86_64_PC_WINDOWS_MSVC(?:_.+)?|(?:(?:HOST|TARGET)_)?(?:C|CXX|CPP)FLAGS(?:_.+)?|(?:(?:HOST|TARGET)_)?(?:CC|CXX)(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$'
 $previousCpuBaselineAmbient = @{}
 foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
     if ([string]$entry.Key -match $cpuBaselineAmbientNamePattern) {
@@ -293,6 +293,9 @@ $previousGlobalCargoScriptBlock = if ($null -ne $previousGlobalCargo) { $previou
 $originalCargoCommandIdentity = Get-CommandIdentity 'cargo'
 $originalGetChildItemCommandIdentity = Get-CommandIdentity 'Get-ChildItem'
 try {
+    foreach ($name in $previousCpuBaselineAmbient.Keys) {
+        if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+    }
     New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
     # Fixture commits must never invoke the developer's hooks/signing tools or
     # inherit repository routing, config injection, attributes, or templates.
@@ -377,6 +380,8 @@ try {
     Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
     $baselineEvidence = [pscustomobject]@{ TargetRoot = $baselineEvidenceTarget; TargetTriple = 'x86_64-pc-windows-msvc' }
     Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence
+    $baselineNativeRoot = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build'
+    Assert-WindowsCpuWorkerBaselineNativeBuildEvidence $baselineNativeRoot
     $baselineCache = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\CMakeCache.txt'
     $baselineCacheText = Get-Content -LiteralPath $baselineCache -Raw
     [System.IO.File]::WriteAllText($baselineCache, $baselineCacheText.Replace('GGML_AVX2:BOOL=OFF', 'GGML_AVX2:BOOL=ON'), [System.Text.UTF8Encoding]::new($false))
@@ -411,6 +416,14 @@ try {
     Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
     Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = /DGGML_AVX2=1'
     Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = /D__AVX2__=0'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = /D "__AVX2__=0"'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = -D__AVX10_1__=1'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
+    Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget 'CXX_FLAGS = /FIhidden.h'
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'native or higher ISA requirement'
     Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
     $visualStudioProject = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\ggml\src\ggml-cpu.vcxproj'
     $visualStudioTlog = Join-Path $baselineEvidenceTarget 'x86_64-pc-windows-msvc\release\build\transcribe-cpp-sys-a1b2c3d4\out\build\ggml\src\ggml-cpu.dir\Release\ggml-cpu.tlog\CL.command.1.tlog'
@@ -429,6 +442,12 @@ try {
     Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
     [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c @hidden.txt", [System.Text.Encoding]::Unicode)
     Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /D__AVX512F__=1", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /D `"__AVX2__=0`"", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
+    [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c -imacros hidden.h", [System.Text.Encoding]::Unicode)
+    Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'command log contains an unresolved or higher ISA requirement'
     [System.IO.File]::WriteAllText($visualStudioTlog, "^C:\fixture\ggml-cpu.c`r`n/c /O2", [System.Text.Encoding]::Unicode)
     [System.IO.File]::WriteAllText($visualStudioProject, $safeVisualStudioProject.Replace('NotSet', 'AdvancedVectorExtensions2'), [System.Text.UTF8Encoding]::new($false))
     Invoke-ExpectedFailure { Assert-WindowsCpuWorkerBaselineEvidence $baselineEvidence } 'Visual Studio ggml-cpu flags contain an unrecognized or higher ISA requirement'
@@ -440,8 +459,14 @@ try {
     Remove-Item -LiteralPath $visualStudioProject -Force
     Write-TestCpuWorkerBaselineEvidence $baselineEvidenceTarget
 
-    foreach ($name in $previousCpuBaselineAmbient.Keys) { Remove-Item -LiteralPath "Env:$name" }
-    $baselineEnvironmentNames = @(Get-WindowsCpuWorkerBaselineEnvironmentNames)
+    foreach ($name in $previousCpuBaselineAmbient.Keys) {
+        if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
+    }
+    # RUSTFLAGS itself is now a presence-based ambient compiler override, so
+    # New-WindowsCpuWorkerBaselineBuild must reject it. Its direct restore
+    # contract is covered separately below; these variables retain the
+    # construction-and-restoration coverage.
+    $baselineEnvironmentNames = @(Get-WindowsCpuWorkerBaselineEnvironmentNames | Where-Object { $_ -cne 'RUSTFLAGS' })
     $baselineBeforeRestorationTests = [Environment]::GetEnvironmentVariables()
     try {
         foreach ($name in $baselineEnvironmentNames) {
@@ -473,7 +498,6 @@ try {
         }
         $env:CARGO_TARGET_DIR = 'C:\fixture\original-target'
         $env:TRANSCRIBE_CMAKE_ARGS = ' '
-        $env:RUSTFLAGS = ' '
         $presentEnvironmentBefore = [Environment]::GetEnvironmentVariables()
         $presentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
         foreach ($attempt in @(1, 2)) {
@@ -510,6 +534,57 @@ try {
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-cpu=native'
     Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'
     Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS
+    [Environment]::SetEnvironmentVariable('CARGO_ENCODED_RUSTFLAGS', '')
+    try {
+        Assert-True (Test-Path -LiteralPath 'Env:CARGO_ENCODED_RUSTFLAGS') 'Present-empty CARGO_ENCODED_RUSTFLAGS fixture was not preserved by this runtime.'
+        Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: CARGO_ENCODED_RUSTFLAGS'
+    }
+    finally { if (Test-Path -LiteralPath 'Env:CARGO_ENCODED_RUSTFLAGS') { Remove-Item -LiteralPath 'Env:CARGO_ENCODED_RUSTFLAGS' -ErrorAction Stop } }
+    $directRustFlagsBefore = [Environment]::GetEnvironmentVariables()
+    try {
+        foreach ($case in @(
+            [pscustomobject]@{ Name = 'absent'; Value = $null; Exists = $false },
+            [pscustomobject]@{ Name = 'empty'; Value = ''; Exists = $true },
+            [pscustomobject]@{ Name = 'value'; Value = '-C target-feature=+crt-static'; Exists = $true }
+        )) {
+            [Environment]::SetEnvironmentVariable('RUSTFLAGS', 'mutated-before-direct-restore', 'Process')
+            $previous = @{}
+            foreach ($name in Get-WindowsCpuWorkerBaselineEnvironmentNames) {
+                $previous[$name] = if ($directRustFlagsBefore.Contains($name)) { [string]$directRustFlagsBefore[$name] } else { $null }
+            }
+            $previous['RUSTFLAGS'] = $case.Value
+            $directRestoreBuild = [pscustomobject]@{ PreviousEnvironment = $previous; Restored = $false }
+            foreach ($attempt in @(1, 2)) {
+                Restore-WindowsCpuWorkerBaselineEnvironment $directRestoreBuild
+                $observed = Get-Item -LiteralPath 'Env:RUSTFLAGS' -ErrorAction SilentlyContinue
+                Assert-Equal ($null -ne $observed) $case.Exists "Direct $($case.Name) RUSTFLAGS presence after restore $attempt"
+                if ($case.Exists) {
+                    Assert-Equal ([string]$observed.Value) ([string]$case.Value) "Direct $($case.Name) RUSTFLAGS value after restore $attempt"
+                }
+            }
+        }
+    }
+    finally {
+        if ($directRustFlagsBefore.Contains('RUSTFLAGS')) {
+            [Environment]::SetEnvironmentVariable('RUSTFLAGS', [string]$directRustFlagsBefore['RUSTFLAGS'], 'Process')
+        }
+        elseif (Test-Path -LiteralPath 'Env:RUSTFLAGS') {
+            Remove-Item -LiteralPath 'Env:RUSTFLAGS' -ErrorAction Stop
+        }
+    }
+    [Environment]::SetEnvironmentVariable('RUSTFLAGS', '')
+    try {
+        Assert-True (Test-Path -LiteralPath 'Env:RUSTFLAGS') 'Present-empty RUSTFLAGS fixture was not preserved by this runtime.'
+        Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } 'does not accept ambient compiler flags: RUSTFLAGS'
+    }
+    finally { if (Test-Path -LiteralPath 'Env:RUSTFLAGS') { Remove-Item -LiteralPath 'Env:RUSTFLAGS' -ErrorAction Stop } }
+    foreach ($name in @('HOST_CFLAGS', 'TARGET_CXXFLAGS', 'HOST_CC', 'CC_x86_64_pc_windows_msvc')) {
+        [Environment]::SetEnvironmentVariable($name, 'fixture-compiler-override')
+        try {
+            Invoke-ExpectedFailure { New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc' } "does not accept ambient compiler flags: $name"
+        }
+        finally { if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop } }
+    }
 
     # Use verbatim creation only to make a test-owned physical path that exceeds
     # MAX_PATH. The helper itself receives its ordinary absolute identity.
