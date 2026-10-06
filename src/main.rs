@@ -132,6 +132,8 @@ mod tray;
 mod ui;
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 mod windows_gpu_capture;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+mod windows_gpu_probe;
 #[cfg(windows)]
 #[allow(
     dead_code,
@@ -162,6 +164,17 @@ fn main() -> eframe::Result<()> {
     if let Err(error) = onnx_worker::harden_windows_dll_search() {
         eprintln!("Scribe could not harden native library loading: {error:#}");
         std::process::exit(1);
+    }
+    #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
+    if std::env::args_os().skip(1).any(|arg| {
+        arg == "--scribe-windows-gpu-pack-probe" || arg == "--ack-local-security-records"
+    }) {
+        eprintln!("Windows GPU pack probing is unavailable in this collector build");
+        std::process::exit(2);
+    }
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    if let Some(exit_code) = windows_gpu_probe::maybe_run_local_command() {
+        std::process::exit(exit_code);
     }
     if let Some(exit_code) = gpu_worker_pack::maybe_run_pack_verifier() {
         std::process::exit(exit_code);
