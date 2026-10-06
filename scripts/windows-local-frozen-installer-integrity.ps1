@@ -113,11 +113,17 @@ function Get-WindowsLocalFrozenCaptureObservationRequest([Collections.IDictionar
         'ObservationGpuDevice', 'ObservationReportPath'
     )
     $present = @($names | Where-Object { @($BoundParameters.Keys) -ccontains $_ })
-    if ($present.Count -eq 0) {
+    $hasCampaignPower = @($BoundParameters.Keys) -ccontains 'ObservationCampaignPower'
+    if ($present.Count -eq 0 -and -not $hasCampaignPower) {
         return $null
     }
     if ($present.Count -ne $names.Count) {
         throw 'Installed GPU observation arguments must be supplied together as one single-pair request.'
+    }
+    if ($hasCampaignPower -and
+        ($BoundParameters['ObservationCampaignPower'] -isnot [string] -or
+         [string]$BoundParameters['ObservationCampaignPower'] -cnotin @('ac', 'battery'))) {
+        throw 'Installed GPU observation campaign power must be lowercase ac or battery.'
     }
 
     $wavPath = [string]$BoundParameters['ObservationWavPath']
@@ -151,6 +157,7 @@ function Get-WindowsLocalFrozenCaptureObservationRequest([Collections.IDictionar
         GpuBackend = $backend
         GpuDevice = $device
         ReportPath = Get-WindowsLocalFrozenNormalizedFullPath $reportPath
+        CampaignPower = if ($hasCampaignPower) { [string]$BoundParameters['ObservationCampaignPower'] } else { $null }
     }
 }
 
@@ -335,8 +342,541 @@ function Read-WindowsLocalFrozenCaptureObservationReport(
     }
 }
 
-function Publish-WindowsLocalFrozenNewReport([string]$OutputPath, [byte[]]$Bytes) {
-    if ($null -eq $Bytes -or $Bytes.Length -le 0 -or $Bytes.Length -gt 1MB) {
+function Assert-WindowsLocalFrozenJsonElementHasNoPropertyCollisions(
+    [System.Text.Json.JsonElement]$Element,
+    [int]$Depth = 0
+) {
+    if ($Depth -gt 32) {
+        throw 'Installed GPU observation campaign JSON exceeds the supported nesting depth.'
+    }
+    if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+        $ordinal = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $ignoreCase = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($property in $Element.EnumerateObject()) {
+            if (-not $ordinal.Add($property.Name) -or -not $ignoreCase.Add($property.Name)) {
+                throw 'Installed GPU observation campaign JSON contains duplicate or case-colliding properties.'
+            }
+            Assert-WindowsLocalFrozenJsonElementHasNoPropertyCollisions $property.Value ($Depth + 1)
+        }
+    }
+    elseif ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+        foreach ($item in $Element.EnumerateArray()) {
+            Assert-WindowsLocalFrozenJsonElementHasNoPropertyCollisions $item ($Depth + 1)
+        }
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignJson([string]$Text) {
+    $options = [System.Text.Json.JsonDocumentOptions]::new()
+    $options.AllowTrailingCommas = $false
+    $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow
+    $options.MaxDepth = 32
+    $document = $null
+    try {
+        $document = [System.Text.Json.JsonDocument]::Parse($Text, $options)
+        Assert-WindowsLocalFrozenJsonElementHasNoPropertyCollisions $document.RootElement
+    }
+    catch {
+        throw 'Installed GPU observation campaign report is not strict duplicate-free JSON.'
+    }
+    finally {
+        if ($null -ne $document) { $document.Dispose() }
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignInteger(
+    [object]$Value,
+    [string]$Description,
+    [switch]$Positive
+) {
+    $number = Assert-WindowsLocalFrozenInt64 $Value $Description
+    if ($number -lt 0 -or ($Positive -and $number -eq 0)) {
+        throw "$Description is outside the supported nonnegative integer range."
+    }
+    return $number
+}
+
+function Assert-WindowsLocalFrozenCampaignUnavailableField(
+    [psobject]$Value,
+    [string]$Reason,
+    [string]$Description
+) {
+    Assert-WindowsLocalFrozenExactProperties $Value @('status', 'reason') $Description
+    if ($Value.status -isnot [string] -or [string]$Value.status -cne 'unavailable' -or
+        $Value.reason -isnot [string] -or [string]$Value.reason -cne $Reason) {
+        throw "$Description is not the required unavailable observation."
+    }
+}
+
+function Get-WindowsLocalFrozenCampaignHandshakeDigest(
+    [string]$HelloFrameHex,
+    [string]$ReadyFrameHex
+) {
+    try {
+        $hello = [Convert]::FromHexString($HelloFrameHex)
+        $ready = [Convert]::FromHexString($ReadyFrameHex)
+    }
+    catch {
+        throw 'Installed GPU observation campaign handshake capture is not canonical hexadecimal.'
+    }
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        foreach ($frame in @($hello, $ready)) {
+            $length = [BitConverter]::GetBytes([uint64]$frame.Length)
+            if (-not [BitConverter]::IsLittleEndian) { [Array]::Reverse($length) }
+            $hash.AppendData($length)
+            $hash.AppendData($frame)
+        }
+        return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally {
+        $hash.Dispose()
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignGpuIdentity(
+    [psobject]$Identity,
+    [psobject]$Expected
+) {
+    Assert-WindowsLocalFrozenExactProperties $Identity @(
+        'backend', 'provider', 'stable_device', 'driver', 'device_class', 'vendor',
+        'memory_total_bytes', 'pack_id', 'pack_version', 'pack_sha256',
+        'pack_security_epoch', 'runtime_abi'
+    ) 'Installed GPU observation campaign GPU identity'
+    foreach ($property in @(
+        'backend', 'provider', 'stable_device', 'driver', 'device_class', 'vendor',
+        'pack_id', 'pack_version', 'pack_sha256'
+    )) {
+        if ($Identity.$property -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$Identity.$property) -or
+            [string]$Identity.$property -cne ([string]$Identity.$property).Trim() -or
+            [string]$Identity.$property -match '[\x00-\x1f\x7f]') {
+            throw "Installed GPU observation campaign GPU identity has an invalid $property."
+        }
+    }
+    if ([string]$Identity.backend -cne [string]$Expected.Backend -or
+        [string]$Identity.provider -cne [string]$Expected.Provider -or
+        [string]$Identity.stable_device -cne [string]$Expected.StableDevice -or
+        [string]$Identity.pack_id -cne [string]$Expected.PackId -or
+        [string]$Identity.pack_version -cne [string]$Expected.PackVersion -or
+        [string]$Identity.pack_sha256 -cne [string]$Expected.PackSha256 -or
+        (Assert-WindowsLocalFrozenCampaignInteger $Identity.pack_security_epoch 'Installed GPU observation campaign pack security epoch') -ne [int64]$Expected.PackSecurityEpoch -or
+        (Assert-WindowsLocalFrozenCampaignInteger $Identity.runtime_abi 'Installed GPU observation campaign runtime ABI') -ne [int64]$Expected.RuntimeAbi -or
+        (Assert-WindowsLocalFrozenCampaignInteger $Identity.memory_total_bytes 'Installed GPU observation campaign memory total' -Positive) -le 0) {
+        throw 'Installed GPU observation campaign report does not bind the requested verified pack/backend/stable device.'
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignSegmentSummary(
+    [psobject]$Summary,
+    [string]$Description
+) {
+    Assert-WindowsLocalFrozenExactProperties $Summary @(
+        'sampled_max_current_usage_bytes', 'sampled_max_current_reservation_bytes',
+        'sampled_min_budget_bytes', 'sampled_min_available_for_reservation_bytes'
+    ) $Description
+    foreach ($property in $Summary.PSObject.Properties.Name) {
+        $null = Assert-WindowsLocalFrozenCampaignInteger $Summary.$property "$Description $property"
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignVideoMemory(
+    [psobject]$VideoMemory,
+    [string]$Target
+) {
+    if ($Target -ceq 'cpu') {
+        Assert-WindowsLocalFrozenExactProperties $VideoMemory @('status') 'Installed GPU observation campaign CPU video memory'
+        if ($VideoMemory.status -isnot [string] -or [string]$VideoMemory.status -cne 'not_applicable') {
+            throw 'Installed GPU observation campaign CPU video memory must be not applicable.'
+        }
+        return
+    }
+    Assert-WindowsLocalFrozenExactProperties $VideoMemory @('status', 'local', 'non_local') 'Installed GPU observation campaign GPU video memory'
+    if ($VideoMemory.status -isnot [string] -or [string]$VideoMemory.status -cne 'available') {
+        throw 'Installed GPU observation campaign GPU video memory must be available.'
+    }
+    Assert-WindowsLocalFrozenCampaignSegmentSummary $VideoMemory.local 'Installed GPU observation campaign local video memory'
+    Assert-WindowsLocalFrozenCampaignSegmentSummary $VideoMemory.non_local 'Installed GPU observation campaign non-local video memory'
+}
+
+function Assert-WindowsLocalFrozenCampaignProviderMemoryEndpoint(
+    [psobject]$Observation,
+    [string]$Target,
+    [psobject]$GpuIdentity
+) {
+    if ($Target -ceq 'cpu') {
+        Assert-WindowsLocalFrozenExactProperties $Observation @('status', 'reason') 'Installed GPU observation campaign CPU provider memory'
+        if ($Observation.status -isnot [string] -or [string]$Observation.status -cne 'not_applicable' -or
+            $Observation.reason -isnot [string] -or [string]$Observation.reason -cne 'cpu_provider') {
+            throw 'Installed GPU observation campaign CPU provider memory is invalid.'
+        }
+        return
+    }
+    if ($Observation.status -isnot [string]) {
+        throw 'Installed GPU observation campaign GPU provider memory status is invalid.'
+    }
+    if ([string]$Observation.status -ceq 'unavailable') {
+        Assert-WindowsLocalFrozenExactProperties $Observation @('status', 'reason') 'Installed GPU observation campaign unavailable GPU provider memory'
+        if ($Observation.reason -isnot [string] -or
+            [string]$Observation.reason -cnotin @('memory_total_unreported', 'provider_query_failed')) {
+            throw 'Installed GPU observation campaign GPU provider memory unavailability is invalid.'
+        }
+        return
+    }
+    Assert-WindowsLocalFrozenExactProperties $Observation @(
+        'status', 'backend', 'provider_id', 'stable_device', 'memory_total_bytes',
+        'provider_reported_memory_free_bytes', 'value_semantics', 'admission_validity'
+    ) 'Installed GPU observation campaign available GPU provider memory'
+    $total = Assert-WindowsLocalFrozenCampaignInteger $Observation.memory_total_bytes 'Installed GPU observation campaign provider memory total' -Positive
+    $free = Assert-WindowsLocalFrozenCampaignInteger $Observation.provider_reported_memory_free_bytes 'Installed GPU observation campaign provider memory free'
+    if ([string]$Observation.status -cne 'available' -or
+        $Observation.backend -isnot [string] -or [string]$Observation.backend -cne [string]$GpuIdentity.backend -or
+        $Observation.provider_id -isnot [string] -or [string]$Observation.provider_id -cne [string]$GpuIdentity.provider -or
+        $Observation.stable_device -isnot [string] -or [string]$Observation.stable_device -cne [string]$GpuIdentity.stable_device -or
+        $total -ne [int64]$GpuIdentity.memory_total_bytes -or $free -gt $total -or
+        $Observation.value_semantics -isnot [string] -or [string]$Observation.value_semantics -cne 'native_backend_defined' -or
+        $Observation.admission_validity -isnot [string] -or [string]$Observation.admission_validity -cne 'unestablished') {
+        throw 'Installed GPU observation campaign available GPU provider memory is inconsistent.'
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignProviderMemory(
+    [psobject]$ProviderMemory,
+    [string]$Target,
+    [psobject]$GpuIdentity
+) {
+    Assert-WindowsLocalFrozenExactProperties $ProviderMemory @('before', 'after') 'Installed GPU observation campaign provider memory pair'
+    Assert-WindowsLocalFrozenCampaignProviderMemoryEndpoint $ProviderMemory.before $Target $GpuIdentity
+    Assert-WindowsLocalFrozenCampaignProviderMemoryEndpoint $ProviderMemory.after $Target $GpuIdentity
+}
+
+function Assert-WindowsLocalFrozenCampaignMemoryAvailabilityEndpoint(
+    [psobject]$Observation,
+    [string]$Target,
+    [psobject]$GpuIdentity
+) {
+    if ($Target -ceq 'cpu') {
+        Assert-WindowsLocalFrozenExactProperties $Observation @('status', 'reason') 'Installed GPU observation campaign CPU memory availability'
+        if ($Observation.status -isnot [string] -or [string]$Observation.status -cne 'not_applicable' -or
+            $Observation.reason -isnot [string] -or [string]$Observation.reason -cne 'cpu_provider') {
+            throw 'Installed GPU observation campaign CPU memory availability is invalid.'
+        }
+        return
+    }
+    if ($Observation.status -isnot [string]) {
+        throw 'Installed GPU observation campaign GPU memory availability status is invalid.'
+    }
+    if ([string]$Observation.status -ceq 'unavailable') {
+        Assert-WindowsLocalFrozenExactProperties $Observation @('status', 'reason') 'Installed GPU observation campaign unavailable GPU memory availability'
+        if ($Observation.reason -isnot [string] -or [string]$Observation.reason -cnotin @(
+            'provider_query_failed', 'stable_device_missing', 'stable_device_ambiguous',
+            'memory_budget_extension_unavailable', 'memory_budget_invalid',
+            'multi_instance_unsupported', 'unsupported_provider'
+        )) {
+            throw 'Installed GPU observation campaign GPU memory unavailability is invalid.'
+        }
+        return
+    }
+    Assert-WindowsLocalFrozenExactProperties $Observation @(
+        'status', 'backend', 'provider_id', 'stable_device', 'memory_total_bytes',
+        'available_memory_bytes', 'source'
+    ) 'Installed GPU observation campaign observed GPU memory availability'
+    $total = Assert-WindowsLocalFrozenCampaignInteger $Observation.memory_total_bytes 'Installed GPU observation campaign availability total' -Positive
+    $available = Assert-WindowsLocalFrozenCampaignInteger $Observation.available_memory_bytes 'Installed GPU observation campaign available memory'
+    if ([string]$Observation.status -cne 'observed' -or
+        $Observation.backend -isnot [string] -or [string]$Observation.backend -cne [string]$GpuIdentity.backend -or
+        $Observation.provider_id -isnot [string] -or [string]$Observation.provider_id -cne [string]$GpuIdentity.provider -or
+        $Observation.stable_device -isnot [string] -or [string]$Observation.stable_device -cne [string]$GpuIdentity.stable_device -or
+        $available -gt $total) {
+        throw 'Installed GPU observation campaign observed GPU memory availability is inconsistent.'
+    }
+    if ([string]$GpuIdentity.backend -ceq 'cuda') {
+        Assert-WindowsLocalFrozenExactProperties $Observation.source @('method') 'Installed GPU observation campaign CUDA memory source'
+        if ($total -ne [int64]$GpuIdentity.memory_total_bytes -or
+            $Observation.source.method -isnot [string] -or [string]$Observation.source.method -cne 'cuda_mem_get_info') {
+            throw 'Installed GPU observation campaign CUDA memory source is invalid.'
+        }
+        return
+    }
+    Assert-WindowsLocalFrozenExactProperties $Observation.source @('method', 'heap_selection', 'heaps') 'Installed GPU observation campaign Vulkan memory source'
+    $expectedSelection = switch ([string]$GpuIdentity.device_class) {
+        'integrated_gpu' { 'all_heaps_integrated' }
+        'discrete_gpu' { 'device_local_heaps' }
+        default { throw 'Installed GPU observation campaign Vulkan device class is unsupported.' }
+    }
+    if ($Observation.source.method -isnot [string] -or [string]$Observation.source.method -cne 'vulkan_memory_budget' -or
+        $Observation.source.heap_selection -isnot [string] -or [string]$Observation.source.heap_selection -cne $expectedSelection -or
+        $Observation.source.heaps -isnot [object[]] -or @($Observation.source.heaps).Count -lt 1 -or @($Observation.source.heaps).Count -gt 16) {
+        throw 'Installed GPU observation campaign Vulkan memory source is invalid.'
+    }
+    [uint64]$derivedTotal = 0
+    [uint64]$derivedAvailable = 0
+    $selected = 0
+    for ($index = 0; $index -lt @($Observation.source.heaps).Count; $index++) {
+        $heap = @($Observation.source.heaps)[$index]
+        Assert-WindowsLocalFrozenExactProperties $heap @(
+            'heap_index', 'size_bytes', 'flags', 'budget_bytes', 'usage_bytes'
+        ) 'Installed GPU observation campaign Vulkan memory heap'
+        $heapIndex = Assert-WindowsLocalFrozenCampaignInteger $heap.heap_index 'Installed GPU observation campaign Vulkan heap index'
+        $size = Assert-WindowsLocalFrozenCampaignInteger $heap.size_bytes 'Installed GPU observation campaign Vulkan heap size' -Positive
+        $flags = Assert-WindowsLocalFrozenCampaignInteger $heap.flags 'Installed GPU observation campaign Vulkan heap flags'
+        $budget = Assert-WindowsLocalFrozenCampaignInteger $heap.budget_bytes 'Installed GPU observation campaign Vulkan heap budget' -Positive
+        $usage = Assert-WindowsLocalFrozenCampaignInteger $heap.usage_bytes 'Installed GPU observation campaign Vulkan heap usage'
+        if ($heapIndex -ne $index -or $flags -gt 3 -or ($flags -band 2) -ne 0 -or $budget -gt $size) {
+            throw 'Installed GPU observation campaign Vulkan heap is noncanonical.'
+        }
+        $include = $expectedSelection -ceq 'all_heaps_integrated' -or ($flags -band 1) -ne 0
+        if ($include) {
+            $selected++
+            if ([uint64]$size -gt [uint64]::MaxValue - $derivedTotal) {
+                throw 'Installed GPU observation campaign Vulkan heap total overflowed.'
+            }
+            $derivedTotal += [uint64]$size
+            $headroom = if ($usage -ge $budget) { [uint64]0 } else { [uint64]($budget - $usage) }
+            if ($headroom -gt [uint64]::MaxValue - $derivedAvailable) {
+                throw 'Installed GPU observation campaign Vulkan heap headroom overflowed.'
+            }
+            $derivedAvailable += $headroom
+        }
+    }
+    if ($selected -eq 0 -or $derivedTotal -ne [uint64]$total -or $derivedAvailable -ne [uint64]$available) {
+        throw 'Installed GPU observation campaign Vulkan heap inventory is inconsistent.'
+    }
+}
+
+function Assert-WindowsLocalFrozenCampaignMemoryAvailability(
+    [psobject]$MemoryAvailability,
+    [string]$Target,
+    [psobject]$GpuIdentity
+) {
+    Assert-WindowsLocalFrozenExactProperties $MemoryAvailability @('before', 'after') 'Installed GPU observation campaign memory availability pair'
+    Assert-WindowsLocalFrozenCampaignMemoryAvailabilityEndpoint $MemoryAvailability.before $Target $GpuIdentity
+    Assert-WindowsLocalFrozenCampaignMemoryAvailabilityEndpoint $MemoryAvailability.after $Target $GpuIdentity
+}
+
+function Assert-WindowsLocalFrozenCampaignAffinityEndpoint(
+    [psobject]$Endpoint,
+    [string]$Description
+) {
+    if ($Endpoint.status -isnot [string]) {
+        throw "$Description status is invalid."
+    }
+    if ([string]$Endpoint.status -ceq 'unavailable') {
+        Assert-WindowsLocalFrozenExactProperties $Endpoint @('status', 'reason') $Description
+        if ($Endpoint.reason -isnot [string] -or [string]$Endpoint.reason -cnotin @(
+            'unsupported_processor_group_topology', 'processor_group_query_failed',
+            'affinity_mask_query_failed', 'topology_changed_during_query', 'invalid_affinity_masks'
+        )) {
+            throw "$Description unavailable reason is invalid."
+        }
+        return 'unavailable'
+    }
+    Assert-WindowsLocalFrozenExactProperties $Endpoint @(
+        'status', 'processor_group', 'process_mask_hex', 'system_mask_hex'
+    ) $Description
+    $group = Assert-WindowsLocalFrozenCampaignInteger $Endpoint.processor_group "$Description processor group"
+    if ([string]$Endpoint.status -cne 'available' -or $group -ne 0 -or
+        $Endpoint.process_mask_hex -isnot [string] -or [string]$Endpoint.process_mask_hex -cnotmatch '^[0-9a-f]{16}$' -or
+        $Endpoint.system_mask_hex -isnot [string] -or [string]$Endpoint.system_mask_hex -cnotmatch '^[0-9a-f]{16}$') {
+        throw "$Description available masks are invalid."
+    }
+    [uint64]$processMask = [Convert]::ToUInt64([string]$Endpoint.process_mask_hex, 16)
+    [uint64]$systemMask = [Convert]::ToUInt64([string]$Endpoint.system_mask_hex, 16)
+    if ($processMask -eq 0 -or $systemMask -eq 0 -or ($processMask -band $systemMask) -ne $processMask) {
+        throw "$Description available masks are inconsistent."
+    }
+    return 'available'
+}
+
+function Assert-WindowsLocalFrozenCampaignAffinityPair([psobject]$Pair) {
+    Assert-WindowsLocalFrozenExactProperties $Pair @('before', 'after', 'changed') 'Installed GPU observation campaign process affinity pair'
+    if ($null -eq $Pair.before -or $null -eq $Pair.after) {
+        throw 'Installed GPU observation campaign successful process affinity pair omitted an endpoint.'
+    }
+    $beforeStatus = Assert-WindowsLocalFrozenCampaignAffinityEndpoint $Pair.before 'Installed GPU observation campaign initial process affinity'
+    $afterStatus = Assert-WindowsLocalFrozenCampaignAffinityEndpoint $Pair.after 'Installed GPU observation campaign final process affinity'
+    if ($beforeStatus -ceq 'available' -and $afterStatus -ceq 'available') {
+        $expectedChanged = [string]$Pair.before.process_mask_hex -cne [string]$Pair.after.process_mask_hex -or
+            [string]$Pair.before.system_mask_hex -cne [string]$Pair.after.system_mask_hex -or
+            [int64]$Pair.before.processor_group -ne [int64]$Pair.after.processor_group
+        if ($Pair.changed -isnot [bool] -or [bool]$Pair.changed -ne $expectedChanged) {
+            throw 'Installed GPU observation campaign process affinity change result is inconsistent.'
+        }
+    }
+    elseif ($null -ne $Pair.changed) {
+        throw 'Installed GPU observation campaign process affinity change must remain unknown.'
+    }
+}
+
+function Get-WindowsLocalFrozenCampaignPairTarget([int]$PairIndex, [int]$OrderInPair) {
+    if (($PairIndex % 2) -eq 1) {
+        if ($OrderInPair -eq 1) { return 'cpu' }
+        return 'gpu'
+    }
+    if ($OrderInPair -eq 1) { return 'gpu' }
+    return 'cpu'
+}
+
+function Read-WindowsLocalFrozenCaptureCampaignReport(
+    [string]$ReportPath,
+    [psobject]$Expected
+) {
+    if (-not (Test-Path -LiteralPath $ReportPath -PathType Leaf)) {
+        throw 'Installed GPU observation campaign report file is missing.'
+    }
+    $serialized = Read-WindowsFrozenCpuWorkerBoundedUtf8File $ReportPath (32MB)
+    Assert-WindowsLocalFrozenCampaignJson $serialized.Text
+    try {
+        $report = $serialized.Text | ConvertFrom-Json -Depth 32
+    }
+    catch {
+        throw 'Installed GPU observation campaign report is not valid JSON.'
+    }
+    Assert-WindowsLocalFrozenExactProperties $report @(
+        'schema_version', 'kind', 'unsigned', 'unqualified', 'auto_eligible',
+        'release_approved', 'collector_build_revision', 'expected_power', 'inputs',
+        'gpu_identity', 'incomplete', 'cleanup_complete', 'captures', 'runs',
+        'unavailable', 'environmental_controls'
+    ) 'Installed GPU observation campaign report'
+    if (($report.schema_version -isnot [int32] -and $report.schema_version -isnot [int64]) -or
+        [int]$report.schema_version -ne 2 -or
+        $report.kind -isnot [string] -or [string]$report.kind -cne 'windows_gpu_capture_campaign' -or
+        $report.unsigned -isnot [bool] -or -not $report.unsigned -or
+        $report.unqualified -isnot [bool] -or -not $report.unqualified -or
+        $report.auto_eligible -isnot [bool] -or $report.auto_eligible -or
+        $report.release_approved -isnot [bool] -or $report.release_approved -or
+        $report.incomplete -isnot [bool] -or $report.incomplete -or
+        $report.cleanup_complete -isnot [bool] -or -not $report.cleanup_complete -or
+        $report.collector_build_revision -isnot [string] -or
+        [string]$report.collector_build_revision -cne [string]$Expected.CollectorBuildRevision -or
+        $report.expected_power -isnot [string] -or
+        [string]$report.expected_power -cne [string]$Expected.CampaignPower) {
+        throw 'Installed GPU observation campaign report has invalid local-only completion or identity flags.'
+    }
+    Assert-WindowsLocalFrozenExactProperties $report.inputs @('model_sha256', 'wav_sha256') 'Installed GPU observation campaign inputs'
+    if ($report.inputs.model_sha256 -isnot [string] -or
+        [string]$report.inputs.model_sha256 -cne [string]$Expected.ModelSha256 -or
+        $report.inputs.wav_sha256 -isnot [string] -or
+        [string]$report.inputs.wav_sha256 -cne [string]$Expected.WavSha256) {
+        throw 'Installed GPU observation campaign report does not bind the installed model and requested WAV identities.'
+    }
+    Assert-WindowsLocalFrozenCampaignGpuIdentity $report.gpu_identity $Expected
+    Assert-WindowsLocalFrozenExactProperties $report.unavailable @('inference_thread_count', 'thermal_state') 'Installed GPU observation campaign unavailable observations'
+    Assert-WindowsLocalFrozenCampaignUnavailableField $report.unavailable.inference_thread_count 'unsupported_by_pinned_runtime_api' 'Installed GPU observation campaign inference thread count'
+    Assert-WindowsLocalFrozenCampaignUnavailableField $report.unavailable.thermal_state 'not_observed' 'Installed GPU observation campaign thermal state'
+    Assert-WindowsLocalFrozenExactProperties $report.environmental_controls @(
+        'background_load', 'host_control', 'affinity_control', 'power_plan'
+    ) 'Installed GPU observation campaign environmental controls'
+    foreach ($property in $report.environmental_controls.PSObject.Properties.Name) {
+        Assert-WindowsLocalFrozenCampaignUnavailableField $report.environmental_controls.$property 'not_observed' "Installed GPU observation campaign $property"
+    }
+    if ($report.captures -isnot [object[]] -or @($report.captures).Count -ne 14 -or
+        $report.runs -isnot [object[]] -or @($report.runs).Count -ne 52) {
+        throw 'Installed GPU observation campaign report does not contain the exact capture and request counts.'
+    }
+
+    $captureReferences = [Collections.Generic.List[string]]::new()
+    $captureDigests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt 14; $index++) {
+        $capture = @($report.captures)[$index]
+        Assert-WindowsLocalFrozenExactProperties $capture @(
+            'logical_sequence', 'generation_ref', 'digest_sha256', 'target', 'purpose',
+            'hello_frame_hex', 'ready_frame_hex'
+        ) 'Installed GPU observation campaign handshake capture'
+        $sequence = $index + 1
+        if ($index -eq 0) { $expectedTarget = 'cpu'; $expectedPurpose = 'preflight' }
+        elseif ($index -eq 1) { $expectedTarget = 'gpu'; $expectedPurpose = 'preflight' }
+        elseif ($index -lt 12) {
+            $pairIndex = [int][Math]::Floor(($index - 2) / 2) + 1
+            $order = (($index - 2) % 2) + 1
+            $expectedTarget = Get-WindowsLocalFrozenCampaignPairTarget $pairIndex $order
+            $expectedPurpose = 'cold'
+        }
+        else { $expectedTarget = if ($index -eq 12) { 'cpu' } else { 'gpu' }; $expectedPurpose = 'prime' }
+        $digest = [string]$capture.digest_sha256
+        $expectedReference = 'generation-{0:D2}-{1}' -f $sequence, $(if ($digest.Length -ge 24) { $digest.Substring(0, 24) } else { '' })
+        foreach ($frame in @('hello_frame_hex', 'ready_frame_hex')) {
+            $value = $capture.$frame
+            if ($value -isnot [string] -or [string]$value -cnotmatch '^53434946[0-9a-f]{44,524332}$' -or
+                ([string]$value).Length % 2 -ne 0) {
+                throw 'Installed GPU observation campaign handshake frame is invalid.'
+            }
+        }
+        if ((Assert-WindowsLocalFrozenCampaignInteger $capture.logical_sequence 'Installed GPU observation campaign capture sequence' -Positive) -ne $sequence -or
+            $capture.target -isnot [string] -or [string]$capture.target -cne $expectedTarget -or
+            $capture.purpose -isnot [string] -or [string]$capture.purpose -cne $expectedPurpose -or
+            $capture.generation_ref -isnot [string] -or [string]$capture.generation_ref -cne $expectedReference -or
+            $capture.digest_sha256 -isnot [string] -or $digest -cnotmatch '^[0-9a-f]{64}$' -or
+            -not $captureDigests.Add($digest) -or
+            (Get-WindowsLocalFrozenCampaignHandshakeDigest $capture.hello_frame_hex $capture.ready_frame_hex) -cne $digest) {
+            throw 'Installed GPU observation campaign captures are not canonical, ordered, unique, and digest-bound.'
+        }
+        $captureReferences.Add([string]$capture.generation_ref)
+    }
+
+    for ($index = 0; $index -lt 52; $index++) {
+        $run = @($report.runs)[$index]
+        if ($index -lt 10) {
+            $phase = 'cold'; $measured = $true
+            $pairIndex = [int][Math]::Floor($index / 2) + 1; $order = ($index % 2) + 1
+            $target = Get-WindowsLocalFrozenCampaignPairTarget $pairIndex $order
+            $generationReference = $captureReferences[$index + 2]
+        }
+        elseif ($index -lt 12) {
+            $phase = 'prime'; $measured = $false; $pairIndex = $null; $order = $index - 9
+            $target = if ($index -eq 10) { 'cpu' } else { 'gpu' }
+            $generationReference = $captureReferences[$index + 2]
+        }
+        else {
+            $phase = 'warm'; $measured = $true
+            $warmIndex = $index - 12; $pairIndex = [int][Math]::Floor($warmIndex / 2) + 1; $order = ($warmIndex % 2) + 1
+            $target = Get-WindowsLocalFrozenCampaignPairTarget $pairIndex $order
+            $generationReference = if ($target -ceq 'cpu') { $captureReferences[12] } else { $captureReferences[13] }
+        }
+        $properties = @(
+            'measured', 'phase', 'order_in_pair', 'target', 'generation_ref', 'status',
+            'power_source_before', 'power_source_after', 'end_to_end_ms', 'backend_ms',
+            'model_load_ms', 'warm_reused', 'sampled_max_private_usage_bytes',
+            'telemetry_sample_count', 'video_memory', 'raw_provider_memory',
+            'memory_availability', 'worker_process_affinity', 'normalized_transcript_sha256'
+        )
+        if ($null -ne $pairIndex) { $properties += 'pair_index' }
+        Assert-WindowsLocalFrozenExactProperties $run $properties 'Installed GPU observation campaign request record'
+        if ($run.measured -isnot [bool] -or [bool]$run.measured -ne $measured -or
+            $run.phase -isnot [string] -or [string]$run.phase -cne $phase -or
+            (Assert-WindowsLocalFrozenCampaignInteger $run.order_in_pair 'Installed GPU observation campaign request order' -Positive) -ne $order -or
+            $run.target -isnot [string] -or [string]$run.target -cne $target -or
+            $run.generation_ref -isnot [string] -or [string]$run.generation_ref -cne $generationReference -or
+            $run.status -isnot [string] -or [string]$run.status -cne 'succeeded' -or
+            $run.power_source_before -isnot [string] -or [string]$run.power_source_before -cne [string]$Expected.CampaignPower -or
+            $run.power_source_after -isnot [string] -or [string]$run.power_source_after -cne [string]$Expected.CampaignPower -or
+            $run.warm_reused -isnot [bool] -or [bool]$run.warm_reused -ne ($phase -ceq 'warm') -or
+            $run.normalized_transcript_sha256 -isnot [string] -or [string]$run.normalized_transcript_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Installed GPU observation campaign request sequence or completion state is invalid.'
+        }
+        if ($null -ne $pairIndex -and
+            (Assert-WindowsLocalFrozenCampaignInteger $run.pair_index 'Installed GPU observation campaign pair index' -Positive) -ne $pairIndex) {
+            throw 'Installed GPU observation campaign pair index is invalid.'
+        }
+        $null = Assert-WindowsLocalFrozenCampaignInteger $run.end_to_end_ms 'Installed GPU observation campaign end-to-end duration'
+        $null = Assert-WindowsLocalFrozenCampaignInteger $run.backend_ms 'Installed GPU observation campaign backend duration'
+        $modelLoad = Assert-WindowsLocalFrozenCampaignInteger $run.model_load_ms 'Installed GPU observation campaign model-load duration'
+        $null = Assert-WindowsLocalFrozenCampaignInteger $run.sampled_max_private_usage_bytes 'Installed GPU observation campaign private usage'
+        $null = Assert-WindowsLocalFrozenCampaignInteger $run.telemetry_sample_count 'Installed GPU observation campaign telemetry sample count' -Positive
+        if ($phase -ceq 'warm' -and $modelLoad -ne 0) {
+            throw 'Installed GPU observation campaign warm request reloaded its model.'
+        }
+        Assert-WindowsLocalFrozenCampaignVideoMemory $run.video_memory $target
+        Assert-WindowsLocalFrozenCampaignProviderMemory $run.raw_provider_memory $target $report.gpu_identity
+        Assert-WindowsLocalFrozenCampaignMemoryAvailability $run.memory_availability $target $report.gpu_identity
+        Assert-WindowsLocalFrozenCampaignAffinityPair $run.worker_process_affinity
+    }
+    return [pscustomobject]@{ Report = $report; Bytes = $serialized.Bytes }
+}
+
+function Publish-WindowsLocalFrozenNewReport([string]$OutputPath, [byte[]]$Bytes, [int]$MaximumBytes = 1MB) {
+    if (($MaximumBytes -ne 1MB -and $MaximumBytes -ne 32MB) -or
+        $null -eq $Bytes -or $Bytes.Length -le 0 -or $Bytes.Length -gt $MaximumBytes) {
         throw 'Installed GPU observation publication bytes are outside the supported bound.'
     }
     $final = Get-WindowsLocalFrozenNormalizedFullPath $OutputPath
@@ -442,6 +982,134 @@ function Invoke-WindowsLocalFrozenBoundedProcess(
     finally {
         $process.Dispose()
     }
+}
+
+function Invoke-WindowsLocalFrozenCampaignProcess(
+    [string]$Executable,
+    [string[]]$Arguments,
+    [string]$Description,
+    [int]$TimeoutMilliseconds = 900000,
+    [int]$StreamDrainMilliseconds = 5000
+) {
+    if ($TimeoutMilliseconds -ne 900000 -or $StreamDrainMilliseconds -lt 1 -or $StreamDrainMilliseconds -gt 30000) {
+        throw 'Local frozen campaign process timeout configuration is outside the fixed supported bounds.'
+    }
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $processStarted = $false
+    try {
+        if (-not $process.Start()) { throw "Could not start $Description." }
+        $processStarted = $true
+        $stdoutBuffer = [char[]]::new(8192)
+        $stderrBuffer = [char[]]::new(8192)
+        $stdoutText = [Text.StringBuilder]::new()
+        $stderrText = [Text.StringBuilder]::new()
+        $stdoutTask = $process.StandardOutput.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+        $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+        $stdoutComplete = $false
+        $stderrComplete = $false
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $exitedAt = $null
+        $captureFailure = $null
+        while ($true) {
+            if (-not $stdoutComplete -and $stdoutTask.IsCompleted) {
+                if ($stdoutTask.IsFaulted -or $stdoutTask.IsCanceled) {
+                    $captureFailure = 'capture'
+                }
+                else {
+                    $count = $stdoutTask.GetAwaiter().GetResult()
+                    if ($count -eq 0) {
+                        $stdoutComplete = $true
+                    }
+                    elseif ($stdoutText.Length -gt 262144 - $count) {
+                        $captureFailure = 'overflow'
+                    }
+                    else {
+                        $null = $stdoutText.Append($stdoutBuffer, 0, $count)
+                        $stdoutTask = $process.StandardOutput.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+                    }
+                }
+            }
+            if (-not $stderrComplete -and $stderrTask.IsCompleted) {
+                if ($stderrTask.IsFaulted -or $stderrTask.IsCanceled) {
+                    $captureFailure = 'capture'
+                }
+                else {
+                    $count = $stderrTask.GetAwaiter().GetResult()
+                    if ($count -eq 0) {
+                        $stderrComplete = $true
+                    }
+                    elseif ($stderrText.Length -gt 262144 - $count) {
+                        $captureFailure = 'overflow'
+                    }
+                    else {
+                        $null = $stderrText.Append($stderrBuffer, 0, $count)
+                        $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                    }
+                }
+            }
+            if ($null -ne $captureFailure) {
+                try { Stop-WindowsLocalFrozenProcessTree $process $Description }
+                catch { throw "$Description output capture failed and parent termination could not be confirmed." }
+                if ($captureFailure -ceq 'overflow') {
+                    throw "$Description exceeded the fixed 262144-character per-stream output bound."
+                }
+                throw "$Description output capture failed."
+            }
+            $exited = $process.HasExited
+            if ($exited -and $null -eq $exitedAt) {
+                $exitedAt = $clock.ElapsedMilliseconds
+            }
+            if ($exited -and $stdoutComplete -and $stderrComplete) {
+                break
+            }
+            if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+                if (-not $exited) {
+                    try { Stop-WindowsLocalFrozenProcessTree $process $Description }
+                    catch { throw "$Description timed out and parent termination could not be confirmed." }
+                    throw "$Description timed out after the fixed campaign deadline."
+                }
+                throw "$Description output streams did not close within the fixed campaign deadline."
+            }
+            if ($exited -and ($clock.ElapsedMilliseconds - $exitedAt) -ge $StreamDrainMilliseconds) {
+                # A parent that has already exited can leave redirected handles
+                # inherited by descendants. The Process API no longer gives us
+                # an owned live parent to terminate, so fail closed without
+                # claiming that those descendants were retired here.
+                throw "$Description output streams did not close within the fixed post-exit drain deadline."
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdoutText.ToString()
+            Stderr = $stderrText.ToString()
+        }
+    }
+    catch {
+        $originalError = $_
+        if ($processStarted) {
+            try {
+                if (-not $process.HasExited) {
+                    Stop-WindowsLocalFrozenProcessTree $process $Description
+                }
+            }
+            catch {
+                # Preserve the primary capture/process failure. This is a
+                # best-effort retry after the normal timeout/overflow paths;
+                # those paths already report an unconfirmed termination.
+            }
+        }
+        throw $originalError
+    }
+    finally { $process.Dispose() }
 }
 
 function Assert-WindowsLocalFrozenInstallerRecord(
