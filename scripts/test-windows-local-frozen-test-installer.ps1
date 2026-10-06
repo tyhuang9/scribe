@@ -20,7 +20,7 @@ function Assert-Equal([object]$Actual, [object]$Expected, [string]$Description) 
     if ($Actual -cne $Expected) { throw "$Description expected '$Expected', got '$Actual'." }
 }
 
-function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
+function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText, [string]$ForbiddenText = '') {
     $script:Assertions++
     try {
         $null = @(& $Action)
@@ -28,6 +28,10 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     catch {
         if (-not $_.Exception.Message.Contains($ExpectedText)) {
             throw "Expected failure containing '$ExpectedText', got: $($_.Exception.Message)"
+        }
+        if ($ForbiddenText.Length -gt 0) {
+            $script:Assertions++
+            if ($_.Exception.Message.Contains($ForbiddenText)) { throw 'Failure exposed forbidden raw diagnostic text.' }
         }
         return
     }
@@ -125,7 +129,7 @@ function Invoke-Builder([string]$Bundle, [string]$Output, [string]$Compiler) {
         -OutputDirectory $Output
 }
 
-function Add-FixtureObservationPack([string]$Root) {
+function Add-FixtureObservationPack([string]$Root, [string]$Backend = 'cuda') {
     $digest = 'c' * 64 -join ''
     $packRoot = "workers/packs/c/1/$digest"
     $files = @(
@@ -150,13 +154,135 @@ function Add-FixtureObservationPack([string]$Root) {
         packs = @([ordered]@{
             pack_id = 'c'; pack_version = '1'; pack_digest = $digest;
             security_epoch = [int64]1; runtime_abi_version = [int64]1;
-            backend = 'cuda'; provider = 'cuda'; target_os = 'windows'; target_arch = 'x86_64';
+            backend = $Backend; provider = $Backend; target_os = 'windows'; target_arch = 'x86_64';
             worker_relative_path = "$packRoot/scribe-inference-worker.exe"; root = $packRoot;
             installed_size_bytes = $installedSize; compressed_size_bytes = [int64]0; files = $files
         })
     }
     Write-Utf8 (Join-Path $Root 'worker-pack-catalog.json') ($catalog | ConvertTo-Json -Depth 6)
     Refresh-BundleInventory $Root
+}
+
+function New-FixtureCampaignReport([string]$Power, [string]$Backend = 'cuda') {
+    # Independent synthetic producer, not a worker or an SCIF authenticator.
+    # Literal target schedule and independent length-prefixed hashing ensure
+    # the validator is not generating its own expected captures.
+    $targets = @('cpu', 'gpu', 'cpu', 'gpu', 'gpu', 'cpu', 'cpu', 'gpu', 'gpu', 'cpu', 'cpu', 'gpu', 'cpu', 'gpu')
+    $captures = @()
+    for ($index = 0; $index -lt $targets.Count; $index++) {
+        $sequence = $index + 1
+        $frames = @()
+        $bytes = [IO.MemoryStream]::new()
+        try {
+            foreach ($kind in @(1, 2)) {
+                $frame = [byte[]]::new(26)
+                $prefix = [byte[]](83, 67, 73, 70)
+                $prefix.CopyTo($frame, 0)
+                $frame[4] = [byte]$sequence; $frame[5] = [byte]$kind
+                $length = [BitConverter]::GetBytes([uint64]$frame.Length)
+                if (-not [BitConverter]::IsLittleEndian) { [Array]::Reverse($length) }
+                $bytes.Write($length, 0, $length.Length)
+                $bytes.Write($frame, 0, $frame.Length)
+                $frames += [Convert]::ToHexString($frame).ToLowerInvariant()
+            }
+            $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes.ToArray())).ToLowerInvariant()
+        }
+        finally { $bytes.Dispose() }
+        $captures += [ordered]@{
+            logical_sequence = $sequence; generation_ref = ('generation-{0:D2}-{1}' -f $sequence, $digest.Substring(0, 24));
+            digest_sha256 = $digest; target = $targets[$index];
+            purpose = $(if ($index -lt 2) { 'preflight' } elseif ($index -lt 12) { 'cold' } else { 'prime' });
+            hello_frame_hex = $frames[0]; ready_frame_hex = $frames[1]
+        }
+    }
+    function New-FixtureCampaignRun([string]$Phase, [string]$Target, [int]$Order, [int]$Pair, [string]$Reference) {
+        $notApplicable = { [ordered]@{ status = 'not_applicable'; reason = 'cpu_provider' } }
+        $segment = { [ordered]@{
+            sampled_max_current_usage_bytes = 8; sampled_max_current_reservation_bytes = 4;
+            sampled_min_budget_bytes = 64; sampled_min_available_for_reservation_bytes = 32
+        } }
+        $provider = { [ordered]@{
+            status = 'available'; backend = $Backend; provider_id = $Backend;
+            stable_device = $global:WindowsLocalFrozenVerifierDevice; memory_total_bytes = 64;
+            provider_reported_memory_free_bytes = 32; value_semantics = 'native_backend_defined'; admission_validity = 'unestablished'
+        } }
+        $availability = {
+            if ($Backend -ceq 'cuda') {
+                return [ordered]@{
+                    status = 'observed'; backend = $Backend; provider_id = $Backend; stable_device = $global:WindowsLocalFrozenVerifierDevice;
+                    memory_total_bytes = 64; available_memory_bytes = 32; source = [ordered]@{ method = 'cuda_mem_get_info' }
+                }
+            }
+            return [ordered]@{
+                status = 'observed'; backend = $Backend; provider_id = $Backend; stable_device = $global:WindowsLocalFrozenVerifierDevice;
+                memory_total_bytes = 1024; available_memory_bytes = 384;
+                source = [ordered]@{
+                    method = 'vulkan_memory_budget'; heap_selection = 'device_local_heaps'; heaps = @(
+                        [ordered]@{ heap_index = 0; size_bytes = 1024; flags = 1; budget_bytes = 512; usage_bytes = 128 },
+                        [ordered]@{ heap_index = 1; size_bytes = 512; flags = 0; budget_bytes = 512; usage_bytes = 256 }
+                    )
+                }
+            }
+        }
+        $gpu = $Target -ceq 'gpu'
+        $run = [ordered]@{
+            measured = $Phase -cne 'prime'; phase = $Phase; order_in_pair = $Order; target = $Target;
+            generation_ref = $Reference; status = 'succeeded'; power_source_before = $Power; power_source_after = $Power;
+            end_to_end_ms = 3; backend_ms = 1; model_load_ms = $(if ($Phase -ceq 'warm') { 0 } else { 1 });
+            warm_reused = $Phase -ceq 'warm'; sampled_max_private_usage_bytes = 1; telemetry_sample_count = 1;
+            video_memory = $(if ($gpu) { [ordered]@{ status = 'available'; local = & $segment; non_local = & $segment } } else { [ordered]@{ status = 'not_applicable' } });
+            raw_provider_memory = [ordered]@{
+                before = $(if ($gpu) { & $provider } else { & $notApplicable }); after = $(if ($gpu) { & $provider } else { & $notApplicable })
+            };
+            memory_availability = [ordered]@{
+                before = $(if ($gpu) { & $availability } else { & $notApplicable }); after = $(if ($gpu) { & $availability } else { & $notApplicable })
+            };
+            worker_process_affinity = [ordered]@{
+                before = [ordered]@{ status = 'available'; processor_group = 0; process_mask_hex = '0000000000000001'; system_mask_hex = '0000000000000003' };
+                after = [ordered]@{ status = 'available'; processor_group = 0; process_mask_hex = '0000000000000002'; system_mask_hex = '0000000000000003' };
+                changed = $true
+            };
+            normalized_transcript_sha256 = $(if ($gpu) { 'b' * 64 -join '' } else { 'a' * 64 -join '' })
+        }
+        if ($Phase -cne 'prime') { $run.pair_index = $Pair }
+        return $run
+    }
+    $runs = @()
+    for ($index = 0; $index -lt 10; $index++) {
+        $runs += New-FixtureCampaignRun 'cold' $targets[$index + 2] (($index % 2) + 1) ([int][Math]::Floor($index / 2) + 1) $captures[$index + 2].generation_ref
+    }
+    $runs += New-FixtureCampaignRun 'prime' 'cpu' 1 0 $captures[12].generation_ref
+    $runs += New-FixtureCampaignRun 'prime' 'gpu' 2 0 $captures[13].generation_ref
+    for ($pair = 1; $pair -le 20; $pair++) {
+        $pairTargets = if ($pair % 2 -eq 1) { @('cpu', 'gpu') } else { @('gpu', 'cpu') }
+        for ($order = 1; $order -le 2; $order++) {
+            $target = $pairTargets[$order - 1]
+            $capture = if ($target -ceq 'cpu') { $captures[12] } else { $captures[13] }
+            $runs += New-FixtureCampaignRun 'warm' $target $order $pair $capture.generation_ref
+        }
+    }
+    return [ordered]@{
+        schema_version = 2; kind = 'windows_gpu_capture_campaign'; unsigned = $true; unqualified = $true;
+        auto_eligible = $false; release_approved = $false; collector_build_revision = $global:WindowsLocalFrozenVerifierRevision;
+        expected_power = $Power; incomplete = $false; cleanup_complete = $true;
+        inputs = [ordered]@{ model_sha256 = $global:WindowsLocalFrozenVerifierModelSha256; wav_sha256 = $global:WindowsLocalFrozenVerifierWavSha256 };
+        gpu_identity = [ordered]@{
+            backend = $Backend; provider = $Backend; stable_device = $global:WindowsLocalFrozenVerifierDevice;
+            driver = 'fixture-driver'; device_class = 'discrete_gpu'; vendor = 'nvidia'; memory_total_bytes = 64;
+            pack_id = 'c'; pack_version = '1'; pack_sha256 = ('c' * 64 -join ''); pack_security_epoch = 1; runtime_abi = 1
+        };
+        captures = $captures; runs = $runs;
+        unavailable = [ordered]@{
+            inference_thread_count = [ordered]@{ status = 'unavailable'; reason = 'unsupported_by_pinned_runtime_api' };
+            thermal_state = [ordered]@{ status = 'unavailable'; reason = 'not_observed' }
+        };
+        environmental_controls = [ordered]@{
+            background_load = [ordered]@{ status = 'unavailable'; reason = 'not_observed' };
+            host_control = [ordered]@{ status = 'unavailable'; reason = 'not_observed' };
+            affinity_control = [ordered]@{ status = 'unavailable'; reason = 'not_observed' };
+            power_plan = [ordered]@{ status = 'unavailable'; reason = 'not_observed' }
+        }
+    }
 }
 
 function Set-FixtureVerifierSeams([string]$VerifierPath, [string]$IntegrityPath) {
@@ -246,6 +372,13 @@ function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path) {
     }
 '@.TrimEnd()
     $source = $source.Replace($temporaryCleanupFunction, $temporaryCleanupReplacement)
+    $contextCheck = 'Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context'
+    if ([regex]::Matches($source, [regex]::Escape($contextCheck)).Count -ne 1) { throw 'Could not isolate the fixture-only post-uninstall source-context check.' }
+    $contextFailureSeam = @'
+if ($global:WindowsLocalFrozenVerifierMode -ceq 'context-check-failure') { throw 'Fixture source context check failed after uninstall.' }
+Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
+'@.Trim()
+    $source = $source.Replace($contextCheck, $contextFailureSeam)
 
     $installedRootStart = $source.IndexOf('$installedRoot = Join-Path ([Environment]::GetFolderPath')
     if ($installedRootStart -lt 0) {
@@ -257,7 +390,10 @@ function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path) {
     }
     $source = $source.Substring(0, $installedRootStart) + '$installedRoot = $global:WindowsLocalFrozenVerifierInstalledRoot' + $source.Substring($installedRootEnd)
 
-    $marker = '$temporaryObservationReport = Join-Path $temporaryRoot ''gpu-observation.json'''
+    $marker = '$campaignMode = $null -ne $observationRequest.CampaignPower'
+    $campaignStart = $source.IndexOf('Invoke-WindowsLocalFrozenCampaignProcess', $source.IndexOf($marker))
+    if ($campaignStart -lt 0) { throw 'Could not isolate the fixture-only installed campaign process seam.' }
+    $source = $source.Substring(0, $campaignStart) + 'Invoke-FixtureInstalledGpuObserver' + $source.Substring($campaignStart + 'Invoke-WindowsLocalFrozenCampaignProcess'.Length)
     $observationStart = $source.IndexOf('Invoke-WindowsLocalFrozenBoundedProcess', $source.IndexOf($marker))
     if ($observationStart -lt 0) {
         throw 'Could not isolate the fixture-only installed observer process seam.'
@@ -278,12 +414,30 @@ function Invoke-FixtureInstalledGpuObserver(
     $global:WindowsLocalFrozenVerifierEvents.Add($Description)
     $global:WindowsLocalFrozenVerifierObserverExecutable = $Executable
     $global:WindowsLocalFrozenVerifierObserverArguments = @($Arguments)
-    if ($Description -cne 'installed local frozen GPU observation' -or $TimeoutMilliseconds -ne 900000 -or $StreamDrainMilliseconds -ne 5000) {
+    if ($Description -cnotin @('installed local frozen GPU observation', 'installed local frozen GPU observation campaign') -or $TimeoutMilliseconds -ne 900000 -or $StreamDrainMilliseconds -ne 5000) {
         throw 'Fixture installed observer did not receive the fixed bounded process contract.'
     }
     $outputIndex = [array]::IndexOf($Arguments, '--output')
     if ($outputIndex -lt 0 -or $outputIndex -ge ($Arguments.Count - 1)) { throw 'Fixture installed observer output argument is missing.' }
     $output = $Arguments[$outputIndex + 1]
+    $powerIndex = [array]::IndexOf($Arguments, '--campaign-power')
+    if ($powerIndex -ge 0) {
+        if ($Arguments.Count -ne 19 -or $powerIndex -ne 15 -or $outputIndex -ne 17) { throw 'Fixture campaign argv is not the exact nineteen-argument contract.' }
+        $report = New-FixtureCampaignReport $Arguments[$powerIndex + 1] $global:WindowsLocalFrozenVerifierBackend
+        switch ($global:WindowsLocalFrozenVerifierMode) {
+            'campaign-timeout' { throw 'Fixture campaign timed out after the fixed campaign deadline.' }
+            'campaign-overflow' { throw 'Fixture campaign exceeded the fixed 262144-character per-stream output bound.' }
+            'campaign-missing' { return [pscustomobject]@{ ExitCode = 0; Stdout = ''; Stderr = '' } }
+            'campaign-incomplete' { $report.incomplete = $true }
+            'campaign-power-drift' { $report.runs[51].power_source_after = 'unknown' }
+            'campaign-nonzero' { $report.incomplete = $true }
+            'output-race' { [IO.File]::WriteAllText($global:WindowsLocalFrozenVerifierFinalReport, 'race sentinel', [Text.UTF8Encoding]::new($false)) }
+        }
+        $text = $report | ConvertTo-Json -Depth 20
+        if ($global:WindowsLocalFrozenVerifierMode -ceq 'campaign-large') { $text = (' ' * 1048576) + $text }
+        [IO.File]::WriteAllText($output, $text, [Text.UTF8Encoding]::new($false))
+        return [pscustomobject]@{ ExitCode = $(if ($global:WindowsLocalFrozenVerifierMode -ceq 'campaign-nonzero') { 37 } else { 0 }); Stdout = ''; Stderr = 'sensitive fixture diagnostic must not escape' }
+    }
     switch ($global:WindowsLocalFrozenVerifierMode) {
         'observer-timeout' { throw 'installed local frozen GPU observation timed out after 900000 milliseconds.' }
         'observer-nonzero' { return [pscustomobject]@{ ExitCode = 37; Stdout = ''; Stderr = 'fixture observer failed' } }
@@ -365,7 +519,9 @@ function Invoke-FixtureVerifier(
     [string]$Report,
     [string]$Mode = '',
     [switch]$PartialRequest,
-    [switch]$MissingPack
+    [switch]$MissingPack,
+    [string]$CampaignPower,
+    [string]$Backend = 'cuda'
 ) {
     $global:WindowsLocalFrozenVerifierMode = $Mode
     $global:WindowsLocalFrozenVerifierEvents = [System.Collections.Generic.List[string]]::new()
@@ -383,6 +539,7 @@ function Invoke-FixtureVerifier(
         Where-Object { $_.path -ceq 'whisper-base.en-Q8_0.gguf' } | Select-Object -ExpandProperty sha256
     $global:WindowsLocalFrozenVerifierWavSha256 = $WavSha256
     $global:WindowsLocalFrozenVerifierDevice = $Device
+    $global:WindowsLocalFrozenVerifierBackend = $Backend
     $parameters = @{
         BundlePath = $Bundle
         FrozenCpuWorkerRecordPath = $FrozenRecord
@@ -396,10 +553,11 @@ function Invoke-FixtureVerifier(
         $parameters.ObservationWavPath = $Wav
         $parameters.ObservationWavSha256 = $WavSha256
         $parameters.ObservationGpuPackId = if ($MissingPack) { 'missing-pack' } else { 'c' }
-        $parameters.ObservationGpuBackend = 'cuda'
+        $parameters.ObservationGpuBackend = $Backend
         $parameters.ObservationGpuDevice = $Device
         $parameters.ObservationReportPath = $Report
     }
+    if ($PSBoundParameters.ContainsKey('CampaignPower')) { $parameters.ObservationCampaignPower = $CampaignPower }
     & $Verifier @parameters
 }
 
@@ -487,6 +645,9 @@ public static class FakeIscc {
   static string Arg(string[] args, string name) { var value = args.FirstOrDefault(x => x.StartsWith(name, StringComparison.Ordinal)); return value == null ? null : value.Substring(name.Length); }
   public static int Main(string[] args) {
     string mode = Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE") ?? "";
+    if (mode == "campaign-exact-cap") { Console.Write(new string('a', 262144)); Console.Error.Write(new string('b', 262144)); return 0; }
+    if (mode == "campaign-overflow-stdout") { Console.Write(new string('a', 262145)); Console.Out.Flush(); Thread.Sleep(60000); return 0; }
+    if (mode == "campaign-overflow-stderr") { Console.Error.Write(new string('b', 262145)); Console.Error.Flush(); Thread.Sleep(60000); return 0; }
     if (args.Length > 0 && (args[0] == "--scribe-install-smoke-parent" || args[0] == "--scribe-windows-gpu-capture-observation")) {
       if (mode == "observer-hang") { Thread.Sleep(60000); return 0; }
       foreach (string arg in args) Console.WriteLine(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(arg)));
@@ -594,6 +755,33 @@ public static class FakeIscc {
     for ($index = 0; $index -lt $observerRoundTrip.Count; $index++) {
         Assert-Equal $receivedObserverArguments[$index] $observerRoundTrip[$index] "Installed observer child argument $index"
     }
+    $campaignRoundTrip = $observerRoundTrip[0..14] + @('--campaign-power', 'battery') + $observerRoundTrip[15..16]
+    $campaignEcho = Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments $campaignRoundTrip -Description 'fixture campaign argument echo'
+    $campaignEchoArguments = @($campaignEcho.Stdout.TrimEnd([char[]]@("`r", "`n")) -split '\r?\n' | ForEach-Object {
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_))
+    })
+    Assert-Equal $campaignEcho.ExitCode 0 'Campaign argument echo exit code'
+    Assert-Equal $campaignEchoArguments.Count 19 'Campaign child nineteen-argument count'
+    for ($index = 0; $index -lt 19; $index++) { Assert-Equal $campaignEchoArguments[$index] $campaignRoundTrip[$index] "Campaign child literal argument $index" }
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'campaign-exact-cap'
+    $boundedCapture = Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments @() -Description 'fixture campaign exact cap'
+    Assert-Equal $boundedCapture.Stdout.Length 262144 'Campaign exact stdout cap'
+    Assert-Equal $boundedCapture.Stderr.Length 262144 'Campaign exact stderr cap'
+    foreach ($overflowMode in @('campaign-overflow-stdout', 'campaign-overflow-stderr')) {
+        $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = $overflowMode
+        $overflowClock = [Diagnostics.Stopwatch]::StartNew()
+        Invoke-ExpectedFailure { Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments @() -Description 'fixture campaign overflow' } '262144-character per-stream output bound'
+        Assert-True ($overflowClock.ElapsedMilliseconds -lt 5000) 'Campaign overflow did not stop its sixty-second sleeping owned child promptly.'
+    }
+    Invoke-ExpectedFailure { Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments @() -Description 'fixture invalid deadline' -TimeoutMilliseconds 250 } 'fixed supported bounds'
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'observer-hang'
+    # Only shorten a parsed fixture copy; production has no timeout override.
+    $campaignRunnerAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $fixtureRoot 'scripts\windows-local-frozen-installer-integrity.ps1'), [ref]$null, [ref]$null)
+    $campaignRunnerFunction = $campaignRunnerAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-WindowsLocalFrozenCampaignProcess' }, $false)
+    $shortRunner = [scriptblock]::Create($campaignRunnerFunction.Extent.Text.Replace('900000', '250'))
+    Invoke-ExpectedFailure {
+        & { . $shortRunner; Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments $campaignRoundTrip -Description 'fixture shortened campaign deadline' }
+    } 'timed out after the fixed campaign deadline'
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'observer-hang'
     Invoke-ExpectedFailure {
         Invoke-WindowsLocalFrozenBoundedProcess `
@@ -770,6 +958,187 @@ public static class FakeIscc {
         }
         Assert-Equal $global:WindowsLocalFrozenVerifierObserverArguments[15] '--output' 'Installed observer verifier output flag'
         Assert-True ($global:WindowsLocalFrozenVerifierObserverArguments[16] -like (Join-Path ([IO.Path]::GetTempPath()) 'scribe-local-frozen-installer-verification-*\gpu-observation.json')) 'Installed observer verifier owns a temporary no-replace output path.'
+
+        $campaignBundle = Copy-Bundle 'campaign-vulkan'
+        Add-FixtureObservationPack $campaignBundle 'vulkan'
+        $campaignInstaller = @(Invoke-Builder $campaignBundle (Join-Path $testRoot 'campaign-vulkan-installer') $fakeCompiler)[0]
+        foreach ($lane in @(
+            @{ Backend = 'cuda'; Power = 'ac'; Bundle = $observationBundle; Installer = $observationInstallerResult; Mode = 'campaign-large' },
+            @{ Backend = 'cuda'; Power = 'battery'; Bundle = $observationBundle; Installer = $observationInstallerResult; Mode = '' },
+            @{ Backend = 'vulkan'; Power = 'ac'; Bundle = $campaignBundle; Installer = $campaignInstaller; Mode = '' }
+        )) {
+            $campaignOutput = Join-Path $testRoot "campaign-$($lane.Backend)-$($lane.Power).json"
+            Invoke-FixtureVerifier $fixtureVerifier $lane.Bundle $frozenRecordPath $lane.Installer.InstallerPath $lane.Installer.RecordPath `
+                $observationWav $observationWavSha256 $observationDevice $campaignOutput -CampaignPower $lane.Power -Backend $lane.Backend -Mode $lane.Mode
+            $campaign = Get-Content -LiteralPath $campaignOutput -Raw | ConvertFrom-Json -Depth 32
+            Assert-Equal ($global:WindowsLocalFrozenVerifierEvents -join '|') 'local frozen installer|installed local frozen CPU smoke|installed local frozen GPU observation campaign|local frozen installer uninstaller' 'Campaign installed verification and cleanup ordering'
+            Assert-Equal $global:WindowsLocalFrozenVerifierObserverExecutable (Join-Path $global:WindowsLocalFrozenVerifierInstalledRoot 'local-transcriber.exe') 'Campaign launches only the installed collector'
+            Assert-Equal $global:WindowsLocalFrozenVerifierObserverArguments.Count 19 'Campaign installed nineteen-argument count'
+            $expectedCampaignArguments = @(
+                '--scribe-windows-gpu-capture-observation', '--model', (Join-Path $global:WindowsLocalFrozenVerifierInstalledRoot 'whisper-base.en-Q8_0.gguf'), '--model-sha256', $modelHash,
+                '--wav', $observationWav, '--wav-sha256', $observationWavSha256, '--gpu-pack-id', 'c', '--gpu-backend', $lane.Backend,
+                '--gpu-device', $observationDevice, '--campaign-power', $lane.Power, '--output'
+            )
+            for ($index = 0; $index -lt 18; $index++) { Assert-Equal $global:WindowsLocalFrozenVerifierObserverArguments[$index] $expectedCampaignArguments[$index] "Campaign installed exact argument $index" }
+            Assert-Equal (Split-Path -Leaf $global:WindowsLocalFrozenVerifierObserverArguments[18]) 'gpu-campaign.json' 'Campaign temporary filename'
+            Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $global:WindowsLocalFrozenVerifierObserverArguments[18]))) 'Campaign publication preceded scratch cleanup'
+            Assert-True (-not (Test-Path -LiteralPath $global:WindowsLocalFrozenVerifierInstalledRoot)) 'Campaign publication preceded trusted uninstall'
+            Assert-Equal $campaign.captures.Count 14 'Campaign exact generation count'
+            Assert-Equal $campaign.runs.Count 52 'Campaign exact run count'
+            Assert-Equal @($campaign.runs | Where-Object { $_.measured -and $_.phase -ceq 'cold' }).Count 10 'Campaign five measured cold CPU/GPU pairs'
+            Assert-Equal @($campaign.runs | Where-Object { $_.measured -and $_.phase -ceq 'warm' }).Count 40 'Campaign twenty measured warm CPU/GPU pairs'
+            Assert-True ($campaign.unsigned -and $campaign.unqualified -and -not $campaign.auto_eligible -and -not $campaign.release_approved) 'Campaign incorrectly became qualification evidence'
+            Assert-True ($campaign.runs[0].normalized_transcript_sha256 -cne $campaign.runs[1].normalized_transcript_sha256) 'Campaign lost diagnostic transcript differences'
+            Assert-True $campaign.runs[0].worker_process_affinity.changed 'Campaign lost diagnostic affinity changes'
+            if ($lane.Mode -ceq 'campaign-large') { Assert-True ((Get-Item -LiteralPath $campaignOutput).Length -gt 1MB) 'Campaign did not exercise its distinct larger report bound' }
+        }
+
+        foreach ($case in @(
+            @{ Mode = 'campaign-nonzero'; Expected = 'failed with exit code 37.' },
+            @{ Mode = 'campaign-timeout'; Expected = 'fixed campaign deadline' },
+            @{ Mode = 'campaign-overflow'; Expected = '262144-character per-stream output bound' },
+            @{ Mode = 'campaign-missing'; Expected = 'report file is missing' },
+            @{ Mode = 'campaign-incomplete'; Expected = 'invalid local-only completion' },
+            @{ Mode = 'campaign-power-drift'; Expected = 'request sequence or completion state' },
+            @{ Mode = 'uninstall-failure'; Expected = 'uninstaller exited with 41' },
+            @{ Mode = 'context-check-failure'; Expected = 'Fixture source context check failed after uninstall' },
+            @{ Mode = 'temporary-cleanup-failure'; Expected = 'Fixture temporary observation cleanup failed' }
+        )) {
+            $campaignFailure = Join-Path $testRoot "campaign-$($case.Mode)-failure.json"
+            Invoke-ExpectedFailure {
+                Invoke-FixtureVerifier $fixtureVerifier $observationBundle $frozenRecordPath $observationInstallerResult.InstallerPath $observationInstallerResult.RecordPath `
+                    $observationWav $observationWavSha256 $observationDevice $campaignFailure -CampaignPower 'ac' -Mode $case.Mode
+            } $case.Expected 'sensitive fixture diagnostic must not escape'
+            Assert-True (-not (Test-Path -LiteralPath $campaignFailure)) "$($case.Mode) published a final campaign report"
+            Assert-True (-not (Test-Path -LiteralPath $global:WindowsLocalFrozenVerifierInstalledRoot)) "$($case.Mode) left the trusted fixture installation"
+            Assert-Equal @($global:WindowsLocalFrozenVerifierEvents | Where-Object { $_ -ceq 'installed local frozen GPU observation campaign' }).Count 1 'Failed campaign replayed the collector'
+        }
+        $campaignRace = Join-Path $testRoot 'campaign-race.json'
+        Invoke-ExpectedFailure {
+            Invoke-FixtureVerifier $fixtureVerifier $observationBundle $frozenRecordPath $observationInstallerResult.InstallerPath $observationInstallerResult.RecordPath `
+                $observationWav $observationWavSha256 $observationDevice $campaignRace -CampaignPower 'ac' -Mode 'output-race'
+        } 'already exists'
+        Assert-Equal (Get-Content -LiteralPath $campaignRace -Raw) 'race sentinel' 'Campaign replaced a racing output'
+        Assert-Equal @(Get-ChildItem -LiteralPath $testRoot -Filter '.campaign-race.json.staging-*' -Force).Count 0 'Campaign race retained staging output'
+        foreach ($invalidPower in @('', 'AC', 'Battery', 'unknown')) {
+            Invoke-ExpectedFailure {
+                Invoke-FixtureVerifier $fixtureVerifier $observationBundle $frozenRecordPath $observationInstallerResult.InstallerPath $observationInstallerResult.RecordPath `
+                    $observationWav $observationWavSha256 $observationDevice (Join-Path $testRoot 'invalid-power.json') -CampaignPower $invalidPower
+            } $(if ($invalidPower -cin @('AC', 'Battery')) { 'lowercase ac or battery' } else { 'does not belong to the set' })
+            Assert-Equal $global:WindowsLocalFrozenVerifierEvents.Count 0 'Invalid campaign power started installation'
+        }
+        Invoke-ExpectedFailure { Get-WindowsLocalFrozenCaptureObservationRequest @{ ObservationCampaignPower = 'ac' } } 'must be supplied together'
+
+        # Strict report boundary tests are pure synthetic data. They use the
+        # same reader as the installed path, but no signing key or GPU worker.
+        $campaignExpected = [pscustomobject]@{
+            CollectorBuildRevision = $global:WindowsLocalFrozenVerifierRevision; ModelSha256 = $modelHash; WavSha256 = $observationWavSha256;
+            PackId = 'c'; PackVersion = '1'; PackSha256 = ('c' * 64 -join ''); PackSecurityEpoch = 1; RuntimeAbi = 1;
+            Backend = 'cuda'; Provider = 'cuda'; StableDevice = $observationDevice; CampaignPower = 'ac'
+        }
+        $syntheticCampaignPath = Join-Path $testRoot 'synthetic-campaign.json'
+        foreach ($case in @(
+            @{ Change = { param($r) $r.schema_version = 3 }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.unsigned = 'true' }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.auto_eligible = $true }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.release_approved = $true }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.cleanup_complete = $false }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.collector_build_revision = '0' * 40 }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.expected_power = 'battery' }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.inputs.model_sha256 = 'd' * 64 }; Expected = 'WAV identities' },
+            @{ Change = { param($r) $r.inputs.wav_sha256 = 'd' * 64 }; Expected = 'WAV identities' },
+            @{ Change = { param($r) $r.gpu_identity.pack_sha256 = 'd' * 64 }; Expected = 'verified pack/backend/stable device' },
+            @{ Change = { param($r) $r.gpu_identity.pack_version = '2' }; Expected = 'verified pack/backend/stable device' },
+            @{ Change = { param($r) $r.gpu_identity.runtime_abi = 2 }; Expected = 'verified pack/backend/stable device' },
+            @{ Change = { param($r) $r.gpu_identity.pack_security_epoch = 2 }; Expected = 'verified pack/backend/stable device' },
+            @{ Change = { param($r) $r.gpu_identity.stable_device = 'different-device' }; Expected = 'verified pack/backend/stable device' },
+            @{ Change = { param($r) $r.gpu_identity.provider = 'vulkan' }; Expected = 'verified pack/backend/stable device' },
+            @{ Change = { param($r) $r.unavailable.thermal_state.reason = 'observed' }; Expected = 'required unavailable observation' },
+            @{ Change = { param($r) $r.environmental_controls.background_load.status = 'available' }; Expected = 'required unavailable observation' },
+            @{ Change = { param($r) $r.captures = $r.captures[0..12] }; Expected = 'exact capture and request counts' },
+            @{ Change = { param($r) $r.runs = $r.runs[0..50] }; Expected = 'exact capture and request counts' },
+            @{ Change = { param($r) $r.captures[0].hello_frame_hex = 'AB' }; Expected = 'handshake frame is invalid' },
+            @{ Change = { param($r) $r.captures[1].digest_sha256 = $r.captures[0].digest_sha256 }; Expected = 'digest-bound' },
+            @{ Change = { param($r) $r.captures[2].logical_sequence = 4 }; Expected = 'digest-bound' },
+            @{ Change = { param($r) $r.captures[2].target = 'gpu' }; Expected = 'digest-bound' },
+            @{ Change = { param($r) $r.captures[2].hello_frame_hex = $r.captures[0].hello_frame_hex }; Expected = 'digest-bound' },
+            @{ Change = { param($r) $r.runs[0].pair_index = 2 }; Expected = 'pair index is invalid' },
+            @{ Change = { param($r) $r.runs[2].target = 'cpu' }; Expected = 'request sequence or completion state' },
+            @{ Change = { param($r) $r.runs[10].measured = $true }; Expected = 'request sequence or completion state' },
+            @{ Change = { param($r) $r.runs[12].generation_ref = $r.captures[2].generation_ref }; Expected = 'request sequence or completion state' },
+            @{ Change = { param($r) $r.runs[12].warm_reused = $false }; Expected = 'request sequence or completion state' },
+            @{ Change = { param($r) $r.runs[12].model_load_ms = 1 }; Expected = 'warm request reloaded its model' },
+            @{ Change = { param($r) $r.runs[51].status = 'cancelled' }; Expected = 'request sequence or completion state' },
+            @{ Change = { param($r) $r.runs[0].telemetry_sample_count = 0 }; Expected = 'nonnegative integer range' },
+            @{ Change = { param($r) $r.runs[0].backend_ms = '1' }; Expected = 'must be an integer' },
+            @{ Change = { param($r) $r.runs[1].video_memory.local.sampled_min_budget_bytes = -1 }; Expected = 'nonnegative integer range' },
+            @{ Change = { param($r) $r.runs[1].raw_provider_memory.before.provider_reported_memory_free_bytes = 65 }; Expected = 'provider memory is inconsistent' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.after.source.method = 'wrong' }; Expected = 'CUDA memory source is invalid' },
+            @{ Change = { param($r) $r.runs[0].worker_process_affinity.changed = $false }; Expected = 'change result is inconsistent' },
+            @{ Change = { param($r) $r.runs[0].worker_process_affinity.after.process_mask_hex = '0000000000000004' }; Expected = 'masks are inconsistent' },
+            @{ Change = { param($r) $r.runs[0].worker_process_affinity.before = $null }; Expected = 'omitted an endpoint' },
+            @{ Change = { param($r) $r.runs[0].unexpected = 'claim' }; Expected = 'unexpected or missing fields' }
+        )) {
+            $syntheticCampaign = New-FixtureCampaignReport 'ac'
+            & $case.Change $syntheticCampaign
+            Write-Utf8 $syntheticCampaignPath ($syntheticCampaign | ConvertTo-Json -Depth 24)
+            Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } $case.Expected
+        }
+        $validCampaignJson = (New-FixtureCampaignReport 'ac') | ConvertTo-Json -Depth 24 -Compress
+        foreach ($invalidJson in @(
+            $validCampaignJson.Replace('"unsigned":true', '"unsigned":true,"unsigned":true'),
+            $validCampaignJson.Replace('"unsigned":true', '"unsigned":true,"Unsigned":true'),
+            $validCampaignJson.Replace('"status":"succeeded"', '"status":"succeeded","Status":"succeeded"'),
+            ($validCampaignJson.Substring(0, $validCampaignJson.Length - 1) + ',}'),
+            ('/* invalid comment */' + $validCampaignJson)
+        )) {
+            Write-Utf8 $syntheticCampaignPath $invalidJson
+            Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } 'not strict duplicate-free JSON'
+        }
+        [IO.File]::WriteAllBytes($syntheticCampaignPath, [byte[]](0xff, 0xfe))
+        Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } 'UTF-8'
+        $oversizedCampaign = [IO.File]::Open($syntheticCampaignPath, [IO.FileMode]::Create)
+        try { $oversizedCampaign.SetLength(32MB + 1) } finally { $oversizedCampaign.Dispose() }
+        Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } 'between 1 and 33554432 bytes'
+        foreach ($invalidLimit in @(0, (1MB + 1), 31MB, (32MB + 1))) {
+            Invoke-ExpectedFailure { Publish-WindowsLocalFrozenNewReport (Join-Path $testRoot 'invalid-publication.json') ([byte[]](1)) $invalidLimit } 'publication bytes are outside the supported bound'
+        }
+
+        $uncertainCampaign = New-FixtureCampaignReport 'ac'
+        $uncertainCampaign.runs[1].raw_provider_memory.before = [ordered]@{ status = 'unavailable'; reason = 'provider_query_failed' }
+        $uncertainCampaign.runs[1].memory_availability.after = [ordered]@{ status = 'unavailable'; reason = 'stable_device_ambiguous' }
+        $uncertainCampaign.runs[0].worker_process_affinity.before = [ordered]@{ status = 'unavailable'; reason = 'unsupported_processor_group_topology' }
+        $uncertainCampaign.runs[0].worker_process_affinity.changed = $null
+        Write-Utf8 $syntheticCampaignPath ($uncertainCampaign | ConvertTo-Json -Depth 24)
+        $acceptedUncertain = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+        Assert-Equal $acceptedUncertain.Report.runs[1].memory_availability.after.reason 'stable_device_ambiguous' 'Campaign diagnostic lost unavailable telemetry'
+        Assert-True ($null -eq $acceptedUncertain.Report.runs[0].worker_process_affinity.changed) 'Campaign diagnostic invented affinity certainty'
+
+        $campaignExpected.Backend = 'vulkan'; $campaignExpected.Provider = 'vulkan'
+        $vulkanCampaign = New-FixtureCampaignReport 'ac' 'vulkan'
+        Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
+        $acceptedVulkan = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+        Assert-True ($acceptedVulkan.Report.runs[1].memory_availability.before.memory_total_bytes -ne $acceptedVulkan.Report.gpu_identity.memory_total_bytes) 'Vulkan derived heap total was incorrectly forced to match provider identity total'
+        foreach ($run in $vulkanCampaign.runs | Where-Object { $_.target -ceq 'gpu' }) {
+            foreach ($endpoint in @($run.memory_availability.before, $run.memory_availability.after)) {
+                $endpoint.source.heap_selection = 'all_heaps_integrated'; $endpoint.memory_total_bytes = 1536; $endpoint.available_memory_bytes = 640
+            }
+        }
+        $vulkanCampaign.gpu_identity.device_class = 'integrated_gpu'
+        Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
+        Assert-Equal (Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected).Report.runs[1].memory_availability.before.available_memory_bytes 640 'Vulkan integrated all-heap headroom'
+        foreach ($case in @(
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.available_memory_bytes = 385 }; Expected = 'heap inventory is inconsistent' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].heap_index = 1 }; Expected = 'heap is noncanonical' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].flags = 3 }; Expected = 'heap is noncanonical' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].budget_bytes = 1025 }; Expected = 'heap is noncanonical' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heap_selection = 'all_heaps_integrated' }; Expected = 'memory source is invalid' }
+        )) {
+            $vulkanCampaign = New-FixtureCampaignReport 'ac' 'vulkan'
+            & $case.Change $vulkanCampaign
+            Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
+            Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } $case.Expected
+        }
 
         $partialReport = Join-Path $testRoot 'partial-observation.json'
         Invoke-ExpectedFailure {
@@ -1226,6 +1595,14 @@ public sealed class FixtureRemovalUnauthorizedAccessException : UnauthorizedAcce
         Receive-Job -Job $delayedRemovalJob | Out-Null
         Remove-Job -Job $delayedRemovalJob -Force
     }
+
+    $verifierCampaignSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\verify-windows-local-frozen-test-installer.ps1') -Raw
+    $integrityCampaignSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\windows-local-frozen-installer-integrity.ps1') -Raw
+    Assert-True ($verifierCampaignSource.Contains("[ValidateSet('ac', 'battery')]")) 'Campaign power parameter is not restricted to the two explicit sources.'
+    Assert-True ($verifierCampaignSource.Contains("'--campaign-power', `$observationRequest.CampaignPower")) 'Campaign invocation does not append the exact requested power argument.'
+    Assert-True ($verifierCampaignSource.Contains('-TimeoutMilliseconds 900000')) 'Campaign invocation does not retain the fixed fifteen-minute deadline.'
+    Assert-True ($integrityCampaignSource.Contains('262144')) 'Campaign process does not retain the fixed per-stream character cap.'
+    Assert-True ($integrityCampaignSource.Contains('Read-WindowsLocalFrozenCaptureCampaignReport')) 'Campaign report has no separate strict validation entry point.'
 
     $existingOutput = Join-Path $testRoot 'existing-output'
     New-Item -ItemType Directory -Path $existingOutput | Out-Null

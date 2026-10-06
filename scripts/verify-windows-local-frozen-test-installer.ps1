@@ -12,7 +12,9 @@ param(
     [string]$ObservationGpuPackId,
     [string]$ObservationGpuBackend,
     [string]$ObservationGpuDevice,
-    [string]$ObservationReportPath
+    [string]$ObservationReportPath,
+    [ValidateSet('ac', 'battery')]
+    [string]$ObservationCampaignPower
 )
 
 $ErrorActionPreference = 'Stop'
@@ -183,39 +185,66 @@ try {
                 throw "Installed GPU observation pack binding changed at $field after payload parity."
             }
         }
-        $temporaryObservationReport = Join-Path $temporaryRoot 'gpu-observation.json'
-        $observation = Invoke-WindowsLocalFrozenBoundedProcess `
-            -Executable $collectorPath `
-            -Arguments @(
-                '--scribe-windows-gpu-capture-observation',
-                '--model', $modelPath, '--model-sha256', $model.Sha256,
-                '--wav', $observationRequest.WavPath, '--wav-sha256', $observationRequest.WavSha256,
-                '--gpu-pack-id', $observationRequest.GpuPackId,
-                '--gpu-backend', $observationRequest.GpuBackend,
-                '--gpu-device', $observationRequest.GpuDevice,
-                '--output', $temporaryObservationReport
-            ) `
-            -Description 'installed local frozen GPU observation' `
-            -TimeoutMilliseconds 900000 `
-            -StreamDrainMilliseconds 5000
+        $campaignMode = $null -ne $observationRequest.CampaignPower
+        $temporaryObservationReport = Join-Path $temporaryRoot $(if ($campaignMode) { 'gpu-campaign.json' } else { 'gpu-observation.json' })
+        $observationArguments = @(
+            '--scribe-windows-gpu-capture-observation',
+            '--model', $modelPath, '--model-sha256', $model.Sha256,
+            '--wav', $observationRequest.WavPath, '--wav-sha256', $observationRequest.WavSha256,
+            '--gpu-pack-id', $observationRequest.GpuPackId,
+            '--gpu-backend', $observationRequest.GpuBackend,
+            '--gpu-device', $observationRequest.GpuDevice
+        )
+        if ($campaignMode) {
+            $observationArguments += @('--campaign-power', $observationRequest.CampaignPower)
+        }
+        $observationArguments += @('--output', $temporaryObservationReport)
+        if ($campaignMode) {
+            $observation = Invoke-WindowsLocalFrozenCampaignProcess `
+                -Executable $collectorPath `
+                -Arguments $observationArguments `
+                -Description 'installed local frozen GPU observation campaign' `
+                -TimeoutMilliseconds 900000 `
+                -StreamDrainMilliseconds 5000
+        }
+        else {
+            $observation = Invoke-WindowsLocalFrozenBoundedProcess `
+                -Executable $collectorPath `
+                -Arguments $observationArguments `
+                -Description 'installed local frozen GPU observation' `
+                -TimeoutMilliseconds 900000 `
+                -StreamDrainMilliseconds 5000
+        }
         if ($observation.ExitCode -ne 0) {
+            if ($campaignMode) {
+                throw "Installed local frozen GPU observation campaign failed with exit code $($observation.ExitCode)."
+            }
             throw "Installed local frozen GPU observation failed with exit code $($observation.ExitCode): $($observation.Stderr.Trim())"
         }
-        $observationReport = Read-WindowsLocalFrozenCaptureObservationReport `
-            -ReportPath $temporaryObservationReport `
-            -Expected ([pscustomobject]@{
-                CollectorBuildRevision = $frozenCpuWorker.Record.source_revision
-                ModelSha256 = $model.Sha256
-                WavSha256 = $observationRequest.WavSha256
-                PackId = $installedPack.PackId
-                PackVersion = $installedPack.PackVersion
-                PackSha256 = $installedPack.PackSha256
-                PackSecurityEpoch = $installedPack.PackSecurityEpoch
-                RuntimeAbi = $installedPack.RuntimeAbi
-                Backend = $installedPack.Backend
-                Provider = $installedPack.Provider
-                StableDevice = $observationRequest.GpuDevice
-            })
+        $expectedObservation = [pscustomobject]@{
+            CollectorBuildRevision = $frozenCpuWorker.Record.source_revision
+            ModelSha256 = $model.Sha256
+            WavSha256 = $observationRequest.WavSha256
+            PackId = $installedPack.PackId
+            PackVersion = $installedPack.PackVersion
+            PackSha256 = $installedPack.PackSha256
+            PackSecurityEpoch = $installedPack.PackSecurityEpoch
+            RuntimeAbi = $installedPack.RuntimeAbi
+            Backend = $installedPack.Backend
+            Provider = $installedPack.Provider
+            StableDevice = $observationRequest.GpuDevice
+        }
+        if ($campaignMode) {
+            $expectedObservation | Add-Member -NotePropertyName CampaignPower -NotePropertyValue $observationRequest.CampaignPower
+            $observationReport = Read-WindowsLocalFrozenCaptureCampaignReport `
+                -ReportPath $temporaryObservationReport `
+                -Expected $expectedObservation
+        }
+        else {
+            $observationReport = Read-WindowsLocalFrozenCaptureObservationReport `
+                -ReportPath $temporaryObservationReport `
+                -Expected $expectedObservation
+        }
     }
     $uninstallLog = Join-Path $temporaryRoot 'uninstall.log'
     $uninstall = Invoke-WindowsLocalFrozenInstallerProcess $uninstaller @(
@@ -233,8 +262,16 @@ try {
         # a cleanup failure cannot look like a successful observation.
         Remove-WindowsLocalFrozenVerifierTemporaryRoot $temporaryRoot
         $temporaryRoot = $null
-        $publishedReport = Publish-WindowsLocalFrozenNewReport $observationOutput $observationReport.Bytes
-        Write-Output "Local frozen installer payload parity, GPU observation, and uninstall cleanup passed: $($record.local_test_token) ($publishedReport)"
+        $publishedReport = Publish-WindowsLocalFrozenNewReport `
+            $observationOutput `
+            $observationReport.Bytes `
+            $(if ($campaignMode) { 32MB } else { 1MB })
+        if ($campaignMode) {
+            Write-Output "Local frozen installer payload parity, unsigned GPU campaign diagnostic validation, and uninstall cleanup completed: $($record.local_test_token) ($publishedReport)"
+        }
+        else {
+            Write-Output "Local frozen installer payload parity, GPU observation, and uninstall cleanup passed: $($record.local_test_token) ($publishedReport)"
+        }
     }
     else {
         Write-Output "Local frozen installer payload parity and uninstall cleanup passed: $($record.local_test_token)"

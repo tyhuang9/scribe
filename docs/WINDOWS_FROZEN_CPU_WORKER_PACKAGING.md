@@ -239,7 +239,25 @@ worker, installer, installation and verifier scratch directories. No collector,
 model or worker path override is accepted: the collector and bundled model
 paths, sizes and hashes come from the parity-verified installed inventory.
 
-After installed payload parity and the CPU smoke pass, the verifier invokes
+For a local, fail-closed diagnostic campaign only, append
+`-ObservationCampaignPower ac` or `-ObservationCampaignPower battery` with the
+same six arguments. This keeps the fixed fifteen-minute deadline and requests
+the collector's schema-2 five-cold/twenty-warm campaign; it is not a performance
+qualification, power-plan change, Auto decision, authorization, or release gate.
+The verifier accepts only a completed, cleanup-complete local-only report and
+does not publish a final report after any timeout, oversized output, malformed
+report, incomplete campaign, uninstall, or cleanup failure.
+Campaign stdout and stderr are each bounded to 262144 characters, and the
+campaign report is bounded to 32 MiB. These are diagnostic containment limits,
+not performance, stability, or hardware qualification evidence.
+If a direct collector parent exits while an inherited descendant still holds a
+pipe, the verifier cannot prove that descendant was retired; it fails closed at
+the bounded post-exit drain deadline and publishes no success report.
+Real hardware use requires a newly frozen CPU worker, observer-enabled bundle,
+and the exact verified installed pack set for that run; it cannot reuse this
+local diagnostic report as production evidence or an Auto/release decision.
+
+By default, after installed payload parity and the CPU smoke pass, the verifier invokes
 the installed collector once for one CPU/GPU pair, with individual arguments
 and a fifteen-minute process deadline. It checks the bounded (1 MiB), UTF-8
 schema-3 report envelope, nonqualification flags, collector revision, input
