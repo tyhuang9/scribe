@@ -9036,7 +9036,10 @@ fn probe_pack_diagnostic(
     GpuPackProbeDiagnostic {
         stage,
         issue: probe_issue(diagnostic.issue),
-        pack_id: diagnostic.pack_id,
+        pack_id: diagnostic
+            .pack_id
+            .and_then(crate::gpu_worker_pack::manifest::StoreComponent::new)
+            .map(|pack_id| pack_id.as_str().to_owned()),
         backend: diagnostic.backend.map(probe_backend_name),
     }
 }
@@ -13480,6 +13483,7 @@ mod tests {
     enum TestMode {
         Normal,
         CapabilityMismatch(CapabilityMismatch),
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         MalformedHello,
         DelayedLaunch {
             started: TestSender<()>,
@@ -13802,6 +13806,7 @@ mod tests {
                 );
                 return;
             }
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             TestMode::MalformedHello => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::Hello { .. }));
@@ -13835,9 +13840,12 @@ mod tests {
         match mode {
             TestMode::DelayedLaunch { .. }
             | TestMode::CapabilityMismatch(_)
-            | TestMode::MalformedHello
             | TestMode::BlockedHello { .. } => {
                 unreachable!("launch-only test mode reached a worker")
+            }
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            TestMode::MalformedHello => {
+                unreachable!("malformed-Hello mode returned to the worker loop")
             }
             TestMode::Normal => run_normal_worker(&mut input, &mut output),
             TestMode::VadNormal => {
@@ -14988,6 +14996,42 @@ mod tests {
         drop(context);
         drop(lease);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_omits_unvalidated_rejected_catalog_pack_ids() {
+        use crate::gpu_worker_pack::manifest::{PackBackend, StoreComponent};
+        use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+        let project = |raw: &str| {
+            let unchecked: StoreComponent =
+                serde_json::from_str(&serde_json::to_string(raw).unwrap()).unwrap();
+            probe_pack_diagnostic(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::EntryIncompatible,
+                &unchecked,
+                PackBackend::Vulkan,
+            ))
+            .pack_id
+        };
+
+        assert_eq!(
+            project("scribe-vulkan-windows-x64"),
+            Some("scribe-vulkan-windows-x64".to_owned())
+        );
+        for rejected in [
+            "C:/Users/fixture/private-model.gguf".to_owned(),
+            "UPPERCASE".to_owned(),
+            "con".to_owned(),
+            "contains/control\u{0007}".to_owned(),
+            "x".repeat(97),
+        ] {
+            assert_eq!(
+                project(&rejected),
+                None,
+                "rejected pack id escaped projection"
+            );
+        }
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]

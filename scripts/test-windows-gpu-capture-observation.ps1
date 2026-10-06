@@ -171,7 +171,7 @@ try {
     # Match the existing release lint's shared UI-route coverage while keeping
     # both production checks above free of test-only UI features. Neither lint
     # configuration enables an inference provider in the desktop process.
-    Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', 'ui-harness', '--', '-D', 'warnings')
+    Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', 'ui-harness', '--', '-D', 'warnings')
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',

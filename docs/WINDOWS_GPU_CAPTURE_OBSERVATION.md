@@ -441,9 +441,9 @@ PowerShell bound-parameter dictionary, not just a Hashtable substitute, and
 launch no collector.
 It does not replace the full command above.
 Both strict lint configurations include `ui-harness`, matching the existing
-release checks' shared UI-route coverage; one excludes the observer and the
-observer configuration lints all targets so probe test helpers cannot escape
-the gate. The production checks do not enable `ui-harness`, and no check in
+release checks' shared UI-route coverage. Both lint all targets, with and without
+the observer, so configuration-specific test helpers cannot escape the gate.
+The production checks do not enable `ui-harness`, and no check in
 this command enables a GPU inference provider by default.
 
 For a provider-enabled worker check, use the same command with
