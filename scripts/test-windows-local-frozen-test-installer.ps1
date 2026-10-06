@@ -638,6 +638,7 @@ try {
     $fakeCompilerSource = Join-Path $compilerRoot 'FakeIscc.cs'
     Write-Utf8 $fakeCompilerSource @'
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -645,6 +646,15 @@ public static class FakeIscc {
   static string Arg(string[] args, string name) { var value = args.FirstOrDefault(x => x.StartsWith(name, StringComparison.Ordinal)); return value == null ? null : value.Substring(name.Length); }
   public static int Main(string[] args) {
     string mode = Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE") ?? "";
+    if (mode == "campaign-live-parent") {
+      using (Process self = Process.GetCurrentProcess()) {
+        File.WriteAllLines(Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE"), new string[] {
+          self.Id.ToString(), self.StartTime.ToUniversalTime().Ticks.ToString(), self.MainModule.FileName
+        });
+      }
+      // Send readiness data through a real ReadAsync before any synthetic fault.
+      Console.Write(new string('R', 8192)); Console.Out.Flush(); Thread.Sleep(60000); return 0;
+    }
     if (mode == "campaign-exact-cap") { Console.Write(new string('a', 262144)); Console.Error.Write(new string('b', 262144)); return 0; }
     if (mode == "campaign-overflow-stdout") { Console.Write(new string('a', 262145)); Console.Out.Flush(); Thread.Sleep(60000); return 0; }
     if (mode == "campaign-overflow-stderr") { Console.Error.Write(new string('b', 262145)); Console.Error.Flush(); Thread.Sleep(60000); return 0; }
@@ -782,6 +792,137 @@ public static class FakeIscc {
     Invoke-ExpectedFailure {
         & { . $shortRunner; Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments $campaignRoundTrip -Description 'fixture shortened campaign deadline' }
     } 'timed out after the fixed campaign deadline'
+    # Exercise real owned-child cleanup with controlled Task outcomes in a
+    # parsed copy only. These are not OS-originated pipe faults, and the child
+    # has no descendants: inherited-pipe descendant retirement is a separate gate.
+    $readerRunnerSource = $campaignRunnerFunction.Extent.Text
+    $startedMarker = '$processStarted = $true'
+    $stderrReadMarker = '$stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)'
+    Assert-Equal ([regex]::Matches($readerRunnerSource, [regex]::Escape($startedMarker)).Count) 1 'Reader fixture owned-start seam count'
+    Assert-Equal ([regex]::Matches($readerRunnerSource, [regex]::Escape($stderrReadMarker)).Count) 2 'Reader fixture initial/reissued stderr seam count'
+    $ownedStartSeam = @'
+        $readerFaultState.Launches++
+        $readerFaultState.Process = [Diagnostics.Process]::GetProcessById($process.Id)
+        # Pin the independently held native handle while this exact child is
+        # alive. Never reacquire a PID for assertions or emergency cleanup.
+        $null = $readerFaultState.Process.SafeHandle
+        $readerFaultState.Id = $readerFaultState.Process.Id
+        $readerFaultState.StartTicks = $readerFaultState.Process.StartTime.ToUniversalTime().Ticks
+        $readerFaultState.ExpectedExecutable = [IO.Path]::GetFullPath($Executable)
+        if ($readerFaultState.Id -ne $process.Id -or
+            $readerFaultState.StartTicks -ne $process.StartTime.ToUniversalTime().Ticks) {
+            throw 'Reader fixture held handle does not match the launched child.'
+        }
+        $readerFaultState.IdentityBound = $true
+'@
+    $readerRunnerSource = $readerRunnerSource.Replace($startedMarker, "$startedMarker`n$ownedStartSeam")
+    $readyAndFaultSeam = @'
+        $readyCount = if ($stdoutTask.Wait(5000)) { $stdoutTask.GetAwaiter().GetResult() } else { -1 }
+        if ($readyCount -lt 1 -or $readyCount -gt $stdoutBuffer.Length -or $stdoutBuffer[0] -cne [char]'R') {
+            throw 'Reader fault fixture did not receive real child readiness.'
+        }
+        # MainModule can be unavailable immediately after Process.Start; query
+        # it only after the owned child is executing and has flushed readiness.
+        $ownedModule = $readerFaultState.Process.MainModule
+        if ($null -eq $ownedModule) { throw 'Reader fixture live child has no main module after readiness.' }
+        $readerFaultState.Executable = $ownedModule.FileName
+        $receipt = [IO.File]::ReadAllLines($readerFaultReceipt)
+        if ($receipt.Length -ne 3 -or [int]$receipt[0] -ne $readerFaultState.Id -or
+            [long]$receipt[1] -ne $readerFaultState.StartTicks -or
+            -not [string]::Equals($receipt[2], $readerFaultState.Executable, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($readerFaultState.Executable, $Executable, [StringComparison]::OrdinalIgnoreCase) -or
+            $readerFaultState.Process.HasExited) {
+            throw 'Reader fault fixture did not bind its exact live owned child.'
+        }
+        $readerFaultState.Ready = $true
+        $injectedTask = switch ($readerFaultCase.Outcome) {
+            'fault' { [Threading.Tasks.Task]::FromException[int]([IO.IOException]::new('fixture-sensitive-read-marker')) }
+            'cancel' { [Threading.Tasks.Task]::FromCanceled[int]([Threading.CancellationToken]::new($true)) }
+            # Complete the selected task so its processing branch throws the
+            # controlled primary IOException, without malformed read counts.
+            'unexpected' { [Threading.Tasks.Task]::FromResult[int](1) }
+            default { throw 'Unknown reader fixture outcome.' }
+        }
+        if ($readerFaultCase.Stream -ceq 'stdout') { $stdoutTask = $injectedTask }
+        else { $stderrTask = $injectedTask }
+'@
+    $initialStderrOffset = $readerRunnerSource.IndexOf($stderrReadMarker, [StringComparison]::Ordinal)
+    $readerRunnerSource = $readerRunnerSource.Insert($initialStderrOffset + $stderrReadMarker.Length, "`n$readyAndFaultSeam")
+    # Array assignment never completes after a terminating pipeline error.
+    # Retain each emitted object in a parent-held list, and prove with a positive
+    # canary that output before a throw cannot disappear from the assertion.
+    $retentionProbe = [Collections.Generic.List[object]]::new()
+    Invoke-ExpectedFailure {
+        & { 'fixture pre-failure output'; throw [IO.IOException]::new('fixture retention failure') } |
+            ForEach-Object { [void]$retentionProbe.Add($_) }
+    } 'fixture retention failure'
+    Assert-Equal $retentionProbe.Count 1 'Reader output collector lost pre-failure output'
+    Assert-Equal $retentionProbe[0] 'fixture pre-failure output' 'Reader output collector altered pre-failure output'
+    $readerCaptureBefore = $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE
+    try {
+        foreach ($readerStream in @('stdout', 'stderr')) {
+            foreach ($readerOutcome in @('fault', 'cancel', 'unexpected')) {
+                $readerFaultCase = @{ Stream = $readerStream; Outcome = $readerOutcome }
+                $readerFaultState = @{ Process = $null; Launches = 0; Ready = $false; IdentityBound = $false; Id = 0; StartTicks = 0; Executable = ''; ExpectedExecutable = '' }
+                $readerFaultReceipt = Join-Path $testRoot "reader-$readerStream-$readerOutcome.txt"
+                $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'campaign-live-parent'
+                $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE = $readerFaultReceipt
+                $caseSource = $readerRunnerSource
+                if ($readerOutcome -ceq 'unexpected') {
+                    $resultMarker = '$count = $' + $readerStream + 'Task.GetAwaiter().GetResult()'
+                    Assert-Equal ([regex]::Matches($caseSource, [regex]::Escape($resultMarker)).Count) 1 "Unexpected $readerStream result seam count"
+                    $caseSource = $caseSource.Replace($resultMarker, "throw [IO.IOException]::new('fixture unexpected $readerStream processing failure')")
+                }
+                $faultRunner = [scriptblock]::Create($caseSource)
+                $readerClock = [Diagnostics.Stopwatch]::StartNew()
+                $readerError = $null
+                $readerResults = [Collections.Generic.List[object]]::new()
+                try {
+                    try {
+                        & { . $faultRunner; Invoke-WindowsLocalFrozenCampaignProcess -Executable $fakeCompiler -Arguments @() -Description 'fixture reader fault' } |
+                            ForEach-Object { [void]$readerResults.Add($_) }
+                    }
+                    catch { $readerError = $_ }
+                    $readerClock.Stop()
+                    Assert-True ($null -ne $readerError) "$readerStream $readerOutcome returned success instead of failing closed."
+                    Assert-Equal $readerResults.Count 0 "$readerStream $readerOutcome published a successful capture result"
+                    Assert-Equal $readerFaultState.Launches 1 "$readerStream $readerOutcome launched more than its one owned child"
+                    Assert-True $readerFaultState.Ready "$readerStream $readerOutcome did not establish real child readiness: $($readerError.Exception.Message)"
+                    Assert-True ($readerClock.ElapsedMilliseconds -lt 10000) "$readerStream $readerOutcome did not return promptly."
+                    Assert-True $readerFaultState.Process.HasExited "$readerStream $readerOutcome left its sixty-second sleeping owned child running."
+                    Assert-True ($readerFaultState.Process.WaitForExit(1000)) "$readerStream $readerOutcome did not reap its owned child."
+                    if ($readerOutcome -ceq 'unexpected') {
+                        Assert-True ($readerError.Exception -is [IO.IOException]) "Unexpected $readerStream failure lost its primary exception type."
+                        Assert-Equal $readerError.Exception.Message "fixture unexpected $readerStream processing failure" "Unexpected $readerStream failure lost its primary error"
+                    }
+                    else {
+                        Assert-Equal $readerError.Exception.Message 'fixture reader fault output capture failed.' "$readerStream $readerOutcome capture failure was not categorical"
+                        Assert-True (-not $readerError.Exception.Message.Contains('fixture-sensitive-read-marker')) "$readerStream $readerOutcome exposed the raw reader diagnostic."
+                    }
+                }
+                finally {
+                    if ($null -ne $readerFaultState.Process) {
+                        try {
+                            if (-not $readerFaultState.Process.HasExited) {
+                                # Launch-time handle/creation identity also
+                                # permits safe cleanup before readiness or
+                                # executable metadata is available.
+                                if (-not $readerFaultState.IdentityBound -or
+                                    $readerFaultState.Process.Id -ne $readerFaultState.Id -or
+                                    $readerFaultState.Process.StartTime.ToUniversalTime().Ticks -ne $readerFaultState.StartTicks -or
+                                    -not [string]::Equals($readerFaultState.ExpectedExecutable, $fakeCompiler, [StringComparison]::OrdinalIgnoreCase)) {
+                                    throw 'Refused reader fixture cleanup without exact live child ownership.'
+                                }
+                                Stop-WindowsLocalFrozenProcessTree $readerFaultState.Process 'exact owned reader fixture child'
+                            }
+                        }
+                        finally { $readerFaultState.Process.Dispose() }
+                    }
+                }
+            }
+        }
+    }
+    finally { $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE = $readerCaptureBefore }
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'observer-hang'
     Invoke-ExpectedFailure {
         Invoke-WindowsLocalFrozenBoundedProcess `
