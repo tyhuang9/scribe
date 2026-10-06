@@ -7,6 +7,8 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'build.rs'
+      - 'build_support/build_revision.rs'
+      - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
       - 'native/**'
       - 'runtime-manifests/gpu-*-macos-*.json'
@@ -20,6 +22,8 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'build.rs'
+      - 'build_support/build_revision.rs'
+      - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
       - 'native/**'
       - 'runtime-manifests/gpu-*-macos-*.json'
@@ -65,6 +69,7 @@ jobs:
         env:
           SCRIBE_BUILD_REVISION: stage6-macos-ci
         run: |
+          cargo test --locked --test build_revision_invalidation -- --test-threads=1
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
           cargo test --manifest-path tools/worker-pack-author/Cargo.toml --locked -- --test-threads=1
