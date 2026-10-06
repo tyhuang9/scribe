@@ -1,8 +1,9 @@
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use sha2::{Digest, Sha256};
+#[path = "build_support/build_revision.rs"]
+mod build_revision;
 
 #[cfg(feature = "cuda-acceleration")]
 #[path = "build_support/windows_cuda_link.rs"]
@@ -370,37 +371,9 @@ fn emit_bundled_worker_trust_anchor() {
 }
 
 fn emit_build_revision() {
-    println!("cargo:rerun-if-env-changed=SCRIBE_BUILD_REVISION");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    let revision = std::env::var("SCRIBE_BUILD_REVISION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            Command::new("git")
-                .args(["rev-parse", "--verify", "HEAD"])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|value| value.trim().to_owned())
-        })
-        .unwrap_or_else(|| {
-            let mut digest = Sha256::new();
-            for path in [
-                "Cargo.lock",
-                "build.rs",
-                "src/onnx_worker.rs",
-                "src/worker_contracts.rs",
-            ] {
-                digest.update(fs::read(path).unwrap_or_default());
-            }
-            format!("source-{:x}", digest.finalize())
-        });
-    assert!(
-        revision.len() >= 12 && revision.len() <= 96 && revision.is_ascii(),
-        "SCRIBE_BUILD_REVISION must be a 12-96 character ASCII build identity"
-    );
-    println!("cargo:rustc-env=SCRIBE_BUILD_REVISION={revision}");
+    build_revision::emit_build_revision(Path::new("."), |bytes| {
+        format!("{:x}", Sha256::digest(bytes))
+    });
 }
 
 #[cfg(all(windows, feature = "vulkan-acceleration"))]
