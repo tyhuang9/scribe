@@ -962,6 +962,28 @@ impl RecordingSession {
     }
 
     #[cfg(test)]
+    pub(crate) fn manual_completion_for_test()
+    -> (Self, Sender<Result<CaptureCompletion, CaptureError>>) {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let discard_requested = Arc::new(AtomicBool::new(false));
+        let (finished_tx, finished_rx) = bounded(1);
+        let session = Self {
+            inner: Arc::new(RecordingSessionInner {
+                stop_requested,
+                discard_requested,
+                abort_action: Arc::new(|| {}),
+                finished_rx,
+                rms_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+                peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+                level_observed: Arc::new(AtomicBool::new(false)),
+                level_revision: Arc::new(AtomicU64::new(0)),
+                worker: Mutex::new(None),
+            }),
+        };
+        (session, finished_tx)
+    }
+
+    #[cfg(test)]
     pub(crate) fn simulated_with_stop_delay(
         audio: Option<Arc<PreparedAudio>>,
         stop_reason: CaptureStopReason,

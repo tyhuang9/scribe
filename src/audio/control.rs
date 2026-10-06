@@ -857,10 +857,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use crossbeam_channel::bounded;
+    use crossbeam_channel::{TryRecvError, bounded};
 
     use super::*;
     use crate::audio::{ABORT_STREAM_DROP_BUDGET, CaptureStopReason};
+
+    const LIFECYCLE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn controller_with_counter(calls: Arc<AtomicUsize>) -> CaptureController {
         CaptureController::with_start_capture(Arc::new(move |_request, cancellation| {
@@ -871,6 +873,53 @@ mod tests {
             Err(CaptureError::StartupCancelled)
         }))
         .unwrap()
+    }
+
+    fn wait_for_ready(controller: &CaptureController, capture_id: CaptureId) {
+        assert!(matches!(
+            controller
+                .lifecycle_rx
+                .recv_timeout(LIFECYCLE_EVENT_TIMEOUT)
+                .unwrap(),
+            CaptureLifecycleEvent::Starting {
+                capture_id: event_capture_id,
+                ..
+            } if event_capture_id == capture_id
+        ));
+        assert!(matches!(
+            controller
+                .lifecycle_rx
+                .recv_timeout(LIFECYCLE_EVENT_TIMEOUT)
+                .unwrap(),
+            CaptureLifecycleEvent::Ready {
+                capture_id: event_capture_id,
+                ..
+            } if event_capture_id == capture_id
+        ));
+    }
+
+    fn assert_abort_and_terminal(
+        controller: &CaptureController,
+        capture_id: CaptureId,
+        terminal: impl Fn(&CaptureLifecycleEvent) -> bool,
+    ) {
+        let first = controller
+            .lifecycle_rx
+            .recv_timeout(LIFECYCLE_EVENT_TIMEOUT)
+            .unwrap();
+        let second = controller
+            .lifecycle_rx
+            .recv_timeout(LIFECYCLE_EVENT_TIMEOUT)
+            .unwrap();
+        let is_abort = |event: &CaptureLifecycleEvent| {
+            matches!(
+                event,
+                CaptureLifecycleEvent::Aborted {
+                    capture_id: event_capture_id,
+                } if *event_capture_id == capture_id
+            )
+        };
+        assert!((is_abort(&first) && terminal(&second)) || (terminal(&first) && is_abort(&second)));
     }
 
     #[test]
@@ -1477,15 +1526,16 @@ mod tests {
 
     #[test]
     fn release_reaper_spawn_failure_fails_closed_without_leaking_owner() {
+        let (session, completion_tx) = RecordingSession::manual_completion_for_test();
+        let start_session = session.clone();
+        let reaper_spawns = Arc::new(AtomicUsize::new(0));
+        let reaper_spawns_for_test = Arc::clone(&reaper_spawns);
         let controller = CaptureController::with_reaper_spawner_for_test(
-            Arc::new(|_, _| {
-                Ok(RecordingSession::simulated_with_stop_delay(
-                    None,
-                    CaptureStopReason::Explicit,
-                    Duration::from_millis(25),
-                ))
+            Arc::new(move |_, _| Ok(start_session.clone())),
+            Arc::new(move |_, _| {
+                reaper_spawns_for_test.fetch_add(1, Ordering::SeqCst);
+                Err("injected spawn failure".to_owned())
             }),
-            Arc::new(|_, _| Err("injected spawn failure".to_owned())),
         )
         .unwrap();
         let handle = controller.handle();
@@ -1498,25 +1548,29 @@ mod tests {
                 CaptureOptions::default(),
             )
             .unwrap();
-        let ready = (0..100).find_map(|_| {
-            let event = controller.poll_events().into_iter().find(|event| {
-                matches!(
-                    event,
-                    CaptureLifecycleEvent::Ready { capture_id, .. }
-                        if *capture_id == ticket.capture_id
-                )
-            });
-            if event.is_none() {
-                thread::sleep(Duration::from_millis(1));
-            }
-            event
-        });
-        assert!(ready.is_some());
+        wait_for_ready(&controller, ticket.capture_id);
+        assert!(session.try_finish().is_none());
 
         handle.abort(ticket.capture_id).unwrap();
+        assert!(session.try_finish().is_none());
         handle.release(ticket.capture_id.0).unwrap();
 
+        assert_eq!(reaper_spawns.load(Ordering::SeqCst), 1);
         assert!(handle.owner().is_none());
+        assert_abort_and_terminal(&controller, ticket.capture_id, |event| {
+            matches!(
+                event,
+                CaptureLifecycleEvent::Failed {
+                    capture_id,
+                    error: CaptureError::WorkerSpawn(message),
+                    ..
+                } if *capture_id == ticket.capture_id && message.contains("injected spawn failure")
+            )
+        });
+        assert!(matches!(
+            controller.lifecycle_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
         assert!(matches!(
             handle.start_capture(
                 AudioOwnerKind::Capture,
@@ -1527,15 +1581,101 @@ mod tests {
             ),
             Err(CaptureControlError::Shutdown)
         ));
-        assert!(controller.poll_events().into_iter().any(|event| {
+        drop(completion_tx);
+    }
+
+    #[test]
+    fn completed_discard_before_release_skips_reaper_and_allows_next_capture() {
+        let (first_session, first_completion_tx) = RecordingSession::manual_completion_for_test();
+        let (second_session, second_completion_tx) = RecordingSession::manual_completion_for_test();
+        let first_start_session = first_session.clone();
+        let second_start_session = second_session.clone();
+        let start_calls = Arc::new(AtomicUsize::new(0));
+        let start_calls_for_test = Arc::clone(&start_calls);
+        let reaper_spawns = Arc::new(AtomicUsize::new(0));
+        let reaper_spawns_for_test = Arc::clone(&reaper_spawns);
+        let controller = CaptureController::with_reaper_spawner_for_test(
+            Arc::new(
+                move |_, _| match start_calls_for_test.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(first_start_session.clone()),
+                    1 => Ok(second_start_session.clone()),
+                    _ => Err(CaptureError::WorkerSpawn(
+                        "unexpected third capture start".to_owned(),
+                    )),
+                },
+            ),
+            Arc::new(move |_, _| {
+                reaper_spawns_for_test.fetch_add(1, Ordering::SeqCst);
+                Err("release reaper unexpectedly spawned".to_owned())
+            }),
+        )
+        .unwrap();
+        let handle = controller.handle();
+        let first = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        wait_for_ready(&controller, first.capture_id);
+
+        handle.abort(first.capture_id).unwrap();
+        first_completion_tx
+            .send(Err(CaptureError::Discarded))
+            .unwrap();
+        handle.release(first.capture_id.0).unwrap();
+
+        assert_abort_and_terminal(&controller, first.capture_id, |event| {
             matches!(
                 event,
-                CaptureLifecycleEvent::Failed {
+                CaptureLifecycleEvent::Released {
                     capture_id,
-                    error: CaptureError::WorkerSpawn(message),
                     ..
-                } if capture_id == ticket.capture_id && message.contains("injected spawn failure")
+                } if *capture_id == first.capture_id
             )
-        }));
+        });
+        assert!(matches!(
+            controller.lifecycle_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(handle.owner().is_none());
+
+        let second = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        wait_for_ready(&controller, second.capture_id);
+        handle.abort(second.capture_id).unwrap();
+        second_completion_tx
+            .send(Err(CaptureError::Discarded))
+            .unwrap();
+        handle.release(second.capture_id.0).unwrap();
+
+        assert_abort_and_terminal(&controller, second.capture_id, |event| {
+            matches!(
+                event,
+                CaptureLifecycleEvent::Released {
+                    capture_id,
+                    ..
+                } if *capture_id == second.capture_id
+            )
+        });
+        assert!(matches!(
+            controller.lifecycle_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(handle.owner().is_none());
+        assert_eq!(start_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(reaper_spawns.load(Ordering::SeqCst), 0);
+        drop(first_completion_tx);
+        drop(second_completion_tx);
     }
 }
