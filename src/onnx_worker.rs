@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -109,6 +111,105 @@ const MAX_BACKEND_IDENTITY_BYTES: usize = 1024;
 const MAX_PACK_DEVICES: usize = 16;
 const MAX_GPU_PROVIDER_PROBES: usize = 8;
 const GPU_PROVIDER_DISCOVERY_BUDGET: Duration = Duration::from_secs(10);
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+const GPU_PROVIDER_PROBE_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+const MAX_GPU_PROBE_REPORT_DEVICES: usize = 16;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+const MAX_GPU_PROBE_REPORT_DIAGNOSTICS: usize = MAX_GPU_PROVIDER_PROBES * 2 + 1;
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuPackProbeStage {
+    PackCatalog,
+    Launch,
+    HelloAuthentication,
+    DeviceBinding,
+    DriverIdentity,
+    SharedBudget,
+    Cleanup,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl GpuPackProbeStage {
+    const fn code(self) -> u8 {
+        match self {
+            Self::PackCatalog => 0,
+            Self::Launch => 1,
+            Self::HelloAuthentication => 2,
+            Self::DeviceBinding => 3,
+            Self::DriverIdentity => 4,
+            Self::SharedBudget => 5,
+            Self::Cleanup => 6,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Launch,
+            2 => Self::HelloAuthentication,
+            3 => Self::DeviceBinding,
+            4 => Self::DriverIdentity,
+            5 => Self::SharedBudget,
+            6 => Self::Cleanup,
+            _ => Self::PackCatalog,
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+struct DiagnosticProbeState {
+    stage: AtomicU8,
+    launch_pending: AtomicBool,
+    process_started: AtomicBool,
+    cleanup_confirmed: AtomicBool,
+    cleanup_deadline: MonotonicDeadline,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl DiagnosticProbeState {
+    fn new(cleanup_deadline: MonotonicDeadline) -> Arc<Self> {
+        Arc::new(Self {
+            stage: AtomicU8::new(GpuPackProbeStage::PackCatalog.code()),
+            launch_pending: AtomicBool::new(false),
+            process_started: AtomicBool::new(false),
+            cleanup_confirmed: AtomicBool::new(true),
+            cleanup_deadline,
+        })
+    }
+
+    fn set_stage(&self, stage: GpuPackProbeStage) {
+        self.stage.store(stage.code(), Ordering::Release);
+    }
+
+    fn stage(&self) -> GpuPackProbeStage {
+        GpuPackProbeStage::from_code(self.stage.load(Ordering::Acquire))
+    }
+
+    fn launch_started(&self) {
+        self.launch_pending.store(true, Ordering::Release);
+    }
+
+    fn launch_finished(&self) {
+        self.launch_pending.store(false, Ordering::Release);
+    }
+
+    fn process_started(&self) {
+        self.process_started.store(true, Ordering::Release);
+        self.cleanup_confirmed.store(false, Ordering::Release);
+    }
+
+    fn cleanup_confirmed(&self) {
+        self.cleanup_confirmed.store(true, Ordering::Release);
+    }
+
+    fn is_cleanup_confirmed(&self) -> bool {
+        !self.launch_pending.load(Ordering::Acquire)
+            && (!self.process_started.load(Ordering::Acquire)
+                || self.cleanup_confirmed.load(Ordering::Acquire))
+    }
+}
 
 #[derive(Clone, Copy)]
 struct SupervisorDeadlines {
@@ -1089,6 +1190,10 @@ trait WorkerProcess: Send + Sync {
     }
     fn terminate(&self) -> Result<()>;
     fn wait(&self) -> Result<()>;
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn wait_before(&self, _deadline: MonotonicDeadline) -> Result<()> {
+        self.wait()
+    }
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
         bail!("worker process does not expose a Windows observation handle")
@@ -3914,6 +4019,8 @@ impl WorkerExecutableResolver for FixedWorkerExecutableResolver {
 struct OsWorkerLauncher {
     role: WorkerRole,
     resolver: Arc<dyn WorkerExecutableResolver>,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    diagnostic_probe: Option<Arc<DiagnosticProbeState>>,
 }
 
 impl OsWorkerLauncher {
@@ -3921,6 +4028,8 @@ impl OsWorkerLauncher {
         Self {
             role: WorkerRole::Inference,
             resolver: Arc::new(InstalledWorkerExecutableResolver),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            diagnostic_probe: None,
         }
     }
 
@@ -3928,6 +4037,8 @@ impl OsWorkerLauncher {
         Self {
             role: WorkerRole::Vad,
             resolver: Arc::new(InstalledWorkerExecutableResolver),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            diagnostic_probe: None,
         }
     }
 
@@ -3935,6 +4046,8 @@ impl OsWorkerLauncher {
         Self {
             role: WorkerRole::Inference,
             resolver: Arc::new(VerifiedPackWorkerExecutableResolver { binding }),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            diagnostic_probe: None,
         }
     }
 
@@ -3942,6 +4055,20 @@ impl OsWorkerLauncher {
         Self {
             role: WorkerRole::Inference,
             resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            diagnostic_probe: None,
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn for_diagnostic_pack_probe(
+        lease: Arc<VerifiedPackLease>,
+        diagnostic_probe: Arc<DiagnosticProbeState>,
+    ) -> Self {
+        Self {
+            role: WorkerRole::Inference,
+            resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
+            diagnostic_probe: Some(diagnostic_probe),
         }
     }
 
@@ -3950,6 +4077,8 @@ impl OsWorkerLauncher {
         Self {
             role,
             resolver: Arc::new(FixedWorkerExecutableResolver(executable)),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            diagnostic_probe: None,
         }
     }
 }
@@ -4017,8 +4146,15 @@ impl WorkerLauncher for OsWorkerLauncher {
                     .ok_or_else(|| anyhow!("worker executable has no trusted parent directory"))?,
             )
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stdout(Stdio::piped());
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if self.diagnostic_probe.is_some() {
+            command.stderr(Stdio::null());
+        } else {
+            command.stderr(Stdio::inherit());
+        }
+        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
+        command.stderr(Stdio::inherit());
         configure_worker_environment(&mut command);
         if let Some(pack) = &executable.pack_launch {
             configure_worker_pack_environment(&mut command, pack);
@@ -4027,6 +4163,13 @@ impl WorkerLauncher for OsWorkerLauncher {
         configure_hidden_worker_command(&mut command);
         let _immediate_identity_check = executable.revalidate()?;
         let mut child = command.spawn()?;
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.diagnostic_probe {
+            // From this point onward an early parent-side setup error must be
+            // reported as unconfirmed cleanup unless an explicit reaper path
+            // proves otherwise.
+            diagnostic_probe.process_started();
+        }
         parent_liveness.child_spawned();
         let process_guard =
             bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?;
@@ -4667,6 +4810,31 @@ impl WorkerProcess for OsWorkerProcess {
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn wait_before(&self, deadline: MonotonicDeadline) -> Result<()> {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("process worker process lock was poisoned"))?;
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let remaining = deadline.remaining()?;
+        let timeout_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        match unsafe { WaitForSingleObject(child.as_raw_handle() as _, timeout_ms) } {
+            WAIT_OBJECT_0 => {
+                let _ = child.wait()?;
+                Ok(())
+            }
+            WAIT_TIMEOUT => bail!("worker cleanup confirmation deadline expired"),
+            _ => Err(std::io::Error::last_os_error())
+                .context("could not confirm worker process termination"),
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
         use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -4810,6 +4978,8 @@ struct SupervisorInner {
     state: Mutex<SupervisorState>,
     writer: Mutex<Option<WriterSlot>>,
     pending: Mutex<HashMap<Correlation, SyncSender<PendingResult>>>,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    diagnostic_probe: Option<Arc<DiagnosticProbeState>>,
 }
 
 /// Cloneable parent-side worker supervisor. Request threads block only on their
@@ -4861,6 +5031,27 @@ impl ProcessWorkerSupervisor {
                 state: Mutex::new(SupervisorState::default()),
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                diagnostic_probe: None,
+            }),
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn unstarted_diagnostic_probe(
+        launcher: Arc<dyn WorkerLauncher>,
+        diagnostic_probe: Arc<DiagnosticProbeState>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(SupervisorInner {
+                launcher,
+                deadlines: SupervisorDeadlines::default(),
+                spawn_gate: Mutex::new(()),
+                retirement_changed: Condvar::new(),
+                state: Mutex::new(SupervisorState::default()),
+                writer: Mutex::new(None),
+                pending: Mutex::new(HashMap::new()),
+                diagnostic_probe: Some(diagnostic_probe),
             }),
         }
     }
@@ -5316,6 +5507,10 @@ impl ProcessWorkerSupervisor {
             }
         }
 
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+            diagnostic_probe.set_stage(GpuPackProbeStage::Launch);
+        }
         let spawned = match deadline {
             Some(deadline) => self.launch_before(deadline, cancelled)?,
             None => self.inner.launcher.launch()?,
@@ -5384,6 +5579,10 @@ impl ProcessWorkerSupervisor {
             }
         };
         let expected = expectation;
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+            diagnostic_probe.set_stage(GpuPackProbeStage::HelloAuthentication);
+        }
         if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
@@ -5407,6 +5606,12 @@ impl ProcessWorkerSupervisor {
         cancelled: Option<&AtomicBool>,
     ) -> Result<SpawnedWorker> {
         let launcher = Arc::clone(&self.inner.launcher);
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        let diagnostic_probe = self.inner.diagnostic_probe.clone();
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &diagnostic_probe {
+            diagnostic_probe.launch_started();
+        }
         let (result_tx, result_rx) = sync_channel(1);
         std::thread::Builder::new()
             .name("scribe-process-worker-launch".to_owned())
@@ -5414,31 +5619,89 @@ impl ProcessWorkerSupervisor {
                 let result = launcher.launch();
                 if deadline.remaining().is_err() {
                     if let Ok(worker) = result {
+                        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                        if let Some(diagnostic_probe) = &diagnostic_probe {
+                            let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+                        } else {
+                            retire_unpublished_worker_synchronously(worker);
+                        }
+                        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
                         retire_unpublished_worker_synchronously(worker);
                     }
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    if let Some(diagnostic_probe) = &diagnostic_probe {
+                        diagnostic_probe.launch_finished();
+                    }
+                    let _ = result_tx.send(Err(anyhow!(
+                        "process worker launch completed after the shared deadline"
+                    )));
                     return;
+                }
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                if let Some(diagnostic_probe) = &diagnostic_probe {
+                    diagnostic_probe.launch_finished();
                 }
                 if let Err(send_error) = result_tx.send(result)
                     && let Ok(worker) = send_error.0
                 {
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    if let Some(diagnostic_probe) = &diagnostic_probe {
+                        let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+                    } else {
+                        retire_unpublished_worker_synchronously(worker);
+                    }
+                    #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
                     retire_unpublished_worker_synchronously(worker);
                 }
             })
-            .context("could not start bounded process worker launcher")?;
+            .map_err(|error| {
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+                    diagnostic_probe.launch_finished();
+                }
+                anyhow!("could not start bounded process worker launcher: {error}")
+            })?;
 
         loop {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+                    await_diagnostic_launch_cleanup(&result_rx, diagnostic_probe);
+                }
                 bail!("Silero VAD acquisition was cancelled");
             }
-            let remaining = deadline.remaining()?;
+            let remaining = match deadline.remaining() {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+                        await_diagnostic_launch_cleanup(&result_rx, diagnostic_probe);
+                    }
+                    return Err(error);
+                }
+            };
             match result_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
                 Ok(result) => {
                     let worker = result?;
                     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+                            let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+                        } else {
+                            retire_unpublished_worker(worker);
+                        }
+                        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
                         retire_unpublished_worker(worker);
                         bail!("Silero VAD acquisition was cancelled");
                     }
                     if let Err(error) = deadline.remaining() {
+                        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+                            let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+                        } else {
+                            retire_unpublished_worker(worker);
+                        }
+                        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
                         retire_unpublished_worker(worker);
                         return Err(error);
                     }
@@ -5490,12 +5753,24 @@ impl ProcessWorkerSupervisor {
                     let response = match response {
                         Ok(response) => response,
                         Err(error) => {
+                            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                            let quiet_diagnostic = inner.diagnostic_probe.is_some();
                             if let Err(retire_error) = ProcessWorkerSupervisor::from_inner(inner)
                                 .invalidate_generation(
                                 generation,
                                 &format!("process worker stdout failed: {error}"),
                                 true,
                             ) {
+                                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                                if !quiet_diagnostic {
+                                    eprintln!(
+                                        "could not retire failed process worker generation {generation}: {retire_error:#}"
+                                    );
+                                }
+                                #[cfg(not(all(
+                                    windows,
+                                    feature = "windows-gpu-capture-observation"
+                                )))]
                                 eprintln!(
                                     "could not retire failed process worker generation {generation}: {retire_error:#}"
                                 );
@@ -5525,12 +5800,24 @@ impl ProcessWorkerSupervisor {
                         }));
                         continue;
                     }
+                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                    let quiet_diagnostic = inner.diagnostic_probe.is_some();
                     if let Err(error) = ProcessWorkerSupervisor::from_inner(inner)
                         .invalidate_generation(
                         generation,
                         "stale or mis-correlated process worker response",
                         true,
                     ) {
+                        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                        if !quiet_diagnostic {
+                            eprintln!(
+                                "could not retire mis-correlated process worker generation {generation}: {error:#}"
+                            );
+                        }
+                        #[cfg(not(all(
+                            windows,
+                            feature = "windows-gpu-capture-observation"
+                        )))]
                         eprintln!(
                             "could not retire mis-correlated process worker generation {generation}: {error:#}"
                         );
@@ -5793,6 +6080,10 @@ impl ProcessWorkerSupervisor {
         expected: &WorkerExpectation,
         capability: &WorkerCapability,
     ) -> Result<()> {
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+            diagnostic_probe.set_stage(GpuPackProbeStage::DeviceBinding);
+        }
         let mut state = self
             .inner
             .state
@@ -6195,6 +6486,14 @@ impl ProcessWorkerSupervisor {
         for waiter in failed {
             let _ = waiter.send(Err(reason.to_owned()));
         }
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+            process.wait_before(diagnostic_probe.cleanup_deadline)?;
+            diagnostic_probe.cleanup_confirmed();
+        } else {
+            reap_process(process, generation)?;
+        }
+        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
         reap_process(process, generation)?;
         // Invalidation, especially cancellation, must never wait for a pipe
         // writer that is blocked in an OS write. Killing the process releases
@@ -6823,6 +7122,38 @@ fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
     }
 }
 
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn retire_unpublished_diagnostic_worker(
+    worker: SpawnedWorker,
+    diagnostic_probe: &DiagnosticProbeState,
+) -> Result<()> {
+    let SpawnedWorker {
+        stdin,
+        stdout,
+        process,
+        ..
+    } = worker;
+    drop(stdin);
+    drop(stdout);
+    process.terminate()?;
+    process.wait_before(diagnostic_probe.cleanup_deadline)?;
+    diagnostic_probe.cleanup_confirmed();
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn await_diagnostic_launch_cleanup(
+    result: &Receiver<Result<SpawnedWorker>>,
+    diagnostic_probe: &DiagnosticProbeState,
+) {
+    let Ok(remaining) = diagnostic_probe.cleanup_deadline.remaining() else {
+        return;
+    };
+    if let Ok(Ok(worker)) = result.recv_timeout(remaining) {
+        let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+    }
+}
+
 fn reap_process(process: Arc<dyn WorkerProcess>, generation: u64) -> Result<()> {
     // Termination, when needed, has already been initiated by the caller.
     // Waiting happens on a generation-local thread, so an indefinitely stalled
@@ -6859,12 +7190,26 @@ impl Drop for SupervisorInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .current
             .take()
-            && let Err(error) = current
+        {
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            if let Some(diagnostic_probe) = &self.diagnostic_probe {
+                if current.process.terminate().is_ok()
+                    && current
+                        .process
+                        .wait_before(diagnostic_probe.cleanup_deadline)
+                        .is_ok()
+                {
+                    diagnostic_probe.cleanup_confirmed();
+                }
+                return;
+            }
+            if let Err(error) = current
                 .process
                 .terminate()
                 .and_then(|()| current.process.wait())
-        {
-            eprintln!("process worker shutdown failed: {error:#}");
+            {
+                eprintln!("process worker shutdown failed: {error:#}");
+            }
         }
     }
 }
@@ -7045,6 +7390,28 @@ impl InferenceWorkerSupervisor {
             ),
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn for_diagnostic_pack_probe(
+        lease: Arc<VerifiedPackLease>,
+        cleanup_deadline: MonotonicDeadline,
+    ) -> (Self, Arc<DiagnosticProbeState>) {
+        let diagnostic_probe = DiagnosticProbeState::new(cleanup_deadline);
+        let launcher = Arc::new(OsWorkerLauncher::for_diagnostic_pack_probe(
+            lease,
+            Arc::clone(&diagnostic_probe),
+        ));
+        (
+            Self {
+                transport: ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+                    launcher,
+                    Arc::clone(&diagnostic_probe),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            diagnostic_probe,
+        )
     }
 
     #[cfg(test)]
@@ -8548,6 +8915,370 @@ fn discover_production_pack_launch_bindings(
         discovery.diagnostics,
         GPU_PROVIDER_DISCOVERY_BUDGET,
     )
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuPackProbeIssue {
+    UnsupportedPlatform,
+    CatalogUnavailable,
+    CatalogRejected,
+    EntryIncompatible,
+    PackRootRejected,
+    SignatureOrInventoryRejected,
+    CatalogInventoryMismatch,
+    SecurityEpochStateRejected,
+    DeviceRollbackAuthorityRejected,
+    ReleaseAuthorityRejected,
+    NotAutoQualified,
+    ProviderProbeRejected,
+    DriverVersionUnavailable,
+    PackLimitExceeded,
+    SharedBudgetExhausted,
+    DeviceIdentityRejected,
+    CleanupUnconfirmed,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct GpuPackProbeDiagnostic {
+    stage: GpuPackProbeStage,
+    issue: GpuPackProbeIssue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<&'static str>,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct AuthenticatedGpuProbeDevice {
+    backend: &'static str,
+    provider: String,
+    stable_device_identity: String,
+    driver_identity_sha256: String,
+    device_class: &'static str,
+    vendor: &'static str,
+    memory_total_bytes: u64,
+    memory_available_bytes: u64,
+    pack_id: String,
+    pack_version: String,
+    pack_digest: String,
+    pack_security_epoch: u64,
+    runtime_abi: u16,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ProductionGpuPackProbeReport {
+    schema_version: u8,
+    kind: &'static str,
+    unqualified: bool,
+    auto_eligible: bool,
+    pub(crate) probe_completed: bool,
+    pub(crate) cleanup_confirmed: bool,
+    pub(crate) authenticated_devices: Vec<AuthenticatedGpuProbeDevice>,
+    authenticated_device_count: usize,
+    authenticated_devices_truncated: bool,
+    diagnostics: Vec<GpuPackProbeDiagnostic>,
+    diagnostic_count: usize,
+    diagnostics_truncated: bool,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn probe_backend_name(backend: PackBackend) -> &'static str {
+    match backend {
+        PackBackend::Cuda => "cuda",
+        PackBackend::Vulkan => "vulkan",
+        PackBackend::Metal => "metal",
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn probe_issue(issue: crate::gpu_worker_pack::PackDiscoveryIssue) -> GpuPackProbeIssue {
+    use crate::gpu_worker_pack::PackDiscoveryIssue;
+
+    match issue {
+        PackDiscoveryIssue::UnsupportedPlatform => GpuPackProbeIssue::UnsupportedPlatform,
+        PackDiscoveryIssue::CatalogUnavailable => GpuPackProbeIssue::CatalogUnavailable,
+        PackDiscoveryIssue::CatalogRejected => GpuPackProbeIssue::CatalogRejected,
+        PackDiscoveryIssue::EntryIncompatible => GpuPackProbeIssue::EntryIncompatible,
+        PackDiscoveryIssue::PackRootRejected => GpuPackProbeIssue::PackRootRejected,
+        PackDiscoveryIssue::SignatureOrInventoryRejected => {
+            GpuPackProbeIssue::SignatureOrInventoryRejected
+        }
+        PackDiscoveryIssue::CatalogInventoryMismatch => GpuPackProbeIssue::CatalogInventoryMismatch,
+        PackDiscoveryIssue::SecurityEpochStateRejected => {
+            GpuPackProbeIssue::SecurityEpochStateRejected
+        }
+        PackDiscoveryIssue::DeviceRollbackAuthorityRejected => {
+            GpuPackProbeIssue::DeviceRollbackAuthorityRejected
+        }
+        PackDiscoveryIssue::ReleaseAuthorityRejected => GpuPackProbeIssue::ReleaseAuthorityRejected,
+        PackDiscoveryIssue::NotAutoQualified => GpuPackProbeIssue::NotAutoQualified,
+        PackDiscoveryIssue::ProviderProbeRejected => GpuPackProbeIssue::ProviderProbeRejected,
+        PackDiscoveryIssue::DriverVersionUnavailable => GpuPackProbeIssue::DriverVersionUnavailable,
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn probe_pack_diagnostic(
+    diagnostic: crate::gpu_worker_pack::PackDiscoveryDiagnostic,
+) -> GpuPackProbeDiagnostic {
+    let stage = if diagnostic.issue
+        == crate::gpu_worker_pack::PackDiscoveryIssue::DriverVersionUnavailable
+    {
+        GpuPackProbeStage::DriverIdentity
+    } else {
+        GpuPackProbeStage::PackCatalog
+    };
+    GpuPackProbeDiagnostic {
+        stage,
+        issue: probe_issue(diagnostic.issue),
+        pack_id: diagnostic.pack_id,
+        backend: diagnostic.backend.map(probe_backend_name),
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn canonical_probe_device_identity(identity: &str) -> bool {
+    fn canonical_hex(value: &str, bytes: usize) -> bool {
+        value.len() == bytes * 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    parse_native_pci_location(identity).is_some()
+        || identity
+            .strip_prefix("native:luid:")
+            .is_some_and(|value| canonical_hex(value, 8))
+        || identity
+            .strip_prefix("native:uuid:")
+            .is_some_and(|value| canonical_hex(value, 16))
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn project_probe_device(
+    binding: VerifiedPackLaunchBinding,
+) -> std::result::Result<AuthenticatedGpuProbeDevice, GpuPackProbeDiagnostic> {
+    let target = binding.backend_target();
+    let backend = match target.backend {
+        BackendKind::Cuda => "cuda",
+        BackendKind::Vulkan => "vulkan",
+        BackendKind::Metal => "metal",
+        BackendKind::Cpu => {
+            return Err(GpuPackProbeDiagnostic {
+                stage: GpuPackProbeStage::DeviceBinding,
+                issue: GpuPackProbeIssue::DeviceIdentityRejected,
+                pack_id: None,
+                backend: None,
+            });
+        }
+    };
+    let pack = target
+        .pack
+        .as_ref()
+        .expect("verified binding retains pack identity");
+    let diagnostic = |stage, issue| GpuPackProbeDiagnostic {
+        stage,
+        issue,
+        pack_id: Some(pack.pack_id.clone()),
+        backend: Some(backend),
+    };
+    if !canonical_probe_device_identity(target.device_id.as_str()) {
+        return Err(diagnostic(
+            GpuPackProbeStage::DeviceBinding,
+            GpuPackProbeIssue::DeviceIdentityRejected,
+        ));
+    }
+    let Some(driver) = target.driver_version.as_deref() else {
+        return Err(diagnostic(
+            GpuPackProbeStage::DriverIdentity,
+            GpuPackProbeIssue::DriverVersionUnavailable,
+        ));
+    };
+    let driver_identity_sha256 = format!("{:x}", Sha256::digest(driver.as_bytes()));
+    Ok(AuthenticatedGpuProbeDevice {
+        backend,
+        provider: target.provider_id.as_str().to_owned(),
+        stable_device_identity: target.device_id.as_str().to_owned(),
+        driver_identity_sha256,
+        device_class: match target.device_class {
+            DeviceClass::Cpu | DeviceClass::Accelerator => {
+                return Err(diagnostic(
+                    GpuPackProbeStage::DeviceBinding,
+                    GpuPackProbeIssue::DeviceIdentityRejected,
+                ));
+            }
+            DeviceClass::DiscreteGpu => "discrete_gpu",
+            DeviceClass::IntegratedGpu => "integrated_gpu",
+            DeviceClass::UnifiedGpu => "unified_gpu",
+            DeviceClass::Unknown => "unknown",
+        },
+        vendor: match target.vendor {
+            GpuVendor::Nvidia => "nvidia",
+            GpuVendor::Amd => "amd",
+            GpuVendor::Intel => "intel",
+            GpuVendor::Apple => "apple",
+            GpuVendor::Other => "other",
+            GpuVendor::Unknown => "unknown",
+        },
+        memory_total_bytes: target.memory_total_bytes,
+        memory_available_bytes: target.memory_available_bytes,
+        pack_id: pack.pack_id.clone(),
+        pack_version: pack.pack_version.clone(),
+        pack_digest: pack.pack_digest.clone(),
+        pack_security_epoch: pack.security_epoch,
+        runtime_abi: pack.runtime_abi,
+    })
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn enforce_gpu_probe_pack_limit<T>(items: &mut Vec<T>) -> bool {
+    let exceeded = items.len() > MAX_GPU_PROVIDER_PROBES;
+    items.truncate(MAX_GPU_PROVIDER_PROBES);
+    exceeded
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn bounded_probe_projection<T>(mut items: Vec<T>, limit: usize) -> (Vec<T>, usize, bool) {
+    let total = items.len();
+    let truncated = total > limit;
+    items.truncate(limit);
+    (items, total, truncated)
+}
+
+/// Authenticates installed production GPU packs and reports only bounded,
+/// privacy-safe worker Hello facts. Pack verification (including local epoch
+/// records) precedes the shared ten-second provider-launch/Hello budget.
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
+    let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+    let mut diagnostics = discovery
+        .diagnostics
+        .into_iter()
+        .map(probe_pack_diagnostic)
+        .collect::<Vec<_>>();
+    let provider_deadline =
+        MonotonicDeadline::after_for(GPU_PROVIDER_DISCOVERY_BUDGET, "GPU provider discovery")
+            .expect("constant provider discovery budget is valid");
+    let cleanup_deadline = MonotonicDeadline::after_for(
+        GPU_PROVIDER_DISCOVERY_BUDGET + GPU_PROVIDER_PROBE_CLEANUP_GRACE,
+        "GPU provider cleanup",
+    )
+    .expect("constant provider cleanup budget is valid");
+    let mut probe_completed = true;
+    let mut cleanup_confirmed = true;
+    let mut devices = Vec::new();
+    let mut probe_states = Vec::new();
+    let mut leases = discovery.leases;
+    if enforce_gpu_probe_pack_limit(&mut leases) {
+        probe_completed = false;
+        diagnostics.push(GpuPackProbeDiagnostic {
+            stage: GpuPackProbeStage::PackCatalog,
+            issue: GpuPackProbeIssue::PackLimitExceeded,
+            pack_id: None,
+            backend: None,
+        });
+    }
+
+    for lease in leases {
+        let pack_id = lease.verified_pack().pack_id.as_str().to_owned();
+        let backend = lease.verified_pack().backend;
+        if provider_deadline.remaining().is_err() {
+            probe_completed = false;
+            diagnostics.push(GpuPackProbeDiagnostic {
+                stage: GpuPackProbeStage::SharedBudget,
+                issue: GpuPackProbeIssue::SharedBudgetExhausted,
+                pack_id: Some(pack_id),
+                backend: Some(probe_backend_name(backend)),
+            });
+            continue;
+        }
+        let (supervisor, state) =
+            InferenceWorkerSupervisor::for_diagnostic_pack_probe(lease, cleanup_deadline);
+        let observed = supervisor.verified_pack_bindings_before(provider_deadline);
+        match observed {
+            Ok(bindings) => {
+                for binding in bindings {
+                    match project_probe_device(binding) {
+                        Ok(device) => devices.push(device),
+                        Err(diagnostic) => diagnostics.push(diagnostic),
+                    }
+                }
+            }
+            Err(_) => {
+                let (stage, issue) = if provider_deadline.remaining().is_err() {
+                    probe_completed = false;
+                    (
+                        GpuPackProbeStage::SharedBudget,
+                        GpuPackProbeIssue::SharedBudgetExhausted,
+                    )
+                } else {
+                    (state.stage(), GpuPackProbeIssue::ProviderProbeRejected)
+                };
+                diagnostics.push(GpuPackProbeDiagnostic {
+                    stage,
+                    issue,
+                    pack_id: Some(pack_id.clone()),
+                    backend: Some(probe_backend_name(backend)),
+                });
+            }
+        }
+        if supervisor.retire().is_err() || !state.is_cleanup_confirmed() {
+            cleanup_confirmed = false;
+            diagnostics.push(GpuPackProbeDiagnostic {
+                stage: GpuPackProbeStage::Cleanup,
+                issue: GpuPackProbeIssue::CleanupUnconfirmed,
+                pack_id: Some(pack_id),
+                backend: Some(probe_backend_name(backend)),
+            });
+        }
+        probe_states.push(state);
+    }
+    if probe_states
+        .iter()
+        .any(|state| !state.is_cleanup_confirmed())
+    {
+        cleanup_confirmed = false;
+    }
+
+    devices.sort_by(|left, right| {
+        (
+            left.backend,
+            left.pack_id.as_str(),
+            left.stable_device_identity.as_str(),
+        )
+            .cmp(&(
+                right.backend,
+                right.pack_id.as_str(),
+                right.stable_device_identity.as_str(),
+            ))
+    });
+    let (devices, authenticated_device_count, authenticated_devices_truncated) =
+        bounded_probe_projection(devices, MAX_GPU_PROBE_REPORT_DEVICES);
+    let (diagnostics, diagnostic_count, diagnostics_truncated) =
+        bounded_probe_projection(diagnostics, MAX_GPU_PROBE_REPORT_DIAGNOSTICS);
+    if authenticated_devices_truncated || diagnostics_truncated {
+        probe_completed = false;
+    }
+
+    ProductionGpuPackProbeReport {
+        schema_version: 1,
+        kind: "windows_gpu_pack_probe",
+        unqualified: true,
+        auto_eligible: false,
+        probe_completed,
+        cleanup_confirmed,
+        authenticated_devices: devices,
+        authenticated_device_count,
+        authenticated_devices_truncated,
+        diagnostics,
+        diagnostic_count,
+        diagnostics_truncated,
+    }
 }
 
 /// Filters immutable pack metadata before constructing a probe supervisor. A
@@ -12564,6 +13295,24 @@ mod tests {
         reaped: Option<TestSender<()>>,
     }
 
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    struct DiagnosticCleanupFailureProcess;
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl WorkerProcess for DiagnosticCleanupFailureProcess {
+        fn is_running(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn terminate(&self) -> Result<()> {
+            bail!("private fixture cleanup failure")
+        }
+
+        fn wait(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     impl WorkerProcess for TestProcess {
         fn is_running(&self) -> Result<bool> {
             Ok(self.running.load(Ordering::Acquire))
@@ -12731,6 +13480,7 @@ mod tests {
     enum TestMode {
         Normal,
         CapabilityMismatch(CapabilityMismatch),
+        MalformedHello,
         DelayedLaunch {
             started: TestSender<()>,
             release: TestReceiver<()>,
@@ -13052,6 +13802,21 @@ mod tests {
                 );
                 return;
             }
+            TestMode::MalformedHello => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Hello { .. }));
+                write_frame(
+                    &mut output,
+                    &Frame {
+                        kind: FrameKind::Control,
+                        session_id,
+                        request_id,
+                        body: b"{".to_vec(),
+                    },
+                )
+                .unwrap();
+                return;
+            }
             TestMode::BlockedHello { started } => {
                 let Ok(frame) = read_frame(&mut input) else {
                     return;
@@ -13070,6 +13835,7 @@ mod tests {
         match mode {
             TestMode::DelayedLaunch { .. }
             | TestMode::CapabilityMismatch(_)
+            | TestMode::MalformedHello
             | TestMode::BlockedHello { .. } => {
                 unreachable!("launch-only test mode reached a worker")
             }
@@ -14165,6 +14931,294 @@ mod tests {
         drop(bindings);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_projects_only_canonical_identity_and_hashed_driver() {
+        assert!(canonical_probe_device_identity("native:pci:0000:01:00.0"));
+        assert!(canonical_probe_device_identity("native:0000:01:00.0"));
+        assert!(canonical_probe_device_identity(
+            "native:luid:0102030405060708"
+        ));
+        assert!(canonical_probe_device_identity(
+            "native:uuid:00112233445566778899aabbccddeeff"
+        ));
+        assert!(!canonical_probe_device_identity(
+            "native:luid:c:/users/example/private"
+        ));
+        assert!(!canonical_probe_device_identity(
+            "native:uuid:00112233445566778899AABBCCDDEEFF"
+        ));
+
+        let root =
+            crate::gpu_worker_pack::manifest::test_support::temp_root("gpu-pack-probe-projection");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let context = PackLaunchContext::fixture(Arc::clone(&lease), None);
+        let capability = WorkerPackCapability {
+            expectation: pack_expectation(&lease),
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: "native:luid:0102030405060708".to_owned(),
+                process_index: 9,
+                display_name: "C:/Users/example/private GPU name".to_owned(),
+                driver_version: Some("C:/Users/example/private/driver.dll".to_owned()),
+                device_class: DeviceClass::DiscreteGpu,
+                vendor: GpuVendor::Nvidia,
+                memory_total_bytes: 8192,
+                memory_available_bytes: 4096,
+            }],
+        };
+        let binding = bind_pack_hello(&context, &capability).unwrap().remove(0);
+        let projected = project_probe_device(binding).unwrap();
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(json.contains("native:luid:0102030405060708"));
+        assert!(json.contains("driver_identity_sha256"));
+        assert!(!json.contains("C:/Users"));
+        assert!(!json.contains("private GPU name"));
+
+        let mut malicious = capability;
+        malicious.devices[0].stable_device_identity =
+            "native:luid:c:/users/example/private".to_owned();
+        let binding = bind_pack_hello(&context, &malicious).unwrap().remove(0);
+        assert_eq!(
+            project_probe_device(binding).unwrap_err().issue,
+            GpuPackProbeIssue::DeviceIdentityRejected
+        );
+        drop(context);
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_hung_hello_confirms_termination_without_replacement() {
+        let (hello_started_tx, hello_started_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::BlockedHello {
+                started: hello_started_tx,
+            }])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let cleanup_deadline =
+            MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap();
+        let diagnostic_probe = DiagnosticProbeState::new(cleanup_deadline);
+        diagnostic_probe.process_started();
+        let transport = ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+            launcher.clone(),
+            Arc::clone(&diagnostic_probe),
+        );
+        let provider_deadline =
+            MonotonicDeadline::after_for(Duration::from_millis(40), "provider probe").unwrap();
+
+        assert!(
+            transport
+                .ensure_generation_before(Some(provider_deadline), None)
+                .is_err()
+        );
+        hello_started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap();
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(transport.current_generation().unwrap(), None);
+        assert_eq!(
+            diagnostic_probe.stage(),
+            GpuPackProbeStage::HelloAuthentication
+        );
+        assert!(diagnostic_probe.is_cleanup_confirmed());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_late_unpublished_launch_uses_one_global_cleanup_deadline() {
+        let (launch_started_tx, launch_started_rx) = channel();
+        let (launch_release_tx, launch_release_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::DelayedLaunch {
+                started: launch_started_tx,
+                release: launch_release_rx,
+                then: Box::new(TestMode::Normal),
+            }])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let cleanup_deadline =
+            MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap();
+        let diagnostic_probe = DiagnosticProbeState::new(cleanup_deadline);
+        let transport = ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+            launcher.clone(),
+            Arc::clone(&diagnostic_probe),
+        );
+        let state = Arc::clone(&diagnostic_probe);
+        let release = std::thread::spawn(move || {
+            launch_started_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap();
+            state.process_started();
+            std::thread::sleep(Duration::from_millis(60));
+            launch_release_tx.send(()).unwrap();
+        });
+        let provider_deadline =
+            MonotonicDeadline::after_for(Duration::from_millis(20), "provider probe").unwrap();
+
+        assert!(
+            transport
+                .ensure_generation_before(Some(provider_deadline), None)
+                .is_err()
+        );
+        release.join().unwrap();
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(transport.current_generation().unwrap(), None);
+        assert!(diagnostic_probe.is_cleanup_confirmed());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_deadline_grace_retires_a_queued_successful_launch() {
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher =
+            TestLauncher::new([TestMode::Normal]).with_process_events(kill_started_tx, reaped_tx);
+        let worker = launcher.launch().unwrap();
+        let diagnostic_probe = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap(),
+        );
+        diagnostic_probe.process_started();
+        diagnostic_probe.launch_started();
+        diagnostic_probe.launch_finished();
+        let (result_tx, result_rx) = sync_channel(1);
+        result_tx.send(Ok(worker)).unwrap();
+
+        await_diagnostic_launch_cleanup(&result_rx, &diagnostic_probe);
+
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert!(diagnostic_probe.is_cleanup_confirmed());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_typed_failures_launch_once_and_confirm_cleanup() {
+        let launch_failure = Arc::new(TestLauncher::new([]));
+        let launch_state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap(),
+        );
+        let launch_transport = ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+            launch_failure.clone(),
+            Arc::clone(&launch_state),
+        );
+        let deadline =
+            MonotonicDeadline::after_for(Duration::from_millis(100), "provider probe").unwrap();
+        assert!(
+            launch_transport
+                .ensure_generation_before(Some(deadline), None)
+                .is_err()
+        );
+        assert_eq!(launch_state.stage(), GpuPackProbeStage::Launch);
+        assert!(launch_state.is_cleanup_confirmed());
+        assert_eq!(launch_failure.launches.load(Ordering::Acquire), 0);
+
+        for (mode, expected_stage) in [
+            (
+                TestMode::CapabilityMismatch(CapabilityMismatch::Challenge),
+                GpuPackProbeStage::HelloAuthentication,
+            ),
+            (
+                TestMode::MalformedHello,
+                GpuPackProbeStage::HelloAuthentication,
+            ),
+            (TestMode::Normal, GpuPackProbeStage::DeviceBinding),
+        ] {
+            let (kill_started_tx, kill_started_rx) = channel();
+            let (reaped_tx, reaped_rx) = channel();
+            let launcher =
+                Arc::new(TestLauncher::new([mode]).with_process_events(kill_started_tx, reaped_tx));
+            let state = DiagnosticProbeState::new(
+                MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap(),
+            );
+            state.process_started();
+            let supervisor = InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+                    launcher.clone(),
+                    Arc::clone(&state),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            };
+            let deadline =
+                MonotonicDeadline::after_for(Duration::from_millis(100), "provider probe").unwrap();
+            assert!(supervisor.verified_pack_bindings_before(deadline).is_err());
+            let _ = supervisor.retire();
+            kill_started_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap();
+            reaped_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+            assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+            assert_eq!(state.stage(), expected_stage);
+            assert!(state.is_cleanup_confirmed());
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_cleanup_failure_and_all_projection_caps_fail_closed() {
+        let cleanup_state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap(),
+        );
+        cleanup_state.process_started();
+        let worker = SpawnedWorker {
+            stdin: Box::new(Cursor::new(Vec::<u8>::new())),
+            stdout: Box::new(Cursor::new(Vec::<u8>::new())),
+            process: Arc::new(DiagnosticCleanupFailureProcess),
+            expectation: expected_worker(WorkerRole::Inference),
+            pack_launch: None,
+        };
+        assert!(retire_unpublished_diagnostic_worker(worker, &cleanup_state).is_err());
+        assert!(!cleanup_state.is_cleanup_confirmed());
+
+        let early_parent_setup_failure = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_millis(500), "probe cleanup").unwrap(),
+        );
+        early_parent_setup_failure.process_started();
+        assert!(
+            !early_parent_setup_failure.is_cleanup_confirmed(),
+            "post-spawn parent setup failure must remain fail-closed until a reaper confirms cleanup"
+        );
+
+        let mut packs = (0..=MAX_GPU_PROVIDER_PROBES).collect::<Vec<_>>();
+        assert!(enforce_gpu_probe_pack_limit(&mut packs));
+        assert_eq!(packs.len(), MAX_GPU_PROVIDER_PROBES);
+        let mut exact = (0..MAX_GPU_PROVIDER_PROBES).collect::<Vec<_>>();
+        assert!(!enforce_gpu_probe_pack_limit(&mut exact));
+        assert_eq!(exact.len(), MAX_GPU_PROVIDER_PROBES);
+
+        let (devices, device_count, devices_truncated) = bounded_probe_projection(
+            (0..=MAX_GPU_PROBE_REPORT_DEVICES).collect(),
+            MAX_GPU_PROBE_REPORT_DEVICES,
+        );
+        assert_eq!(device_count, MAX_GPU_PROBE_REPORT_DEVICES + 1);
+        assert_eq!(devices.len(), MAX_GPU_PROBE_REPORT_DEVICES);
+        assert!(devices_truncated);
+        let (diagnostics, diagnostic_count, diagnostics_truncated) = bounded_probe_projection(
+            (0..=MAX_GPU_PROBE_REPORT_DIAGNOSTICS).collect(),
+            MAX_GPU_PROBE_REPORT_DIAGNOSTICS,
+        );
+        assert_eq!(diagnostic_count, MAX_GPU_PROBE_REPORT_DIAGNOSTICS + 1);
+        assert_eq!(diagnostics.len(), MAX_GPU_PROBE_REPORT_DIAGNOSTICS);
+        assert!(diagnostics_truncated);
     }
 
     #[test]

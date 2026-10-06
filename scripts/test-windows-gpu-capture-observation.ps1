@@ -172,12 +172,13 @@ try {
     # both production checks above free of test-only UI features. Neither lint
     # configuration enables an inference provider in the desktop process.
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', 'ui-harness', '--', '-D', 'warnings')
-    Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--bin', 'local-transcriber', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
+    Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',
+            'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
             'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
-            'architecture_guard::windows_gpu_capture')) {
+            'architecture_guard::windows_gpu_capture', 'architecture_guard::windows_gpu_probe')) {
         Invoke-CaptureTests $feature $filter
     }
     if ($GpuProviderCheck -ne 'None') {

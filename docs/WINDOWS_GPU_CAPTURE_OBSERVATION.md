@@ -34,6 +34,38 @@ Observation-only raw-frame buffers, retained handshake state, duplicated
 process handles and lease APIs are compiled out of ordinary builds. The
 existing IPC frame format and protocol version are unchanged.
 
+## Production-trust pack probe
+
+Collector builds also expose a narrower, probe-only command:
+
+```text
+--scribe-windows-gpu-pack-probe --ack-local-security-records
+```
+
+Those are the only accepted arguments. The acknowledgement is required because
+ordinary production pack discovery may create or update Scribe's local GPU
+security-epoch record and lock file. The command accepts no pack root, worker
+path, trust key, device selector, model, audio, output path or timeout override.
+It runs before every other private command dispatcher, so combining it with an
+installer smoke, verifier, capture or benchmark mode is rejected before that
+other mode can initialize.
+
+The probe reuses production catalog/signature/inventory/epoch verification,
+canonical worker launch and challenge-bound Hello/device binding. It issues no
+model, audio, health or inference command and does not enter the normal worker
+registry. Its stdout is one bounded JSON document containing only categorical
+stages and authenticated, schema-approved device facts. Device display names,
+volatile process indexes, raw Hello frames, native errors and worker stderr are
+excluded; driver identity is represented by a SHA-256 rather than raw text.
+
+The existing ten-second provider-discovery budget is shared by all accepted
+pack launches and Hello exchanges. Catalog hashing, signature verification and
+OS security-record locking happen before that provider budget and are not
+claimed to fit inside it. Started and late unpublished workers share a further
+two-second cleanup grace. Missing usable bindings or unconfirmed cleanup makes
+the command fail. A report is always unqualified and never Auto-eligible; it is
+not inference, performance or release evidence.
+
 Only validated Hello/Ready wire frames may be retained, bound to their actual
 worker generation. Capturing arbitrary IPC would expose audio, model paths or
 transcripts. Do not retain PCM, transcription responses, native stderr, user
@@ -391,9 +423,10 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and six test groups: collector, native telemetry, paired campaigns,
-supervisor observation controls/leases, provider-memory snapshots and architecture
-guards.
+discovery and nine test groups: collector, native telemetry, paired campaigns,
+strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
+observation controls/leases, provider-memory snapshots, capture architecture
+guards and probe architecture guards.
 `-ScriptOnly` provides the fast inner-loop check: script parsing and
 nineteen prelaunch argument/file-rejection cases without invoking any
 executable. The three tiny owned fixture files are removed after use.
@@ -408,8 +441,9 @@ PowerShell bound-parameter dictionary, not just a Hashtable substitute, and
 launch no collector.
 It does not replace the full command above.
 Both strict lint configurations include `ui-harness`, matching the existing
-release checks' shared UI-route coverage; one excludes the observer and one
-includes it. The production checks do not enable `ui-harness`, and no check in
+release checks' shared UI-route coverage; one excludes the observer and the
+observer configuration lints all targets so probe test helpers cannot escape
+the gate. The production checks do not enable `ui-harness`, and no check in
 this command enables a GPU inference provider by default.
 
 For a provider-enabled worker check, use the same command with

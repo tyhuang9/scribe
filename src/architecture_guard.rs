@@ -845,6 +845,95 @@ fn windows_gpu_capture_stays_opt_in_and_out_of_release_builds() {
     ));
 }
 
+#[test]
+fn windows_gpu_probe_stays_early_opt_in_and_probe_only() {
+    let main = production_source(include_str!("main.rs"));
+    assert!(main.contains(
+        "#[cfg(all(windows, feature = \"windows-gpu-capture-observation\"))]\nmod windows_gpu_probe;"
+    ));
+    let probe = main
+        .find("windows_gpu_probe::maybe_run_local_command()")
+        .expect("GPU pack probe remains an explicit optional entry point");
+    for later in [
+        "gpu_worker_pack::maybe_run_pack_verifier()",
+        "onnx_worker::maybe_run_vad_worker()",
+        "transcription::maybe_run_installation_smoke_helper()",
+        "windows_gpu_capture::maybe_run_local_command()",
+        "benchmark::maybe_run_local_command()",
+        "support_assets::materialize_bundled_support_assets()",
+    ] {
+        assert!(
+            probe
+                < main
+                    .find(later)
+                    .expect("expected later private/startup mode"),
+            "GPU pack probe must reject combined modes before {later} can run"
+        );
+    }
+
+    let command = production_source(include_str!("windows_gpu_probe.rs"));
+    for required in [
+        "--scribe-windows-gpu-pack-probe",
+        "--ack-local-security-records",
+        "run_production_gpu_pack_probe()",
+        "MAX_REPORT_BYTES",
+    ] {
+        assert!(
+            command.contains(required),
+            "GPU pack probe must retain boundary {required:?}"
+        );
+    }
+    for forbidden in [
+        "--model",
+        "--wav",
+        "--output",
+        "--gpu-device",
+        "--pack-root",
+        "--trust",
+        "--timeout",
+        "RuntimeWorker",
+        "TranscriptionService",
+        "PreparedAudio",
+        "HealthCache",
+    ] {
+        assert!(
+            !command.contains(forbidden),
+            "GPU pack probe must not accept or construct {forbidden:?}"
+        );
+    }
+
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    for required in [
+        "GPU_PROVIDER_DISCOVERY_BUDGET",
+        "GPU_PROVIDER_PROBE_CLEANUP_GRACE",
+        "for_diagnostic_pack_probe",
+        "stderr(Stdio::null())",
+        "wait_before(diagnostic_probe.cleanup_deadline)",
+        "driver_identity_sha256",
+        "authenticated_devices_truncated",
+        "diagnostics_truncated",
+    ] {
+        assert!(
+            worker.contains(required),
+            "GPU pack probe must retain bounded authenticated behavior {required:?}"
+        );
+    }
+    let spawned = worker
+        .find("let mut child = command.spawn()?")
+        .expect("diagnostic worker launch must remain explicit");
+    let started = worker[spawned..]
+        .find("diagnostic_probe.process_started()")
+        .map(|offset| spawned + offset)
+        .expect("diagnostic probe must mark a started child");
+    let bound = worker
+        .find("bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)")
+        .expect("worker process-tree binding must remain explicit");
+    assert!(
+        spawned < started && started < bound,
+        "diagnostic cleanup must become unconfirmed immediately after process creation"
+    );
+}
+
 const NATIVE_RUNTIME_OWNER_PATHS: [&str; 4] = [
     "embedded_runtime.rs",
     "inference_server.rs",
