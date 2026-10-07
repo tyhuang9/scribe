@@ -1262,6 +1262,17 @@ public static class FakeIscc {
         Assert-True ($acceptedVulkan.Report.runs[1].memory_availability.before.memory_total_bytes -ne $acceptedVulkan.Report.gpu_identity.memory_total_bytes) 'Vulkan derived heap total was incorrectly forced to match provider identity total'
         foreach ($run in $vulkanCampaign.runs | Where-Object { $_.target -ceq 'gpu' }) {
             foreach ($endpoint in @($run.memory_availability.before, $run.memory_availability.after)) {
+                $endpoint.source.heaps[0].flags = 3
+                $endpoint.source.heaps[1].flags = 2
+            }
+        }
+        Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
+        $acceptedSingleton = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+        Assert-Equal $acceptedSingleton.Report.runs[1].memory_availability.before.available_memory_bytes 384 'Vulkan singleton discrete heap scope changed'
+        Assert-Equal $acceptedSingleton.Report.runs[1].memory_availability.before.source.heaps[0].flags 3 'Vulkan device-local multi-instance capability was lost'
+        Assert-Equal $acceptedSingleton.Report.runs[1].memory_availability.before.source.heaps[1].flags 2 'Vulkan nonlocal multi-instance capability was lost'
+        foreach ($run in $vulkanCampaign.runs | Where-Object { $_.target -ceq 'gpu' }) {
+            foreach ($endpoint in @($run.memory_availability.before, $run.memory_availability.after)) {
                 $endpoint.source.heap_selection = 'all_heaps_integrated'; $endpoint.memory_total_bytes = 1536; $endpoint.available_memory_bytes = 640
             }
         }
@@ -1271,7 +1282,8 @@ public static class FakeIscc {
         foreach ($case in @(
             @{ Change = { param($r) $r.runs[1].memory_availability.before.available_memory_bytes = 385 }; Expected = 'heap inventory is inconsistent' },
             @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].heap_index = 1 }; Expected = 'heap is noncanonical' },
-            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].flags = 3 }; Expected = 'heap is noncanonical' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].flags = 4 }; Expected = 'heap is noncanonical' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].flags = 2 }; Expected = 'heap inventory is inconsistent' },
             @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].budget_bytes = 1025 }; Expected = 'heap is noncanonical' },
             @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heap_selection = 'all_heaps_integrated' }; Expected = 'memory source is invalid' }
         )) {

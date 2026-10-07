@@ -622,7 +622,9 @@ function Assert-WindowsLocalFrozenCampaignMemoryAvailabilityEndpoint(
         $flags = Assert-WindowsLocalFrozenCampaignInteger $heap.flags 'Installed GPU observation campaign Vulkan heap flags'
         $budget = Assert-WindowsLocalFrozenCampaignInteger $heap.budget_bytes 'Installed GPU observation campaign Vulkan heap budget' -Positive
         $usage = Assert-WindowsLocalFrozenCampaignInteger $heap.usage_bytes 'Installed GPU observation campaign Vulkan heap usage'
-        if ($heapIndex -ne $index -or $flags -gt 3 -or ($flags -band 2) -ne 0 -or $budget -gt $size) {
+        # MULTI_INSTANCE is a heap capability, not evidence that the pinned
+        # singleton logical device allocates across physical devices.
+        if ($heapIndex -ne $index -or $flags -gt 3 -or $budget -gt $size) {
             throw 'Installed GPU observation campaign Vulkan heap is noncanonical.'
         }
         $include = $expectedSelection -ceq 'all_heaps_integrated' -or ($flags -band 1) -ne 0
