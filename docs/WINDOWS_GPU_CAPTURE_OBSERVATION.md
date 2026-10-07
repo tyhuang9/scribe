@@ -327,6 +327,9 @@ an independently trusted collector executable. `CollectorPath` and
 the inputs above. Keep the executable and its parent directories in a trusted,
 operator-controlled location. The wrapper's supplied digest does not establish
 build provenance or grant pack trust. It performs no build, download or signing.
+It explicitly waits for the GUI collector and checks that process's exit code,
+independently of PowerShell's `$LASTEXITCODE`. Its verified-executable read lock
+remains held until termination, and a failed capture's report is preserved.
 
 The schema-3 report kind is `windows_gpu_capture_observation`, with
 `unsigned:true`, `unqualified:true`, `auto_eligible:false` and
@@ -459,9 +462,15 @@ discovery and nine test groups: collector, native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, provider-memory snapshots, capture architecture
 guards and probe architecture guards.
-`-ScriptOnly` provides the fast inner-loop check: script parsing and
-nineteen prelaunch argument/file-rejection cases without invoking any
-executable. The three tiny owned fixture files are removed after use.
+`-ScriptOnly` provides the fast inner-loop check: script parsing, nineteen
+prelaunch argument/file-rejection cases, and four local GUI-process cases.
+The latter compile a tiny x64 GUI fixture using the Windows .NET Framework C#
+compiler (also required by the installer fixture tests). Event gates and bounded
+watchdogs exercise waiting, absent/stale exit status, nonzero exits, literal
+Unicode/metacharacter arguments, report preservation and executable-lock release.
+They do not run Scribe, models, GPU providers or Cargo and do not access the
+Scribe profile. Generated fixtures are removed on success; failure cleanup
+retention is reported without hiding the original assertion failure.
 Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo

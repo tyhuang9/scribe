@@ -158,7 +158,7 @@ try {
         Remove-Item -LiteralPath $fixtureRoot -ErrorAction Stop
     }
     if ($ScriptOnly) {
-        Write-Output 'Windows GPU capture observation script contracts passed (19 prelaunch cases); native checks not run.'
+        Write-Output 'Windows GPU capture observation script contracts passed (19 prelaunch cases plus GUI process fixtures); GPU/Cargo checks not run.'
         return
     }
 

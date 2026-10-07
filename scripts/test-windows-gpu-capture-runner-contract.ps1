@@ -197,3 +197,199 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
     }
 } -Definition $argumentBuilder[0].Extent.Text
 Write-Output 'Capture wrapper forwarding contracts passed (6 cases); no collector was launched.'
+
+# Exercise the full wrapper with a GUI executable, not a console mock. Named
+# events control completion, so no sleep or GPU/app/profile access is needed.
+$fixtureParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([char[]]@('\', '/'))
+$fixtureRoot = Join-Path $fixtureParent ('scribe-capture-gui-' + [guid]::NewGuid().ToString('N'))
+$fixtureSource = Join-Path $fixtureRoot 'collector.cs'
+$fixtureExe = Join-Path $fixtureRoot 'collector space Ω.exe'
+$fixtureHost = Join-Path $fixtureRoot 'collector-host.ps1'
+$savedFixtureExitCode = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+$hadFixtureExitCode = $null -ne $savedFixtureExitCode
+$originalFixtureExitCode = if ($hadFixtureExitCode) { $savedFixtureExitCode.Value } else { $null }
+$fixtureFailed = $false
+$null = New-Item -ItemType Directory -Path $fixtureRoot
+try {
+    [IO.File]::WriteAllText($fixtureSource, @'
+using System;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Threading;
+class CaptureFixture {
+  static int Main(string[] args) {
+    int outputIndex = Array.IndexOf(args, "--output");
+    if (outputIndex < 0 || outputIndex + 1 >= args.Length) return 90;
+    string output = args[outputIndex + 1];
+    string id = Path.GetFileNameWithoutExtension(output);
+    using (var started = EventWaitHandle.OpenExisting(@"Local\ScribeCaptureStarted-" + id))
+    using (var gate = EventWaitHandle.OpenExisting(@"Local\ScribeCaptureGate-" + id)) {
+      File.WriteAllLines(output, args);
+      File.WriteAllText(output + ".pid", Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture));
+      started.Set();
+      if (!gate.WaitOne(10000)) return 91;
+      return Int32.Parse(id.Split('_')[0], CultureInfo.InvariantCulture);
+    }
+  }
+}
+'@, [Text.UTF8Encoding]::new($false))
+    # A disposable host also releases PowerShell's native GUI-command handles
+    # when testing the old wrapper's early-return failure path.
+    [IO.File]::WriteAllText($fixtureHost, @'
+param([string]$Wrapper, [string]$OptionsPath, [int]$Previous)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$options = Get-Content -LiteralPath $OptionsPath -Raw | ConvertFrom-Json -AsHashtable
+if ($Previous -lt 0) { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+else { $global:LASTEXITCODE = $Previous }
+try { & $Wrapper @options; exit 0 }
+catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+'@, [Text.UTF8Encoding]::new($false))
+    $csharpCompiler = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if (-not (Test-Path -LiteralPath $csharpCompiler -PathType Leaf)) {
+        throw 'The Windows .NET Framework C# compiler is required for the GUI capture fixture.'
+    }
+    & $csharpCompiler '/nologo' '/target:winexe' '/platform:x64' "/out:$fixtureExe" $fixtureSource
+    if ($LASTEXITCODE -ne 0) { throw 'Could not compile the GUI capture fixture.' }
+    $fixtureBytes = [IO.File]::ReadAllBytes($fixtureExe)
+    $peOffset = [BitConverter]::ToInt32($fixtureBytes, 60)
+    if ([BitConverter]::ToUInt16($fixtureBytes, $peOffset + 4) -ne 0x8664 -or
+        [BitConverter]::ToUInt16($fixtureBytes, $peOffset + 92) -ne 2) {
+        throw 'Capture regression fixture must be a Windows x64 GUI executable.'
+    }
+    $fixtureHash = (Get-FileHash -LiteralPath $fixtureExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    foreach ($case in @(
+        @{ Exit = 0; Previous = -1 },
+        @{ Exit = 0; Previous = 42 },
+        @{ Exit = 23; Previous = 0 }
+    )) {
+        $id = "$($case.Exit)_$([guid]::NewGuid().ToString('N'))"
+        $output = Join-Path $fixtureRoot "$id.txt"
+        $started = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureStarted-$id")
+        $gate = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureGate-$id")
+        $hostProcess = [Diagnostics.Process]::new()
+        $hostStarted = $false
+        try {
+            $options = @{
+                CollectorPath = $fixtureExe; CollectorSha256 = $fixtureHash
+                ModelPath = (Join-Path $fixtureRoot "model Ω & '(one).gguf"); ModelSha256 = 'a' * 64
+                WavPath = (Join-Path $fixtureRoot 'audio;input.wav'); WavSha256 = 'b' * 64
+                GpuPackId = 'fixture-pack'; GpuBackend = 'vulkan'
+                GpuDevice = 'native:luid:0102030405060708'
+                OutputPath = $output; CampaignPower = 'battery'
+            }
+            $optionsPath = Join-Path $fixtureRoot "$id-options.json"
+            [IO.File]::WriteAllText($optionsPath, ($options | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+            $hostStartInfo = [Diagnostics.ProcessStartInfo]::new()
+            $hostStartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+            $hostStartInfo.UseShellExecute = $false
+            $hostStartInfo.CreateNoWindow = $true
+            $hostStartInfo.RedirectStandardOutput = $true
+            $hostStartInfo.RedirectStandardError = $true
+            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixtureHost,
+                '-Wrapper', $wrapper, '-OptionsPath', $optionsPath, '-Previous', [string]$case.Previous)) {
+                $hostStartInfo.ArgumentList.Add($argument)
+            }
+            $hostProcess.StartInfo = $hostStartInfo
+            $hostStarted = $hostProcess.Start()
+            if (-not $hostStarted) { throw 'Could not start the isolated capture fixture host.' }
+            $hostStdout = $hostProcess.StandardOutput.ReadToEndAsync()
+            $hostStderr = $hostProcess.StandardError.ReadToEndAsync()
+            if (-not $started.WaitOne(10000)) { throw 'GUI fixture did not signal startup.' }
+            if ($hostProcess.HasExited) { throw 'Capture wrapper returned while its GUI collector was still running.' }
+            $expectedArguments = @(& {
+                param($Definition, $Options)
+                . ([scriptblock]::Create($Definition))
+                Get-CaptureObservationArguments $Options
+            } $argumentBuilder[0].Extent.Text $options)
+            $actualArguments = @([IO.File]::ReadAllLines($output))
+            if ($actualArguments.Count -ne $expectedArguments.Count) { throw 'GUI collector argument count differs.' }
+            for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
+                if ($actualArguments[$index] -cne $expectedArguments[$index]) { throw 'GUI collector literal argument differs.' }
+            }
+            $null = $gate.Set()
+            if (-not $hostProcess.WaitForExit(15000)) { throw 'Capture wrapper did not observe GUI termination.' }
+            $expectedError = if ($case.Exit -eq 0) { '' } else {
+                'Capture observation failed; no qualification or release approval was produced.'
+            }
+            $expectedExit = if ($case.Exit -eq 0) { 0 } else { 1 }
+            if ($hostProcess.ExitCode -ne $expectedExit -or
+                $hostStdout.GetAwaiter().GetResult().Trim() -cne '' -or
+                $hostStderr.GetAwaiter().GetResult().Trim() -cne $expectedError) {
+                throw 'Capture wrapper ignored the GUI process exit status or used stale LASTEXITCODE.'
+            }
+            if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Capture wrapper removed the fixture report.' }
+            $exclusive = [IO.File]::Open($fixtureExe, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $exclusive.Dispose()
+        }
+        finally {
+            $null = $gate.Set()
+            if ($hostStarted -and -not $hostProcess.WaitForExit(15000)) {
+                $hostProcess.Kill($true)
+                if (-not $hostProcess.WaitForExit(10000)) { throw 'Owned capture fixture host did not terminate.' }
+            }
+            $hostProcess.Dispose()
+            if (Test-Path -LiteralPath "$output.pid" -PathType Leaf) {
+                $fixturePid = [int]([IO.File]::ReadAllText("$output.pid"))
+                $ownedProcess = Get-Process -Id $fixturePid -ErrorAction SilentlyContinue
+                if ($null -ne $ownedProcess) {
+                    try {
+                        if (-not $ownedProcess.WaitForExit(10000)) {
+                            if (-not [string]::Equals($ownedProcess.MainModule.FileName, $fixtureExe, [StringComparison]::OrdinalIgnoreCase)) {
+                                throw 'Refusing cleanup of a process outside the GUI fixture.'
+                            }
+                            $ownedProcess.Kill()
+                            if (-not $ownedProcess.WaitForExit(10000)) { throw 'Owned GUI fixture did not terminate.' }
+                        }
+                    }
+                    finally { $ownedProcess.Dispose() }
+                }
+            }
+            $gate.Dispose()
+            $started.Dispose()
+        }
+    }
+    # A valid digest does not make a malformed executable launchable. Startup
+    # failure must also release the read lock, without producing a report.
+    $invalidExe = Join-Path $fixtureRoot 'invalid.exe'
+    [IO.File]::WriteAllBytes($invalidExe, [byte[]]@(0, 1, 2, 3))
+    $options.CollectorPath = $invalidExe
+    $options.CollectorSha256 = (Get-FileHash -LiteralPath $invalidExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $options.OutputPath = Join-Path $fixtureRoot 'invalid-output.txt'
+    $failed = $false
+    try { & $wrapper @options }
+    catch { $failed = $true }
+    if (-not $failed) { throw 'Capture wrapper accepted a malformed executable.' }
+    if (Test-Path -LiteralPath $options.OutputPath) { throw 'Malformed executable produced a report.' }
+    $exclusive = [IO.File]::Open($invalidExe, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $exclusive.Dispose()
+}
+catch {
+    $fixtureFailed = $true
+    throw
+}
+finally {
+    if (-not $hadFixtureExitCode) { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    else { Set-Variable LASTEXITCODE -Scope Global -Value $originalFixtureExitCode }
+    # This exact test-owned directory contains only generated regular files.
+    if ([IO.Path]::GetFullPath($fixtureRoot) -cne $fixtureRoot -or
+        -not [string]::Equals((Split-Path -Parent $fixtureRoot), $fixtureParent, [StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Leaf $fixtureRoot) -cnotmatch '\Ascribe-capture-gui-[0-9a-f]{32}\z' -or
+        ((Get-Item -LiteralPath $fixtureRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Refusing GUI fixture cleanup outside the exact owned directory.'
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $fixtureRoot -Force)) {
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Refusing GUI fixture cleanup with unexpected directory/link content.'
+        }
+    }
+    try { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force }
+    catch {
+        if (-not $fixtureFailed) { throw }
+        # Preserve the original assertion failure if Windows still holds a
+        # generated image open. Report retention instead of masking that error.
+        Write-Warning "Failed GUI fixture cleanup; retained generated files at $fixtureRoot"
+    }
+}
+Write-Output 'Capture wrapper GUI process contracts passed (4 cases); local synthetic executable only, no GPU or Cargo process.'
