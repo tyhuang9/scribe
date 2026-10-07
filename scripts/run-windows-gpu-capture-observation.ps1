@@ -72,9 +72,22 @@ try {
     # Pass individual arguments, never a composed shell command. Rust owns the
     # actual input/output checks, observation lifetime and no-replace publication.
     $arguments = @(Get-CaptureObservationArguments $PSBoundParameters)
-    & $collectorPathFull @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Capture observation failed; no qualification or release approval was produced.'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $collectorPathFull
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in $arguments) { $startInfo.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw 'Could not start the capture observation collector.' }
+        # The collector is a GUI executable: the call operator need not wait or
+        # set LASTEXITCODE. Keep the verified executable locked until it exits.
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw 'Capture observation failed; no qualification or release approval was produced.'
+        }
     }
+    finally { $process.Dispose() }
 }
 finally { $collectorLock.Dispose() }
