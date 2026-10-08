@@ -20,12 +20,12 @@ already be listed in the fixed checked-in production authority.
 
 ## Bound review inputs
 
-A canonical schema-v3 plan fixes the exact evaluator, Windows worker toolchain,
-and Auto manifest SHA-256 digests. It also fixes exactly five cold and twenty warm
-CPU/GPU pairs per required power source, the inclusive 110 percent p95 boundary,
-the required scenario
-set, whether reviewers have established complete coverage of an Auto runtime
-bucket, and every required lane with a digest of its complete evidence object.
+A canonical schema-v3 or schema-v4 plan fixes the exact evaluator, Windows
+worker toolchain, and Auto manifest SHA-256 digests. It also fixes exactly five
+cold and twenty warm CPU/GPU pairs per required power source, the inclusive 110
+percent p95 boundary, the required scenario set, whether reviewers have
+established complete coverage of an Auto runtime bucket, and every required lane
+with a digest of its complete evidence object.
 The evidence document binds the exact plan digest. The plan also binds a
 256-bit nonzero campaign nonce, `p256:<sha256-of-SPKI-DER>` capture key ID, and
 the exact raw-frame/capture policy. A fixture plan alone may carry a fixture
@@ -41,6 +41,16 @@ retains its original AC-only shapes and rules, including the prohibition on
 completing integrated/unified runtime buckets. Plan and evidence versions must
 match. Supporting the old schema does not waive its exact evaluator digest or
 authorize rebinding historical evidence to a new evaluator.
+
+Schema v4 retains the full v3 installer, identity, signed-lane, inventory,
+scenario, SCIF-generation, challenge, and power-matrix boundaries while adding
+a new exact run-observation shape for final-installer qualification. It uses
+the same protocol-2/system-managed AC and battery acquisitions as v3, including
+the discrete-AC/shared-AC-and-battery matrix. It is not a relabeling adapter:
+schemas 2 and 3 retain their exact legacy threading and peak-memory shapes, and
+neither an old qualification bundle nor an unsigned observation report can be
+transformed into v4 evidence. A v4 campaign requires fresh authenticated
+acquisition and a plan with a new evaluator digest.
 
 Each lane binds:
 
@@ -106,6 +116,13 @@ fresh worker generations, provider discovery, and globally unique challenges.
 These observations are signed capture-envelope metadata: SCIF remains version 5,
 and its Hello/Ready frames do not themselves report host power.
 
+V4 uses the same signed AC/battery capture, session, pair, generation, and
+scenario bindings as v3. Its acquisition threading record instead requires
+`policy: "native_default"`, `requested_n_threads: 0`, a null
+`resolved_n_threads`, and the bound CPU/GPU affinity digests. This records the
+actual native-default request without inventing a resolved thread count from OS
+process threads.
+
 CUDA lanes require a bounded canonical `windows-display:` version. Vulkan
 lanes may use that Windows display form or the exact provider runtime identity
 `vulkan:<vendor-id>:<driver-id>:<driver-version>:<driver-uuid>`, with fixed
@@ -134,6 +151,18 @@ shared-host-memory telemetry and zero dedicated VRAM. Failed records remain in
 the report and prevent correctness and reliability equivalence; they are never
 dropped to improve a percentile.
 
+V4 identifies both the selected device observer and its GPU executions as
+`windows_local_non_local_segments`, replacing the legacy class-specific
+dedicated/shared memory-model labels. It records sampled worker private commit,
+a positive telemetry sample count, and explicit local and non-local Windows video
+memory segments. It also carries a typed raw provider-memory observation before
+and after the request. Those raw and segment observations are deliberately
+separate from the bounded numeric-or-null
+`available_device_memory_bytes_before/after` admission pair; none can be
+derived from, substituted for, or silently coerced into another. CPU runs use
+the canonical not-applicable observation and null admission pair. V4 rejects
+the legacy dedicated/shared peak aliases, and schemas 2/3 reject v4 fields.
+
 The projected minimum total memory equals the observed lane total; neither
 schema generalizes one device's result to a smaller adapter. For each power,
 the evaluator finds the lowest availability actually exercised by a successful
@@ -145,6 +174,16 @@ their own power. A lower plan-asserted common threshold is rejected. AC-only v3
 lanes use the AC exercised minimum. V2 retains its legacy minimum across AC
 runs and all successful GPU scenario observations; it still cannot complete an
 integrated/unified runtime bucket without battery performance.
+
+For v4, only the `before` values of complete numeric admission pairs on
+successful GPU **runs** contribute to the exercised floor. Scenario admission,
+raw provider readings, and local/non-local segment counters never contribute.
+If either admission value is null on any successful GPU run for a power, that
+power's available-memory floor and the common floor are null; the candidate
+projection is suppressed and the decision records a power-specific missing-
+admission reason. The evaluator does not compare the declared identity threshold
+to a null floor. This preserves scenarios' separate installer and lifecycle
+semantics without allowing them to repair an incomplete performance observation.
 
 The evaluator recomputes nearest-rank p50 and p95 using integers. The cold p95
 is rank 5 of 5; the warm p95 is rank 19 of 20. Both cold and warm pass only
@@ -190,6 +229,9 @@ matching power. Discrete battery scenarios continue to require CPU selection.
 Their success remains mandatory even though discrete lanes have no battery
 performance metrics. V3 reports an aggregate `checks.scenarios_passed` across
 all nine scenarios as well as the per-power performance checks.
+V4 keeps these scenario and installer bindings unchanged, including their
+separate scenario-memory input; it adopts only v3's power scoping, not scenario
+memory as a substitute for per-run admission evidence.
 Schema v2 collects its 5/20 performance pairs on AC only and therefore still
 rejects `runtime_bucket_complete: true` when any lane is integrated or unified.
 V3 supplies the missing evidence shape, not representative hardware coverage or
@@ -217,9 +259,9 @@ ordered required-lane identity matrix, while deliberately excluding final
 evidence digests to avoid a signature/plan cycle.
 
 The attestation record's `acquisition_batch_id` continues to denote the AC
-acquisition. In v3, the signed lane identity and payload additionally bind the
-battery acquisition, its batch, and every battery artifact; the attestation
-preimage and signature scheme do not change.
+acquisition. In schemas v3 and v4, the signed lane identity and payload
+additionally bind the battery acquisition, its batch, and every battery artifact;
+the attestation preimage and signature scheme do not change.
 
 The signing preimage is exactly:
 
