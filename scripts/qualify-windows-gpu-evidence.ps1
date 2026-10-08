@@ -7,6 +7,8 @@ param(
     [switch]$RequireEligible,
     [string]$ExpectedAuthorizationSha256,
     [string]$ExpectedCampaignNonce,
+    [string]$ReviewRecordPath,
+    [string]$ExpectedReviewSha256,
     [Nullable[Int64]]$FixtureNowUnixSeconds
 )
 
@@ -1167,10 +1169,14 @@ function Import-AutoManifest([byte[]]$Raw) {
     return ,([object[]]@($manifest.entries))
 }
 
-function Assert-Plan($Plan, [string]$RepositoryRoot) {
-    Assert-ExactKeys $Plan @('schema_version', 'kind', 'fixture_only', 'target_os', 'target_arch', 'cold_runs', 'warm_runs', 'maximum_gpu_p95_cpu_percent', 'runtime_bucket_complete', 'required_scenarios', 'contract_bindings', 'capture_contract', 'capture_authority', 'required_lanes') 'qualification plan'
+function Assert-Plan($Plan, [string]$RepositoryRoot, [bool]$MaintainerReviewed = $false) {
+    $planKeys = @('schema_version', 'kind', 'fixture_only', 'target_os', 'target_arch', 'cold_runs', 'warm_runs', 'maximum_gpu_p95_cpu_percent', 'runtime_bucket_complete', 'required_scenarios', 'contract_bindings', 'capture_contract', 'required_lanes')
+    if (-not $MaintainerReviewed) { $planKeys += 'capture_authority' }
+    Assert-ExactKeys $Plan $planKeys 'qualification plan'
     $schemaVersion = [int](Get-JsonInteger $Plan.schema_version 'qualification plan.schema_version' 2 4)
-    Assert-Condition ((Get-JsonString $Plan.kind 'qualification plan.kind') -ceq 'windows_gpu_release_qualification_plan') 'Qualification plan kind is unsupported.'
+    $expectedKind = if ($MaintainerReviewed) { 'windows_gpu_maintainer_review_qualification_plan' } else { 'windows_gpu_release_qualification_plan' }
+    Assert-Condition ((Get-JsonString $Plan.kind 'qualification plan.kind') -ceq $expectedKind) 'Qualification plan kind is unsupported.'
+    if ($MaintainerReviewed) { Assert-Condition ($schemaVersion -eq 4) 'Maintainer-reviewed qualification plans must use schema v4.' }
     $fixture = Get-JsonBoolean $Plan.fixture_only 'qualification plan.fixture_only'
     Assert-Condition ((Get-JsonString $Plan.target_os 'qualification plan.target_os') -ceq 'windows') 'Qualification plan must target Windows.'
     Assert-Condition ((Get-JsonString $Plan.target_arch 'qualification plan.target_arch') -ceq 'x86_64') 'Qualification plan must target x86_64.'
@@ -1196,15 +1202,18 @@ function Assert-Plan($Plan, [string]$RepositoryRoot) {
     if ($schemaVersion -ge 3) {
         Assert-Condition ((Get-JsonString $Plan.capture_contract.power_policy 'qualification plan.capture_contract.power_policy' 80) -ceq $V3PowerPolicy) 'Qualification capture power policy is unsupported.'
     }
-    $captureAuthorityKeys = if ($fixture) { @('campaign_nonce', 'capture_key_id', 'fixture_capture_public_key_spki_base64') } else { @('campaign_nonce', 'capture_key_id') }
-    Assert-ExactKeys $Plan.capture_authority $captureAuthorityKeys 'qualification plan.capture_authority'
-    $nonce = Get-Sha256Value $Plan.capture_authority.campaign_nonce 'qualification plan.capture_authority.campaign_nonce' $true
-    Assert-Condition ($nonce -cne $ZeroSha256) 'Qualification campaign nonce must be nonzero.'
-    $captureKeyId = Get-JsonString $Plan.capture_authority.capture_key_id 'qualification plan.capture_authority.capture_key_id' 69
-    Assert-Condition ($captureKeyId -cmatch '^p256:[0-9a-f]{64}$') 'Qualification capture key ID is invalid.'
-    if ($fixture) {
-        $fixtureKey = Import-P256PublicKey $Plan.capture_authority.fixture_capture_public_key_spki_base64 $captureKeyId 'fixture capture key'
-        $fixtureKey.Dispose()
+    $captureKeyId = $null
+    if (-not $MaintainerReviewed) {
+        $captureAuthorityKeys = if ($fixture) { @('campaign_nonce', 'capture_key_id', 'fixture_capture_public_key_spki_base64') } else { @('campaign_nonce', 'capture_key_id') }
+        Assert-ExactKeys $Plan.capture_authority $captureAuthorityKeys 'qualification plan.capture_authority'
+        $nonce = Get-Sha256Value $Plan.capture_authority.campaign_nonce 'qualification plan.capture_authority.campaign_nonce' $true
+        Assert-Condition ($nonce -cne $ZeroSha256) 'Qualification campaign nonce must be nonzero.'
+        $captureKeyId = Get-JsonString $Plan.capture_authority.capture_key_id 'qualification plan.capture_authority.capture_key_id' 69
+        Assert-Condition ($captureKeyId -cmatch '^p256:[0-9a-f]{64}$') 'Qualification capture key ID is invalid.'
+        if ($fixture) {
+            $fixtureKey = Import-P256PublicKey $Plan.capture_authority.fixture_capture_public_key_spki_base64 $captureKeyId 'fixture capture key'
+            $fixtureKey.Dispose()
+        }
     }
     Assert-ExactKeys $Plan.contract_bindings @($ContractPaths.Keys) 'qualification plan.contract_bindings'
     $contracts = [ordered]@{}
@@ -1252,9 +1261,12 @@ function Assert-PerformanceCaptureContract($CaptureContract, [string]$Label) {
     Assert-Condition ((Get-JsonString $CaptureContract.power_policy "$Label.power_policy" 80) -ceq $V3PowerPolicy) "$Label power policy is unsupported."
 }
 
-function Assert-PerformancePlan($Plan, [string]$RepositoryRoot) {
-    Assert-ExactKeys $Plan @('schema_version', 'kind', 'fixture_only', 'source', 'target_os', 'target_arch', 'cold_runs', 'warm_runs', 'maximum_gpu_p95_cpu_percent', 'contract_bindings', 'capture_contract', 'capture_authority', 'authorization', 'required_lanes') 'performance plan'
-    Assert-Condition ((Get-JsonInteger $Plan.schema_version 'performance plan.schema_version' 1 1) -eq 1 -and (Get-JsonString $Plan.kind 'performance plan.kind') -ceq 'windows_gpu_performance_candidate_plan') 'Performance plan contract is unsupported.'
+function Assert-PerformancePlan($Plan, [string]$RepositoryRoot, [bool]$MaintainerReviewed = $false) {
+    $planKeys = @('schema_version', 'kind', 'fixture_only', 'source', 'target_os', 'target_arch', 'cold_runs', 'warm_runs', 'maximum_gpu_p95_cpu_percent', 'contract_bindings', 'capture_contract', 'required_lanes')
+    if (-not $MaintainerReviewed) { $planKeys += @('capture_authority', 'authorization') }
+    Assert-ExactKeys $Plan $planKeys 'performance plan'
+    $expectedKind = if ($MaintainerReviewed) { 'windows_gpu_maintainer_review_performance_plan' } else { 'windows_gpu_performance_candidate_plan' }
+    Assert-Condition ((Get-JsonInteger $Plan.schema_version 'performance plan.schema_version' 1 1) -eq 1 -and (Get-JsonString $Plan.kind 'performance plan.kind') -ceq $expectedKind) 'Performance plan contract is unsupported.'
     $fixture = Get-JsonBoolean $Plan.fixture_only 'performance plan.fixture_only'
     Assert-ExactKeys $Plan.source @('repository', 'ref', 'revision', 'app_version') 'performance plan.source'
     Assert-Condition ((Get-JsonString $Plan.source.repository 'performance plan.source.repository' 64) -ceq 'tyhuang9/scribe' -and (Get-JsonString $Plan.source.ref 'performance plan.source.ref' 64) -ceq 'refs/heads/main') 'Performance plan source repository/ref is unsupported.'
@@ -1265,12 +1277,14 @@ function Assert-PerformancePlan($Plan, [string]$RepositoryRoot) {
     Assert-Condition ((Get-JsonString $Plan.target_os 'performance plan.target_os') -ceq 'windows' -and (Get-JsonString $Plan.target_arch 'performance plan.target_arch') -ceq 'x86_64') 'Performance plan target is unsupported.'
     Assert-Condition ((Get-JsonInteger $Plan.cold_runs 'performance plan.cold_runs') -eq 5 -and (Get-JsonInteger $Plan.warm_runs 'performance plan.warm_runs') -eq 20 -and (Get-JsonInteger $Plan.maximum_gpu_p95_cpu_percent 'performance plan.maximum_gpu_p95_cpu_percent') -eq 110) 'Performance plan run policy is unsupported.'
     Assert-PerformanceCaptureContract $Plan.capture_contract 'performance plan.capture_contract'
-    Assert-ExactKeys $Plan.capture_authority @('campaign_nonce', 'capture_key_id', 'capture_public_key_spki_base64') 'performance plan.capture_authority'
-    $nonce = Get-Sha256Value $Plan.capture_authority.campaign_nonce 'performance plan.capture_authority.campaign_nonce'
-    $captureKeyId = Get-JsonString $Plan.capture_authority.capture_key_id 'performance plan.capture_authority.capture_key_id' 69
-    Assert-Condition ($captureKeyId -cmatch '^p256:[0-9a-f]{64}$') 'Performance capture key ID is invalid.'
-    $captureKey = Import-P256PublicKey $Plan.capture_authority.capture_public_key_spki_base64 $captureKeyId 'performance capture key'
-    $captureKey.Dispose()
+    if (-not $MaintainerReviewed) {
+        Assert-ExactKeys $Plan.capture_authority @('campaign_nonce', 'capture_key_id', 'capture_public_key_spki_base64') 'performance plan.capture_authority'
+        $nonce = Get-Sha256Value $Plan.capture_authority.campaign_nonce 'performance plan.capture_authority.campaign_nonce'
+        $captureKeyId = Get-JsonString $Plan.capture_authority.capture_key_id 'performance plan.capture_authority.capture_key_id' 69
+        Assert-Condition ($captureKeyId -cmatch '^p256:[0-9a-f]{64}$') 'Performance capture key ID is invalid.'
+        $captureKey = Import-P256PublicKey $Plan.capture_authority.capture_public_key_spki_base64 $captureKeyId 'performance capture key'
+        $captureKey.Dispose()
+    }
     $performanceContractPaths = [ordered]@{
         base_auto_manifest_sha256 = 'runtime-manifests\gpu-auto-qualification-windows-x64.json'
         evaluator_sha256 = 'scripts\qualify-windows-gpu-evidence.ps1'
@@ -1308,6 +1322,33 @@ function Assert-PerformancePlan($Plan, [string]$RepositoryRoot) {
     return [pscustomobject]@{ Contracts = $contracts; Fixture = $fixture; Required = $required }
 }
 
+function Assert-MaintainerReviewRecord([string]$Path, [string]$ExpectedReview, [byte[]]$PlanRaw, [byte[]]$EvidenceRaw, $Plan, [bool]$Performance) {
+    $expectedReviewSha = Get-Sha256Value $ExpectedReview 'ExpectedReviewSha256'
+    $loaded = Import-CanonicalJson $Path 'Maintainer review record'
+    $reviewSha = Get-Sha256Bytes $loaded.Raw
+    Assert-Condition ($reviewSha -ceq $expectedReviewSha) 'Maintainer review record digest differs from ExpectedReviewSha256.'
+    $record = $loaded.Document
+    Assert-ExactKeys $record @('schema_version', 'kind', 'fixture_only', 'plan_sha256', 'evidence_sha256', 'source_revision', 'review_reference', 'ci_run_reference') 'Maintainer review record'
+    Assert-Condition ((Get-JsonInteger $record.schema_version 'Maintainer review record.schema_version' 1 1) -eq 1 -and (Get-JsonString $record.kind 'Maintainer review record.kind' 64) -ceq 'windows_gpu_maintainer_review') 'Maintainer review record contract is unsupported.'
+    Assert-Condition ((Get-JsonBoolean $record.fixture_only 'Maintainer review record.fixture_only') -eq [bool]$Plan.fixture_only) 'Maintainer review record fixture mode differs from the plan.'
+    Assert-Condition ((Get-Sha256Value $record.plan_sha256 'Maintainer review record.plan_sha256') -ceq (Get-Sha256Bytes $PlanRaw)) 'Maintainer review record plan_sha256 does not bind the exact plan bytes.'
+    Assert-Condition ((Get-Sha256Value $record.evidence_sha256 'Maintainer review record.evidence_sha256') -ceq (Get-Sha256Bytes $EvidenceRaw)) 'Maintainer review record evidence_sha256 does not bind the exact evidence bytes.'
+    $sourceRevision = Get-JsonString $record.source_revision 'Maintainer review record.source_revision' 40
+    Assert-Condition ($sourceRevision -cmatch '^[0-9a-f]{40}$' -and $sourceRevision -cne ('0' * 40)) 'Maintainer review record source_revision is invalid.'
+    $reviewReference = Get-JsonString $record.review_reference 'Maintainer review record.review_reference' 256
+    $ciRunReference = Get-JsonString $record.ci_run_reference 'Maintainer review record.ci_run_reference' 256
+    if ($Performance) {
+        Assert-Condition ($sourceRevision -ceq $Plan.source.revision) 'Maintainer review source_revision does not match the performance plan source.'
+    }
+    else {
+        foreach ($entry in @($Plan.required_lanes)) {
+            $appBuild = Get-JsonString $entry.identity.app_build_id 'Maintainer-reviewed final lane app_build_id' 160
+            Assert-Condition ($appBuild -cmatch '^local-transcriber@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?#([0-9a-f]{40})$' -and $Matches[1] -ceq $sourceRevision) 'Maintainer review source_revision does not match final qualification lane builds.'
+        }
+    }
+    return [pscustomobject]@{ CiRunReference = $ciRunReference; ReviewReference = $reviewReference; ReviewSha256 = $reviewSha; SourceRevision = $sourceRevision }
+}
+
 function Get-ArtifactRelativePath($Value, [string]$Label) {
     $raw = Get-JsonString $Value $Label 240
     Assert-Condition (-not $raw.StartsWith('/') -and -not $raw.Contains('\') -and -not $raw.Contains(':')) "$Label must be a relative canonical artifact path."
@@ -1333,6 +1374,30 @@ function Resolve-CapturePublicKey($Plan, [string]$PlanDigest, $Authority) {
     return Import-P256PublicKey $approval.capture_public_key_spki_base64 $approval.capture_key_id 'production capture key'
 }
 
+function Assert-SortedLaneInventory($Lane, [string]$Label, [bool]$IncludePathDetail = $false) {
+    Assert-Array $Lane.artifact_inventory "$Label.artifact_inventory"
+    [object[]]$inventory = @($Lane.artifact_inventory)
+    Assert-Condition ($inventory.Count -gt 0 -and $inventory.Count -le $MaxArtifacts) "$Label artifact inventory is empty or oversized."
+    $priorPath = ''
+    $inventoryDigests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $inventory) {
+        Assert-ExactKeys $entry @('artifact_path', 'artifact_sha256') "$Label artifact inventory entry"
+        $path = Get-ArtifactRelativePath $entry.artifact_path "$Label artifact inventory entry.artifact_path"
+        $sortMessage = if ($IncludePathDetail) { "$Label artifact inventory must be strictly stable-path-sorted and unique ($priorPath then $path)." } else { "$Label artifact inventory must be strictly stable-path-sorted and unique." }
+        Assert-Condition ([StringComparer]::Ordinal.Compare($path, $priorPath) -gt 0) $sortMessage
+        $priorPath = $path
+        Assert-Condition ($inventoryDigests.Add((Get-Sha256Value $entry.artifact_sha256 "$Label artifact inventory entry.artifact_sha256"))) "$Label artifact inventory reuses a digest."
+    }
+    return ,$inventory
+}
+
+function Assert-MaintainerReviewedLane($Lane, $ExpectedLane, [string[]]$ExpectedKeys, [string]$Label) {
+    Assert-ExactKeys $Lane $ExpectedKeys $Label
+    Assert-Condition ((Get-CanonicalDigest $Lane) -ceq $ExpectedLane.evidence_sha256) "$Label does not match its reviewed evidence digest."
+    Assert-Condition ([ScribeWindowsQualification.StrictJson]::Equal((Get-CanonicalBytesFromObject $Lane.identity), (Get-CanonicalBytesFromObject $ExpectedLane.identity))) "$Label identity does not match its reviewed plan."
+    return Assert-SortedLaneInventory $Lane $Label
+}
+
 function Assert-LaneAttestation($Lane, $Plan, $ExpectedLane, [string]$PlanDigest, $Authority, [string]$Label) {
     $laneKeys = @('identity', 'acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'scenarios', 'captures', 'artifact_inventory', 'attestation')
     if ($Plan.schema_version -ge 3) { $laneKeys += 'battery' }
@@ -1344,19 +1409,7 @@ function Assert-LaneAttestation($Lane, $Plan, $ExpectedLane, [string]$PlanDigest
     [byte[]]$signature = Get-CanonicalBase64 $Lane.attestation.signature_base64 "$Label.attestation.signature_base64" 64
     Assert-Condition ($signature.Length -eq 64) "$Label attestation must contain a 64-byte IEEE-P1363 signature."
 
-    Assert-Array $Lane.artifact_inventory "$Label.artifact_inventory"
-    [object[]]$inventory = @($Lane.artifact_inventory)
-    Assert-Condition ($inventory.Count -gt 0 -and $inventory.Count -le $MaxArtifacts) "$Label artifact inventory is empty or oversized."
-    $priorPath = ''
-    $inventoryDigests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($entry in $inventory) {
-        Assert-ExactKeys $entry @('artifact_path', 'artifact_sha256') "$Label artifact inventory entry"
-        $path = Get-ArtifactRelativePath $entry.artifact_path "$Label artifact inventory entry.artifact_path"
-        Assert-Condition ([StringComparer]::Ordinal.Compare($path, $priorPath) -gt 0) "$Label artifact inventory must be strictly stable-path-sorted and unique ($priorPath then $path)."
-        $priorPath = $path
-        $digest = Get-Sha256Value $entry.artifact_sha256 "$Label artifact inventory entry.artifact_sha256"
-        Assert-Condition ($inventoryDigests.Add($digest)) "$Label artifact inventory reuses a digest."
-    }
+    [object[]]$inventory = Assert-SortedLaneInventory $Lane $Label $true
 
     $unsignedLane = Get-UnsignedLane $Lane
     $lanePayloadDigest = Get-CanonicalDigest $unsignedLane
@@ -1395,17 +1448,7 @@ function Assert-PerformanceLaneAttestation($Lane, $Plan, $ExpectedLane, [string]
     Assert-Condition ((Get-JsonString $Lane.attestation.signature_scheme "$Label.attestation.signature_scheme" 64) -ceq 'ecdsa-p256-sha256-ieee-p1363') "$Label attestation signature scheme is unsupported."
     [byte[]]$signature = Get-CanonicalBase64 $Lane.attestation.signature_base64 "$Label.attestation.signature_base64" 64
     Assert-Condition ($signature.Length -eq 64) "$Label attestation must contain a 64-byte IEEE-P1363 signature."
-    Assert-Array $Lane.artifact_inventory "$Label.artifact_inventory"
-    [object[]]$inventory = @($Lane.artifact_inventory)
-    Assert-Condition ($inventory.Count -gt 0 -and $inventory.Count -le $MaxArtifacts) "$Label artifact inventory is empty or oversized."
-    $priorPath = ''; $inventoryDigests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($entry in $inventory) {
-        Assert-ExactKeys $entry @('artifact_path', 'artifact_sha256') "$Label artifact inventory entry"
-        $path = Get-ArtifactRelativePath $entry.artifact_path "$Label artifact inventory entry.artifact_path"
-        Assert-Condition ([StringComparer]::Ordinal.Compare($path, $priorPath) -gt 0) "$Label artifact inventory must be strictly stable-path-sorted and unique."
-        $priorPath = $path
-        Assert-Condition ($inventoryDigests.Add((Get-Sha256Value $entry.artifact_sha256 "$Label artifact inventory entry.artifact_sha256"))) "$Label artifact inventory reuses a digest."
-    }
+    [object[]]$inventory = Assert-SortedLaneInventory $Lane $Label
     $record = $Lane.attestation.record
     Assert-ExactKeys $record @('schema_version', 'kind', 'performance_contract_sha256', 'authorization_sha256', 'campaign_nonce', 'lane_id', 'acquisition_batch_id', 'lane_payload_sha256', 'artifact_inventory_sha256') "$Label.attestation.record"
     Assert-Condition ((Get-JsonInteger $record.schema_version "$Label.attestation.record.schema_version" 1 1) -eq 1 -and (Get-JsonString $record.kind "$Label.attestation.record.kind") -ceq 'windows_gpu_performance_lane_attestation') "$Label attestation record contract is unsupported."
@@ -2493,18 +2536,96 @@ function Get-Decision($Plan, [byte[]]$PlanRaw, $Evidence, [string]$RepositoryRoo
     }
 }
 
+function Get-MaintainerReviewedQualificationDecision($Plan, [byte[]]$PlanRaw, $Evidence, [byte[]]$EvidenceRaw, [string]$RepositoryRoot, [bool]$FixtureAllowed, [string]$ArtifactDirectory, [string]$ReviewPath, [string]$ExpectedReview) {
+    $validatedPlan = Assert-Plan $Plan $RepositoryRoot $true
+    $null = Import-AutoManifest $validatedPlan.Contracts.auto_manifest_sha256
+    $review = Assert-MaintainerReviewRecord $ReviewPath $ExpectedReview $PlanRaw $EvidenceRaw $Plan $false
+    if (-not $Plan.fixture_only) { Assert-ProductionSourceCheckout $RepositoryRoot $review.SourceRevision }
+    Assert-ExactKeys $Evidence @('schema_version', 'kind', 'fixture_only', 'plan_sha256', 'lanes') 'maintainer qualification evidence'
+    Assert-Condition ((Get-JsonInteger $Evidence.schema_version 'maintainer qualification evidence.schema_version' 4 4) -eq 4 -and (Get-JsonString $Evidence.kind 'maintainer qualification evidence.kind') -ceq 'windows_gpu_maintainer_review_qualification_evidence') 'Maintainer qualification evidence contract is unsupported.'
+    $fixture = Get-JsonBoolean $Evidence.fixture_only 'maintainer qualification evidence.fixture_only'
+    Assert-Condition ($fixture -eq $Plan.fixture_only) 'Maintainer qualification plan and evidence fixture modes differ.'
+    Assert-Condition (-not $fixture -or $FixtureAllowed) 'Fixture-only maintainer qualification evidence requires -AllowFixture.'
+    $planDigest = Get-Sha256Bytes $PlanRaw
+    Assert-Condition ((Get-Sha256Value $Evidence.plan_sha256 'maintainer qualification evidence.plan_sha256') -ceq $planDigest) 'Maintainer qualification evidence does not bind the exact reviewed plan.'
+    Assert-Array $Evidence.lanes 'maintainer qualification evidence.lanes'; [object[]]$lanes = @($Evidence.lanes)
+    Assert-Condition ($lanes.Count -le $MaxLanes -and $lanes.Count -eq $validatedPlan.Required.Count) 'Maintainer qualification evidence does not exactly cover the reviewed lanes.'
+    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty maintainer qualification evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) } catch { Fail "Maintainer qualification artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
+    $context = [pscustomobject]@{ Root = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { '' } else { [IO.Path]::GetFullPath($ArtifactDirectory) }; Paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Count = 0; Bytes = [UInt64]0; Inventory = $null; Used = $null }
+    $generationCaptures = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $captureGenerations = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $challenges = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $validatedCaptures = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $summaries = [Collections.Generic.List[object]]::new()
+    $laneKeys = @('identity', 'acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'scenarios', 'captures', 'battery', 'artifact_inventory')
+    for ($index = 0; $index -lt $lanes.Count; $index++) {
+        [object[]]$inventory = Assert-MaintainerReviewedLane $lanes[$index] $validatedPlan.Required[$index] $laneKeys "maintainer evidence lane $index"
+        Read-LaneInventory $context $inventory "maintainer evidence lane $index"
+        $summaries.Add((Assert-LaneEvidence $lanes[$index] $validatedPlan.Required[$index] $Plan $index $context $generationCaptures $captureGenerations $challenges $validatedCaptures))
+    }
+    $summaryArray = $summaries.ToArray(); $complete = $validatedPlan.Required.Count -gt 0 -and $summaryArray.Count -eq $validatedPlan.Required.Count
+    $mixedCoverage = $complete -and @($lanes | Where-Object { $_.identity.acquisition.device_set.mixed_gpu }).Count -gt 0
+    $passed = $complete -and $mixedCoverage -and @($summaryArray | Where-Object { -not $_.qualification_passed }).Count -eq 0
+    $reason = if ($fixture) { 'fixture_only_human_reviewed_not_authenticated' } elseif (-not $complete) { 'no_complete_representative_evidence' } elseif (-not $mixedCoverage) { 'mixed_gpu_coverage_missing' } elseif (-not $passed) { 'one_or_more_representative_lanes_failed' } else { 'human_reviewed_not_authenticated' }
+    return [ordered]@{ schema_version = 4; kind = 'windows_gpu_maintainer_review_qualification_decision'; artifact_bytes = [Int64]$context.Bytes; artifact_count = $context.Count; auto_eligible = $false; release_approved = $false; decision_reason = $reason; evidence_complete = $complete; evidence_sha256 = Get-Sha256Bytes $EvidenceRaw; evidence_trust = 'human-reviewed-not-authenticated'; fixture_only = $fixture; lanes = $summaryArray; mixed_gpu_coverage = $mixedCoverage; plan_sha256 = $planDigest; qualification_passed = $passed; review_reference = $review.ReviewReference; review_sha256 = $review.ReviewSha256; ci_run_reference = $review.CiRunReference; source_revision = $review.SourceRevision }
+}
+
+function Get-MaintainerReviewedPerformanceDecision($Plan, [byte[]]$PlanRaw, $Evidence, [byte[]]$EvidenceRaw, [string]$RepositoryRoot, [bool]$FixtureAllowed, [string]$ArtifactDirectory, [string]$ReviewPath, [string]$ExpectedReview) {
+    $validatedPlan = Assert-PerformancePlan $Plan $RepositoryRoot $true
+    $review = Assert-MaintainerReviewRecord $ReviewPath $ExpectedReview $PlanRaw $EvidenceRaw $Plan $true
+    if (-not $Plan.fixture_only) { Assert-ProductionSourceCheckout $RepositoryRoot $review.SourceRevision }
+    Assert-ExactKeys $Evidence @('schema_version', 'kind', 'fixture_only', 'plan_sha256', 'lanes') 'maintainer performance evidence'
+    Assert-Condition ((Get-JsonInteger $Evidence.schema_version 'maintainer performance evidence.schema_version' 1 1) -eq 1 -and (Get-JsonString $Evidence.kind 'maintainer performance evidence.kind') -ceq 'windows_gpu_maintainer_review_performance_evidence') 'Maintainer performance evidence contract is unsupported.'
+    $fixture = Get-JsonBoolean $Evidence.fixture_only 'maintainer performance evidence.fixture_only'
+    Assert-Condition ($fixture -eq $Plan.fixture_only) 'Maintainer performance plan and evidence fixture modes differ.'
+    Assert-Condition (-not $fixture -or $FixtureAllowed) 'Fixture-only maintainer performance evidence requires -AllowFixture.'
+    $planDigest = Get-Sha256Bytes $PlanRaw
+    Assert-Condition ((Get-Sha256Value $Evidence.plan_sha256 'maintainer performance evidence.plan_sha256') -ceq $planDigest) 'Maintainer performance evidence does not bind the exact reviewed plan.'
+    Assert-Array $Evidence.lanes 'maintainer performance evidence.lanes'; [object[]]$lanes = @($Evidence.lanes)
+    Assert-Condition ($lanes.Count -le $MaxLanes -and $lanes.Count -eq $validatedPlan.Required.Count) 'Maintainer performance evidence does not exactly cover the reviewed lanes.'
+    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty maintainer performance evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) } catch { Fail "Maintainer performance artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
+    $context = [pscustomobject]@{ Root = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { '' } else { [IO.Path]::GetFullPath($ArtifactDirectory) }; Paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Count = 0; Bytes = [UInt64]0; Inventory = $null; Used = $null }
+    $generationCaptures = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $captureGenerations = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $challenges = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $validatedCaptures = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $summaries = [Collections.Generic.List[object]]::new()
+    $laneKeys = @('identity', 'acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'captures', 'battery', 'artifact_inventory')
+    for ($index = 0; $index -lt $lanes.Count; $index++) {
+        [object[]]$inventory = Assert-MaintainerReviewedLane $lanes[$index] $validatedPlan.Required[$index] $laneKeys "maintainer performance evidence lane $index"
+        Read-LaneInventory $context $inventory "maintainer performance evidence lane $index"
+        $summaries.Add((Assert-PerformanceLaneEvidence $lanes[$index] $validatedPlan.Required[$index] $Plan $index $context $generationCaptures $captureGenerations $challenges $validatedCaptures))
+    }
+    $summaryArray = $summaries.ToArray(); $complete = $validatedPlan.Required.Count -gt 0 -and $summaryArray.Count -eq $validatedPlan.Required.Count
+    $passed = $complete -and @($summaryArray | Where-Object { -not $_.performance_passed }).Count -eq 0
+    [object[]]$entries = @($summaryArray | Where-Object { $null -ne $_.candidate_entry } | ForEach-Object { $_.candidate_entry })
+    $coverage = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $entries) { $match = [ordered]@{ pack = $entry.pack; model_digest = $entry.model_digest; backend = $entry.backend; provider_id = $entry.provider_id; vendor = $entry.vendor; device_class = $entry.device_class; driver = $entry.driver }; Assert-Condition ($coverage.Add((Get-CanonicalDigest $match))) 'Maintainer performance candidate has duplicate or ambiguous runtime coverage.' }
+    $candidate = if ($passed -and $entries.Count -eq $validatedPlan.Required.Count) { Get-RuntimeAutoCandidate $entries } else { $null }
+    $reason = if (-not $complete) { 'incomplete_performance_evidence' } elseif (-not $passed) { 'performance_evidence_failed' } elseif ($fixture) { 'fixture_human_reviewed_not_authenticated' } else { 'human_reviewed_not_authenticated' }
+    return [ordered]@{ schema_version = 1; kind = 'windows_gpu_maintainer_review_performance_decision'; artifact_bytes = [Int64]$context.Bytes; artifact_count = $context.Count; source_revision = $Plan.source.revision; plan_sha256 = $planDigest; evidence_sha256 = Get-Sha256Bytes $EvidenceRaw; fixture_only = $fixture; evidence_complete = $complete; performance_passed = $passed; lanes = $summaryArray; candidate_policy = if ($null -eq $candidate) { $null } else { $candidate.Text }; candidate_policy_sha256 = if ($null -eq $candidate) { $null } else { $candidate.Sha256 }; auto_eligible = $false; release_approved = $false; decision_reason = $reason; evidence_trust = 'human-reviewed-not-authenticated'; review_reference = $review.ReviewReference; review_sha256 = $review.ReviewSha256; ci_run_reference = $review.CiRunReference }
+}
+
 $repositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 try {
     $loadedPlan = Import-CanonicalJson $PlanPath 'qualification plan'
     $loadedEvidence = Import-CanonicalJson $EvidencePath 'qualification evidence'
-    if ($loadedPlan.Document.kind -ceq 'windows_gpu_performance_candidate_plan') {
+    $reviewPathProvided = $PSBoundParameters.ContainsKey('ReviewRecordPath')
+    $reviewShaProvided = $PSBoundParameters.ContainsKey('ExpectedReviewSha256')
+    $maintainerQualification = $loadedPlan.Document.kind -ceq 'windows_gpu_maintainer_review_qualification_plan'
+    $maintainerPerformance = $loadedPlan.Document.kind -ceq 'windows_gpu_maintainer_review_performance_plan'
+    if ($maintainerQualification -or $maintainerPerformance) {
+        Assert-Condition ($reviewPathProvided -and $reviewShaProvided -and -not [string]::IsNullOrWhiteSpace($ReviewRecordPath) -and -not [string]::IsNullOrWhiteSpace($ExpectedReviewSha256)) 'Maintainer-reviewed plans require -ReviewRecordPath and -ExpectedReviewSha256 together.'
+        Assert-Condition (-not $PSBoundParameters.ContainsKey('ExpectedAuthorizationSha256') -and -not $PSBoundParameters.ContainsKey('ExpectedCampaignNonce') -and -not $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds')) 'Authorization and fixture-clock arguments are not accepted for maintainer-reviewed plans.'
+        if ($maintainerPerformance) {
+            $decision = Get-MaintainerReviewedPerformanceDecision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $loadedEvidence.Raw $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot $ReviewRecordPath $ExpectedReviewSha256
+        }
+        else {
+            $decision = Get-MaintainerReviewedQualificationDecision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $loadedEvidence.Raw $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot $ReviewRecordPath $ExpectedReviewSha256
+        }
+    }
+    elseif ($loadedPlan.Document.kind -ceq 'windows_gpu_performance_candidate_plan') {
+        Assert-Condition (-not $reviewPathProvided -and -not $reviewShaProvided) 'Maintainer review arguments are not accepted for legacy plans.'
         $decision = Get-PerformanceDecision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot $ExpectedAuthorizationSha256 $ExpectedCampaignNonce $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds') $FixtureNowUnixSeconds
     }
     else {
+        Assert-Condition (-not $reviewPathProvided -and -not $reviewShaProvided) 'Maintainer review arguments are not accepted for legacy plans.'
         Assert-Condition (-not $PSBoundParameters.ContainsKey('ExpectedAuthorizationSha256') -and -not $PSBoundParameters.ContainsKey('ExpectedCampaignNonce') -and -not $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds')) 'Performance-only arguments are not accepted for legacy qualification plans.'
         $decision = Get-Decision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot
     }
-    [byte[]]$payload = if ($decision.kind -ceq 'windows_gpu_performance_candidate_decision') {
+    [byte[]]$payload = if ($decision.kind -ceq 'windows_gpu_performance_candidate_decision' -or $decision.kind -ceq 'windows_gpu_maintainer_review_performance_decision') {
         # StrictJson deliberately rejects control characters in decoded string
         # values. The candidate policy contract requires a decoded trailing LF,
         # so the new decision uses this stable ordered serializer, which emits

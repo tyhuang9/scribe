@@ -8,29 +8,39 @@ hardware acquisition and a later, explicit Auto-policy change.
 The checked-in plan is production-shaped but has no hardware lanes. The
 independent production authority has no approved plan or capture key, and
 `gpu-auto-qualification-windows-x64.json` remains the exact zero-entry
-`default_deny` manifest. Consequently this stage does not qualify a GPU,
-provision pack trust, or enable Auto.
+`default_deny` manifest. Consequently the legacy signed-production route does
+not qualify a GPU, provision pack trust, or enable Auto. The separate
+maintainer-reviewed audit route below can evaluate the same bounded evidence
+without that authority, but is permanently candidate-only: it cannot enable
+Auto or approve a release.
 
 Pull-request CI uses synthetic fixture evidence only. `-AllowFixture` must be
 present to evaluate a fixture, a passing fixture always reports
 `auto_eligible: false`, and `-RequireEligible` returns exit status 2 for that
-valid ineligible decision. Fixture data cannot be relabeled as production:
-every production plan digest and its exact P-256 capture public key must
-already be listed in the fixed checked-in production authority.
+valid ineligible decision. Fixture data cannot be relabeled as a legacy signed
+production bundle: every such plan digest and its exact P-256 capture public
+key must already be listed in the fixed checked-in production authority. A
+maintainer-reviewed fixture is likewise permanently ineligible.
 
 ## Bound review inputs
 
-A canonical schema-v3 or schema-v4 plan fixes the exact evaluator, Windows
+A legacy signed schema-v3 or schema-v4 plan fixes the exact evaluator, Windows
 worker toolchain, and Auto manifest SHA-256 digests. It also fixes exactly five
 cold and twenty warm CPU/GPU pairs per required power source, the inclusive 110
 percent p95 boundary, the required scenario set, whether reviewers have
 established complete coverage of an Auto runtime bucket, and every required lane
-with a digest of its complete evidence object.
-The evidence document binds the exact plan digest. The plan also binds a
-256-bit nonzero campaign nonce, `p256:<sha256-of-SPKI-DER>` capture key ID, and
-the exact raw-frame/capture policy. A fixture plan alone may carry a fixture
-SPKI and still requires `-AllowFixture`; a production SPKI resolves only from
-the fixed production authority.
+with a digest of its complete evidence object. The separate maintainer-reviewed
+schema-4 plan retains those evaluator, contract, performance, scenario and lane
+bindings, but uses its distinct kind and review record described below.
+
+The evidence document binds the exact plan digest. A legacy signed plan also
+binds a 256-bit nonzero campaign nonce,
+`p256:<sha256-of-SPKI-DER>` capture key ID, and the exact raw-frame/capture
+policy. A fixture plan alone may carry a fixture SPKI and still requires
+`-AllowFixture`; a production SPKI resolves only from the fixed production
+authority. The maintainer-reviewed kind deliberately has no capture authority;
+its independently pinned canonical review record binds exact plan/evidence bytes
+without treating the record as an authentication credential.
 
 Schema v3 requires AC performance for discrete GPUs and independent AC and
 battery performance for integrated/unified GPUs. The capture contract fixes
@@ -42,15 +52,19 @@ completing integrated/unified runtime buckets. Plan and evidence versions must
 match. Supporting the old schema does not waive its exact evaluator digest or
 authorize rebinding historical evidence to a new evaluator.
 
-Schema v4 retains the full v3 installer, identity, signed-lane, inventory,
-scenario, SCIF-generation, challenge, and power-matrix boundaries while adding
-a new exact run-observation shape for final-installer qualification. It uses
-the same protocol-2/system-managed AC and battery acquisitions as v3, including
-the discrete-AC/shared-AC-and-battery matrix. It is not a relabeling adapter:
-schemas 2 and 3 retain their exact legacy threading and peak-memory shapes, and
-neither an old qualification bundle nor an unsigned observation report can be
-transformed into v4 evidence. A v4 campaign requires fresh authenticated
-acquisition and a plan with a new evaluator digest.
+Schema v4 retains the full v3 installer, identity, inventory, scenario,
+SCIF-generation, challenge, and power-matrix boundaries while adding a new
+exact run-observation shape for final-installer qualification. The legacy
+schema-4 kind additionally retains the signed-lane boundary; the separate
+maintainer-reviewed schema-4 kind replaces only that lane attestation with its
+pinned review record. Both use the same protocol-2/system-managed AC and
+battery acquisitions as v3, including the discrete-AC/shared-AC-and-battery
+matrix. It is not a relabeling adapter: schemas 2 and 3 retain their exact
+legacy threading and peak-memory shapes, and neither an old qualification
+bundle nor an unsigned observation report can be transformed into v4 evidence.
+A signed v4 campaign requires fresh authenticated acquisition and a plan with a
+new evaluator digest; a maintainer-reviewed v4 campaign requires the new kind,
+fresh review record bindings, and remains ineligible.
 
 Each lane binds:
 
@@ -116,8 +130,10 @@ fresh worker generations, provider discovery, and globally unique challenges.
 These observations are signed capture-envelope metadata: SCIF remains version 5,
 and its Hello/Ready frames do not themselves report host power.
 
-V4 uses the same signed AC/battery capture, session, pair, generation, and
-scenario bindings as v3. Its acquisition threading record instead requires
+V4 uses the same AC/battery capture, session, pair, generation, and scenario
+bindings as v3. Legacy v4 lanes retain their signed capture boundary; the
+maintainer-reviewed kind instead uses its external review-record boundary. Its
+acquisition threading record instead requires
 `policy: "native_default"`, `requested_n_threads: 0`, a null
 `resolved_n_threads`, and the bound CPU/GPU affinity digests. This records the
 actual native-default request without inventing a resolved thread count from OS
@@ -164,16 +180,17 @@ the canonical not-applicable observation and null admission pair. V4 rejects
 the legacy dedicated/shared peak aliases, and schemas 2/3 reject v4 fields.
 
 The projected minimum total memory equals the observed lane total; neither
-schema generalizes one device's result to a smaller adapter. For each power,
-the evaluator finds the lowest availability actually exercised by a successful
-GPU run or successful Auto-to-GPU scenario on that power. The v3 shared-memory
-projection uses the **higher** of those AC and battery minima, so evidence at a
-lower availability on one power cannot weaken the other power's requirement.
-Valid measurements below this conservative common floor remain evidence for
-their own power. A lower plan-asserted common threshold is rejected. AC-only v3
-lanes use the AC exercised minimum. V2 retains its legacy minimum across AC
-runs and all successful GPU scenario observations; it still cannot complete an
-integrated/unified runtime bucket without battery performance.
+schema generalizes one device's result to a smaller adapter. For schemas 2 and
+3, the evaluator finds the lowest availability actually exercised by a
+successful GPU run or successful Auto-to-GPU scenario on that power. The v3
+shared-memory projection uses the **higher** of those AC and battery minima, so
+evidence at a lower availability on one power cannot weaken the other power's
+requirement. Valid measurements below this conservative common floor remain
+evidence for their own power. A lower plan-asserted common threshold is
+rejected. AC-only v3 lanes use the AC exercised minimum. V2 retains its legacy
+minimum across AC runs and all successful GPU scenario observations; it still
+cannot complete an integrated/unified runtime bucket without battery
+performance.
 
 For v4, only the `before` values of complete numeric admission pairs on
 successful GPU **runs** contribute to the exercised floor. Scenario admission,
@@ -246,9 +263,10 @@ has no battery performance acquisition, requires both power observations to be
 `battery`, and uses zero acquisition and selected-capture digests. Existing
 mixed-device before/after capture fields retain their remapping purpose.
 
-## Capture attestation and inventory
+## Legacy capture attestation and inventory
 
-Every lane carries an ECDSA NIST P-256 signature in 64-byte IEEE-P1363 form.
+Every legacy signed-route lane carries an ECDSA NIST P-256 signature in 64-byte
+IEEE-P1363 form.
 Its key ID is `p256:` followed by the lowercase SHA-256 of the exact canonical
 SPKI DER. SPKI and signatures use canonical standard base64. The signed record
 contains exactly the capture-contract projection digest, campaign nonce, lane
@@ -259,7 +277,7 @@ ordered required-lane identity matrix, while deliberately excluding final
 evidence digests to avoid a signature/plan cycle.
 
 The attestation record's `acquisition_batch_id` continues to denote the AC
-acquisition. In schemas v3 and v4, the signed lane identity and payload
+acquisition. In legacy schemas v3 and v4, the signed lane identity and payload
 additionally bind the battery acquisition, its batch, and every battery artifact;
 the attestation preimage and signature scheme do not change.
 
@@ -271,13 +289,16 @@ ASCII("SCRIBE-WINDOWS-GPU-QUALIFICATION-LANE-ATTESTATION-V1\0")
 || canonical_record_bytes
 ```
 
-ECDSA signs SHA-256 of that preimage. The evaluator authenticates this record
-before opening any referenced artifact. It then opens every signed inventory
-member through retained handles, checks its digest and limits, and only then
-parses the acquisitions, runs, scenarios, and raw captures. AC-only lanes have
-one acquisition, 50 runs, nine scenarios, and 15 captures (75 artifacts). V3
-integrated/unified lanes add one battery acquisition, 50 runs, and 13 captures
-(139 artifacts total). Every inventory member must be consumed exactly once.
+ECDSA signs SHA-256 of that preimage. The evaluator authenticates this legacy
+record before opening any referenced artifact. The maintainer-reviewed route
+omits only `attestation`: it validates its pinned review record, exact lane
+keys, whole-lane digest, exact identity and sorted inventory before opening any
+referenced artifact. It then opens every inventory member through retained
+handles, checks its digest and limits, and only then parses the acquisitions,
+runs, scenarios, and raw captures. AC-only lanes have one acquisition, 50 runs,
+nine scenarios, and 15 captures (75 artifacts). V3 integrated/unified lanes add
+one battery acquisition, 50 runs, and 13 captures (139 artifacts total). Every
+inventory member must be consumed exactly once.
 
 ## Filesystem and JSON boundary
 
@@ -299,7 +320,7 @@ global limits are 64 lanes, 4096 artifacts, 16 MiB per file, and 512 MiB total
 artifacts.
 The limits apply to the entire evidence document, not separately to each power.
 Adding battery evidence does not double the budgets. The cumulative declared
-artifact count is checked before the next signed inventory is opened.
+artifact count is checked before the next lane inventory is opened.
 
 The evaluator writes only one canonical decision to stdout. It has no apply,
 activate, output-file, trust, catalog, state, or Auto-manifest mutation mode.
@@ -308,8 +329,47 @@ text, user path, or raw diagnostic data.
 
 The protected production capture signer and campaign-nonce ledger required to
 prevent key misuse and cross-campaign replay are not implemented in this stage.
-The production authority is intentionally empty. Therefore real production
-qualification is a NO-GO even though the synthetic fixture contract passes.
+The production authority is intentionally empty. Therefore legacy signed
+production qualification is a NO-GO even though the synthetic fixture contract
+passes. The maintainer-reviewed route intentionally does not require those
+services, but is an ineligible audit result rather than a substitute for them.
+
+## Maintainer-reviewed audit route
+
+Schema 4 also has a deliberately separate, audit-only maintainer-reviewed
+format. Its exact plan, evidence and decision kinds are
+`windows_gpu_maintainer_review_qualification_plan`,
+`windows_gpu_maintainer_review_qualification_evidence`, and
+`windows_gpu_maintainer_review_qualification_decision`. The plan omits
+`capture_authority`; lanes omit only `attestation`. All installer, identity,
+contract-binding, power, scenario, run, capture and inventory rules remain
+unchanged. This is not a relaxed signed-capture format and cannot be relabeled
+as one.
+
+Evaluation requires both `-ReviewRecordPath` and `-ExpectedReviewSha256`; those
+arguments are rejected for every legacy qualification or performance kind. The
+external canonical review record has exactly schema 1, kind
+`windows_gpu_maintainer_review`, fixture mode, raw plan/evidence SHA-256 values,
+a nonzero lowercase 40-hex source revision, and bounded printable
+`review_reference` and `ci_run_reference` fields. The evaluator reads and hashes
+that canonical record through its retained-handle boundary once, compares its
+raw digest to the independently supplied expected digest, then validates the
+raw plan/evidence bindings. It never copies a pin from the reviewed bundle.
+
+For a final-installer plan, the record revision must match every required lane's
+`app_build_id` revision suffix; an empty plan remains valid but ineligible. The
+same exact identity and lane digest, lane keys without an attestation, and
+strictly sorted inventory are checked before any artifact is opened. A
+non-fixture review also requires the existing clean source-checkout validation
+at the recorded revision. The record references are human audit claims, not
+credentials, signatures, or proof of CI provenance.
+
+Maintainer-reviewed decisions expose the review digest and references with
+`evidence_trust: "human-reviewed-not-authenticated"`. They always set
+`auto_eligible: false` and `release_approved: false`, even if semantic evidence
+passes or a current Auto entry would match. No production consumer, pack trust,
+authority record, candidate embedding, publication or release workflow accepts
+this route as authorization.
 
 ## Decision and activation separation
 
@@ -317,15 +377,16 @@ A passing lane produces a diagnostic projection using the current Windows Auto
 schema. The projection includes only vendor and device class, not adapter
 family or a narrower device constraint. One physical machine must never be
 treated as proof for that broad runtime bucket. `runtime_bucket_complete` may
-be set only in a production plan after reviewers establish representative
-coverage for the entire projected backend/vendor/class/driver/model/pack
+be set only in a legacy signed production plan after reviewers establish
+representative coverage for the entire projected backend/vendor/class/driver/model/pack
 bucket; the exact reviewed plan must then be approved by the production
-authority.
+authority. A maintainer-reviewed plan cannot make that authorization claim.
 
-Even complete approved evidence is not Auto-eligible until its projections
-match the checked-in Auto entries exactly one-for-one. This evaluator never
-performs that later policy edit. Pack trust and release signing remain separate
-gates.
+Even complete legacy approved evidence is not Auto-eligible until its
+projections match the checked-in Auto entries exactly one-for-one. This
+evaluator never performs that later policy edit. Maintainer-reviewed evidence
+is always ineligible regardless of that comparison. Pack trust and release
+signing remain separate gates.
 
 The current release path also has a source-revision feedback constraint: pack
 digests include build identities tied to the source revision, and the installer
@@ -368,13 +429,16 @@ pwsh -NoProfile -File .\scripts\qualify-windows-gpu-evidence.ps1 `
   -PlanPath C:\reviewed\plan.json `
   -EvidencePath C:\reviewed\evidence.json `
   -ArtifactRoot C:\reviewed\artifacts `
+  -ReviewRecordPath C:\reviewed\maintainer-review.json `
+  -ExpectedReviewSha256 <independently-pinned-review-sha256> `
   -RequireEligible
 ```
 
 The caller may capture stdout as review evidence using its own protected
 create-new publication boundary. Do not redirect over an existing decision.
-Before any production evaluation, reviewers must approve artifact provenance,
-the complete hardware/runtime bucket, clean-installer execution, acquisition
-controls, exact pack/model inputs, the plan digest, the protected capture key,
-and the nonce-ledger record. The current empty authority and absent protected
-signer/ledger deliberately make that operation a NO-GO.
+Before any legacy signed production evaluation, reviewers must approve artifact
+provenance, the complete hardware/runtime bucket, clean-installer execution,
+acquisition controls, exact pack/model inputs, the plan digest, the protected
+capture key, and the nonce-ledger record. The current empty authority and absent
+protected signer/ledger deliberately make that operation a NO-GO. The reviewed
+command above produces only the human-reviewed audit decision described here.
