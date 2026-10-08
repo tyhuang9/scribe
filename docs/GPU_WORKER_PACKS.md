@@ -185,7 +185,9 @@ future desktop build M to launch an exact immutable inference worker from an
 older source build R. The canonical policy is
 `runtime-manifests/frozen-worker-compatibility-windows-x64.json`. Its checked-in
 table is a bounded LOCAL diagnostic artifact mapping for the frozen R source
-build. It contains exactly three independently verified entries: the CPU worker
+build. The current cohort uses the batch-load-diagnostics workers and replaces
+the previous cohort; old or mixed identities remain denied.
+It contains exactly three independently verified entries: the CPU worker
 and the CUDA and Vulkan worker packs. This completes the bounded three-entry
 CPU/CUDA/Vulkan local diagnostic cohort only; it does not make the table a
 release or installer candidate. Unknown hashes and pack identities remain
