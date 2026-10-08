@@ -42,6 +42,17 @@ impl RuntimeRouter {
         Err(RuntimeError::UnsupportedModel(artifact.model_id()))
     }
 
+    pub(crate) fn transcribe_retained(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancellation_snapshot: u64,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        self.transcribe(artifact, preference, audio, options, cancellation_snapshot)
+    }
+
     pub(crate) fn provider_memory_observation_before(
         &self,
         _preference: AccelerationPreference,

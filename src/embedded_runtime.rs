@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use thiserror::Error;
@@ -84,6 +85,14 @@ pub(crate) struct EmbeddedRuntime {
     detected_architecture: Option<String>,
     resolved_acceleration: Option<ResolvedAcceleration>,
     backend_environment: Option<BackendEnvironmentFingerprint>,
+    #[cfg(test)]
+    load_attempts: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EmbeddedLoadReceipt {
+    pub(crate) warm_reused: bool,
+    pub(crate) model_load_duration_ms: u128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +125,8 @@ impl EmbeddedRuntime {
             detected_architecture: None,
             resolved_acceleration: None,
             backend_environment: None,
+            #[cfg(test)]
+            load_attempts: 0,
         }
     }
 
@@ -133,9 +144,12 @@ impl EmbeddedRuntime {
 
     pub(crate) fn is_loaded(&self) -> bool {
         self.session.is_some()
-            && self.backend_environment.as_ref().is_some_and(|loaded| {
-                current_runtime_backend_environment(self.preference)
-                    .is_ok_and(|current| backend_environment_matches(loaded, &current.fingerprint))
+            && current_runtime_backend_environment(self.preference).is_ok_and(|current| {
+                loaded_model_matches_environment(
+                    true,
+                    self.backend_environment.as_ref(),
+                    &current.fingerprint,
+                )
             })
     }
 
@@ -271,12 +285,44 @@ impl EmbeddedRuntime {
     ) -> Result<Transcript> {
         validate_audio(audio)?;
         validate_options(options)?;
-        self.load_model()?;
+        self.load_with_receipt(|| Ok(()))?;
+        self.transcribe_retained_with_cancellation(
+            audio,
+            options,
+            cancellation_generation,
+            cancellation_snapshot,
+        )
+    }
+
+    pub(crate) fn transcribe_retained_with_cancellation(
+        &mut self,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancellation_generation: &AtomicU64,
+        cancellation_snapshot: u64,
+    ) -> Result<Transcript> {
+        validate_audio(audio)?;
+        validate_options(options)?;
+        validate_retained_runtime_presence(
+            self.model.is_some(),
+            self.session.is_some(),
+            self.resolved_acceleration.is_some(),
+            self.backend_environment.as_ref(),
+        )?;
+        let current_environment = current_runtime_backend_environment(self.preference)?;
+        let state_validation = validate_retained_runtime_state(
+            self.model.is_some(),
+            self.session.is_some(),
+            self.resolved_acceleration.is_some(),
+            self.backend_environment.as_ref(),
+            &current_environment.fingerprint,
+        );
         let session = self
             .session
             .as_mut()
-            .expect("load_model must retain a session");
-        let native = run_if_not_cancelled(
+            .ok_or_else(|| retained_runtime_unavailable("no native session is retained"))?;
+        let native = run_validated_retained_decode(
+            state_validation,
             &self.cancellation,
             cancellation_generation,
             cancellation_snapshot,
@@ -287,6 +333,13 @@ impl EmbeddedRuntime {
             },
         )?;
         Ok(normalize_transcript(native, audio))
+    }
+
+    pub(crate) fn load_with_receipt(
+        &mut self,
+        verify_before_native_load: impl FnOnce() -> Result<()>,
+    ) -> Result<EmbeddedLoadReceipt> {
+        self.load_model(verify_before_native_load)
     }
 
     fn ensure_backends() -> Result<()> {
@@ -300,76 +353,88 @@ impl EmbeddedRuntime {
         }
     }
 
-    fn load_model(&mut self) -> Result<()> {
-        Self::ensure_backends()?;
+    fn load_model(
+        &mut self,
+        verify_before_native_load: impl FnOnce() -> Result<()>,
+    ) -> Result<EmbeddedLoadReceipt> {
+        #[cfg(test)]
+        {
+            self.load_attempts = self.load_attempts.saturating_add(1);
+        }
         if !self.model_path.is_file() {
+            verify_before_native_load()?;
             return Err(anyhow!(EmbeddedRuntimeError::ModelNotInstalled(
                 self.model_path.clone()
             )));
+        }
+        if let Err(error) = Self::ensure_backends() {
+            verify_before_native_load()?;
+            return Err(error);
         }
 
         let environment = match current_runtime_backend_environment(self.preference) {
             Ok(environment) => environment,
             Err(error) => {
                 self.clear_loaded_state();
+                verify_before_native_load()?;
                 return Err(error);
             }
         };
-        if self.session.is_some()
-            && self
-                .backend_environment
-                .as_ref()
-                .is_some_and(|loaded| backend_environment_matches(loaded, &environment.fingerprint))
-        {
-            return Ok(());
-        }
-        self.clear_loaded_state();
-
-        let RuntimeBackendEnvironment {
-            mut selection,
-            fingerprint,
-        } = environment;
-        let gpu_device = selected_process_index(&selection)?;
-
-        let model = Model::load_with(
-            &self.model_path,
-            &ModelOptions {
-                backend: requested_backend(selection.target.backend),
-                gpu_device,
-            },
-        )
-        .map_err(map_native_error)?;
-        let detected_architecture = model.arch();
-        let native_capabilities = model.capabilities();
-        let resolved_backend = model.backend();
-        let resolved_device = model.device().map_err(map_native_error)?;
-        reconcile_observed_target(&mut selection, &resolved_backend, &resolved_device)?;
-        let resolved_acceleration = resolved_acceleration(
-            self.preference,
-            &resolved_backend,
-            &resolved_device,
-            Some(selection),
+        let warm_reused = loaded_model_matches_environment(
+            self.session.is_some(),
+            self.backend_environment.as_ref(),
+            &environment.fingerprint,
         );
-        let capabilities = RuntimeCapabilities {
-            streaming: native_capabilities.supports_streaming,
-            cancellation: model.supports(Feature::Cancellation),
-            translation: native_capabilities.supports_translate,
-            timestamps: native_capabilities.max_timestamp_kind != TimestampKind::None,
-            language_detection: native_capabilities.supports_language_detect,
-            confidence_scores: false,
-            custom_vocabulary: false,
-            supported_languages: native_capabilities.languages,
-        };
-        let mut session = model.session().map_err(map_native_error)?;
-        session.set_cancel_token(&self.cancellation);
+        load_model_for_decision(warm_reused, verify_before_native_load, || {
+            self.clear_loaded_state();
 
-        self.capabilities = capabilities;
-        self.detected_architecture = Some(detected_architecture);
-        self.resolved_acceleration = Some(resolved_acceleration);
-        self.backend_environment = Some(fingerprint);
-        self.model = Some(model);
-        self.session = Some(session);
-        Ok(())
+            let RuntimeBackendEnvironment {
+                mut selection,
+                fingerprint,
+            } = environment;
+            let gpu_device = selected_process_index(&selection)?;
+
+            let load_started = Instant::now();
+            let model = Model::load_with(
+                &self.model_path,
+                &ModelOptions {
+                    backend: requested_backend(selection.target.backend),
+                    gpu_device,
+                },
+            )
+            .map_err(map_native_error)?;
+            let detected_architecture = model.arch();
+            let native_capabilities = model.capabilities();
+            let resolved_backend = model.backend();
+            let resolved_device = model.device().map_err(map_native_error)?;
+            reconcile_observed_target(&mut selection, &resolved_backend, &resolved_device)?;
+            let resolved_acceleration = resolved_acceleration(
+                self.preference,
+                &resolved_backend,
+                &resolved_device,
+                Some(selection),
+            );
+            let capabilities = RuntimeCapabilities {
+                streaming: native_capabilities.supports_streaming,
+                cancellation: model.supports(Feature::Cancellation),
+                translation: native_capabilities.supports_translate,
+                timestamps: native_capabilities.max_timestamp_kind != TimestampKind::None,
+                language_detection: native_capabilities.supports_language_detect,
+                confidence_scores: false,
+                custom_vocabulary: false,
+                supported_languages: native_capabilities.languages,
+            };
+            let mut session = model.session().map_err(map_native_error)?;
+            session.set_cancel_token(&self.cancellation);
+
+            self.capabilities = capabilities;
+            self.detected_architecture = Some(detected_architecture);
+            self.resolved_acceleration = Some(resolved_acceleration);
+            self.backend_environment = Some(fingerprint);
+            self.model = Some(model);
+            self.session = Some(session);
+            Ok(load_started.elapsed().as_millis())
+        })
     }
 
     fn clear_loaded_state(&mut self) {
@@ -479,7 +544,7 @@ fn provider_memory_observation_from_target(
 
 impl SpeechEngine for EmbeddedRuntime {
     fn load(&mut self) -> Result<()> {
-        self.load_model()
+        self.load_with_receipt(|| Ok(())).map(|_| ())
     }
 
     fn capabilities(&self) -> RuntimeCapabilities {
@@ -490,6 +555,107 @@ impl SpeechEngine for EmbeddedRuntime {
         self.clear_loaded_state();
         Ok(())
     }
+}
+
+fn load_model_for_decision(
+    warm_reused: bool,
+    verify_before_native_load: impl FnOnce() -> Result<()>,
+    construct_native_model: impl FnOnce() -> Result<u128>,
+) -> Result<EmbeddedLoadReceipt> {
+    if warm_reused {
+        return Ok(EmbeddedLoadReceipt {
+            warm_reused: true,
+            model_load_duration_ms: 0,
+        });
+    }
+    verify_before_native_load()?;
+    let model_load_duration_ms = construct_native_model()?;
+    Ok(EmbeddedLoadReceipt {
+        warm_reused: false,
+        model_load_duration_ms,
+    })
+}
+
+fn loaded_model_matches_environment(
+    session_present: bool,
+    loaded_environment: Option<&BackendEnvironmentFingerprint>,
+    current_environment: &BackendEnvironmentFingerprint,
+) -> bool {
+    session_present
+        && loaded_environment
+            .is_some_and(|loaded| backend_environment_matches(loaded, current_environment))
+}
+
+fn retained_runtime_unavailable(message: &str) -> anyhow::Error {
+    anyhow!(EmbeddedRuntimeError::BackendUnavailable(format!(
+        "retained GGUF runtime is unavailable: {message}"
+    )))
+}
+
+fn validate_retained_runtime_state(
+    model_present: bool,
+    session_present: bool,
+    acceleration_present: bool,
+    loaded_environment: Option<&BackendEnvironmentFingerprint>,
+    current_environment: &BackendEnvironmentFingerprint,
+) -> Result<()> {
+    validate_retained_runtime_presence(
+        model_present,
+        session_present,
+        acceleration_present,
+        loaded_environment,
+    )?;
+    let loaded_environment = loaded_environment
+        .expect("retained runtime presence validation requires a backend environment");
+    if !backend_environment_matches(loaded_environment, current_environment) {
+        return Err(retained_runtime_unavailable(
+            "the backend environment changed after the model was loaded",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_runtime_presence(
+    model_present: bool,
+    session_present: bool,
+    acceleration_present: bool,
+    loaded_environment: Option<&BackendEnvironmentFingerprint>,
+) -> Result<()> {
+    if !model_present {
+        return Err(retained_runtime_unavailable("no native model is retained"));
+    }
+    if !session_present {
+        return Err(retained_runtime_unavailable(
+            "no native session is retained",
+        ));
+    }
+    if !acceleration_present {
+        return Err(retained_runtime_unavailable(
+            "the retained model has no resolved acceleration",
+        ));
+    }
+    if loaded_environment.is_none() {
+        return Err(retained_runtime_unavailable(
+            "the retained model has no backend environment binding",
+        ));
+    }
+    Ok(())
+}
+
+fn run_validated_retained_decode<T>(
+    state_validation: Result<()>,
+    cancellation: &CancelToken,
+    cancellation_generation: &AtomicU64,
+    cancellation_snapshot: u64,
+    inference: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    state_validation?;
+    run_if_not_cancelled(
+        cancellation,
+        cancellation_generation,
+        cancellation_snapshot,
+        inference,
+    )
 }
 
 fn run_if_not_cancelled<T>(
@@ -1165,6 +1331,266 @@ fn map_native_error(error: NativeError) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::transcription::PreviewDecodeOptions;
+
+    fn retained_gguf_audio() -> PreparedAudio {
+        PreparedAudio::from_captured_mono(vec![0.0], PREPARED_SAMPLE_RATE, 1, 1).unwrap()
+    }
+
+    fn retained_gguf_missing_path(label: &str) -> PathBuf {
+        for suffix in 0_u32..128 {
+            let path = std::env::temp_dir().join(format!(
+                "scribe-retained-gguf-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            if !path.exists() {
+                return path;
+            }
+        }
+        panic!("could not find an absent retained GGUF fixture path within its bound")
+    }
+
+    #[test]
+    fn retained_gguf_load_decision_reports_actual_reuse_and_cold_duration() {
+        let warm_verified = std::cell::Cell::new(0_u32);
+        let warm_constructed = std::cell::Cell::new(0_u32);
+        let warm = load_model_for_decision(
+            true,
+            || {
+                warm_verified.set(warm_verified.get() + 1);
+                Ok(())
+            },
+            || {
+                warm_constructed.set(warm_constructed.get() + 1);
+                Ok(99)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            warm,
+            EmbeddedLoadReceipt {
+                warm_reused: true,
+                model_load_duration_ms: 0,
+            }
+        );
+        assert_eq!(warm_verified.get(), 0);
+        assert_eq!(warm_constructed.get(), 0);
+
+        let cold_order = std::cell::RefCell::new(Vec::new());
+        let cold = load_model_for_decision(
+            false,
+            || {
+                cold_order.borrow_mut().push("verify");
+                Ok(())
+            },
+            || {
+                cold_order.borrow_mut().push("construct");
+                Ok(37)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cold,
+            EmbeddedLoadReceipt {
+                warm_reused: false,
+                model_load_duration_ms: 37,
+            }
+        );
+        assert_eq!(cold_order.borrow().as_slice(), ["verify", "construct"]);
+    }
+
+    #[test]
+    fn retained_gguf_failed_cold_verification_never_constructs_a_native_model() {
+        let constructed = std::cell::Cell::new(false);
+
+        let error = load_model_for_decision(
+            false,
+            || Err(anyhow!("fixture integrity failure")),
+            || {
+                constructed.set(true);
+                Ok(1)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("fixture integrity failure"));
+        assert!(!constructed.get());
+    }
+
+    #[test]
+    fn retained_gguf_absent_runtime_fails_without_attempting_a_native_load() {
+        let missing = retained_gguf_missing_path("missing-model");
+        let mut runtime = EmbeddedRuntime::new(missing, AccelerationPreference::Cpu);
+        let generation = AtomicU64::new(0);
+
+        let error = runtime
+            .transcribe_retained_with_cancellation(
+                &retained_gguf_audio(),
+                &TranscriptionOptions::default(),
+                &generation,
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no native model is retained"));
+        assert_eq!(runtime.load_attempts, 0);
+    }
+
+    #[test]
+    fn retained_gguf_direct_decode_preserves_load_on_demand() {
+        let missing = retained_gguf_missing_path("direct-missing-model");
+        let mut runtime = EmbeddedRuntime::new(missing, AccelerationPreference::Cpu);
+        let generation = AtomicU64::new(0);
+
+        let error = runtime
+            .transcribe_with_cancellation(
+                &retained_gguf_audio(),
+                &TranscriptionOptions::default(),
+                &generation,
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("ModelNotInstalled:"));
+        assert_eq!(runtime.load_attempts, 1);
+    }
+
+    #[test]
+    fn retained_gguf_cpu_device_set_drift_fails_before_decoder_invocation() {
+        let loaded = snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            vec![BackendCandidate::available(BackendTarget::cpu())],
+        );
+        let current = snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            fake_vulkan_candidates(DeviceClass::DiscreteGpu),
+        );
+        assert_eq!(
+            select_backend(AccelerationPreference::Cpu, &loaded)
+                .unwrap()
+                .target
+                .backend,
+            BackendKind::Cpu
+        );
+        assert_eq!(
+            select_backend(AccelerationPreference::Cpu, &current)
+                .unwrap()
+                .target
+                .backend,
+            BackendKind::Cpu
+        );
+        let loaded_fingerprint = loaded.environment_fingerprint();
+        let current_fingerprint = current.environment_fingerprint();
+        assert!(!loaded_model_matches_environment(
+            true,
+            Some(&loaded_fingerprint),
+            &current_fingerprint,
+        ));
+        let load_receipt = load_model_for_decision(
+            loaded_model_matches_environment(true, Some(&loaded_fingerprint), &current_fingerprint),
+            || Ok(()),
+            || Ok(23),
+        )
+        .unwrap();
+        assert_eq!(
+            load_receipt,
+            EmbeddedLoadReceipt {
+                warm_reused: false,
+                model_load_duration_ms: 23,
+            }
+        );
+        let validation = validate_retained_runtime_state(
+            true,
+            true,
+            true,
+            Some(&loaded_fingerprint),
+            &current_fingerprint,
+        );
+        let generation = AtomicU64::new(0);
+        let cancellation = CancelToken::new();
+        let decoder_invoked = std::sync::atomic::AtomicBool::new(false);
+
+        let error =
+            run_validated_retained_decode(validation, &cancellation, &generation, 0, || {
+                decoder_invoked.store(true, Ordering::Release);
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("backend environment changed"));
+        assert!(!decoder_invoked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn retained_gguf_cancellation_still_prevents_decoder_invocation() {
+        let environment = snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            vec![BackendCandidate::available(BackendTarget::cpu())],
+        )
+        .environment_fingerprint();
+        let validation =
+            validate_retained_runtime_state(true, true, true, Some(&environment), &environment);
+        let generation = AtomicU64::new(1);
+        let cancellation = CancelToken::new();
+        let decoder_invoked = std::sync::atomic::AtomicBool::new(false);
+
+        let error =
+            run_validated_retained_decode(validation, &cancellation, &generation, 0, || {
+                decoder_invoked.store(true, Ordering::Release);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<EmbeddedRuntimeError>(),
+            Some(EmbeddedRuntimeError::Cancelled)
+        ));
+        assert!(!decoder_invoked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn retained_gguf_state_requires_every_substate_and_accepts_volatile_device_changes() {
+        let base = snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            fake_vulkan_candidates(DeviceClass::DiscreteGpu),
+        );
+        let mut volatile_change = base.clone();
+        volatile_change.candidates[0].target.memory_available_bytes = 1;
+        volatile_change.candidates[0].target.process_index = Some(17);
+        let loaded = base.environment_fingerprint();
+        let current = volatile_change.environment_fingerprint();
+        assert!(loaded_model_matches_environment(
+            true,
+            Some(&loaded),
+            &current,
+        ));
+        assert!(validate_retained_runtime_state(true, true, true, Some(&loaded), &current).is_ok());
+
+        for (model, session, acceleration, environment) in [
+            (false, true, true, Some(&loaded)),
+            (true, false, true, Some(&loaded)),
+            (true, true, false, Some(&loaded)),
+            (true, true, true, None),
+        ] {
+            assert!(
+                validate_retained_runtime_state(
+                    model,
+                    session,
+                    acceleration,
+                    environment,
+                    &current,
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn queued_request_cancelled_before_router_transcribe_never_starts_native_inference() {

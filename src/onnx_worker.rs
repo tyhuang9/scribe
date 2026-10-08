@@ -12899,17 +12899,43 @@ fn execute_worker_batch<R: WorkerRecognizer>(
                 processing_duration_ms,
             })
         }
-        WireRuntimeArtifact::Gguf(_) => runtime_router
-            .transcribe(
+        WireRuntimeArtifact::Gguf(_) => {
+            let execution = runtime_router.transcribe_retained(
                 RuntimeArtifact::try_from(batch.artifact)?,
                 batch.preference,
                 &audio,
                 &batch.options,
                 runtime_router.cancellation_snapshot(),
+            )?;
+            gguf_batch_execution(
+                WireRuntimeExecution::from(execution),
+                &batch.load.diagnostics,
             )
-            .map(WireRuntimeExecution::from)
-            .map_err(anyhow::Error::new),
+        }
     }
+}
+
+fn gguf_batch_execution(
+    mut execution: WireRuntimeExecution,
+    load: &WireRuntimeDiagnostics,
+) -> Result<WireRuntimeExecution> {
+    if execution.diagnostics.resolved_acceleration != load.resolved_acceleration
+        || execution.diagnostics.runtime_location != load.runtime_location
+    {
+        bail!("GGUF batch runtime identity changed after loading");
+    }
+    if !execution.diagnostics.warm_reused || execution.diagnostics.model_load_duration_ms != 0 {
+        bail!("GGUF batch unexpectedly reloaded its model during decoding");
+    }
+    if load.warm_reused && load.model_load_duration_ms != 0 {
+        bail!("GGUF batch load reported inconsistent reuse diagnostics");
+    }
+    // BeginBatch already performed this request's load. The router sees a warm
+    // model during decode, even for the first batch; retain the actual load
+    // measurements rather than deriving cold/warm facts from the decode phase.
+    execution.diagnostics.warm_reused = load.warm_reused;
+    execution.diagnostics.model_load_duration_ms = load.model_load_duration_ms;
+    Ok(execution)
 }
 
 fn handle_audio_chunk<R: WorkerRecognizer>(
@@ -22555,6 +22581,111 @@ mod tests {
                 .validate_for_preference(AccelerationPreference::Cpu)
                 .is_ok()
         );
+    }
+
+    fn gguf_batch_decode_fixture(load: &WireRuntimeDiagnostics) -> WireRuntimeExecution {
+        let mut diagnostics = load.clone();
+        diagnostics.warm_reused = true;
+        diagnostics.model_load_duration_ms = 0;
+        WireRuntimeExecution {
+            transcript: WireTranscript {
+                text: "synthetic decode result".to_owned(),
+                segments: vec![WireTranscriptSegment {
+                    text: "synthetic decode result".to_owned(),
+                    start_ms: Some(0),
+                    end_ms: Some(12),
+                    confidence: Some(0.75),
+                }],
+                detected_language: Some("en".to_owned()),
+                duration_ms: Some(12),
+            },
+            diagnostics,
+            processing_duration_ms: 17,
+        }
+    }
+
+    #[test]
+    fn capture_observation_gguf_batch_preserves_actual_cold_load_diagnostics() {
+        let gpu = diagnostics_with_typed_backend_selection();
+        let mut cpu = gpu.clone();
+        cpu.resolved_acceleration =
+            resolve_cpu_only_acceleration(AccelerationPreference::Cpu).unwrap();
+        for load in [cpu, gpu] {
+            assert!(!load.warm_reused);
+            let decode = gguf_batch_decode_fixture(&load);
+            let expected_transcript = decode.transcript.clone();
+            let result = gguf_batch_execution(decode, &load).unwrap();
+            assert_eq!(result.diagnostics, load);
+            assert_eq!(result.transcript, expected_transcript);
+            assert_eq!(result.processing_duration_ms, 17);
+        }
+    }
+
+    #[test]
+    fn capture_observation_gguf_batch_preserves_actual_warm_load_diagnostics() {
+        let mut gpu = diagnostics_with_typed_backend_selection();
+        gpu.warm_reused = true;
+        gpu.model_load_duration_ms = 0;
+        let mut cpu = gpu.clone();
+        cpu.resolved_acceleration =
+            resolve_cpu_only_acceleration(AccelerationPreference::Cpu).unwrap();
+        for load in [cpu, gpu] {
+            let decode = gguf_batch_decode_fixture(&load);
+            let expected_transcript = decode.transcript.clone();
+            let result = gguf_batch_execution(decode, &load).unwrap();
+            assert_eq!(result.diagnostics, load);
+            assert_eq!(result.transcript, expected_transcript);
+            assert_eq!(result.processing_duration_ms, 17);
+        }
+    }
+
+    #[test]
+    fn capture_observation_gguf_batch_preserves_measured_zero_cold_load_duration() {
+        let mut load = diagnostics_with_typed_backend_selection();
+        load.model_load_duration_ms = 0;
+        let result = gguf_batch_execution(gguf_batch_decode_fixture(&load), &load).unwrap();
+        assert_eq!(result.diagnostics, load);
+        assert!(!result.diagnostics.warm_reused);
+    }
+
+    #[test]
+    fn capture_observation_gguf_batch_rejects_decode_runtime_and_device_drift() {
+        let load = diagnostics_with_typed_backend_selection();
+        let mut wrong_runtime = gguf_batch_decode_fixture(&load);
+        wrong_runtime.diagnostics.runtime_location = PathBuf::from("other-runtime");
+        let mut wrong_acceleration = gguf_batch_decode_fixture(&load);
+        wrong_acceleration.diagnostics.resolved_acceleration =
+            resolve_cpu_only_acceleration(AccelerationPreference::Cpu).unwrap();
+        let mut wrong_device = gguf_batch_decode_fixture(&load);
+        wrong_device
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap()
+            .target = backend_target(BackendKind::Cuda, "other-device", Some(2));
+        for decode in [wrong_runtime, wrong_acceleration, wrong_device] {
+            let error = gguf_batch_execution(decode, &load).unwrap_err();
+            assert!(error.to_string().contains("runtime identity changed"));
+        }
+    }
+
+    #[test]
+    fn capture_observation_gguf_batch_rejects_decode_reload_and_inconsistent_load() {
+        let load = diagnostics_with_typed_backend_selection();
+        let mut reloaded = gguf_batch_decode_fixture(&load);
+        reloaded.diagnostics.warm_reused = false;
+        let mut load_time_during_decode = gguf_batch_decode_fixture(&load);
+        load_time_during_decode.diagnostics.model_load_duration_ms = 1;
+        for decode in [reloaded, load_time_during_decode] {
+            let error = gguf_batch_execution(decode, &load).unwrap_err();
+            assert!(error.to_string().contains("unexpectedly reloaded"));
+        }
+        let mut invalid_load = load;
+        invalid_load.warm_reused = true;
+        let error = gguf_batch_execution(gguf_batch_decode_fixture(&invalid_load), &invalid_load)
+            .unwrap_err();
+        assert!(error.to_string().contains("inconsistent reuse diagnostics"));
     }
 
     #[test]
