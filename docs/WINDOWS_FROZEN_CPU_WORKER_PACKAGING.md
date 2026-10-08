@@ -58,6 +58,43 @@ construction and staging, embeds its exact digest, and verifies the copied
 bytes. Invalid, changed, missing, or incompatible inputs fail rather than
 causing a replacement worker build.
 
+Frozen mode can instead read a separately retained clean checkout as the worker
+source **R**, via `-FrozenCpuWorkerSourceRoot`; the checkout running the
+desktop builder is independently derived as **M**. R is validation data only:
+the builder never executes its helpers or rebuilds its worker. M is the only
+checkout used for the desktop build, and its revision forcibly replaces any
+caller `SCRIBE_BUILD_REVISION` value. The record remains schema 1 and describes
+R exactly. Both clean contexts are checked before output boundaries, while their
+target, protocol and ABI must agree. Omitting the option retains the historical
+same-source M=R behavior.
+
+When M and R use different checkout roots, bundle/staging, explicit
+installer-allowlist, and Cargo target outputs are rejected if they would
+overlap R in either direction,
+including ignored directories. Ambient `TEMP`/`TMP` values must be fully
+qualified (so relative and drive-relative values are rejected), and they and
+the resolved temporary root are rejected when they point under R before a
+desktop, installer, or verifier process can write scratch data. The M-owned Git reader
+requires Git support for `--no-lazy-fetch`, uses no pager/no optional locks,
+disables fsmonitor, and rejects configured external `clean` or `process`
+filters by name before checking status; an older Git fails rather than falling
+back to a fetch-capable query. It never runs an R helper or reports a filter
+command value. These checks happen before their corresponding output directories
+or tools are used; historical
+same-checkout behavior is unchanged.
+
+Before a frozen bundle can publish or run the worker, the verified, read-held
+desktop executable is invoked only with `--scribe-frozen-worker-admission`.
+That bounded, no-native command takes no policy, path, hash, or build-ID input;
+its one JSON report comes from the desktop's compiled compatibility parser and
+embedded CPU digest. A malformed map, missing anchor, unsupported platform,
+extra argument, timeout, nonzero exit, or mismatch against the expected M/R
+identities rejects the bundle. With the checked-in empty map, only the strict
+same-source expectation is reported; it does not attest the origin of arbitrary
+bytes that happen to match the embedded anchor. A foreign R therefore needs an
+exact compiled approval and cannot be admitted by a PowerShell map or caller
+argument.
+
 The freeze directory has exactly three files: the worker, its JSON record, and
 `WINDOWS-FROZEN-CPU-WORKER-LOCAL-ONLY.txt`. The record is bounded to 64 KiB and
 the worker to 2 GiB; these are format limits, not expected artifact sizes.
@@ -71,6 +108,14 @@ Use a clean checkout and the repository's existing pinned Windows x64 build
 toolchain and offline dependencies. Choose new output directories outside the
 checkout and Cargo target trees. Do not use existing release artifacts as
 scratch output or remove them automatically to make a command succeed.
+
+The commands below use the default same-source M=R workflow. For an approved
+mixed-source assembly, run the producer from retained R and the three consumers
+(`build-windows-release.ps1`, `build-windows-frozen-test-installer.ps1`, and
+`verify-windows-local-frozen-test-installer.ps1`) from M, passing
+`-FrozenCpuWorkerSourceRoot C:\ScribeLocal\retained-worker-source` to each
+consumer. The checked-in empty compatibility map rejects a different worker
+origin; this option alone cannot authorize it.
 
 ```powershell
 pwsh -NoProfile -File scripts/new-windows-frozen-cpu-worker.ps1 `
@@ -115,9 +160,10 @@ processes keep their separate one-minute deadlines. Numeric integrity fields
 require actual JSON integer scalars rather than coercible strings or booleans.
 
 Use a new, non-existent output directory outside the checkout, bundle, and
-freeze. The freeze record binds the current clean source revision, so a source
-change requires a new freeze and a new bundle; do not rebind a previously
-captured PR artifact to a later checkout.
+freeze. The freeze record binds the clean worker source R revision, so an R
+change requires a new freeze and a new bundle. An M-only change requires a new
+approved desktop and bundle, but does not relabel or rebuild R; do not rebind a
+previously captured PR artifact to a later checkout.
 
 ```powershell
 pwsh -NoProfile -File scripts/build-windows-frozen-test-installer.ps1 `
@@ -138,10 +184,20 @@ not inventory or authenticate every native file installed alongside the
 compiler. That upstream native-component review is separate from this local
 compiler-path validation.
 
-The frozen record remains bound to its captured source revision. Updating the
-Inno compiler does not rebind a previously captured frozen record, bundle, or
-installer output to a later checkout; create a new freeze and bundle whenever
-the source identity changes.
+The frozen record remains bound to its captured worker-source R revision.
+Updating the Inno compiler does not rebind a previously captured frozen record,
+bundle, or installer output. A change to R requires a new freeze and bundle;
+a change only to desktop source M requires a new approved desktop and bundle,
+but does not relabel or rebuild R.
+
+For M=R, the installer record remains the exact schema-1 local record. For an
+approved mixed M/R assembly, it uses explicit schema 2 with separate desktop
+revision/version/build ID and worker record/origin/worker ID fields, while
+binding the same exact CPU anchor and inventory. Schema 1 is never reinterpreted
+as mixed-source data. The installer `AppVersion` and any installed observation
+collector revision are M, not R. The installer builder and verifier each run
+the verified source or installed desktop admission report and require its
+compiled M/R identity before smoke or collection.
 
 The generated installer has a separate local-only AppId and an immutable,
 token-bound default location:
@@ -178,9 +234,11 @@ directory cleanup, so the verifier polls the derived token-bound root with a
 five-second monotonic deadline instead of treating that short delay as a
 failure. If parity was not established, it deliberately retains the token-bound
 installation for inspection rather than executing an untrusted uninstaller.
-Its own bounded temporary log directory is cleaned after use. The real manual
-gate must also record refusal of `/DIR`, an existing destination, and a
-reparse-point destination before relying on this test installer.
+Its own bounded temporary log directory is cleaned after use, and the verifier
+rejects a distinct R selected through ambient or resolved temporary paths before
+creating that scratch root. The real manual gate must also record refusal of
+`/DIR`, an existing destination, and a reparse-point destination before relying
+on this test installer.
 
 This is a LOCAL test format, not a release format. It adds no new GPU-pack
 trust path: a bundle that contains already-verified signed GPU packs must still

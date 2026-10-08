@@ -3,6 +3,7 @@ param(
     [string]$BundlePath,
     [Parameter(Mandatory = $true)]
     [string]$FrozenCpuWorkerRecordPath,
+    [string]$FrozenCpuWorkerSourceRoot,
     [Parameter(Mandatory = $true)]
     [string]$InnoCompilerPath,
     [Parameter(Mandatory = $true)]
@@ -154,21 +155,48 @@ function Assert-WindowsLocalFrozenCompilerOutput([string]$OutputRoot, [string]$E
 }
 
 function New-WindowsLocalFrozenInstallerRecord(
+    [psobject]$DesktopContext,
     [psobject]$FrozenCpuWorker,
     [psobject]$Bundle,
     [string]$InstallerName,
     [System.IO.FileInfo]$Installer,
     [string]$Token
 ) {
+    if (Test-WindowsFrozenCpuWorkerSameSourceContext $DesktopContext $FrozenCpuWorker.Context) {
+        # Preserve the exact schema-1 record for the historical same-source
+        # local path. It is never silently repurposed for a mixed M/R bundle.
+        return [ordered]@{
+            schema_version = 1
+            kind = 'windows-local-frozen-test-installer'
+            local_only = $true
+            release_approved = $false
+            source_revision = [string]$FrozenCpuWorker.Record.source_revision
+            app_version = [string]$FrozenCpuWorker.Record.app_version
+            target_triple = [string]$FrozenCpuWorker.Record.target_triple
+            frozen_record_sha256 = [string]$FrozenCpuWorker.RecordSha256
+            bundle_inventory_sha256 = [string]$Bundle.InventorySha256
+            installer_filename = $InstallerName
+            installer_size_bytes = [int64]$Installer.Length
+            installer_sha256 = (Get-WindowsFrozenCpuWorkerFileSha256 $Installer.FullName)
+            local_test_token = $Token
+            install_relative_path = "Scribe/LOCAL-Frozen-Test/$Token"
+        }
+    }
     return [ordered]@{
-        schema_version = 1
+        schema_version = 2
         kind = 'windows-local-frozen-test-installer'
         local_only = $true
         release_approved = $false
-        source_revision = [string]$FrozenCpuWorker.Record.source_revision
-        app_version = [string]$FrozenCpuWorker.Record.app_version
-        target_triple = [string]$FrozenCpuWorker.Record.target_triple
+        desktop_source_revision = [string]$DesktopContext.SourceRevision
+        desktop_app_version = [string]$DesktopContext.AppVersion
+        desktop_build_id = [string]$DesktopContext.DesktopBuildId
+        target_triple = [string]$DesktopContext.TargetTriple
         frozen_record_sha256 = [string]$FrozenCpuWorker.RecordSha256
+        worker_source_revision = [string]$FrozenCpuWorker.Record.source_revision
+        worker_app_version = [string]$FrozenCpuWorker.Record.app_version
+        worker_origin_app_build = [string]$FrozenCpuWorker.Context.DesktopBuildId
+        worker_build_id = [string]$FrozenCpuWorker.Context.WorkerBuildId
+        bundled_cpu_worker_sha256 = [string]$FrozenCpuWorker.Record.worker_sha256
         bundle_inventory_sha256 = [string]$Bundle.InventorySha256
         installer_filename = $InstallerName
         installer_size_bytes = [int64]$Installer.Length
@@ -180,20 +208,34 @@ function New-WindowsLocalFrozenInstallerRecord(
 
 Assert-WindowsFrozenCpuWorkerLocalOnlyEnvironment
 $repositoryRoot = Get-WindowsLocalFrozenNormalizedFullPath (Split-Path -Parent $PSScriptRoot)
+if ($PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot') -and [string]::IsNullOrWhiteSpace($FrozenCpuWorkerSourceRoot)) {
+    throw 'FrozenCpuWorkerSourceRoot was explicitly supplied but is empty or whitespace.'
+}
+$resolvedFrozenWorkerSourceRoot = if ($PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot')) {
+    Get-WindowsLocalFrozenNormalizedFullPath $FrozenCpuWorkerSourceRoot
+}
+else {
+    $repositoryRoot
+}
 $templatePath = Join-Path $repositoryRoot 'installer\scribe-local-frozen.iss'
 $provenance = Join-Path $repositoryRoot 'installer\inno-setup-7.1.0-provenance.json'
 $null = Assert-WindowsFrozenCpuWorkerRegularFile $templatePath
 $compiler = Assert-WindowsLocalFrozenInnoCompiler $InnoCompilerPath $provenance
 $frozenCpuWorker = $null
+$desktopSourceContext = $null
 $payloadReadHandles = $null
 $staging = $null
 try {
-    # Record validation also confirms the current source revision and retains the
-    # worker read handle. This is local byte integrity, never release authority.
-    $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $repositoryRoot
+    # M is derived from this builder checkout. R is read only as record/worker
+    # data from its independently clean checkout.
+    $desktopSourceContext = Get-WindowsFrozenCpuWorkerSourceContext $repositoryRoot
+    $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $resolvedFrozenWorkerSourceRoot
+    Assert-WindowsFrozenCpuWorkerCompatibleSourceContexts $desktopSourceContext $frozenCpuWorker.Context
+    $null = Get-WindowsFrozenCpuWorkerSafeTemporaryRoot $desktopSourceContext $frozenCpuWorker
     $bundle = Assert-WindowsLocalFrozenBundle $BundlePath $frozenCpuWorker
+    Assert-WindowsLocalFrozenBundleCompiledAdmission $bundle $desktopSourceContext $frozenCpuWorker | Out-Null
     $finalOutput = Assert-WindowsLocalFrozenOutputPath $OutputDirectory @(
-        $repositoryRoot, $bundle.Root, $frozenCpuWorker.Root
+        $repositoryRoot, $resolvedFrozenWorkerSourceRoot, $bundle.Root, $frozenCpuWorker.Root
     )
     $outputParent = Split-Path -Parent $finalOutput
     if (-not (Test-Path -LiteralPath $outputParent)) {
@@ -215,12 +257,14 @@ try {
     $payloadStaging = Join-Path $staging 'payload'
     Copy-WindowsLocalFrozenBundle $bundle.Root $payloadStaging
     $copiedBundle = Assert-WindowsLocalFrozenBundle $payloadStaging $frozenCpuWorker
+    Assert-WindowsLocalFrozenBundleCompiledAdmission $copiedBundle $desktopSourceContext $frozenCpuWorker | Out-Null
     $sourceAfterCopy = Assert-WindowsLocalFrozenBundle $bundle.Root $frozenCpuWorker
     if ($sourceAfterCopy.InventorySha256 -cne $bundle.InventorySha256 -or
         $copiedBundle.InventorySha256 -cne $bundle.InventorySha256) {
         throw 'Local frozen installer source bundle changed while staging; refusing to compile from drifted bytes.'
     }
     $payloadReadHandles = Open-WindowsLocalFrozenPayloadReadHandles $payloadStaging (@($copiedBundle.Files) + @('bundle-inventory.json'))
+    Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
     Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
 
     $compilerOutput = Join-Path $staging 'compiler-output'
@@ -231,7 +275,7 @@ try {
         "/DLocalFrozenBundleRoot=$payloadStaging",
         "/DLocalFrozenInstallerOutputRoot=$compilerOutput",
         "/DLocalFrozenTestToken=$token",
-        "/DAppVersion=$($frozenCpuWorker.Record.app_version)",
+        "/DAppVersion=$($desktopSourceContext.AppVersion)",
         $templatePath
     ) -Description 'Pinned Inno Setup compilation' -TimeoutMilliseconds 900000
     if ($compilation.ExitCode -ne 0) {
@@ -256,6 +300,7 @@ try {
     if ($sourceAfterCompile.InventorySha256 -cne $bundle.InventorySha256) {
         throw 'Local frozen installer source bundle changed during compilation; refusing to publish the staged installer.'
     }
+    Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
     Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
     foreach ($handle in $payloadReadHandles) { $handle.Dispose() }
     $payloadReadHandles = $null
@@ -268,7 +313,7 @@ try {
         (Get-WindowsFrozenCpuWorkerFileSha256 $publishedInstaller) -cne (Get-WindowsFrozenCpuWorkerFileSha256 $installer.FullName)) {
         throw 'Local frozen installer output bytes changed while publishing the compiler result.'
     }
-    $record = New-WindowsLocalFrozenInstallerRecord $frozenCpuWorker $bundle $installerName $publishedInstallerItem $token
+    $record = New-WindowsLocalFrozenInstallerRecord $desktopSourceContext $frozenCpuWorker $bundle $installerName $publishedInstallerItem $token
     $recordPath = Join-Path $publish 'windows-local-frozen-test-installer-record.json'
     Write-WindowsFrozenCpuWorkerAtomicUtf8File $recordPath ($record | ConvertTo-Json -Depth 5)
     $publishedItems = @(Get-ChildItem -LiteralPath $publish -Force | ForEach-Object { $_.Name } | Sort-Object)

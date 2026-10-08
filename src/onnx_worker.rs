@@ -13827,11 +13827,31 @@ mod tests {
         AvailabilityCpuStatus,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CompatibilityPackMutation {
+        None,
+        ReturnedSessionApp,
+        ReturnedWorkerHash,
+        ReturnedPack,
+        ReturnedOrigin,
+        MissingContext,
+        ReturnedStableDevice,
+    }
+
     enum TestMode {
         Normal,
         CompatibilityNormal {
             worker_sha256: String,
             wrong_session_app: bool,
+        },
+        CompatibilityPack {
+            local: Box<WorkerExpectation>,
+            capability: WorkerPackCapability,
+            mutation: CompatibilityPackMutation,
+            post_response: Option<TestSender<Option<String>>>,
+        },
+        CompatibilityPackLegacyReject {
+            post_response: TestSender<Option<String>>,
         },
         LegacyRejectCompatibility,
         CapabilityMismatch(CapabilityMismatch),
@@ -13904,8 +13924,10 @@ mod tests {
 
     struct TestLauncher {
         modes: Mutex<VecDeque<TestMode>>,
+        launch_attempts: AtomicUsize,
         launches: AtomicUsize,
         frozen_worker_approval: Option<FrozenWorkerApproval>,
+        pack_launch: Option<PackLaunchContext>,
         session_app_build: Option<String>,
         kill_started: Option<TestSender<()>>,
         reaped: Option<TestSender<()>>,
@@ -13915,8 +13937,10 @@ mod tests {
         fn new(modes: impl IntoIterator<Item = TestMode>) -> Self {
             Self {
                 modes: Mutex::new(modes.into_iter().collect()),
+                launch_attempts: AtomicUsize::new(0),
                 launches: AtomicUsize::new(0),
                 frozen_worker_approval: None,
+                pack_launch: None,
                 session_app_build: None,
                 kill_started: None,
                 reaped: None,
@@ -13942,10 +13966,21 @@ mod tests {
             self.session_app_build = Some(session_app_build.into());
             self
         }
+
+        fn with_pack_launch(mut self, pack_launch: PackLaunchContext) -> Self {
+            self.frozen_worker_approval = pack_launch.frozen_worker_approval.clone();
+            assert!(
+                self.frozen_worker_approval.is_some(),
+                "foreign signed pack fixture must retain its verified approval"
+            );
+            self.pack_launch = Some(pack_launch);
+            self
+        }
     }
 
     impl WorkerLauncher for TestLauncher {
         fn launch(&self) -> Result<SpawnedWorker> {
+            self.launch_attempts.fetch_add(1, Ordering::AcqRel);
             let mode = self
                 .modes
                 .lock()
@@ -13988,11 +14023,23 @@ mod tests {
             });
             *process.worker.lock().unwrap() = Some(worker);
             let mut expectation = expected_worker(WorkerRole::Inference);
+            if let Some(pack_launch) = &self.pack_launch {
+                expectation.provider = pack_launch.expectation.backend;
+                expectation.pack = Some(pack_launch.expectation.clone());
+                expectation.bundled_worker_sha256 = self
+                    .frozen_worker_approval
+                    .as_ref()
+                    .expect("verified pack launch retains its frozen approval")
+                    .worker_sha256()
+                    .to_owned();
+            }
             if let Some(approval) = &self.frozen_worker_approval {
-                expectation.app_build = self
-                    .session_app_build
-                    .clone()
-                    .expect("compatible test launcher requires a session app build");
+                if self.pack_launch.is_none() {
+                    expectation.app_build = self
+                        .session_app_build
+                        .clone()
+                        .expect("compatible test launcher requires a session app build");
+                }
                 expectation.worker_build = approval.worker_build().to_owned();
                 expectation.bundled_worker_sha256 = approval.worker_sha256().to_owned();
             }
@@ -14004,7 +14051,7 @@ mod tests {
                 process,
                 expectation,
                 frozen_worker_approval: self.frozen_worker_approval.clone(),
-                pack_launch: None,
+                pack_launch: self.pack_launch.clone(),
             })
         }
     }
@@ -14204,6 +14251,102 @@ mod tests {
                 }
                 return;
             }
+            TestMode::CompatibilityPack {
+                local,
+                capability: pack,
+                mutation,
+                post_response,
+            } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::CompatibilityHello {
+                    challenge,
+                    expected,
+                    compatibility,
+                } = control
+                else {
+                    panic!("expected foreign GPU CompatibilityHello");
+                };
+                let session = validate_compatible_worker_hello_against_local(
+                    Some(WorkerRole::Inference),
+                    &challenge,
+                    &expected,
+                    &compatibility,
+                    &local,
+                )
+                .expect("foreign signed pack fixture must accept the exact launch context");
+                let mut capability = compatible_worker_capability(&session, challenge, Some(pack))
+                    .expect("foreign signed pack fixture capability must be canonical");
+                capability.bundled_worker_sha256 = expected.bundled_worker_sha256.clone();
+                match mutation {
+                    CompatibilityPackMutation::None => {}
+                    CompatibilityPackMutation::ReturnedSessionApp => {
+                        capability.app_build.push_str("-wrong");
+                    }
+                    CompatibilityPackMutation::ReturnedWorkerHash => {
+                        capability.bundled_worker_sha256 = "ff".repeat(32);
+                    }
+                    CompatibilityPackMutation::ReturnedPack => {
+                        capability
+                            .pack
+                            .as_mut()
+                            .expect("pack capability is present")
+                            .expectation
+                            .pack_digest = "ee".repeat(32);
+                    }
+                    CompatibilityPackMutation::ReturnedOrigin => {
+                        capability
+                            .compatibility
+                            .as_mut()
+                            .expect("compatibility context is present")
+                            .origin_app_build = "local-transcriber@0.1.0#wrong-origin".to_owned();
+                    }
+                    CompatibilityPackMutation::MissingContext => {
+                        capability.compatibility = None;
+                    }
+                    CompatibilityPackMutation::ReturnedStableDevice => {
+                        capability
+                            .pack
+                            .as_mut()
+                            .expect("pack capability is present")
+                            .devices[0]
+                            .stable_device_identity = "native:pci:0000:02:00.0".to_owned();
+                    }
+                }
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Ready { capability },
+                );
+                if let Some(post_response) = post_response {
+                    let control = read_frame(&mut input)
+                        .ok()
+                        .and_then(|frame| parse_parent_control(frame).ok())
+                        .map(|(_, _, control)| format!("{control:?}"));
+                    post_response.send(control).unwrap();
+                } else {
+                    run_normal_worker(&mut input, &mut output);
+                }
+                return;
+            }
+            TestMode::CompatibilityPackLegacyReject { post_response } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::CompatibilityHello { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "foreign signed worker rejected compatibility Hello".to_owned(),
+                    },
+                );
+                let control = read_frame(&mut input)
+                    .ok()
+                    .and_then(|frame| parse_parent_control(frame).ok())
+                    .map(|(_, _, control)| format!("{control:?}"));
+                post_response.send(control).unwrap();
+                return;
+            }
             TestMode::LegacyRejectCompatibility => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::CompatibilityHello { .. }));
@@ -14282,6 +14425,8 @@ mod tests {
         match mode {
             TestMode::DelayedLaunch { .. }
             | TestMode::CompatibilityNormal { .. }
+            | TestMode::CompatibilityPack { .. }
+            | TestMode::CompatibilityPackLegacyReject { .. }
             | TestMode::LegacyRejectCompatibility
             | TestMode::CapabilityMismatch(_)
             | TestMode::BlockedHello { .. } => {
@@ -15145,6 +15290,178 @@ mod tests {
         .expect("fixture policy must approve its exact CPU worker")
     }
 
+    #[derive(Clone, Copy)]
+    struct ForeignGpuSessionSpec {
+        backend: PackBackend,
+        provider: &'static str,
+        label: &'static str,
+    }
+
+    struct ForeignGpuSessionFixture {
+        root: PathBuf,
+        context: PackLaunchContext,
+        local: WorkerExpectation,
+        capability: WorkerPackCapability,
+        expected_device: BackendTarget,
+    }
+
+    fn foreign_gpu_session_specs() -> [ForeignGpuSessionSpec; 2] {
+        [
+            ForeignGpuSessionSpec {
+                backend: PackBackend::Cuda,
+                provider: "transcribe-cpp-ggml-cuda",
+                label: "cuda",
+            },
+            ForeignGpuSessionSpec {
+                backend: PackBackend::Vulkan,
+                provider: "transcribe-cpp-ggml-vulkan",
+                label: "vulkan",
+            },
+        ]
+    }
+
+    fn foreign_gpu_policy(manifest: &crate::gpu_worker_pack::manifest::PackManifest) -> Vec<u8> {
+        let worker_sha256 = manifest
+            .payload
+            .iter()
+            .find(|entry| entry.path == manifest.worker_path)
+            .expect("fixture manifest includes the worker")
+            .sha256
+            .as_str();
+        let backend = match manifest.backend {
+            PackBackend::Cuda => "cuda",
+            PackBackend::Vulkan => "vulkan",
+            PackBackend::Metal => unreachable!("fixture covers Windows GPU backends only"),
+        };
+        format!(
+            "{{\"schema_version\":1,\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"kind\":\"gpu\",\"origin_app_build\":\"{}\",\"worker_build\":\"{}\",\"worker_sha256\":\"{}\",\"protocol_version\":{},\"runtime_abi_version\":{},\"backend\":\"{}\",\"provider\":\"{}\",\"pack_id\":\"{}\",\"pack_version\":\"{}\",\"pack_digest\":\"{}\",\"security_epoch\":{}}}]}}",
+            manifest.app_build,
+            manifest.worker_build,
+            worker_sha256,
+            PROTOCOL_VERSION,
+            manifest.runtime_abi_version,
+            backend,
+            manifest.provider,
+            manifest.pack_id.as_str(),
+            manifest.pack_version.as_str(),
+            manifest.pack_digest,
+            manifest.security_epoch,
+        )
+        .into_bytes()
+    }
+
+    fn foreign_signed_gpu_session_fixture(spec: ForeignGpuSessionSpec) -> ForeignGpuSessionFixture {
+        use crate::gpu_worker_pack::manifest::test_support::{
+            base_manifest, temp_root, write_signed,
+        };
+        use crate::gpu_worker_pack::manifest::{
+            Compatibility, PinnedPackRoot, compute_pack_digest,
+        };
+
+        let root = temp_root(&format!("foreign-{}-session", spec.label));
+        let source = root.join("source");
+        let mut manifest = base_manifest();
+        manifest.app_build = "local-transcriber@0.9.0#approved-r".to_owned();
+        manifest.worker_build = "scribe-inference-worker@0.9.0#approved-r".to_owned();
+        manifest.backend = spec.backend;
+        manifest.provider = spec.provider.to_owned();
+        manifest.target_os = std::env::consts::OS.to_owned();
+        manifest.target_arch = std::env::consts::ARCH.to_owned();
+        manifest.pack_digest = compute_pack_digest(&manifest)
+            .expect("foreign GPU fixture manifest must have a canonical digest");
+        let policy = foreign_gpu_policy(&manifest);
+        let trust = write_signed(&source, manifest);
+        let allowed_backends = [spec.backend];
+        let verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: DESKTOP_BUILD_ID,
+                worker_build: INFERENCE_WORKER_BUILD_ID,
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &allowed_backends,
+            },
+        );
+        let lease = crate::worker_compatibility::with_test_frozen_worker_policy(&policy, || {
+            let descriptor = verifier
+                .verify(&source)
+                .expect("fixture signature and foreign policy must verify");
+            let store_root = root.join("workers/packs");
+            let parent = store_root
+                .join(descriptor.pack_id.as_str())
+                .join(descriptor.pack_version.as_str());
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::rename(&source, parent.join(&descriptor.pack_digest)).unwrap();
+            let pinned = PinnedPackRoot::open(
+                &std::fs::canonicalize(&store_root).unwrap(),
+                [&descriptor.pack_id, &descriptor.pack_version],
+                &descriptor.pack_digest,
+            )
+            .expect("fixture pack store must pin the exact signed pack");
+            let lease = Arc::new(
+                verifier
+                    .verify_pinned(pinned)
+                    .expect("foreign signed fixture must retain a verified lease"),
+            );
+            assert!(lease.frozen_worker_approval().is_some());
+            lease
+        });
+        let expectation = pack_expectation(&lease);
+        let approval = lease
+            .frozen_worker_approval()
+            .expect("foreign signed fixture retains its approved R identity")
+            .clone();
+        let mut expected_device = backend_target(
+            match spec.backend {
+                PackBackend::Cuda => BackendKind::Cuda,
+                PackBackend::Vulkan => BackendKind::Vulkan,
+                PackBackend::Metal => unreachable!("fixture covers Windows GPU backends only"),
+            },
+            "native:pci:0000:01:00.0",
+            Some(9),
+        );
+        expected_device.provider_id = ProviderIdentity::new(spec.provider);
+        expected_device.driver_version = Some("fixture-driver-1".to_owned());
+        expected_device.vendor = GpuVendor::Nvidia;
+        expected_device.device_class = DeviceClass::DiscreteGpu;
+        let capability = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: expected_device.device_id.as_str().to_owned(),
+                // The fresh worker enumeration deliberately differs from the
+                // parent probe index; only the stable device identity binds.
+                process_index: 2,
+                display_name: format!("Fixture {} GPU", spec.label),
+                driver_version: expected_device.driver_version.clone(),
+                device_class: expected_device.device_class,
+                vendor: expected_device.vendor,
+                memory_total_bytes: expected_device.memory_total_bytes,
+                memory_available_bytes: expected_device.memory_available_bytes,
+            }],
+        };
+        let local = WorkerExpectation {
+            app_build: approval.context().origin_app_build,
+            worker_build: approval.worker_build().to_owned(),
+            bundled_worker_sha256: approval.worker_sha256().to_owned(),
+            abi: approval.runtime_abi_version(),
+            role: WorkerRole::Inference,
+            provider: expectation.backend,
+            pack: Some(expectation),
+        };
+        let context = PackLaunchContext::fixture(lease, Some(expected_device.clone()));
+        ForeignGpuSessionFixture {
+            root,
+            context,
+            local,
+            capability,
+            expected_device,
+        }
+    }
+
+    fn remove_foreign_gpu_session_fixture(root: PathBuf) {
+        std::fs::remove_dir_all(root).expect("foreign signed GPU fixture must release its lease");
+    }
+
     fn short_vad_deadlines() -> VadDeadlines {
         VadDeadlines {
             acquisition: Duration::from_millis(40),
@@ -15414,6 +15731,262 @@ mod tests {
                 .contains("generation changed")
         );
         supervisor.terminate_current().unwrap();
+    }
+
+    #[test]
+    fn foreign_signed_cuda_and_vulkan_leases_bind_one_compatible_generation_to_the_stable_device() {
+        for spec in foreign_gpu_session_specs() {
+            let fixture = foreign_signed_gpu_session_fixture(spec);
+            let root = fixture.root.clone();
+            let expected_device = fixture.expected_device.clone();
+            let foreign_origin = fixture.local.app_build.clone();
+            let foreign_worker = fixture.local.worker_build.clone();
+            let foreign_worker_sha256 = fixture.local.bundled_worker_sha256.clone();
+            let launcher = Arc::new(
+                TestLauncher::new([TestMode::CompatibilityPack {
+                    local: Box::new(fixture.local.clone()),
+                    capability: fixture.capability.clone(),
+                    mutation: CompatibilityPackMutation::None,
+                    post_response: None,
+                }])
+                .with_pack_launch(fixture.context.clone()),
+            );
+            let worker_launcher: Arc<dyn WorkerLauncher> = launcher.clone();
+            let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                worker_launcher,
+                short_deadlines(),
+            );
+
+            assert_eq!(supervisor.ensure_generation().unwrap(), 1, "{}", spec.label);
+            let bindings = supervisor.generation_context().unwrap().pack_bindings;
+            assert_eq!(bindings.len(), 1, "{}", spec.label);
+            let target = bindings[0].backend_target();
+            assert_eq!(target.backend, expected_device.backend, "{}", spec.label);
+            assert_eq!(
+                target.provider_id.as_str(),
+                expected_device.provider_id.as_str(),
+                "{}",
+                spec.label
+            );
+            assert_eq!(
+                target.device_id.as_str(),
+                expected_device.device_id.as_str(),
+                "{}",
+                spec.label
+            );
+            assert_eq!(
+                target.driver_version, expected_device.driver_version,
+                "{}",
+                spec.label
+            );
+            assert_eq!(
+                target.memory_total_bytes,
+                expected_device.memory_total_bytes
+            );
+            assert_eq!(target.process_index, Some(2), "{}", spec.label);
+            drop(bindings);
+            {
+                let state = supervisor.inner.state.lock().unwrap();
+                let current = state.current.as_ref().unwrap();
+                assert_eq!(
+                    current.expectation.app_build, DESKTOP_BUILD_ID,
+                    "{}",
+                    spec.label
+                );
+                assert_eq!(
+                    current
+                        .frozen_worker_approval
+                        .as_ref()
+                        .unwrap()
+                        .context()
+                        .origin_app_build,
+                    foreign_origin,
+                    "{}",
+                    spec.label
+                );
+                assert_eq!(
+                    current
+                        .frozen_worker_approval
+                        .as_ref()
+                        .unwrap()
+                        .worker_build(),
+                    foreign_worker,
+                    "{}",
+                    spec.label
+                );
+                assert_eq!(
+                    current
+                        .frozen_worker_approval
+                        .as_ref()
+                        .unwrap()
+                        .worker_sha256(),
+                    foreign_worker_sha256,
+                    "{}",
+                    spec.label
+                );
+                assert_eq!(current.pack_bindings.len(), 1, "{}", spec.label);
+            }
+
+            let generation = supervisor.generation_for_test();
+            supervisor.terminate_current().unwrap();
+            assert!(
+                supervisor.generation_context_exact(generation).is_err(),
+                "retired {} generation remained usable",
+                spec.label
+            );
+            assert_eq!(
+                launcher.launches.load(Ordering::Acquire),
+                1,
+                "{}",
+                spec.label
+            );
+            drop(supervisor);
+            drop(launcher);
+            drop(fixture);
+            remove_foreign_gpu_session_fixture(root);
+        }
+    }
+
+    #[test]
+    fn foreign_signed_cuda_and_vulkan_leases_reject_returned_identity_mutations_without_legacy_downgrade()
+     {
+        for spec in foreign_gpu_session_specs() {
+            for mutation in [
+                CompatibilityPackMutation::ReturnedSessionApp,
+                CompatibilityPackMutation::ReturnedWorkerHash,
+                CompatibilityPackMutation::ReturnedPack,
+                CompatibilityPackMutation::ReturnedOrigin,
+                CompatibilityPackMutation::MissingContext,
+                CompatibilityPackMutation::ReturnedStableDevice,
+            ] {
+                let fixture = foreign_signed_gpu_session_fixture(spec);
+                let root = fixture.root.clone();
+                let (post_response_tx, post_response_rx) = channel();
+                let launcher = Arc::new(
+                    TestLauncher::new([TestMode::CompatibilityPack {
+                        local: Box::new(fixture.local.clone()),
+                        capability: fixture.capability.clone(),
+                        mutation,
+                        post_response: Some(post_response_tx),
+                    }])
+                    .with_pack_launch(fixture.context.clone()),
+                );
+                let worker_launcher: Arc<dyn WorkerLauncher> = launcher.clone();
+                let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    worker_launcher,
+                    short_deadlines(),
+                );
+
+                let mutation_label = format!("{mutation:?}").to_ascii_lowercase();
+                let expected_error = match mutation {
+                    CompatibilityPackMutation::ReturnedStableDevice => {
+                        "GPU worker Hello omitted the parent-selected stable device"
+                    }
+                    CompatibilityPackMutation::None => {
+                        unreachable!("success mutation is not rejected")
+                    }
+                    CompatibilityPackMutation::ReturnedSessionApp
+                    | CompatibilityPackMutation::ReturnedWorkerHash
+                    | CompatibilityPackMutation::ReturnedPack
+                    | CompatibilityPackMutation::ReturnedOrigin
+                    | CompatibilityPackMutation::MissingContext => {
+                        "worker capability is incompatible with the requesting application"
+                    }
+                };
+                let error = supervisor.ensure_generation().unwrap_err().to_string();
+                assert!(
+                    error.contains(expected_error),
+                    "{}/{} rejected through the wrong boundary: {error}",
+                    spec.label,
+                    mutation_label
+                );
+                assert_eq!(
+                    supervisor.current_generation().unwrap(),
+                    None,
+                    "{}/{} left a usable generation",
+                    spec.label,
+                    mutation_label
+                );
+                assert_eq!(
+                    launcher.launches.load(Ordering::Acquire),
+                    1,
+                    "{}/{} retried as a legacy worker",
+                    spec.label,
+                    mutation_label
+                );
+                assert_eq!(
+                    launcher.launch_attempts.load(Ordering::Acquire),
+                    1,
+                    "{}/{} attempted a legacy fallback launch",
+                    spec.label,
+                    mutation_label
+                );
+                assert_eq!(
+                    post_response_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap(),
+                    None,
+                    "{}/{} sent a same-pipe legacy control after Ready",
+                    spec.label,
+                    mutation_label
+                );
+                drop(supervisor);
+                drop(launcher);
+                drop(fixture);
+                remove_foreign_gpu_session_fixture(root);
+            }
+
+            let fixture = foreign_signed_gpu_session_fixture(spec);
+            let root = fixture.root.clone();
+            let (post_response_tx, post_response_rx) = channel();
+            let launcher = Arc::new(
+                TestLauncher::new([TestMode::CompatibilityPackLegacyReject {
+                    post_response: post_response_tx,
+                }])
+                .with_pack_launch(fixture.context.clone()),
+            );
+            let worker_launcher: Arc<dyn WorkerLauncher> = launcher.clone();
+            let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                worker_launcher,
+                short_deadlines(),
+            );
+            let error = supervisor.ensure_generation().unwrap_err().to_string();
+            assert!(
+                error.contains("foreign signed worker rejected compatibility Hello"),
+                "{} rejected through the wrong boundary: {error}",
+                spec.label
+            );
+            assert_eq!(
+                supervisor.current_generation().unwrap(),
+                None,
+                "{}",
+                spec.label
+            );
+            assert_eq!(
+                launcher.launches.load(Ordering::Acquire),
+                1,
+                "{}",
+                spec.label
+            );
+            assert_eq!(
+                launcher.launch_attempts.load(Ordering::Acquire),
+                1,
+                "{} attempted a legacy fallback launch",
+                spec.label
+            );
+            assert_eq!(
+                post_response_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                None,
+                "{} sent a same-pipe legacy Hello",
+                spec.label
+            );
+            drop(supervisor);
+            drop(launcher);
+            drop(fixture);
+            remove_foreign_gpu_session_fixture(root);
+        }
     }
 
     #[test]

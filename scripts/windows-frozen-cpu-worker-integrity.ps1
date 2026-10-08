@@ -289,19 +289,187 @@ function Assert-WindowsFrozenCpuWorkerExactProperties(
     }
 }
 
+function Assert-WindowsFrozenCpuWorkerInt64([object]$Value, [string]$Description) {
+    if ($Value -isnot [int32] -and $Value -isnot [int64]) {
+        throw "$Description must be an integer."
+    }
+    return [int64]$Value
+}
+
 function Assert-WindowsFrozenCpuWorkerDigest([string]$Value, [string]$Description) {
     if ($Value -isnot [string] -or $Value -cnotmatch '^[0-9a-f]{64}$') {
         throw "$Description must be a lowercase SHA-256 digest."
     }
 }
 
-function Invoke-WindowsFrozenCpuWorkerGit([string]$RepositoryRoot, [string[]]$Arguments) {
-    $global:LASTEXITCODE = 0
-    $output = @(& git -C $RepositoryRoot @Arguments)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not run git $($Arguments -join ' ') for frozen CPU worker source context."
+function Test-WindowsFrozenCpuWorkerPathIsWithin([string]$CandidatePath, [string]$RootPath) {
+    $candidate = Get-WindowsFrozenCpuWorkerNormalizedFullPath $CandidatePath
+    $root = Get-WindowsFrozenCpuWorkerNormalizedFullPath $RootPath
+    return [string]::Equals($candidate, $root, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $candidate.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-WindowsFrozenCpuWorkerSafeTemporaryRoot(
+    [psobject]$DesktopContext,
+    [psobject]$FrozenCpuWorker
+) {
+    $desktopSourceRoot = Get-WindowsFrozenCpuWorkerNormalizedFullPath $DesktopContext.RepositoryRoot
+    $workerSourceRoot = Get-WindowsFrozenCpuWorkerNormalizedFullPath $FrozenCpuWorker.Context.RepositoryRoot
+    if ([string]::Equals($desktopSourceRoot, $workerSourceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return Get-WindowsFrozenCpuWorkerNormalizedFullPath ([System.IO.Path]::GetTempPath())
     }
-    return @($output | ForEach-Object { [string]$_ })
+    # A relative TEMP/TMP resolves against the caller's current directory. In
+    # distinct-source assembly that is not a stable, independently verified
+    # location, so reject it before resolving a scratch root or inspecting any
+    # ancestor.
+    foreach ($name in @('TEMP', 'TMP')) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if (-not [System.IO.Path]::IsPathFullyQualified($value)) {
+            throw 'A separately retained frozen worker source requires fully qualified temporary output paths.'
+        }
+    }
+    $temporaryRoot = Get-WindowsFrozenCpuWorkerNormalizedFullPath ([System.IO.Path]::GetTempPath())
+    Assert-WindowsFrozenCpuWorkerNoReparseAncestors $temporaryRoot
+    foreach ($name in @('TEMP', 'TMP')) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        Assert-WindowsFrozenCpuWorkerNoReparseAncestors $value
+        if (Test-WindowsFrozenCpuWorkerPathIsWithin $value $workerSourceRoot) {
+            throw 'A separately retained frozen worker source cannot contain temporary output paths.'
+        }
+    }
+    if (Test-WindowsFrozenCpuWorkerPathIsWithin $temporaryRoot $workerSourceRoot) {
+        throw 'A separately retained frozen worker source cannot contain temporary output paths.'
+    }
+    return $temporaryRoot
+}
+
+function Invoke-WindowsFrozenCpuWorkerGitProcess([string]$RepositoryRoot, [string[]]$Arguments) {
+    $gitCommand = @(Get-Command -Name git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($gitCommand.Count -ne 1 -or [string]::IsNullOrWhiteSpace($gitCommand[0].Path)) {
+        throw 'Could not resolve the Git executable for frozen CPU worker source context.'
+    }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Get-WindowsFrozenCpuWorkerNormalizedFullPath $gitCommand[0].Path
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @('--no-optional-locks', '--no-lazy-fetch', '-c', 'core.fsmonitor=false', '--no-pager', '-C', $RepositoryRoot) + $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        if (-not $process.Start()) {
+            throw 'Frozen CPU worker Git query could not start.'
+        }
+        $started = $true
+        $stdoutBuffer = [char[]]::new(4096)
+        $stderrBuffer = [char[]]::new(4096)
+        $stdout = [Text.StringBuilder]::new()
+        $stderr = [Text.StringBuilder]::new()
+        $stdoutTask = $process.StandardOutput.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+        $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+        $stdoutClosed = $false
+        $stderrClosed = $false
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $exitedAt = $null
+        while ($true) {
+            foreach ($stream in @(
+                [pscustomobject]@{ Task = $stdoutTask; Buffer = $stdoutBuffer; Text = $stdout; Closed = $stdoutClosed; Name = 'stdout' },
+                [pscustomobject]@{ Task = $stderrTask; Buffer = $stderrBuffer; Text = $stderr; Closed = $stderrClosed; Name = 'stderr' }
+            )) {
+                if ($stream.Closed -or -not $stream.Task.IsCompleted) { continue }
+                if ($stream.Task.IsFaulted -or $stream.Task.IsCanceled) {
+                    Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker Git query'
+                    throw "Frozen CPU worker Git query $($stream.Name) capture failed."
+                }
+                $count = $stream.Task.GetAwaiter().GetResult()
+                if ($count -eq 0) {
+                    if ($stream.Name -ceq 'stdout') { $stdoutClosed = $true } else { $stderrClosed = $true }
+                    continue
+                }
+                if ($stream.Text.Length -gt 65536 - $count) {
+                    Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker Git query'
+                    throw "Frozen CPU worker Git query $($stream.Name) exceeded the fixed 65536-character bound."
+                }
+                $null = $stream.Text.Append($stream.Buffer, 0, $count)
+                if ($stream.Name -ceq 'stdout') {
+                    $stdoutTask = $process.StandardOutput.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+                }
+                else {
+                    $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                }
+            }
+            if ($process.HasExited -and $null -eq $exitedAt) {
+                $exitedAt = $clock.ElapsedMilliseconds
+            }
+            if ($process.HasExited -and $stdoutClosed -and $stderrClosed) { break }
+            if ($clock.ElapsedMilliseconds -ge 10000) {
+                if (-not $process.HasExited) {
+                    Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker Git query'
+                    throw 'Frozen CPU worker Git query timed out after the fixed 10000-millisecond deadline.'
+                }
+                throw 'Frozen CPU worker Git query output streams did not close within the fixed deadline.'
+            }
+            if ($process.HasExited -and ($clock.ElapsedMilliseconds - $exitedAt) -ge 5000) {
+                throw 'Frozen CPU worker Git query output streams did not close within the fixed post-exit drain deadline.'
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdout.ToString()
+            Stderr = $stderr.ToString()
+        }
+    }
+    catch {
+        $originalError = $_
+        if ($started -and -not $process.HasExited) {
+            try {
+                Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker Git query'
+            }
+            catch {
+                throw 'Frozen CPU worker Git query failed and process termination could not be confirmed.'
+            }
+        }
+        throw $originalError
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function ConvertFrom-WindowsFrozenCpuWorkerGitOutputLines([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    return @($Text -split "`r?`n" | Where-Object { $_.Length -ne 0 })
+}
+
+function Invoke-WindowsFrozenCpuWorkerGit([string]$RepositoryRoot, [string[]]$Arguments) {
+    $result = Invoke-WindowsFrozenCpuWorkerGitProcess $RepositoryRoot $Arguments
+    if ($result.ExitCode -ne 0) {
+        throw 'Could not run Git for frozen CPU worker source context; Git with --no-lazy-fetch support is required.'
+    }
+    return ConvertFrom-WindowsFrozenCpuWorkerGitOutputLines $result.Stdout
+}
+
+function Assert-WindowsFrozenCpuWorkerNoExternalGitFilters([string]$RepositoryRoot) {
+    # `status` must not consult an externally configured filter from R. Ask Git
+    # for names only so an unsafe command value is never echoed into diagnostics.
+    $result = Invoke-WindowsFrozenCpuWorkerGitProcess $RepositoryRoot @(
+        'config', '--name-only', '--get-regexp', '^(filter\..*\.(clean|process))$'
+    )
+    $filterNames = @(ConvertFrom-WindowsFrozenCpuWorkerGitOutputLines $result.Stdout)
+    if ($result.ExitCode -eq 1 -and $filterNames.Count -eq 0) { return }
+    if ($result.ExitCode -ne 0) {
+        throw 'Could not inspect frozen CPU worker Git filters; Git with --no-lazy-fetch support is required.'
+    }
+    if ($filterNames.Count -ne 0) {
+        throw 'Frozen CPU worker Git configuration contains an external clean or process filter.'
+    }
 }
 
 function Get-WindowsFrozenCpuWorkerSourceContext([string]$RepositoryRoot) {
@@ -317,6 +485,7 @@ function Get-WindowsFrozenCpuWorkerSourceContext([string]$RepositoryRoot) {
             throw "Frozen CPU worker packaging does not accept Git repository overrides: $name"
         }
     }
+    Assert-WindowsFrozenCpuWorkerNoExternalGitFilters $root
     $topLevelLines = @(Invoke-WindowsFrozenCpuWorkerGit $root @('rev-parse', '--show-toplevel'))
     if ($topLevelLines.Count -ne 1 -or
         -not [string]::Equals((Get-WindowsFrozenCpuWorkerNormalizedFullPath $topLevelLines[0]), $root, [StringComparison]::OrdinalIgnoreCase)) {
@@ -403,6 +572,210 @@ function Assert-WindowsFrozenCpuWorkerContextUnchanged([psobject]$ExpectedContex
             throw "Frozen CPU worker source context changed before publication: $property"
         }
     }
+}
+
+function Test-WindowsFrozenCpuWorkerSameSourceContext(
+    [psobject]$DesktopContext,
+    [psobject]$WorkerContext
+) {
+    foreach ($property in @(
+        'SourceRevision', 'AppVersion', 'TargetTriple', 'ProtocolVersion', 'WorkerAbiVersion',
+        'DesktopBuildId', 'WorkerBuildId', 'CargoLockSha256', 'RustToolchainSha256',
+        'CargoManifestSha256', 'WorkerIdentitySha256', 'BuildRsSha256', 'BuildContractSha256'
+    )) {
+        if ([string]$DesktopContext.$property -cne [string]$WorkerContext.$property) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-WindowsFrozenCpuWorkerCompatibleSourceContexts(
+    [psobject]$DesktopContext,
+    [psobject]$WorkerContext
+) {
+    foreach ($property in @('TargetTriple', 'ProtocolVersion', 'WorkerAbiVersion')) {
+        if ([string]$DesktopContext.$property -cne [string]$WorkerContext.$property) {
+            throw "Frozen CPU worker source contexts are incompatible: $property"
+        }
+    }
+}
+
+function Stop-WindowsFrozenCpuWorkerAdmissionProcess(
+    [System.Diagnostics.Process]$Process,
+    [string]$Description
+) {
+    if ($Process.HasExited) { return }
+    try { $Process.Kill($true) }
+    catch {
+        try { $Process.Kill() }
+        catch { throw "$Description could not be terminated after its bounded deadline." }
+    }
+    if (-not $Process.WaitForExit(5000)) {
+        throw "$Description did not exit within the fixed termination deadline."
+    }
+}
+
+function Invoke-WindowsFrozenCpuWorkerAdmissionProcess([string]$Executable) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Get-WindowsFrozenCpuWorkerNormalizedFullPath $Executable
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.ArgumentList.Add('--scribe-frozen-worker-admission')
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        if (-not $process.Start()) {
+            throw 'Frozen CPU worker admission report process could not start.'
+        }
+        $started = $true
+        $stdoutBuffer = [char[]]::new(4096)
+        $stderrBuffer = [char[]]::new(4096)
+        $stdout = [Text.StringBuilder]::new()
+        $stderr = [Text.StringBuilder]::new()
+        $stdoutTask = $process.StandardOutput.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+        $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+        $stdoutClosed = $false
+        $stderrClosed = $false
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $exitedAt = $null
+        while ($true) {
+            foreach ($stream in @(
+                [pscustomobject]@{ Task = $stdoutTask; Buffer = $stdoutBuffer; Text = $stdout; Closed = $stdoutClosed; Name = 'stdout' },
+                [pscustomobject]@{ Task = $stderrTask; Buffer = $stderrBuffer; Text = $stderr; Closed = $stderrClosed; Name = 'stderr' }
+            )) {
+                if ($stream.Closed -or -not $stream.Task.IsCompleted) { continue }
+                if ($stream.Task.IsFaulted -or $stream.Task.IsCanceled) {
+                    Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker admission report process'
+                    throw "Frozen CPU worker admission report $($stream.Name) capture failed."
+                }
+                $count = $stream.Task.GetAwaiter().GetResult()
+                if ($count -eq 0) {
+                    if ($stream.Name -ceq 'stdout') { $stdoutClosed = $true } else { $stderrClosed = $true }
+                    continue
+                }
+                if ($stream.Text.Length -gt 65536 - $count) {
+                    Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker admission report process'
+                    throw "Frozen CPU worker admission report $($stream.Name) exceeded the fixed 65536-character bound."
+                }
+                $null = $stream.Text.Append($stream.Buffer, 0, $count)
+                if ($stream.Name -ceq 'stdout') {
+                    $stdoutTask = $process.StandardOutput.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+                }
+                else {
+                    $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                }
+            }
+            if ($process.HasExited -and $null -eq $exitedAt) {
+                $exitedAt = $clock.ElapsedMilliseconds
+            }
+            if ($process.HasExited -and $stdoutClosed -and $stderrClosed) { break }
+            if ($clock.ElapsedMilliseconds -ge 30000) {
+                if (-not $process.HasExited) {
+                    Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker admission report process'
+                    throw 'Frozen CPU worker admission report process timed out after the fixed 30000-millisecond deadline.'
+                }
+                throw 'Frozen CPU worker admission report output streams did not close within the fixed deadline.'
+            }
+            if ($process.HasExited -and ($clock.ElapsedMilliseconds - $exitedAt) -ge 5000) {
+                throw 'Frozen CPU worker admission report output streams did not close within the fixed post-exit drain deadline.'
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdout.ToString()
+            Stderr = $stderr.ToString()
+        }
+    }
+    catch {
+        $originalError = $_
+        if ($started -and -not $process.HasExited) {
+            try {
+                Stop-WindowsFrozenCpuWorkerAdmissionProcess $process 'Frozen CPU worker admission report process'
+            }
+            catch {
+                throw "Frozen CPU worker admission report process failed and parent termination could not be confirmed: $($originalError.Exception.Message)"
+            }
+        }
+        throw $originalError
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Assert-WindowsFrozenCpuWorkerCompiledAdmission(
+    [string]$Executable,
+    [int64]$ExpectedSize,
+    [string]$ExpectedSha256,
+    [psobject]$DesktopContext,
+    [psobject]$FrozenCpuWorker
+) {
+    Assert-WindowsFrozenCpuWorkerDigest $ExpectedSha256 'Frozen desktop executable SHA-256'
+    Assert-WindowsFrozenCpuWorkerCompatibleSourceContexts $DesktopContext $FrozenCpuWorker.Context
+    $executablePath = Get-WindowsFrozenCpuWorkerNormalizedFullPath $Executable
+    $stream = Open-WindowsFrozenCpuWorkerReadHandle $executablePath
+    try {
+        if ($stream.Length -ne $ExpectedSize -or
+            (Get-WindowsFrozenCpuWorkerOpenStreamSha256 $stream) -cne $ExpectedSha256) {
+            throw 'Frozen desktop executable changed before compiled admission verification.'
+        }
+        $result = Invoke-WindowsFrozenCpuWorkerAdmissionProcess $executablePath
+    }
+    finally {
+        $stream.Dispose()
+    }
+    if ($result.ExitCode -ne 0) {
+        throw "Frozen desktop compiled admission failed with exit code $($result.ExitCode): $($result.Stderr.Trim())"
+    }
+    if ([string]::IsNullOrWhiteSpace($result.Stdout)) {
+        throw 'Frozen desktop compiled admission returned no report.'
+    }
+    try {
+        $report = ConvertFrom-Json -InputObject $result.Stdout -Depth 5 -NoEnumerate
+    }
+    catch {
+        throw "Frozen desktop compiled admission returned malformed JSON: $($_.Exception.Message)"
+    }
+    if ($report -is [array] -or $report -isnot [pscustomobject]) {
+        throw 'Frozen desktop compiled admission report must be one JSON object.'
+    }
+    Assert-WindowsFrozenCpuWorkerExactProperties $report @(
+        'schema_version', 'desktop_build_id', 'bundled_worker_sha256',
+        'protocol_version', 'worker_abi_version', 'worker_origin_app_build',
+        'worker_build_id', 'admission_kind'
+    ) 'Frozen desktop compiled admission report'
+    foreach ($field in @(
+        'desktop_build_id', 'bundled_worker_sha256', 'worker_origin_app_build',
+        'worker_build_id', 'admission_kind'
+    )) {
+        if ($report.$field -isnot [string]) {
+            throw "Frozen desktop compiled admission report field '$field' must be a string."
+        }
+    }
+    Assert-WindowsFrozenCpuWorkerDigest $report.bundled_worker_sha256 'Frozen desktop admission bundled CPU worker SHA-256'
+    $expectedKind = if (Test-WindowsFrozenCpuWorkerSameSourceContext $DesktopContext $FrozenCpuWorker.Context) {
+        'strict_legacy_same_source'
+    }
+    else {
+        'compiled_foreign_approval'
+    }
+    if (($report.schema_version -isnot [int64] -and $report.schema_version -isnot [int32]) -or
+        [int]$report.schema_version -ne 1 -or
+        $report.desktop_build_id -cne $DesktopContext.DesktopBuildId -or
+        $report.bundled_worker_sha256 -cne $FrozenCpuWorker.Record.worker_sha256 -or
+        (Assert-WindowsFrozenCpuWorkerInt64 $report.protocol_version 'Frozen desktop admission protocol version') -ne [int64]$DesktopContext.ProtocolVersion -or
+        (Assert-WindowsFrozenCpuWorkerInt64 $report.worker_abi_version 'Frozen desktop admission worker ABI version') -ne [int64]$DesktopContext.WorkerAbiVersion -or
+        $report.worker_origin_app_build -cne $FrozenCpuWorker.Context.DesktopBuildId -or
+        $report.worker_build_id -cne $FrozenCpuWorker.Context.WorkerBuildId -or
+        $report.admission_kind -cne $expectedKind) {
+        throw 'Frozen desktop compiled admission does not match the expected desktop and frozen worker identities.'
+    }
+    return $report
 }
 
 function New-WindowsFrozenCpuWorkerRecord([psobject]$Context, [int64]$WorkerSize, [string]$WorkerSha256) {

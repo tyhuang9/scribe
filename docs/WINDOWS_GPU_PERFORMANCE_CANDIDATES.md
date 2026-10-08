@@ -47,6 +47,13 @@ that handshake existed cannot gain support retroactively. Populating the map
 and integrating authenticated frozen inputs into an exact candidate installer
 remain separately reviewed work.
 
+The LOCAL frozen-worker assembly path may ask its already verified desktop M
+for a bounded compiled admission report before it packages or observes R. That
+report is a local consistency gate, not a new authority: it cannot populate the
+empty map, authenticate an unknown hash origin, approve a GPU pack, or enable
+Auto. CUDA and Vulkan descriptor admission remain on their existing compiled
+signature/epoch path.
+
 A complete authenticated campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
 CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct

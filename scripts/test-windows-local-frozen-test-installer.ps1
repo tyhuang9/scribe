@@ -58,6 +58,54 @@ function Copy-FixtureSource([string]$RelativePath) {
     Copy-Item -LiteralPath $source -Destination $destination
 }
 
+function Set-FixtureCompiledAdmissionSeam([string]$IntegrityPath) {
+    $source = Get-Content -LiteralPath $IntegrityPath -Raw
+    $start = $source.IndexOf('function Invoke-WindowsFrozenCpuWorkerAdmissionProcess')
+    $end = $source.IndexOf('function Assert-WindowsFrozenCpuWorkerCompiledAdmission', $start)
+    if ($start -lt 0 -or $end -le $start) {
+        throw 'Could not isolate the fixture-only compiled admission seam.'
+    }
+    $fixtureAdmission = @'
+function Invoke-WindowsFrozenCpuWorkerAdmissionProcess([string]$Executable) {
+    if ($null -eq $global:WindowsLocalFrozenInstallerTestAdmissionResponse) {
+        throw 'Fixture compiled admission response was not configured.'
+    }
+    $global:WindowsLocalFrozenInstallerTestAdmissionCalls.Add($Executable)
+    return $global:WindowsLocalFrozenInstallerTestAdmissionResponse
+}
+
+'@
+    $source = $source.Substring(0, $start) + $fixtureAdmission + $source.Substring($end)
+    Write-Utf8 $IntegrityPath $source
+}
+
+function Set-FixtureCompiledAdmissionResponse(
+    [psobject]$DesktopContext,
+    [psobject]$WorkerContext,
+    [psobject]$Record
+) {
+    $kind = if (Test-WindowsFrozenCpuWorkerSameSourceContext $DesktopContext $WorkerContext) {
+        'strict_legacy_same_source'
+    }
+    else {
+        'compiled_foreign_approval'
+    }
+    $global:WindowsLocalFrozenInstallerTestAdmissionResponse = [pscustomobject]@{
+        ExitCode = 0
+        Stdout = ([ordered]@{
+            schema_version = 1
+            desktop_build_id = $DesktopContext.DesktopBuildId
+            bundled_worker_sha256 = $Record.worker_sha256
+            protocol_version = $DesktopContext.ProtocolVersion
+            worker_abi_version = $DesktopContext.WorkerAbiVersion
+            worker_origin_app_build = $WorkerContext.DesktopBuildId
+            worker_build_id = $WorkerContext.WorkerBuildId
+            admission_kind = $kind
+        } | ConvertTo-Json -Compress)
+        Stderr = ''
+    }
+}
+
 function Set-UInt16([byte[]]$Bytes, [int]$Offset, [uint16]$Value) {
     [BitConverter]::GetBytes($Value).CopyTo($Bytes, $Offset)
 }
@@ -359,12 +407,12 @@ function Invoke-WindowsLocalFrozenInstallerProcess([string]$Executable, [string[
 '@
     $source = $source.Substring(0, $start) + $installerSeam + $source.Substring($end)
 
-    $temporaryCleanupFunction = 'function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path) {'
+    $temporaryCleanupFunction = 'function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path, [string]$TemporaryBaseRoot) {'
     if ([regex]::Matches($source, [regex]::Escape($temporaryCleanupFunction)).Count -ne 1) {
         throw 'Could not isolate the fixture-only temporary cleanup seam.'
     }
     $temporaryCleanupReplacement = @'
-function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path) {
+function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path, [string]$TemporaryBaseRoot) {
     if ($global:WindowsLocalFrozenVerifierMode -ceq 'temporary-cleanup-failure' -and
         -not $global:WindowsLocalFrozenVerifierTemporaryCleanupFailureInjected) {
         $global:WindowsLocalFrozenVerifierTemporaryCleanupFailureInjected = $true
@@ -582,6 +630,8 @@ $previousGitHubActions = $env:GITHUB_ACTIONS
 $previousMode = $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE
 $previousCapture = $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE
 $previousSourceMutation = $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_SOURCE_MUTATION
+$previousAdmissionChild = $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_CHILD
+$previousAdmissionParent = $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_PARENT
 $previousGitEnvironment = @{}
 foreach ($entry in @(Get-ChildItem Env:GIT_*)) { $previousGitEnvironment[$entry.Name] = $entry.Value }
 try {
@@ -646,6 +696,27 @@ public static class FakeIscc {
   static string Arg(string[] args, string name) { var value = args.FirstOrDefault(x => x.StartsWith(name, StringComparison.Ordinal)); return value == null ? null : value.Substring(name.Length); }
   public static int Main(string[] args) {
     string mode = Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE") ?? "";
+    if (args.Length == 1 && args[0] == "admission-child-hold") {
+      string childMarker = Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_CHILD") ?? "";
+      if (!String.IsNullOrEmpty(childMarker)) File.WriteAllText(childMarker, Process.GetCurrentProcess().Id.ToString());
+      Thread.Sleep(60000); return 0;
+    }
+    if (args.Length == 1 && args[0] == "--scribe-frozen-worker-admission") {
+      if (mode == "admission-nonzero") { Console.Error.Write("fixture admission failure"); return 29; }
+      if (mode == "admission-malformed") { Console.Write("{"); return 0; }
+      if (mode == "admission-overflow-stdout") { Console.Write(new string('a', 65537)); return 0; }
+      if (mode == "admission-overflow-stderr") { Console.Error.Write(new string('b', 65537)); return 0; }
+      if (mode == "admission-hang") {
+        string parentMarker = Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_PARENT") ?? "";
+        if (!String.IsNullOrEmpty(parentMarker)) File.WriteAllText(parentMarker, Process.GetCurrentProcess().Id.ToString());
+        Thread.Sleep(60000); return 0;
+      }
+      if (mode == "admission-post-exit-hold") {
+        Process.Start(new ProcessStartInfo { FileName = Process.GetCurrentProcess().MainModule.FileName, Arguments = "admission-child-hold", UseShellExecute = false, CreateNoWindow = true });
+        return 0;
+      }
+      Console.Write("{\"fixture\":true}"); return 0;
+    }
     if (mode == "campaign-live-parent") {
       using (Process self = Process.GetCurrentProcess()) {
         File.WriteAllLines(Environment.GetEnvironmentVariable("SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE"), new string[] {
@@ -698,6 +769,7 @@ public static class FakeIscc {
         verification_method = 'fixture only'; trust_scope = 'fixture only'
     }
     Write-Utf8 (Join-Path $fixtureRoot 'installer\inno-setup-7.1.0-provenance.json') ($provenance | ConvertTo-Json -Depth 4)
+    Set-FixtureCompiledAdmissionSeam (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
     Set-FixtureVerifierSeams `
         (Join-Path $fixtureRoot 'scripts\verify-windows-local-frozen-test-installer.ps1') `
         (Join-Path $fixtureRoot 'scripts\windows-local-frozen-installer-integrity.ps1')
@@ -708,6 +780,115 @@ public static class FakeIscc {
 
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
     . (Join-Path $fixtureRoot 'scripts\windows-local-frozen-installer-integrity.ps1')
+    $productionAdmissionIntegrity = Join-Path $repositoryRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1'
+    $admissionRunnerAst = [Management.Automation.Language.Parser]::ParseFile(
+        $productionAdmissionIntegrity, [ref]$null, [ref]$null)
+    $admissionRunnerFunction = $admissionRunnerAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Invoke-WindowsFrozenCpuWorkerAdmissionProcess'
+        }, $false)
+    $admissionAssertFunction = $admissionRunnerAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Assert-WindowsFrozenCpuWorkerCompiledAdmission'
+        }, $false)
+    if ($null -eq $admissionRunnerFunction -or $null -eq $admissionAssertFunction) {
+        throw 'Could not locate compiled admission process functions.'
+    }
+    $fixtureAdmissionRunnerSource = $admissionRunnerFunction.Extent.Text.Replace(
+        'function Invoke-WindowsFrozenCpuWorkerAdmissionProcess',
+        'function Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess'
+    )
+    $fixtureAdmissionAssertSource = $admissionAssertFunction.Extent.Text.Replace(
+        'function Assert-WindowsFrozenCpuWorkerCompiledAdmission',
+        'function Assert-FixtureWindowsFrozenCpuWorkerCompiledAdmission'
+    ).Replace(
+        'Invoke-WindowsFrozenCpuWorkerAdmissionProcess',
+        'Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess'
+    )
+    . ([scriptblock]::Create($fixtureAdmissionRunnerSource))
+    . ([scriptblock]::Create($fixtureAdmissionAssertSource))
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = ''
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_PARENT = $null
+    $admissionSuccess = Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess $fakeCompiler
+    Assert-Equal $admissionSuccess.ExitCode 0 'Compiled admission process success exit code'
+    Assert-Equal $admissionSuccess.Stdout '{"fixture":true}' 'Compiled admission process success stdout'
+    Assert-Equal $admissionSuccess.Stderr '' 'Compiled admission process success stderr'
+    $shortAdmissionRunnerSource = $fixtureAdmissionRunnerSource.Replace('30000', '1000').Replace('5000', '250')
+    $shortAdmissionRunner = [scriptblock]::Create($shortAdmissionRunnerSource)
+    foreach ($overflowMode in @('admission-overflow-stdout', 'admission-overflow-stderr')) {
+        $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = $overflowMode
+        Invoke-ExpectedFailure {
+            & { . $shortAdmissionRunner; Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess $fakeCompiler }
+        } 'exceeded the fixed 65536-character bound'
+    }
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'admission-hang'
+    $admissionHangClock = [Diagnostics.Stopwatch]::StartNew()
+    Invoke-ExpectedFailure {
+        & { . $shortAdmissionRunner; Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess $fakeCompiler }
+    } 'timed out after the fixed 1000-millisecond deadline'
+    Assert-True ($admissionHangClock.ElapsedMilliseconds -lt 5000) 'Compiled admission deadline did not retire its owned child promptly.'
+    $admissionParentMarker = Join-Path $testRoot 'compiled-admission-parent.txt'
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_PARENT = $admissionParentMarker
+    $admissionUnconfirmedParent = $null
+    try {
+        # Do not create an unkillable OS process: shadow only the fixture copy's
+        # termination helper, then retire its exact recorded child ourselves.
+        Invoke-ExpectedFailure {
+            & {
+                function Stop-WindowsFrozenCpuWorkerAdmissionProcess {
+                    param([System.Diagnostics.Process]$Process, [string]$Description)
+                    throw 'fixture termination helper refuses to confirm retirement'
+                }
+                . $shortAdmissionRunner
+                Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess $fakeCompiler
+            }
+        } 'parent termination could not be confirmed'
+        $parentDeadline = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $admissionParentMarker) -and $parentDeadline.ElapsedMilliseconds -lt 1000) {
+            [Threading.Thread]::Sleep(10)
+        }
+        Assert-True (Test-Path -LiteralPath $admissionParentMarker -PathType Leaf) 'Unconfirmed-termination fixture did not start its owned child.'
+        $admissionUnconfirmedParent = [Diagnostics.Process]::GetProcessById([int](Get-Content -LiteralPath $admissionParentMarker -Raw))
+        Assert-Equal $admissionUnconfirmedParent.MainModule.FileName $fakeCompiler 'Unconfirmed-termination fixture executable identity'
+        Assert-True (-not $admissionUnconfirmedParent.HasExited) 'Unconfirmed-termination fixture unexpectedly exited before explicit cleanup.'
+    }
+    finally {
+        if ($null -ne $admissionUnconfirmedParent) {
+            try {
+                if (-not $admissionUnconfirmedParent.HasExited) { $admissionUnconfirmedParent.Kill($true) }
+                Assert-True ($admissionUnconfirmedParent.WaitForExit(5000)) 'Unconfirmed-termination fixture child did not terminate during explicit cleanup.'
+            }
+            finally { $admissionUnconfirmedParent.Dispose() }
+        }
+        $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_PARENT = $null
+        $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = ''
+    }
+    $admissionChildMarker = Join-Path $testRoot 'compiled-admission-child.txt'
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_CHILD = $admissionChildMarker
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'admission-post-exit-hold'
+    try {
+        Invoke-ExpectedFailure {
+            & { . $shortAdmissionRunner; Invoke-FixtureWindowsFrozenCpuWorkerAdmissionProcess $fakeCompiler }
+        } 'output streams did not close within the fixed post-exit drain deadline'
+        $childDeadline = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $admissionChildMarker) -and $childDeadline.ElapsedMilliseconds -lt 1000) {
+            [Threading.Thread]::Sleep(10)
+        }
+        Assert-True (Test-Path -LiteralPath $admissionChildMarker -PathType Leaf) 'Compiled admission stream-drain fixture did not start its inheriting child.'
+        $admissionChild = [Diagnostics.Process]::GetProcessById([int](Get-Content -LiteralPath $admissionChildMarker -Raw))
+        try {
+            Assert-Equal $admissionChild.MainModule.FileName $fakeCompiler 'Compiled admission stream-drain child executable identity'
+            if (-not $admissionChild.HasExited) { $admissionChild.Kill($true) }
+            Assert-True ($admissionChild.WaitForExit(5000)) 'Compiled admission stream-drain child did not terminate.'
+        }
+        finally { $admissionChild.Dispose() }
+    }
+    finally {
+        $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_CHILD = $null
+        $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = ''
+    }
     foreach ($invalidInteger in @($null, $true, $false, '1024', '', [double]1, [single]1, [decimal]1, [uint64]::MaxValue)) {
         Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInt64 $invalidInteger 'Fixture size' } 'must be an integer'
     }
@@ -987,6 +1168,28 @@ public static class FakeIscc {
     Refresh-BundleInventory $bundleRoot
     $openedFrozen = Open-ValidatedWindowsFrozenCpuWorker $frozenRecordPath $fixtureRoot
     try { $fixtureBundle = Assert-WindowsLocalFrozenBundle $bundleRoot $openedFrozen } finally { $openedFrozen.WorkerStream.Dispose() }
+    $global:WindowsLocalFrozenInstallerTestAdmissionCalls = [System.Collections.Generic.List[string]]::new()
+    Set-FixtureCompiledAdmissionResponse $context $context ([pscustomobject]$frozenRecord)
+    $fakeCompilerHash = (Get-FileHash -LiteralPath $fakeCompiler -Algorithm SHA256).Hash.ToLowerInvariant()
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'admission-nonzero'
+    Invoke-ExpectedFailure {
+        Assert-FixtureWindowsFrozenCpuWorkerCompiledAdmission `
+            -Executable $fakeCompiler `
+            -ExpectedSize ([int64](Get-Item -LiteralPath $fakeCompiler).Length) `
+            -ExpectedSha256 $fakeCompilerHash `
+            -DesktopContext $context `
+            -FrozenCpuWorker $openedFrozen
+    } 'failed with exit code 29'
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = 'admission-malformed'
+    Invoke-ExpectedFailure {
+        Assert-FixtureWindowsFrozenCpuWorkerCompiledAdmission `
+            -Executable $fakeCompiler `
+            -ExpectedSize ([int64](Get-Item -LiteralPath $fakeCompiler).Length) `
+            -ExpectedSha256 $fakeCompilerHash `
+            -DesktopContext $context `
+            -FrozenCpuWorker $openedFrozen
+    } 'returned malformed JSON'
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = ''
 
     $template = Get-Content -LiteralPath (Join-Path $repositoryRoot 'installer\scribe-local-frozen.iss') -Raw
     foreach ($required in @('CloseApplications=no', 'CreateUninstallRegKey=no', 'UsePreviousAppDir=no', 'DisableDirPage=yes', 'SetupArchitecture=x86', 'ArchitecturesAllowed=x64compatible', 'ArchitecturesInstallIn64BitMode=x64compatible', "ExpandConstant('{param:DIR|}')", 'HasNoReparseAncestors', 'RejectLocalFrozenWizardDestination')) {
@@ -1051,10 +1254,108 @@ public static class FakeIscc {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $outputRoot 'payload'))) 'Local frozen installer builder retained a duplicate payload in final output.'
     Assert-True ((Get-Content -LiteralPath $capture -Raw).Contains('/DLocalFrozenBundleRoot=')) 'Local frozen installer compiler missed staged payload input.'
     Assert-True ((Get-Content -LiteralPath $capture -Raw).Contains('/DLocalFrozenTestToken=')) 'Local frozen installer compiler missed generated local token.'
-    $publishedRecord = Get-Content -LiteralPath $result.RecordPath -Raw | ConvertFrom-Json
+    $publishedRecordText = Get-Content -LiteralPath $result.RecordPath -Raw
+    $publishedRecord = $publishedRecordText | ConvertFrom-Json
+    Assert-Equal $publishedRecord.schema_version 1 'Same-source local frozen installer record schema'
     Assert-Equal $publishedRecord.bundle_inventory_sha256 ((Get-FileHash -LiteralPath (Join-Path $bundleRoot 'bundle-inventory.json') -Algorithm SHA256).Hash.ToLowerInvariant()) 'Published local frozen installer inventory binding'
-    $verifiedInstallerRecord = Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath
+    $verifiedInstallerRecord = Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath
     Assert-Equal $verifiedInstallerRecord.local_test_token $publishedRecord.local_test_token 'Published local frozen installer record token binding'
+    $schema1ScalarRecord = Get-Content -LiteralPath $result.RecordPath -Raw | ConvertFrom-Json
+    $schema1ScalarRecord.source_revision = @($context.SourceRevision)
+    Write-Utf8 $result.RecordPath ($schema1ScalarRecord | ConvertTo-Json -Depth 5)
+    Invoke-ExpectedFailure {
+        Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath
+    } "schema-1 record field 'source_revision' must be a string"
+    $schema1ScalarRecord = Get-Content -LiteralPath $result.RecordPath -Raw | ConvertFrom-Json
+    $schema1ScalarRecord.source_revision = $context.SourceRevision
+    $schema1ScalarRecord.kind = @('windows-local-frozen-test-installer')
+    Write-Utf8 $result.RecordPath ($schema1ScalarRecord | ConvertTo-Json -Depth 5)
+    Invoke-ExpectedFailure {
+        Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath
+    } 'record kind must be a string'
+    Write-Utf8 $result.RecordPath $publishedRecordText
+
+    # The mixed record constructor belongs to the executable installer builder.
+    # Load only that parsed function so this pure record boundary keeps the
+    # real schema-2 construction without invoking the builder a second time.
+    $installerBuilderAst = [Management.Automation.Language.Parser]::ParseFile($fixtureBuilder, [ref]$null, [ref]$null)
+    $installerRecordConstructor = $installerBuilderAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'New-WindowsLocalFrozenInstallerRecord'
+        }, $false)
+    if ($null -eq $installerRecordConstructor) {
+        throw 'Could not locate the local frozen installer record constructor.'
+    }
+    . ([scriptblock]::Create($installerRecordConstructor.Extent.Text))
+
+    $mixedWorkerContext = [pscustomobject]@{
+        RepositoryRoot = (Join-Path $testRoot 'separately-retained-worker-source')
+        SourceRevision = ('a' * 40)
+        AppVersion = '9.9.9'
+        TargetTriple = $context.TargetTriple
+        ProtocolVersion = $context.ProtocolVersion
+        WorkerAbiVersion = $context.WorkerAbiVersion
+        DesktopBuildId = 'local-transcriber@9.9.9#' + ('a' * 40)
+        WorkerBuildId = 'scribe-inference-worker@9.9.9#' + ('a' * 40)
+        CargoLockSha256 = $context.CargoLockSha256
+        RustToolchainSha256 = $context.RustToolchainSha256
+        CargoManifestSha256 = $context.CargoManifestSha256
+        WorkerIdentitySha256 = $context.WorkerIdentitySha256
+        BuildRsSha256 = $context.BuildRsSha256
+        BuildContractSha256 = $context.BuildContractSha256
+    }
+    $mixedWorkerRecord = [pscustomobject]@{
+        source_revision = $mixedWorkerContext.SourceRevision
+        app_version = $mixedWorkerContext.AppVersion
+        target_triple = $mixedWorkerContext.TargetTriple
+        protocol_version = $mixedWorkerContext.ProtocolVersion
+        worker_abi_version = $mixedWorkerContext.WorkerAbiVersion
+        desktop_build_id = $mixedWorkerContext.DesktopBuildId
+        worker_build_id = $mixedWorkerContext.WorkerBuildId
+        worker_sha256 = $frozenRecord.worker_sha256
+    }
+    $mixedFrozen = [pscustomobject]@{
+        Context = $mixedWorkerContext
+        Record = $mixedWorkerRecord
+        RecordSha256 = ('e' * 64)
+    }
+    $mixedRecord = New-WindowsLocalFrozenInstallerRecord `
+        $context $mixedFrozen $fixtureBundle (Split-Path -Leaf $result.InstallerPath) `
+        (Get-Item -LiteralPath $result.InstallerPath) $publishedRecord.local_test_token
+    Assert-Equal $mixedRecord.schema_version 2 'Mixed-source local frozen installer record schema'
+    Assert-Equal $mixedRecord.desktop_source_revision $context.SourceRevision 'Mixed-source installer record desktop revision'
+    Assert-Equal $mixedRecord.desktop_app_version $context.AppVersion 'Mixed-source installer record desktop AppVersion'
+    Assert-Equal $mixedRecord.worker_source_revision $mixedWorkerContext.SourceRevision 'Mixed-source installer record worker revision'
+    Assert-Equal $mixedRecord.worker_app_version $mixedWorkerContext.AppVersion 'Mixed-source installer record worker AppVersion'
+    $mixedRecordPath = Join-Path $testRoot 'mixed-windows-local-frozen-installer-record.json'
+    Write-Utf8 $mixedRecordPath ($mixedRecord | ConvertTo-Json -Depth 5)
+    $verifiedMixedRecord = Assert-WindowsLocalFrozenInstallerRecord $mixedRecordPath $context $mixedFrozen $fixtureBundle $result.InstallerPath
+    Assert-Equal $verifiedMixedRecord.desktop_build_id $context.DesktopBuildId 'Mixed-source installer record desktop build ID'
+    Assert-Equal $verifiedMixedRecord.worker_build_id $mixedWorkerContext.WorkerBuildId 'Mixed-source installer record worker build ID'
+    $sameSourceRecordForMixedContext = Join-Path $testRoot 'schema-1-record-for-mixed-context.json'
+    Write-Utf8 $sameSourceRecordForMixedContext $publishedRecordText
+    Invoke-ExpectedFailure {
+        Assert-WindowsLocalFrozenInstallerRecord $sameSourceRecordForMixedContext $context $mixedFrozen $fixtureBundle $result.InstallerPath
+    } 'cannot represent distinct desktop and worker sources'
+    $tamperedMixedRecord = Get-Content -LiteralPath $mixedRecordPath -Raw | ConvertFrom-Json
+    $tamperedMixedRecord.desktop_source_revision = ('b' * 40)
+    Write-Utf8 $mixedRecordPath ($tamperedMixedRecord | ConvertTo-Json -Depth 5)
+    Invoke-ExpectedFailure {
+        Assert-WindowsLocalFrozenInstallerRecord $mixedRecordPath $context $mixedFrozen $fixtureBundle $result.InstallerPath
+    } 'does not bind the exact desktop and frozen worker identities'
+    Write-Utf8 $mixedRecordPath ($mixedRecord | ConvertTo-Json -Depth 5)
+    $arrayIdentityMixedRecord = Get-Content -LiteralPath $mixedRecordPath -Raw | ConvertFrom-Json
+    $arrayIdentityMixedRecord.worker_build_id = @($mixedWorkerContext.WorkerBuildId)
+    Write-Utf8 $mixedRecordPath ($arrayIdentityMixedRecord | ConvertTo-Json -Depth 5)
+    Invoke-ExpectedFailure {
+        Assert-WindowsLocalFrozenInstallerRecord $mixedRecordPath $context $mixedFrozen $fixtureBundle $result.InstallerPath
+    } 'must be a string'
+    Write-Utf8 $mixedRecordPath ("[" + ($mixedRecord | ConvertTo-Json -Depth 5) + "]")
+    Invoke-ExpectedFailure {
+        Assert-WindowsLocalFrozenInstallerRecord $mixedRecordPath $context $mixedFrozen $fixtureBundle $result.InstallerPath
+    } 'must be one JSON object'
+    Write-Utf8 $mixedRecordPath ($mixedRecord | ConvertTo-Json -Depth 5)
 
     # Exercise the copied real verifier's local-only observation path. The
     # fixture process seams preserve its ordering and cleanup boundary without
@@ -1438,32 +1739,32 @@ public static class FakeIscc {
     $tamperedInstallerBytes = [byte[]]$originalInstallerBytes.Clone()
     $tamperedInstallerBytes[100] = $tamperedInstallerBytes[100] -bxor 1
     [IO.File]::WriteAllBytes($result.InstallerPath, $tamperedInstallerBytes)
-    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath } 'bytes do not match'
+    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath } 'bytes do not match'
     [IO.File]::WriteAllBytes($result.InstallerPath, $originalInstallerBytes)
 
     $originalInstallerRecordText = Get-Content -LiteralPath $result.RecordPath -Raw
     $coercedInstallerRecord = $originalInstallerRecordText | ConvertFrom-Json
     $coercedInstallerRecord.installer_size_bytes = [string]$coercedInstallerRecord.installer_size_bytes
     Write-Utf8 $result.RecordPath ($coercedInstallerRecord | ConvertTo-Json -Depth 5)
-    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath } 'must be an integer'
+    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath } 'must be an integer'
     Write-Utf8 $result.RecordPath $originalInstallerRecordText
     $tamperedInstallerRecord = $originalInstallerRecordText | ConvertFrom-Json
     $tamperedInstallerRecord.bundle_inventory_sha256 = ('0' * 64)
     Write-Utf8 $result.RecordPath ($tamperedInstallerRecord | ConvertTo-Json -Depth 5)
-    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath } 'does not bind'
+    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath } 'does not bind'
     Write-Utf8 $result.RecordPath $originalInstallerRecordText
 
     $tamperedInstallerRecord = $originalInstallerRecordText | ConvertFrom-Json
     $tamperedInstallerRecord.local_test_token = ('a' * 31)
     Write-Utf8 $result.RecordPath ($tamperedInstallerRecord | ConvertTo-Json -Depth 5)
-    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath } 'invalid installer or local-test identity'
+    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath } 'invalid installer or local-test identity'
     Write-Utf8 $result.RecordPath $originalInstallerRecordText
 
     $tamperedInstallerRecord = $originalInstallerRecordText | ConvertFrom-Json
     $tamperedInstallerRecord.local_test_token = ('b' * 32)
     $tamperedInstallerRecord.install_relative_path = "Scribe/LOCAL-Frozen-Test/$($tamperedInstallerRecord.local_test_token)"
     Write-Utf8 $result.RecordPath ($tamperedInstallerRecord | ConvertTo-Json -Depth 5)
-    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $openedFrozen $fixtureBundle $result.InstallerPath } 'invalid installer or local-test identity'
+    Invoke-ExpectedFailure { Assert-WindowsLocalFrozenInstallerRecord $result.RecordPath $context $openedFrozen $fixtureBundle $result.InstallerPath } 'invalid installer or local-test identity'
     Write-Utf8 $result.RecordPath $originalInstallerRecordText
 
     $installedParityFixture = Join-Path $testRoot 'installed-parity-fixture'
@@ -1806,6 +2107,8 @@ finally {
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE = $previousMode
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_CAPTURE = $previousCapture
     $env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_SOURCE_MUTATION = $previousSourceMutation
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_CHILD = $previousAdmissionChild
+    $env:SCRIBE_LOCAL_FROZEN_TEST_ADMISSION_PARENT = $previousAdmissionParent
     foreach ($entry in @(Get-ChildItem Env:GIT_*)) { Remove-Item -LiteralPath "Env:$($entry.Name)" }
     foreach ($name in $previousGitEnvironment.Keys) { Set-Item -LiteralPath "Env:$name" -Value $previousGitEnvironment[$name] }
     Remove-TestRootSafely $testRoot

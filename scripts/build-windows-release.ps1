@@ -5,6 +5,7 @@ param(
     [string[]]$WorkerPackRoot = @(),
     [string]$InstallerPackAllowlistPath,
     [string]$FrozenCpuWorkerRecordPath,
+    [string]$FrozenCpuWorkerSourceRoot,
     [switch]$LocalFrozenGpuObservation
 )
 
@@ -379,13 +380,27 @@ function Test-PathIsWithin([string]$CandidatePath, [string]$RootPath) {
 }
 
 $frozenCpuWorkerRequested = $PSBoundParameters.ContainsKey('FrozenCpuWorkerRecordPath')
+$frozenCpuWorkerSourceRootWasExplicit = $PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot')
+$resolvedFrozenWorkerSourceRoot = $null
 $installerPackAllowlistWasExplicit = $PSBoundParameters.ContainsKey('InstallerPackAllowlistPath') -and
     -not [string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)
 if ($frozenCpuWorkerRequested -and [string]::IsNullOrWhiteSpace($FrozenCpuWorkerRecordPath)) {
     throw 'FrozenCpuWorkerRecordPath was explicitly supplied but is empty or whitespace.'
 }
+if ($frozenCpuWorkerSourceRootWasExplicit -and -not $frozenCpuWorkerRequested) {
+    throw 'FrozenCpuWorkerSourceRoot is available only with a local frozen CPU worker record.'
+}
+if ($frozenCpuWorkerSourceRootWasExplicit -and [string]::IsNullOrWhiteSpace($FrozenCpuWorkerSourceRoot)) {
+    throw 'FrozenCpuWorkerSourceRoot was explicitly supplied but is empty or whitespace.'
+}
 if ($frozenCpuWorkerRequested) {
     Assert-WindowsFrozenCpuWorkerLocalOnlyEnvironment
+    $resolvedFrozenWorkerSourceRoot = if ($frozenCpuWorkerSourceRootWasExplicit) {
+        Get-NormalizedFullPath $FrozenCpuWorkerSourceRoot
+    }
+    else {
+        $repositoryRoot
+    }
 }
 if ($LocalFrozenGpuObservation -and -not $frozenCpuWorkerRequested) {
     throw 'LocalFrozenGpuObservation is available only with a local frozen CPU worker record.'
@@ -449,6 +464,12 @@ foreach ($protectedCargoTargetRoot in @($defaultCargoTargetRoot, $cargoTargetRoo
         throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
     }
 }
+if ($frozenCpuWorkerRequested -and
+    -not [string]::Equals($resolvedFrozenWorkerSourceRoot, $repositoryRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+    ((Test-PathIsWithin $cargoTargetRoot $resolvedFrozenWorkerSourceRoot) -or
+        (Test-PathIsWithin $resolvedFrozenWorkerSourceRoot $cargoTargetRoot))) {
+    throw 'A separately retained frozen worker source cannot contain Cargo build output.'
+}
 if ($frozenCpuWorkerRequested) {
     $frozenInputRoot = Split-Path -Parent (Get-NormalizedFullPath $FrozenCpuWorkerRecordPath)
     # Reject overlapping outputs before creating any directories: even a failed
@@ -456,6 +477,11 @@ if ($frozenCpuWorkerRequested) {
     if ((Test-PathIsWithin $finalBundle $frozenInputRoot) -or
         ($installerPackAllowlistWasExplicit -and (Test-PathIsWithin $InstallerPackAllowlistPath $frozenInputRoot))) {
         throw 'Frozen CPU worker inputs cannot contain bundle, staging, or installer-allowlist outputs.'
+    }
+    if (-not [string]::Equals($resolvedFrozenWorkerSourceRoot, $repositoryRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+        ((Test-PathIsWithin $finalBundle $resolvedFrozenWorkerSourceRoot) -or
+            ($installerPackAllowlistWasExplicit -and (Test-PathIsWithin $InstallerPackAllowlistPath $resolvedFrozenWorkerSourceRoot)))) {
+        throw 'A separately retained frozen worker source cannot contain bundle, staging, or installer-allowlist outputs.'
     }
 }
 Assert-NoReparseAncestors $bundleParent
@@ -488,16 +514,22 @@ $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 $sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
 $frozenCpuWorker = $null
+$desktopSourceContext = $null
 $cpuWorkerBaseline = $null
 try {
     if ($frozenCpuWorkerRequested) {
         if (Test-PathIsWithin $stagingBundle $frozenInputRoot) {
             throw 'Frozen CPU worker inputs cannot contain bundle, staging, or installer-allowlist outputs.'
         }
-        # Validate every source/build-contract field and retain the exact worker
-        # read handle before any Cargo invocation.  This is local byte integrity,
+        # M and R are independently clean source contexts. R is read only as
+        # frozen-worker data; no helper or build command is loaded from it.
+        $desktopSourceContext = Get-WindowsFrozenCpuWorkerSourceContext $repositoryRoot
+        # Validate every R source/build-contract field and retain the exact worker
+        # read handle before any Cargo invocation. This is local byte integrity,
         # never a substitute for production provenance or signing.
-        $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $repositoryRoot
+        $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $resolvedFrozenWorkerSourceRoot
+        Assert-WindowsFrozenCpuWorkerCompatibleSourceContexts $desktopSourceContext $frozenCpuWorker.Context
+        $null = Get-WindowsFrozenCpuWorkerSafeTemporaryRoot $desktopSourceContext $frozenCpuWorker
         $sourceInferenceWorker = $frozenCpuWorker.WorkerPath
     }
     $previousWorkerSha256 = $env:SCRIBE_BUNDLED_WORKER_SHA256
@@ -508,7 +540,8 @@ try {
         if ($frozenCpuWorkerRequested) {
             $env:SCRIBE_BUILDING_WORKER = $null
             $env:SCRIBE_BUNDLED_WORKER_SHA256 = [string]$frozenCpuWorker.Record.worker_sha256
-            $env:SCRIBE_BUILD_REVISION = [string]$frozenCpuWorker.Context.SourceRevision
+            # Always overwrite a hostile caller value with desktop M, never R.
+            $env:SCRIBE_BUILD_REVISION = [string]$desktopSourceContext.SourceRevision
         }
         else {
             # The worker is built and hashed first. The desktop then embeds that exact
@@ -554,6 +587,7 @@ try {
     }
 
     if ($frozenCpuWorkerRequested) {
+        Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
         Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
     }
 
@@ -562,6 +596,15 @@ Assert-WindowsGuiSubsystem $sourceExecutable
 $null = Assert-ReviewedWindowsPe $sourceExecutable
 Assert-Amd64Pe $sourceInferenceWorker
 $null = Assert-ReviewedWindowsPe $sourceInferenceWorker 3
+if ($frozenCpuWorkerRequested) {
+    $sourceExecutableItem = Assert-RegularFile $sourceExecutable
+    Assert-WindowsFrozenCpuWorkerCompiledAdmission `
+        -Executable $sourceExecutable `
+        -ExpectedSize ([int64]$sourceExecutableItem.Length) `
+        -ExpectedSha256 (Get-WindowsFrozenCpuWorkerFileSha256 $sourceExecutable) `
+        -DesktopContext $desktopSourceContext `
+        -FrozenCpuWorker $frozenCpuWorker | Out-Null
+}
 
 try {
     New-Item -ItemType Directory -Path $stagingBundle | Out-Null
@@ -765,6 +808,7 @@ try {
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
     if ($frozenCpuWorkerRequested) {
+        Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
         Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
     }
     if (Test-Path -LiteralPath $finalBundle) {
