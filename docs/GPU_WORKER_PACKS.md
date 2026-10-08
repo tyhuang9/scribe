@@ -178,6 +178,41 @@ name with `fstatat(AT_SYMLINK_NOFOLLOW)`; neither treats `/proc/self/fd` or
 Directory identities are checked again before the lease is returned and before
 launch handoff; unsupported platforms fail closed.
 
+## Frozen Windows worker session compatibility
+
+Windows x64 has a compile-time-only, versioned compatibility boundary for a
+future desktop build M to launch an exact immutable inference worker from an
+older source build R. The canonical policy is
+`runtime-manifests/frozen-worker-compatibility-windows-x64.json`. Its checked-in
+`entries: []` grants no foreign CPU worker or GPU pack today. A production
+entry requires a separately reviewed source change and binds the R-origin
+desktop build, inference-worker build, SCIF protocol, runtime ABI and exact
+worker SHA-256. GPU entries additionally bind backend/provider and the already
+signed pack ID, version, digest and security epoch. Pack signatures, complete
+inventory verification, rollback floors, device reconciliation and the CPU
+worker's embedded SHA-256 anchor remain independently mandatory.
+
+Ordinary sessions retain the unchanged SCIF v5 `Hello` and strict same-source
+build checks. Only an opaque approval produced from the compiled policy may
+select the distinct inference-only compatibility Hello. Its version-1 context
+names the worker's R-origin application build, while the existing `app_build`
+continues to name the actual M desktop session and `worker_build` truthfully
+names R. The child validates the challenge, context version, its compiled R
+origin/worker identity, ABI, role, provider and private pack expectation before
+collecting provider capabilities. The parent then checks the exact M/R tuple,
+worker hash, pack/provider facts, challenge and process generation. Rejection
+terminates that generation; there is no retry with legacy Hello. VAD and every
+non-Windows production target remain strict same-source.
+
+This mapping does not authenticate the parent executable to the child. The
+parent continues to own executable admission; the child only correlates a
+validated session and never authorizes an unknown future desktop. No setting,
+environment variable, CLI value, caller JSON or test key can add production
+authority. Previously accepted legacy R worker bytes cannot acquire the new Hello behavior
+retroactively. Frozen-artifact acquisition, candidate installer construction,
+capture, qualification, signing, Auto enablement and publication remain outside
+this runtime slice.
+
 Pack ID and version are stricter than general signed identifiers because they
 become immutable-store directory names. They are bounded lowercase ASCII
 components that start and end with an alphanumeric character and otherwise use

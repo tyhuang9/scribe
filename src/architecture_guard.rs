@@ -1212,6 +1212,50 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 }
 
 #[test]
+fn frozen_worker_compatibility_is_compiled_empty_and_inference_only() {
+    let desktop = production_source(include_str!("main.rs"));
+    let worker_entry = production_source(include_str!("bin/scribe-inference-worker.rs"));
+    let author = production_source(include_str!("../tools/worker-pack-author/src/main.rs"));
+    let compatibility = production_source(include_str!("worker_compatibility.rs"));
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
+    let documentation_words = documentation
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../runtime-manifests/frozen-worker-compatibility-windows-x64.json"
+    ))
+    .expect("compiled frozen-worker policy must be valid JSON");
+
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["target_os"], "windows");
+    assert_eq!(manifest["target_arch"], "x86_64");
+    assert_eq!(manifest["entries"], serde_json::json!([]));
+    for source in [desktop.as_str(), worker_entry.as_str(), author.as_str()] {
+        assert!(source.contains("mod worker_compatibility;"));
+    }
+    for required in [
+        "struct FrozenWorkerApproval",
+        "approve_compiled_cpu_worker",
+        "approve_compiled_gpu_worker",
+        "include_bytes!(\"../runtime-manifests/frozen-worker-compatibility-windows-x64.json\")",
+    ] {
+        assert!(
+            compatibility.contains(required),
+            "frozen-worker compile-time authority lost {required:?}"
+        );
+    }
+    assert!(!compatibility.contains("std::env::var"));
+    assert!(!compatibility.contains("std::env::args"));
+    assert!(worker.contains("CompatibilityHello"));
+    assert!(worker.contains("worker compatibility Hello is inference-only"));
+    assert!(worker.contains("worker compatibility sessions are unsupported on this platform"));
+    assert!(documentation.contains("`entries: []` grants no foreign CPU worker or GPU pack"));
+    assert!(documentation_words.contains("cannot acquire the new Hello behavior retroactively"));
+}
+
+#[test]
 fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() {
     let desktop = include_str!("main.rs");
     let module = include_str!("gpu_worker_pack/mod.rs");

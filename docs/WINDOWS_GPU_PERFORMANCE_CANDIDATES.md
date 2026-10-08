@@ -38,6 +38,15 @@ local integrity record and explicitly non-publishing bundle are not production
 provenance or a complete candidate installer. Authenticated input custody,
 candidate-policy embedding and production acceptance remain later integration.
 
+The runtime now has a separate compile-time Windows-x64 compatibility map and a
+versioned, inference-only session handshake for exact frozen R workers. The
+checked-in map is canonical and empty, so it grants no foreign worker or pack.
+It is an admission mechanism only: it does not build, acquire, capture, qualify,
+sign, package, enable Auto for, or publish a candidate. Workers built before
+that handshake existed cannot gain support retroactively. Populating the map
+and integrating authenticated frozen inputs into an exact candidate installer
+remain separately reviewed work.
+
 A complete authenticated campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
 CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct

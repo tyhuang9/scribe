@@ -106,6 +106,8 @@ mod support_assets;
 #[cfg(windows)]
 #[path = "../windows_vulkan_loader.rs"]
 mod windows_vulkan_loader;
+#[path = "../worker_compatibility.rs"]
+mod worker_compatibility;
 #[allow(
     dead_code,
     reason = "the dedicated worker consumes only the wire-facing subset of shared worker contracts"
