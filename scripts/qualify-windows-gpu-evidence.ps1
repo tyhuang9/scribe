@@ -2621,7 +2621,8 @@ try {
         $decision = Get-PerformanceDecision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot $ExpectedAuthorizationSha256 $ExpectedCampaignNonce $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds') $FixtureNowUnixSeconds
     }
     else {
-        Assert-Condition (-not $reviewPathProvided -and -not $reviewShaProvided -and -not $PSBoundParameters.ContainsKey('ExpectedAuthorizationSha256') -and -not $PSBoundParameters.ContainsKey('ExpectedCampaignNonce') -and -not $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds')) 'Performance-only or maintainer-review arguments are not accepted for legacy qualification plans.'
+        Assert-Condition (-not $reviewPathProvided -and -not $reviewShaProvided) 'Maintainer review arguments are not accepted for legacy plans.'
+        Assert-Condition (-not $PSBoundParameters.ContainsKey('ExpectedAuthorizationSha256') -and -not $PSBoundParameters.ContainsKey('ExpectedCampaignNonce') -and -not $PSBoundParameters.ContainsKey('FixtureNowUnixSeconds')) 'Performance-only arguments are not accepted for legacy qualification plans.'
         $decision = Get-Decision $loadedPlan.Document $loadedPlan.Raw $loadedEvidence.Document $repositoryRoot $AllowFixture.IsPresent $ArtifactRoot
     }
     [byte[]]$payload = if ($decision.kind -ceq 'windows_gpu_performance_candidate_decision' -or $decision.kind -ceq 'windows_gpu_maintainer_review_performance_decision') {
