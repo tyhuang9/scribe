@@ -184,13 +184,19 @@ Windows x64 has a compile-time-only, versioned compatibility boundary for a
 future desktop build M to launch an exact immutable inference worker from an
 older source build R. The canonical policy is
 `runtime-manifests/frozen-worker-compatibility-windows-x64.json`. Its checked-in
-`entries: []` grants no foreign CPU worker or GPU pack today. A production
-entry requires a separately reviewed source change and binds the R-origin
-desktop build, inference-worker build, SCIF protocol, runtime ABI and exact
-worker SHA-256. GPU entries additionally bind backend/provider and the already
-signed pack ID, version, digest and security epoch. Pack signatures, complete
-inventory verification, rollback floors, device reconciliation and the CPU
-worker's embedded SHA-256 anchor remain independently mandatory.
+table is a bounded LOCAL diagnostic artifact mapping for the frozen R source
+build. It contains exactly three independently verified entries: the CPU worker
+and the CUDA and Vulkan worker packs. This completes the bounded three-entry
+CPU/CUDA/Vulkan local diagnostic cohort only; it does not make the table a
+release or installer candidate. Unknown hashes and pack identities remain
+denied, and replacing or adding any tuple requires actual independently
+verified values in a separately reviewed source change, never placeholders.
+Every entry binds the R-origin desktop build, inference-worker build, SCIF
+protocol, runtime ABI and exact worker SHA-256. GPU entries additionally bind
+backend/provider and the already signed pack ID, version, digest and security
+epoch. Pack signatures, complete inventory verification, rollback floors,
+device reconciliation and the CPU worker's embedded SHA-256 anchor remain
+independently mandatory.
 
 Ordinary sessions retain the unchanged SCIF v5 `Hello` and strict same-source
 build checks. Only an opaque approval produced from the compiled policy may
@@ -209,9 +215,11 @@ parent continues to own executable admission; the child only correlates a
 validated session and never authorizes an unknown future desktop. No setting,
 environment variable, CLI value, caller JSON or test key can add production
 authority. Previously accepted legacy R worker bytes cannot acquire the new Hello behavior
-retroactively. Frozen-artifact acquisition, candidate installer construction,
-capture, qualification, signing, Auto enablement and publication remain outside
-this runtime slice.
+retroactively. This local diagnostic mapping does not qualify `Auto`, grant
+production publication authority, authorize release or installer signing, or
+weaken the inference-only SCIF v5 session boundary. Frozen-artifact acquisition,
+candidate installer construction, capture, qualification, signing, Auto
+enablement and publication remain outside this runtime slice.
 
 Pack ID and version are stricter than general signed identifiers because they
 become immutable-store directory names. They are bounded lowercase ASCII
