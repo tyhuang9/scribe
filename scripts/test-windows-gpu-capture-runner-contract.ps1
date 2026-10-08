@@ -8,6 +8,48 @@ $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($runner, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw 'Capture runner does not parse.' }
+$captureTestLoops = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.ForEachStatementAst] -and
+        $node.Body.Extent.Text -cmatch 'Invoke-CaptureTests\s+\$feature\s+\$filter'
+}, $true))
+$providerTestLoops = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.ForEachStatementAst] -and
+        $node.Body.Extent.Text -cmatch 'Invoke-CaptureTests\s+"ui-harness,\$providerFeature"\s+\$filter'
+}, $true))
+if ($captureTestLoops.Count -ne 1 -or $providerTestLoops.Count -ne 1) {
+    throw 'Capture runner must have one canonical and one provider-specific test group.'
+}
+function Get-LoopFilterLiterals([Management.Automation.Language.ForEachStatementAst]$Loop) {
+    @($Loop.Condition.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.StringConstantExpressionAst]
+    }, $true) | ForEach-Object Value)
+}
+$expectedCaptureFilters = @(
+    'windows_gpu_capture::tests',
+    'windows_gpu_capture::telemetry::tests',
+    'windows_gpu_capture::campaign::tests',
+    'windows_gpu_probe::tests',
+    'onnx_worker::tests::gpu_pack_probe',
+    'onnx_worker::tests::capture_observation',
+    'onnx_worker::tests::vulkan_hello_memory',
+    'embedded_runtime::tests::provider_memory_observation',
+    'architecture_guard::windows_gpu_capture',
+    'architecture_guard::windows_gpu_probe'
+)
+$expectedProviderFilters = @(
+    'onnx_worker::tests::capture_observation',
+    'onnx_worker::tests::vulkan_hello_memory',
+    'embedded_runtime::tests::provider_memory_observation'
+)
+$actualCaptureFilters = @(Get-LoopFilterLiterals -Loop $captureTestLoops[0])
+$actualProviderFilters = @(Get-LoopFilterLiterals -Loop $providerTestLoops[0])
+if (($actualCaptureFilters -join "`0") -cne ($expectedCaptureFilters -join "`0") -or
+    ($actualProviderFilters -join "`0") -cne ($expectedProviderFilters -join "`0")) {
+    throw 'Capture runner changed its exact canonical Hello-memory test commands.'
+}
 $definitions = foreach ($name in @('Invoke-CaptureCargo', 'Invoke-CaptureTests')) {
     $functions = @($ast.FindAll({
         param($node)

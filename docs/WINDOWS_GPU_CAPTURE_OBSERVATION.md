@@ -165,6 +165,21 @@ reading. Vulkan budgets and usage are changing process-level estimates, not
 physical free VRAM. See the
 [Vulkan memory-budget specification](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceMemoryBudgetPropertiesEXT.html).
 
+For an authenticated Windows Vulkan worker Hello, the worker collects one
+fresh bounded Vulkan snapshot inventory for that Hello and applies this same
+exact stable-identity/class/heap derivation to each already-resolved provider
+device. The native `memory_total_bytes` remains the parent identity and
+reconciliation input. The Hello advertises derived headroom only when the
+selected Vulkan heap capacity exactly equals that unchanged native total;
+query failure, absent extension, invalid heap data, missing or ambiguous
+mapping, and capacity mismatch all project into its existing availability
+scalar as `0`. There is no raw provider-free fallback or mismatch clamp. That
+scalar zero is conservative unavailable-or-exhausted state, while this
+observation extension retains its typed `unavailable` reasons and a valid
+measured zero remains `observed`. Positive policy floors consequently reject
+the scalar zero. Snapshot inventories are not cached across worker launches,
+and CPU, CUDA, Metal, non-Windows, and desktop behavior is unchanged.
+
 Both methods retain the existing generation/model/batch correlation and
 before/after validation. Cancellation, stale completion or device changes
 cannot reuse an earlier pair. No availability observation establishes that a
@@ -271,6 +286,11 @@ without modifying the native library. It does not prove which internal native
 branch supplied the unchanged raw snapshot. Qualification and runtime
 admission must use consistent measurement semantics before such observations
 can affect Auto; there is no evaluator adapter in this observer.
+
+The Hello headroom projection is likewise an authenticated worker fact, not
+unsigned capture custody, a native-memory acquisition proof, hardware
+validation, or a qualification result. Existing production trust and
+default-deny Auto policy remain unchanged.
 
 The paired warm campaign retains one CPU worker and one GPU worker, executing
 inference serially. This exception stays private to the collector and is bounded

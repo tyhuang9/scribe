@@ -794,6 +794,22 @@ handle. Vulkan identity discovery resolves its entry point from that admitted
 module, without performing another DLL search. The fixed layer-disable variable
 is set only for verified Windows Vulkan packs; other backends are unchanged.
 
+Each authenticated Windows Vulkan worker Hello collects one fresh bounded
+Vulkan memory-budget inventory alongside provider identity discovery and reuses
+that single inventory only for the resolved devices in that Hello. It binds
+each result by exact LUID, UUID, or canonical zero-domain PCI identity and uses
+all heaps for integrated GPUs or device-local heaps for discrete GPUs. The
+native Hello total remains unchanged for parent identity reconciliation. Only
+when the selected heap capacity exactly equals that native total may the Hello
+availability scalar advertise derived budget headroom. Query failure, no
+extension, invalid/ambiguous/missing mapping or heap data, overflow, and a
+capacity mismatch advertise `0`; there is no raw native-free fallback or
+mismatch clamp. A zero is conservative unavailable-or-exhausted state for the
+existing scalar and causes positive policy floors to reject. Typed observation
+unavailability remains available to the capture-observation extension. The
+inventory is not cached across worker launches, and no Vulkan query runs for
+CUDA, Metal, CPU, desktop, or non-Vulkan worker Hello paths.
+
 This integration remains in development pending exact signed-pack
 SCIF/model/warm verification and native CI/hardware qualification.
 The Windows static import is mapped before Rust `main`; prelaunch full-pack

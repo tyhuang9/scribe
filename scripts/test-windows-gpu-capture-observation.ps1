@@ -177,7 +177,8 @@ try {
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',
             'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
-            'onnx_worker::tests::capture_observation', 'embedded_runtime::tests::provider_memory_observation',
+            'onnx_worker::tests::capture_observation', 'onnx_worker::tests::vulkan_hello_memory',
+            'embedded_runtime::tests::provider_memory_observation',
             'architecture_guard::windows_gpu_capture', 'architecture_guard::windows_gpu_probe')) {
         Invoke-CaptureTests $feature $filter
     }
@@ -191,6 +192,7 @@ try {
         # release lint. A production-only check cannot catch unused test helpers.
         Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$providerFeature", '--', '-D', 'warnings')
         foreach ($filter in @('onnx_worker::tests::capture_observation',
+                'onnx_worker::tests::vulkan_hello_memory',
                 'embedded_runtime::tests::provider_memory_observation')) {
             Invoke-CaptureTests "ui-harness,$providerFeature" $filter
         }

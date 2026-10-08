@@ -1973,6 +1973,44 @@ fn derive_vulkan_memory_availability(
     }
 }
 
+// The parent reconciles this Hello's native total with its selected target, so
+// retain that native value verbatim. A Vulkan budget can replace only the
+// volatile availability scalar when its selected heap scope has the same
+// capacity. The helper deliberately has no native free-memory input: a failed
+// or mismatched Vulkan query must not fall back to a backend-defined raw value.
+#[cfg(any(
+    test,
+    all(windows, feature = "inference-worker", feature = "vulkan-acceleration")
+))]
+fn vulkan_hello_memory_available_bytes(
+    snapshots: Option<&[VulkanMemoryDeviceSnapshot]>,
+    provider_id: &str,
+    stable_device: &str,
+    expected_class: DeviceClass,
+    native_memory_total_bytes: u64,
+) -> u64 {
+    let Some(snapshots) = snapshots else {
+        // Query failure projects into the existing scalar Hello field as
+        // conservative unavailable-or-exhausted headroom.
+        return 0;
+    };
+    match derive_vulkan_memory_availability(snapshots, provider_id, stable_device, expected_class) {
+        WorkerMemoryAvailability::Observed {
+            memory_total_bytes,
+            available_memory_bytes,
+            source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget { .. },
+            ..
+        } if memory_total_bytes == native_memory_total_bytes => available_memory_bytes,
+        // Keep the typed unavailability reason in the observation path. The
+        // authenticated Hello has only its existing scalar availability field,
+        // for which every missing, invalid, ambiguous, or mismatched budget is
+        // conservatively zero.
+        WorkerMemoryAvailability::Observed { .. }
+        | WorkerMemoryAvailability::Unavailable { .. } => 0,
+        WorkerMemoryAvailability::NotApplicable { .. } => 0,
+    }
+}
+
 #[cfg(all(windows, feature = "vulkan-acceleration"))]
 fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> {
     use ash::vk;
@@ -2595,6 +2633,13 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         .then(|| VulkanDeviceCatalog::discover(true))
         .transpose()
         .context("could not obtain Vulkan LUID/UUID identity")?;
+    #[cfg(all(windows, feature = "vulkan-acceleration"))]
+    // A worker Hello has one fresh, bounded physical-device inventory. Reuse
+    // it only for the already-resolved provider devices in this Hello; do not
+    // issue a query per device or retain it across worker launches.
+    let vulkan_memory_snapshots = (expectation.backend == WorkerProvider::Vulkan)
+        .then(collect_vulkan_memory_snapshots)
+        .and_then(Result::ok);
     #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
     if expectation.backend == WorkerProvider::Metal {
         let provider = provider_devices
@@ -2705,6 +2750,19 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
                 let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
                 (stable_device_identity, driver_version)
             };
+        let memory_available_bytes = device.memory_free.min(device.memory_total);
+        #[cfg(all(windows, feature = "vulkan-acceleration"))]
+        let memory_available_bytes = if expectation.backend == WorkerProvider::Vulkan {
+            vulkan_hello_memory_available_bytes(
+                vulkan_memory_snapshots.as_deref(),
+                &expectation.provider,
+                &stable_device_identity,
+                device_class,
+                device.memory_total,
+            )
+        } else {
+            memory_available_bytes
+        };
         devices.push(WorkerPackDeviceCapability {
             stable_device_identity,
             process_index,
@@ -2713,7 +2771,7 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
             device_class,
             vendor,
             memory_total_bytes: device.memory_total,
-            memory_available_bytes: device.memory_free.min(device.memory_total),
+            memory_available_bytes,
         });
     }
     finish_worker_pack_capability(expectation, expected_device_id, devices)
@@ -20329,6 +20387,155 @@ mod tests {
             }
         ));
         exhausted.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn vulkan_hello_memory_projects_equal_scope_capacity_for_discrete_and_integrated_devices() {
+        let provider = "transcribe-cpp-ggml-vulkan";
+        for (stable_device, device_class, heaps, expected_available) in [
+            (
+                "native:luid:0102030405060708",
+                DeviceClass::DiscreteGpu,
+                // MULTI_INSTANCE remains a valid singleton physical-device
+                // heap capability; it is not an instruction to aggregate
+                // another device's heaps.
+                vec![vulkan_heap(0, 100, 0b11, 80, 80)],
+                0,
+            ),
+            (
+                "native:uuid:00112233445566778899aabbccddeeff",
+                DeviceClass::IntegratedGpu,
+                vec![
+                    vulkan_heap(0, 70, 0b10, 60, 10),
+                    vulkan_heap(1, 30, 0b11, 20, 10),
+                ],
+                60,
+            ),
+        ] {
+            let snapshots = [vulkan_memory_snapshot(stable_device, device_class, heaps)];
+            assert_eq!(
+                vulkan_hello_memory_available_bytes(
+                    Some(&snapshots),
+                    provider,
+                    stable_device,
+                    device_class,
+                    100,
+                ),
+                expected_available,
+                "{stable_device}"
+            );
+        }
+    }
+
+    #[test]
+    fn vulkan_hello_memory_uses_exact_luid_uuid_or_pci_snapshot_not_order_or_other_devices() {
+        let provider = "transcribe-cpp-ggml-vulkan";
+        for (stable_device, snapshot_identity, target_pci) in [
+            (
+                "native:luid:0102030405060708",
+                "native:luid:0102030405060708",
+                None,
+            ),
+            (
+                "native:uuid:00112233445566778899aabbccddeeff",
+                "native:uuid:00112233445566778899aabbccddeeff",
+                None,
+            ),
+            (
+                "native:0000:01:00.0",
+                "native:luid:1112131415161718",
+                Some((1, 0, 0)),
+            ),
+        ] {
+            let mut target = vulkan_memory_snapshot(
+                snapshot_identity,
+                DeviceClass::DiscreteGpu,
+                vec![vulkan_heap(0, 100, 0b1, 80, 25)],
+            );
+            target.pci_location = target_pci;
+            let mut unrelated = vulkan_memory_snapshot(
+                "native:uuid:ffeeddccbbaa99887766554433221100",
+                DeviceClass::DiscreteGpu,
+                vec![vulkan_heap(0, 900, 0b1, 800, 100)],
+            );
+            unrelated.pci_location = Some((2, 0, 0));
+
+            for snapshots in [
+                vec![unrelated.clone(), target.clone()],
+                vec![target.clone(), unrelated.clone()],
+            ] {
+                assert_eq!(
+                    vulkan_hello_memory_available_bytes(
+                        Some(&snapshots),
+                        provider,
+                        stable_device,
+                        DeviceClass::DiscreteGpu,
+                        100,
+                    ),
+                    55,
+                    "{stable_device}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vulkan_hello_memory_projects_query_mapping_heap_and_capacity_failures_to_zero() {
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let stable_device = "native:luid:0102030405060708";
+        let valid = vulkan_memory_snapshot(
+            stable_device,
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 0b1, 80, 20)],
+        );
+        let project = |snapshots, native_memory_total_bytes| {
+            vulkan_hello_memory_available_bytes(
+                snapshots,
+                provider,
+                stable_device,
+                DeviceClass::DiscreteGpu,
+                native_memory_total_bytes,
+            )
+        };
+
+        // The helper intentionally accepts no native raw-free value, so none
+        // of these failures can be repaired by a positive provider snapshot.
+        assert_eq!(project(None, 100), 0, "query failure");
+        let missing = [vulkan_memory_snapshot(
+            "native:luid:1112131415161718",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 0b1, 80, 20)],
+        )];
+        assert_eq!(project(Some(&missing), 100), 0, "missing stable mapping");
+        let duplicate = [valid.clone(), valid.clone()];
+        assert_eq!(
+            project(Some(&duplicate), 100),
+            0,
+            "duplicate stable mapping"
+        );
+
+        let mut no_extension = valid.clone();
+        no_extension.memory_budget_supported = false;
+        let no_extension_snapshots = [no_extension];
+        assert_eq!(
+            project(Some(&no_extension_snapshots), 100),
+            0,
+            "missing extension"
+        );
+        let mut invalid_heaps = valid.clone();
+        invalid_heaps.heaps[0].budget_bytes = 101;
+        let invalid_heap_snapshots = [invalid_heaps];
+        assert_eq!(
+            project(Some(&invalid_heap_snapshots), 100),
+            0,
+            "invalid heap budget"
+        );
+        let valid_snapshots = [valid];
+        assert_eq!(
+            project(Some(&valid_snapshots), 99),
+            0,
+            "scope capacity mismatch"
+        );
     }
 
     #[test]
