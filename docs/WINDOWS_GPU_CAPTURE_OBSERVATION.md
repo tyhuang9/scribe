@@ -398,6 +398,16 @@ window**, not ordinary-application end-to-end latency:
   `model_load_ms` and `warm_reused`. Never subtract an estimated instrumentation
   overhead or replace a measured zero duration with a fabricated positive value.
 
+GGUF batch load diagnostics belong to the actual load decision performed by
+`BeginBatch`, not an earlier warm-model preflight or the later decode's warm
+check. The worker preserves that load's reuse flag and measured duration in the
+result, while keeping the decode's transcript and processing duration. Batch
+decoding uses only the exact retained model: a changed runtime/device environment
+fails before decoding instead of implicitly loading or replacing the model.
+An explicit earlier model load can therefore make `BeginBatch` genuinely warm;
+no campaign phase is used to manufacture these values. Existing worker binaries
+require a new build to gain this correction.
+
 Campaigns use a distinct `windows_gpu_capture_campaign` schema-2 report, bounded
 to 32 MiB, at most 14 captured worker handshakes and 52 request records. A
 successful sequence has 50 measured records and two separately identified
@@ -458,11 +468,11 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and ten test groups: collector, native telemetry, paired campaigns,
+discovery and twelve test groups: collector, native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, authenticated Vulkan Hello memory projection,
-provider-memory snapshots, capture architecture guards and probe architecture
-guards.
+provider-memory snapshots, retained GGUF native/runtime boundaries, capture
+architecture guards and probe architecture guards.
 `-ScriptOnly` provides the fast inner-loop check: script parsing, nineteen
 prelaunch argument/file-rejection cases, and four local GUI-process cases.
 The latter compile a tiny x64 GUI fixture using the Windows .NET Framework C#
