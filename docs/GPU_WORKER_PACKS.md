@@ -49,6 +49,15 @@ packs for publication.
 - GPU health uses the exact pack/runtime/OS/driver/device/model key described
   below.
 
+Successful GPU diagnostics use the parent's verified route plan after the
+supervisor validates the selected worker identity. They retain actual parent
+skips and pre-output failure history, not the worker's raw discovery context.
+Remaining GPU fallbacks respect the four-attempt limit. An exact-target retry
+reports the freshly matched target with no alternative fallback routes.
+Explicit GPU retains the supervisor-reconciled launch target, including a
+remapped process index and updated volatile facts, instead of restoring cached
+probe metadata.
+
 ## Stage 5 Windows Auto qualification
 
 `runtime-manifests/gpu-auto-qualification-windows-x64.json` is a compact,
