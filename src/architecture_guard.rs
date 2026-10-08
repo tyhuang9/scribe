@@ -1219,24 +1219,42 @@ fn frozen_worker_compatibility_is_compiled_exact_and_inference_only() {
     };
 
     const ORIGIN_APP_BUILD: &str =
-        "local-transcriber@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20";
+        "local-transcriber@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078";
     const WORKER_BUILD: &str =
-        "scribe-inference-worker@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20";
+        "scribe-inference-worker@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078";
     const CPU_WORKER_SHA256: &str =
-        "e7085925086fde3a25aa410610c4c89324bbc3b4ed6b857c28a08d31ca33b54d";
+        "2f8c80b0f74d8c52b88569ce851964da91f36c76a537e9a447995a0aa00ee0f0";
     const CUDA_WORKER_SHA256: &str =
-        "d490a858c86876773606ef5f8c1dc50109a17bdd72a9a248dee83e3a6282186e";
+        "4059b48dcdc94e79c2bd278f886549b85e61f319e3518ff72d5d163b987f2e43";
+    const CUDA_PACK_VERSION: &str = "r209-49e9d68";
     const CUDA_PACK_DIGEST: &str =
-        "fc1f003b290209ebdd285820befcc74ddaa9d4582e1ae8ac86e983779f72db70";
+        "7fe5bb0e0137b8d8a9c9c08c5fa21e66e9f0ea6e40c0dd2b0464b4351d9559bb";
     const VULKAN_WORKER_SHA256: &str =
-        "b5b10d6cc67791644f3cd2d0db53b610b112fedaef004918f3651b9d7e335b62";
+        "46d946c8aed1b830317b038f97ca1ed5fdce1483c859d471c2f8d4ecae202463";
+    const VULKAN_PACK_VERSION: &str = "r209-49e9d68-v1";
     const VULKAN_PACK_DIGEST: &str =
+        "6a68d3b00b7afea39eed52f03121ccbfadfd080333963101770e6a717f1db763";
+    const OLD_ORIGIN_APP_BUILD: &str =
+        "local-transcriber@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20";
+    const OLD_WORKER_BUILD: &str =
+        "scribe-inference-worker@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20";
+    const OLD_CPU_WORKER_SHA256: &str =
+        "e7085925086fde3a25aa410610c4c89324bbc3b4ed6b857c28a08d31ca33b54d";
+    const OLD_CUDA_WORKER_SHA256: &str =
+        "d490a858c86876773606ef5f8c1dc50109a17bdd72a9a248dee83e3a6282186e";
+    const OLD_CUDA_PACK_VERSION: &str = "frozen-r-c03e125";
+    const OLD_CUDA_PACK_DIGEST: &str =
+        "fc1f003b290209ebdd285820befcc74ddaa9d4582e1ae8ac86e983779f72db70";
+    const OLD_VULKAN_WORKER_SHA256: &str =
+        "b5b10d6cc67791644f3cd2d0db53b610b112fedaef004918f3651b9d7e335b62";
+    const OLD_VULKAN_PACK_VERSION: &str = "frozen-r-c03e125";
+    const OLD_VULKAN_PACK_DIGEST: &str =
         "9d3f2b18c9a20206afa2ac831d92ee080c04114b5dfa1607bc5fa4bb679283a5";
     const EXPECTED_POLICY: &str = concat!(
         "{\"schema_version\":1,\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[",
-        "{\"kind\":\"cpu\",\"origin_app_build\":\"local-transcriber@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20\",\"worker_build\":\"scribe-inference-worker@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20\",\"worker_sha256\":\"e7085925086fde3a25aa410610c4c89324bbc3b4ed6b857c28a08d31ca33b54d\",\"protocol_version\":5,\"runtime_abi_version\":1},",
-        "{\"kind\":\"gpu\",\"origin_app_build\":\"local-transcriber@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20\",\"worker_build\":\"scribe-inference-worker@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20\",\"worker_sha256\":\"d490a858c86876773606ef5f8c1dc50109a17bdd72a9a248dee83e3a6282186e\",\"protocol_version\":5,\"runtime_abi_version\":1,\"backend\":\"cuda\",\"provider\":\"transcribe-cpp-ggml-cuda\",\"pack_id\":\"scribe-cuda-windows-x64\",\"pack_version\":\"frozen-r-c03e125\",\"pack_digest\":\"fc1f003b290209ebdd285820befcc74ddaa9d4582e1ae8ac86e983779f72db70\",\"security_epoch\":1},",
-        "{\"kind\":\"gpu\",\"origin_app_build\":\"local-transcriber@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20\",\"worker_build\":\"scribe-inference-worker@0.1.0#c03e125ced185e74a3215bd582a5f5f621569f20\",\"worker_sha256\":\"b5b10d6cc67791644f3cd2d0db53b610b112fedaef004918f3651b9d7e335b62\",\"protocol_version\":5,\"runtime_abi_version\":1,\"backend\":\"vulkan\",\"provider\":\"transcribe-cpp-ggml-vulkan\",\"pack_id\":\"scribe-vulkan-windows-x64\",\"pack_version\":\"frozen-r-c03e125\",\"pack_digest\":\"9d3f2b18c9a20206afa2ac831d92ee080c04114b5dfa1607bc5fa4bb679283a5\",\"security_epoch\":1}",
+        "{\"kind\":\"cpu\",\"origin_app_build\":\"local-transcriber@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078\",\"worker_build\":\"scribe-inference-worker@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078\",\"worker_sha256\":\"2f8c80b0f74d8c52b88569ce851964da91f36c76a537e9a447995a0aa00ee0f0\",\"protocol_version\":5,\"runtime_abi_version\":1},",
+        "{\"kind\":\"gpu\",\"origin_app_build\":\"local-transcriber@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078\",\"worker_build\":\"scribe-inference-worker@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078\",\"worker_sha256\":\"4059b48dcdc94e79c2bd278f886549b85e61f319e3518ff72d5d163b987f2e43\",\"protocol_version\":5,\"runtime_abi_version\":1,\"backend\":\"cuda\",\"provider\":\"transcribe-cpp-ggml-cuda\",\"pack_id\":\"scribe-cuda-windows-x64\",\"pack_version\":\"r209-49e9d68\",\"pack_digest\":\"7fe5bb0e0137b8d8a9c9c08c5fa21e66e9f0ea6e40c0dd2b0464b4351d9559bb\",\"security_epoch\":1},",
+        "{\"kind\":\"gpu\",\"origin_app_build\":\"local-transcriber@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078\",\"worker_build\":\"scribe-inference-worker@0.1.0#49e9d684c40798d913949c88fd7cd1dd363e7078\",\"worker_sha256\":\"46d946c8aed1b830317b038f97ca1ed5fdce1483c859d471c2f8d4ecae202463\",\"protocol_version\":5,\"runtime_abi_version\":1,\"backend\":\"vulkan\",\"provider\":\"transcribe-cpp-ggml-vulkan\",\"pack_id\":\"scribe-vulkan-windows-x64\",\"pack_version\":\"r209-49e9d68-v1\",\"pack_digest\":\"6a68d3b00b7afea39eed52f03121ccbfadfd080333963101770e6a717f1db763\",\"security_epoch\":1}",
         "]}"
     );
 
@@ -1282,7 +1300,7 @@ fn frozen_worker_compatibility_is_compiled_exact_and_inference_only() {
         backend: FrozenGpuBackend::Cuda,
         provider: "transcribe-cpp-ggml-cuda",
         pack_id: "scribe-cuda-windows-x64",
-        pack_version: "frozen-r-c03e125",
+        pack_version: CUDA_PACK_VERSION,
         pack_digest: CUDA_PACK_DIGEST,
         security_epoch: 1,
     };
@@ -1299,13 +1317,88 @@ fn frozen_worker_compatibility_is_compiled_exact_and_inference_only() {
         backend: FrozenGpuBackend::Vulkan,
         provider: "transcribe-cpp-ggml-vulkan",
         pack_id: "scribe-vulkan-windows-x64",
-        pack_version: "frozen-r-c03e125",
+        pack_version: VULKAN_PACK_VERSION,
         pack_digest: VULKAN_PACK_DIGEST,
         security_epoch: 1,
     };
     let vulkan_approval = approve_test_gpu_worker(manifest_bytes, &exact_vulkan_candidate)
         .expect("the exact frozen Vulkan worker pack must be approved");
     assert!(vulkan_approval.matches_gpu(&exact_vulkan_candidate));
+
+    assert!(
+        approve_test_cpu_worker(
+            manifest_bytes,
+            &FrozenCpuWorkerCandidate {
+                worker_sha256: OLD_CPU_WORKER_SHA256,
+                protocol_version: 5,
+                runtime_abi_version: 1,
+            },
+        )
+        .is_none()
+    );
+    for (current, old_worker_sha256, old_pack_version, old_pack_digest) in [
+        (
+            &exact_cuda_candidate,
+            OLD_CUDA_WORKER_SHA256,
+            OLD_CUDA_PACK_VERSION,
+            OLD_CUDA_PACK_DIGEST,
+        ),
+        (
+            &exact_vulkan_candidate,
+            OLD_VULKAN_WORKER_SHA256,
+            OLD_VULKAN_PACK_VERSION,
+            OLD_VULKAN_PACK_DIGEST,
+        ),
+    ] {
+        for (case, candidate) in [
+            (
+                "previous complete cohort",
+                FrozenGpuWorkerCandidate {
+                    origin_app_build: OLD_ORIGIN_APP_BUILD,
+                    worker_build: OLD_WORKER_BUILD,
+                    worker_sha256: old_worker_sha256,
+                    pack_version: old_pack_version,
+                    pack_digest: old_pack_digest,
+                    ..*current
+                },
+            ),
+            (
+                "new worker with previous pack identity",
+                FrozenGpuWorkerCandidate {
+                    pack_version: old_pack_version,
+                    pack_digest: old_pack_digest,
+                    ..*current
+                },
+            ),
+            (
+                "previous worker with new pack identity",
+                FrozenGpuWorkerCandidate {
+                    worker_sha256: old_worker_sha256,
+                    ..*current
+                },
+            ),
+            (
+                "previous origin build",
+                FrozenGpuWorkerCandidate {
+                    origin_app_build: OLD_ORIGIN_APP_BUILD,
+                    ..*current
+                },
+            ),
+            (
+                "previous worker build",
+                FrozenGpuWorkerCandidate {
+                    worker_build: OLD_WORKER_BUILD,
+                    ..*current
+                },
+            ),
+        ] {
+            assert!(
+                approve_test_gpu_worker(manifest_bytes, &candidate).is_none(),
+                "{case} unexpectedly approved for {:?}",
+                current.backend,
+            );
+        }
+    }
 
     let unknown_cpu_sha256 = "00".repeat(32);
     assert!(
