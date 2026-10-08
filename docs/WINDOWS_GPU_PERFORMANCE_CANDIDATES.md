@@ -1,19 +1,23 @@
 # Windows GPU performance-policy candidates
 
 This is an offline, pre-installer evidence boundary. It derives proposed Auto
-policy bytes from authenticated performance records for frozen workers. It
-does **not** approve an installer, change runtime policy, enable production Auto,
-sign packs, or publish a release.
+policy bytes from legacy authenticated performance records or separately
+maintainer-reviewed records for frozen workers. It does **not** approve an
+installer, change runtime policy, enable production Auto, sign packs, or publish
+a release.
 
-The independent campaign authority is initially empty. Production campaign
-approval, capture-key custody, nonce consumption and final release approval
-remain unprovisioned. GPU-pack signing authority does not grant these powers.
+The independent legacy campaign authority is initially empty. Production
+campaign approval, capture-key custody, nonce consumption and final release
+approval remain unprovisioned. GPU-pack signing authority does not grant these
+powers. The maintainer-reviewed audit route below deliberately has no campaign
+authority, but is never a replacement for these production approvals.
 
 ## Why this phase is separate
 
 The full qualification schemas in
 [`WINDOWS_GPU_QUALIFICATION.md`](WINDOWS_GPU_QUALIFICATION.md) bind an installed
-package and include scenario observations in their memory floor. They cannot
+package. Schemas 2/3 include scenario observations in their memory floor;
+schema 4 uses only successful GPU-run before observations. None can
 also be the input used to construct that same package. Committing a completed
 qualification entry creates another cycle: changing the source revision changes
 the exact worker/pack identities that the entry approves.
@@ -22,14 +26,16 @@ The intended release sequence is:
 
 1. Freeze source revision R and the exact CPU and GPU worker artifacts.
 2. Approve an installation-independent performance capture contract.
-3. Capture and authenticate performance evidence; derive candidate policy M.
+3. Capture legacy authenticated evidence or evaluate separately
+   maintainer-reviewed evidence; derive candidate policy M.
 4. Separately authorize candidate construction; build only the desktop using M
-   and the existing workers from R.
+   and the existing workers from R. A maintainer review is not that authorization.
 5. Test the actual candidate installer, including Auto selection and failure
    scenarios, against the frozen policy and memory floor.
 6. Approve and publish that exact installer without rebuilding it.
 
-This delivery implements the evidence boundary in steps 2–3, not the protected
+This delivery implements the evidence boundary in steps 2–3, including an
+explicit candidate-only maintainer-reviewed audit route, not the protected
 approval service, candidate builder, final qualification or publication flow.
 The normal release builder still builds its CPU worker. The separate
 [local frozen-worker packaging path](WINDOWS_FROZEN_CPU_WORKER_PACKAGING.md)
@@ -57,7 +63,7 @@ compiled map, authenticate an unknown hash origin, approve a GPU pack, or enable
 Auto. CUDA and Vulkan descriptor admission remain on their existing compiled
 signature/epoch path.
 
-A complete authenticated campaign writer is still missing. The opt-in
+A complete signed campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
 CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct
 campaign schema 2). The campaign executes five cold and twenty warm pairs,
@@ -87,14 +93,14 @@ candidate-installer integration remain distinct stages.
 
 The existing `qualify-windows-gpu-evidence.ps1` entrypoint dispatches by an exact
 plan kind. Full qualification schemas 2 and 3 retain their existing shapes,
-authority and behavior. Performance documents instead use schema 1 and distinct
-kinds:
+authority and behavior. Legacy signed performance documents use schema 1 and
+distinct kinds:
 
 - `windows_gpu_performance_candidate_plan`
 - `windows_gpu_performance_candidate_evidence`
 - `windows_gpu_performance_candidate_decision`
 
-The performance plan contains `fixture_only`, `source`, Windows/x86_64 target,
+The legacy signed performance plan contains `fixture_only`, `source`, Windows/x86_64 target,
 the fixed 5-cold/20-warm/110-percent rules, `contract_bindings`,
 `capture_contract`, `capture_authority`, `authorization`, and ordered
 `required_lanes` with exact identity/evidence digests. `source` names
@@ -105,7 +111,36 @@ fixture identities are not production provenance.
 The checkout is a trusted build input. Local Git checks do not independently
 prove GitHub repository ownership, protected-branch membership or a hosted
 workflow's identity. A future protected controller must authenticate those
-facts and the caller's integrity pins before using a performance decision.
+facts and the caller's integrity pins before using a legacy signed performance
+decision for a protected action. A maintainer-reviewed decision cannot support
+that action.
+
+Schema 1 also defines the separate audit-only
+`windows_gpu_maintainer_review_performance_plan`,
+`windows_gpu_maintainer_review_performance_evidence`, and
+`windows_gpu_maintainer_review_performance_decision` kinds. The reviewed plan
+omits `capture_authority` and `authorization`; reviewed lanes omit only
+`attestation`. It retains the same source, 5/20/p95, contract-binding, identity,
+acquisition, run, raw-capture and inventory semantics. It is not a conversion
+path for diagnostic or signed campaign evidence.
+
+The maintainer route requires `-ReviewRecordPath` and
+`-ExpectedReviewSha256` together and rejects those switches for legacy kinds.
+The external canonical review record has exactly schema 1, kind
+`windows_gpu_maintainer_review`, matching fixture mode, raw plan/evidence
+hashes, the exact 40-hex plan source revision, and bounded printable review and
+CI-run references. Its independently supplied digest is checked from the same
+retained bytes used for parsing; the record's own references are human audit
+claims, not signatures, credentials or authentication. Before an artifact is
+opened, every reviewed lane must have the exact no-attestation key set, required
+identity and whole-lane digest, and a strictly sorted inventory. Non-fixture
+evaluation also performs the existing clean source-checkout check.
+
+A passing maintainer-reviewed performance report may emit the same candidate
+bytes for inspection, but labels them
+`evidence_trust: "human-reviewed-not-authenticated"` and always sets
+`auto_eligible: false` and `release_approved: false`. It cannot authorize a
+runtime manifest, pack release, installer promotion or publication.
 
 The contract bindings are `evaluator_sha256`, `toolchain_contract_sha256`, and
 `base_auto_manifest_sha256`. They pin the current evaluator, Windows worker

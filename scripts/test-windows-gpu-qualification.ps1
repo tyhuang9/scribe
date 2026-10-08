@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only)
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -656,6 +656,18 @@ function New-PerformanceDocuments([string]$DeviceClass = 'integrated_gpu', [int]
     return [pscustomobject]@{ Plan = $plan; Evidence = $evidence }
 }
 
+function New-MaintainerReviewDocuments([string]$Purpose = 'qualification', [string]$DeviceClass = 'integrated_gpu') {
+    # Synthetic fixtures only: no existing diagnostic evidence is converted.
+    Assert-True (@('qualification', 'performance') -ccontains $Purpose) 'Unsupported maintainer review fixture purpose.'
+    $documents = if ($Purpose -ceq 'performance') { New-PerformanceDocuments $DeviceClass } else { New-V4FixtureDocuments $DeviceClass }
+    $documents.Plan.kind = "windows_gpu_maintainer_review_${Purpose}_plan"
+    $documents.Evidence.kind = "windows_gpu_maintainer_review_${Purpose}_evidence"
+    $documents.Plan.Remove('capture_authority')
+    if ($documents.Plan.Contains('authorization')) { $documents.Plan.Remove('authorization') }
+    foreach ($lane in @($documents.Evidence.lanes)) { $lane.Remove('attestation') }
+    return $documents
+}
+
 function Write-Envelope([string]$Path, [string]$Kind, $Record) {
     [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
     Write-Canonical $Path ([ordered]@{ kind = $Kind; record = $Record; schema_version = 1 })
@@ -726,9 +738,12 @@ function New-PerformanceAttestation($Plan, $Lane, [Security.Cryptography.ECDsa]$
 }
 
 function Update-PerformanceBindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifacts) {
+    $maintainerReviewed = $Documents.Plan.kind -ceq 'windows_gpu_maintainer_review_performance_plan'
     $Documents.Plan.required_lanes = @($Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-Digest 'pending-performance-lane'; identity = $_.identity } })
-    $Documents.Plan.authorization = [ordered]@{ key_id = $PerformanceApprovalKeyId }
-    $Documents.Plan.authorization = New-PerformanceAuthorization $Documents.Plan
+    if (-not $maintainerReviewed) {
+        $Documents.Plan.authorization = [ordered]@{ key_id = $PerformanceApprovalKeyId }
+        $Documents.Plan.authorization = New-PerformanceAuthorization $Documents.Plan
+    }
     foreach ($lane in @($Documents.Evidence.lanes)) {
         if ($WriteArtifacts) { $lane.acquisition_artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($lane.acquisition_artifact_path.Replace('/', '\'))) 'windows_gpu_performance_acquisition_artifact' $lane.identity.acquisition }
         foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_performance_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
@@ -739,7 +754,7 @@ function Update-PerformanceBindings($Documents, [string]$ArtifactRoot, [bool]$Wr
             foreach ($capture in @($lane.battery.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_performance_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
         }
         $lane.artifact_inventory = Get-ArtifactReferences $lane
-        $lane.attestation = New-PerformanceAttestation $Documents.Plan $lane
+        if (-not $maintainerReviewed) { $lane.attestation = New-PerformanceAttestation $Documents.Plan $lane }
     }
     $Documents.Plan.required_lanes = @($Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-CanonicalDigest $_; identity = $_.identity } })
     $Documents.Evidence.plan_sha256 = Get-CanonicalDigest $Documents.Plan
@@ -756,7 +771,8 @@ function Resign-PerformanceBundle($Bundle, [byte[]]$AuthorizationDomain = $Perfo
 }
 
 function Update-Bindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifacts) {
-    if ($Documents.Plan.kind -ceq 'windows_gpu_performance_candidate_plan') { Update-PerformanceBindings $Documents $ArtifactRoot $WriteArtifacts; return }
+    if (@('windows_gpu_performance_candidate_plan', 'windows_gpu_maintainer_review_performance_plan') -ccontains $Documents.Plan.kind) { Update-PerformanceBindings $Documents $ArtifactRoot $WriteArtifacts; return }
+    $maintainerReviewed = $Documents.Plan.kind -ceq 'windows_gpu_maintainer_review_qualification_plan'
     if (@($Documents.Plan.required_lanes).Count -eq @($Documents.Evidence.lanes).Count) {
         for ($laneIndex = 0; $laneIndex -lt @($Documents.Evidence.lanes).Count; $laneIndex++) { $Documents.Plan.required_lanes[$laneIndex].identity = $Documents.Evidence.lanes[$laneIndex].identity }
     }
@@ -771,7 +787,7 @@ function Update-Bindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifact
             foreach ($capture in @($lane.battery.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
         }
         $lane.artifact_inventory = Get-ArtifactReferences $lane
-        $lane.attestation = New-Attestation $Documents.Plan $lane
+        if (-not $maintainerReviewed) { $lane.attestation = New-Attestation $Documents.Plan $lane }
     }
     $Documents.Plan.required_lanes = @($Documents.Evidence.lanes | ForEach-Object { [ordered]@{ evidence_sha256 = Get-CanonicalDigest $_; identity = $_.identity } })
     # required_lanes.evidence_sha256 is deliberately excluded from the signed
@@ -808,6 +824,44 @@ function Invoke-Evaluator($Bundle, [bool]$AllowFixture = $true, [bool]$RequireEl
     foreach ($argument in $ExtraArguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::Start($start); $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd(); $process.WaitForExit()
     return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+}
+
+function Write-MaintainerReviewRecord($Bundle, $Record = $null) {
+    if ($null -eq $Record) {
+        $revision = if ($Bundle.Documents.Plan.kind -ceq 'windows_gpu_maintainer_review_performance_plan') { $Bundle.Documents.Plan.source.revision } else { ([string]$Bundle.Documents.Plan.required_lanes[0].identity.app_build_id).Split('#')[-1] }
+        $Record = [ordered]@{
+            ci_run_reference = 'fixture-ci-run/1'; evidence_sha256 = Get-FileDigest $Bundle.EvidencePath
+            fixture_only = $Bundle.Documents.Plan.fixture_only; kind = 'windows_gpu_maintainer_review'
+            plan_sha256 = Get-FileDigest $Bundle.PlanPath; review_reference = 'fixture-maintainer-review/1'
+            schema_version = 1; source_revision = $revision
+        }
+    }
+    $path = Join-Path $Bundle.Root 'maintainer-review.json'
+    Write-Canonical $path $Record
+    foreach ($property in @(
+        [pscustomobject]@{ Name = 'ReviewPath'; Value = $path },
+        [pscustomobject]@{ Name = 'ReviewSha256'; Value = Get-FileDigest $path },
+        [pscustomobject]@{ Name = 'ReviewRecord'; Value = $Record }
+    )) { Add-Member -InputObject $Bundle -MemberType NoteProperty -Name $property.Name -Value $property.Value -Force }
+}
+
+function New-MaintainerReviewBundle($Documents, [string]$Name, [bool]$WriteArtifacts = $true) {
+    $bundle = New-Bundle $Documents $Name $WriteArtifacts
+    Write-MaintainerReviewRecord $bundle
+    return $bundle
+}
+
+function Refresh-MaintainerReviewInputs($Bundle) {
+    # Explicitly rebind metadata for semantic/pre-artifact negatives. Do not
+    # regenerate artifacts or silently repair a deliberately wrong lane digest.
+    $Bundle.Documents.Evidence.plan_sha256 = Get-CanonicalDigest $Bundle.Documents.Plan
+    Write-Canonical $Bundle.PlanPath $Bundle.Documents.Plan
+    Rewrite-BundleEvidence $Bundle
+    Write-MaintainerReviewRecord $Bundle
+}
+
+function Invoke-MaintainerReviewEvaluator($Bundle, [bool]$AllowFixture = $true, [bool]$RequireEligible = $false) {
+    return Invoke-Evaluator $Bundle $AllowFixture $RequireEligible -ExtraArguments @('-ReviewRecordPath', $Bundle.ReviewPath, '-ExpectedReviewSha256', $Bundle.ReviewSha256)
 }
 
 function Invoke-PassingPerformanceFixture($Documents, [string]$Name, [int]$ExpectedArtifacts) {
@@ -1011,6 +1065,157 @@ function Invoke-V4ContractTests {
     return 3
 }
 
+function Invoke-MaintainerReviewContractTests {
+    [int]$positiveCaseCount = 0
+    $shared = @{}
+    foreach ($purpose in @('qualification', 'performance')) {
+        foreach ($deviceClass in @('discrete_gpu', 'integrated_gpu')) {
+            $bundle = New-MaintainerReviewBundle (New-MaintainerReviewDocuments $purpose $deviceClass) "reviewed-$purpose-$deviceClass"
+            $result = Invoke-MaintainerReviewEvaluator $bundle
+            Assert-True ($result.ExitCode -eq 0) "Reviewed $purpose $deviceClass fixture failed: $($result.Stderr)"
+            $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+            $passedField = if ($purpose -ceq 'qualification') { 'qualification_passed' } else { 'performance_passed' }
+            $expectedSchema = if ($purpose -ceq 'qualification') { 4 } else { 1 }
+            $expectedCount = if ($purpose -ceq 'qualification') { if ($deviceClass -ceq 'discrete_gpu') { 75 } else { 139 } } else { if ($deviceClass -ceq 'discrete_gpu') { 64 } else { 128 } }
+            Assert-True ($decision.kind -ceq "windows_gpu_maintainer_review_${purpose}_decision" -and $decision.schema_version -eq $expectedSchema -and $decision[$passedField]) 'Reviewed decision lost its explicit kind, schema, or measurement result.'
+            Assert-True (-not $decision.auto_eligible -and -not $decision.release_approved -and $decision.evidence_trust -ceq 'human-reviewed-not-authenticated') 'A reviewed fixture claimed authenticated provenance, release approval, or Auto eligibility.'
+            Assert-True ($decision.review_sha256 -ceq $bundle.ReviewSha256 -and $decision.review_reference -ceq $bundle.ReviewRecord.review_reference -and $decision.ci_run_reference -ceq $bundle.ReviewRecord.ci_run_reference) 'Reviewed output omitted the exact pinned review and unverified references.'
+            Assert-True ($decision.artifact_count -eq $expectedCount -and (($null -eq $decision.lanes[0].metrics.battery) -eq ($deviceClass -ceq 'discrete_gpu'))) 'Reviewed fixture lost its exact AC/shared-power artifact shape.'
+            Assert-True (-not $bundle.Documents.Plan.Contains('capture_authority') -and -not $bundle.Documents.Plan.Contains('authorization') -and -not $bundle.Documents.Evidence.lanes[0].Contains('attestation')) 'Reviewed fixture unexpectedly required a signing field.'
+            if ($purpose -ceq 'performance') {
+                Assert-True ($null -ne $decision.candidate_policy -and $null -ne $decision.candidate_policy_sha256) 'Passing reviewed performance evidence did not retain its proposed candidate bytes.'
+            }
+            if ($deviceClass -ceq 'integrated_gpu') {
+                Assert-True ((Invoke-MaintainerReviewEvaluator $bundle $true $true).ExitCode -eq 2) 'Reviewed -RequireEligible did not remain valid but ineligible.'
+                $shared[$purpose] = $bundle
+            }
+            $positiveCaseCount += 1
+        }
+    }
+
+    # CLI authority is an explicit external pair; partial/blank/malformed pins
+    # must not become defaults, even for otherwise valid reviewed evidence.
+    foreach ($case in @(
+        [pscustomobject]@{ Name = 'missing'; Arguments = @() },
+        [pscustomobject]@{ Name = 'path-only'; Arguments = @('-ReviewRecordPath', $shared.qualification.ReviewPath) },
+        [pscustomobject]@{ Name = 'digest-only'; Arguments = @('-ExpectedReviewSha256', $shared.qualification.ReviewSha256) },
+        [pscustomobject]@{ Name = 'blank'; Arguments = @('-ReviewRecordPath', '', '-ExpectedReviewSha256', '') },
+        [pscustomobject]@{ Name = 'malformed'; Arguments = @('-ReviewRecordPath', $shared.qualification.ReviewPath, '-ExpectedReviewSha256', ('g' * 64)) }
+    )) { Assert-Rejected (Invoke-Evaluator $shared.qualification -ExtraArguments $case.Arguments) "Reviewed CLI $($case.Name)" }
+    $wrongPin = New-MaintainerReviewBundle (New-MaintainerReviewDocuments) 'reviewed-wrong-pin-before-artifacts' $false
+    Assert-Rejected (Invoke-Evaluator $wrongPin -ExtraArguments @('-ReviewRecordPath', $wrongPin.ReviewPath, '-ExpectedReviewSha256', (Get-Digest 'wrong-review-pin'))) 'Reviewed wrong pin before missing artifacts' 'digest differs from ExpectedReviewSha256'
+    Assert-Rejected (Invoke-MaintainerReviewEvaluator $shared.qualification $false) 'Reviewed fixture without AllowFixture' 'requires -AllowFixture'
+
+    # Stale raw bindings cannot be repaired implicitly. These deliberately
+    # have no artifacts, proving rejection precedes inventory-selected reads.
+    foreach ($binding in @('plan', 'evidence', 'record')) {
+        $bundle = New-MaintainerReviewBundle (New-MaintainerReviewDocuments) "reviewed-stale-$binding" $false
+        if ($binding -ceq 'plan') {
+            $bundle.Documents.Plan.required_lanes[0].evidence_sha256 = Get-Digest 'changed-plan-lane-digest'
+            Write-Canonical $bundle.PlanPath $bundle.Documents.Plan
+            $expected = 'plan_sha256 does not bind the exact plan bytes'
+        }
+        elseif ($binding -ceq 'evidence') {
+            $bundle.Documents.Evidence.lanes[0].artifact_inventory[0].artifact_sha256 = Get-Digest 'changed-inventory'
+            Rewrite-BundleEvidence $bundle
+            $expected = 'evidence_sha256 does not bind the exact evidence bytes'
+        }
+        else {
+            $bundle.ReviewRecord.review_reference = 'changed-review-reference'
+            Write-Canonical $bundle.ReviewPath $bundle.ReviewRecord
+            $expected = 'digest differs from ExpectedReviewSha256'
+        }
+        Assert-Rejected (Invoke-MaintainerReviewEvaluator $bundle) "Reviewed stale $binding binding" $expected
+    }
+
+    # Independently repinning an invalid record does not waive its exact shape,
+    # fixture scope, source binding, or printable-reference bounds.
+    foreach ($case in @(
+        [pscustomobject]@{ Name = 'source'; Purpose = 'performance'; Mutate = { param($r) $r.source_revision = 'f' * 40 } },
+        [pscustomobject]@{ Name = 'fixture'; Purpose = 'qualification'; Mutate = { param($r) $r.fixture_only = $false } },
+        [pscustomobject]@{ Name = 'extra-field'; Purpose = 'qualification'; Mutate = { param($r) $r.campaign_id = 'not-part-of-this-contract' } },
+        [pscustomobject]@{ Name = 'reference-control'; Purpose = 'qualification'; Mutate = { param($r) $r.review_reference = "review`ncontrol" } },
+        [pscustomobject]@{ Name = 'reference-overflow'; Purpose = 'qualification'; Mutate = { param($r) $r.ci_run_reference = 'x' * 257 } }
+    )) {
+        $bundle = New-MaintainerReviewBundle (New-MaintainerReviewDocuments $case.Purpose) "reviewed-record-$($case.Name)" $false
+        & $case.Mutate $bundle.ReviewRecord
+        Write-MaintainerReviewRecord $bundle $bundle.ReviewRecord
+        $expected = if ($case.Name -ceq 'source') { 'source_revision does not match the performance plan source' } else { '' }
+        Assert-Rejected (Invoke-MaintainerReviewEvaluator $bundle) "Reviewed repinned record $($case.Name)" $expected
+    }
+    $mixedSource = New-MaintainerReviewDocuments
+    $otherLane = Copy-Document $mixedSource.Evidence.lanes[0]
+    $otherLane.identity.lane_id += '-z'
+    $otherLane.identity.app_build_id = ([string]$otherLane.identity.app_build_id).Split('#')[0] + '#' + ('f' * 40)
+    foreach ($worker in @($otherLane.identity.cpu_baseline, $otherLane.identity.gpu_worker)) { $worker.worker_build_id = ([string]$worker.worker_build_id).Split('#')[0] + '#' + ('f' * 40) }
+    $mixedSource.Evidence.lanes = @($mixedSource.Evidence.lanes[0], $otherLane)
+    Assert-Rejected (Invoke-MaintainerReviewEvaluator (New-MaintainerReviewBundle $mixedSource 'reviewed-mixed-final-source-before-artifacts' $false)) 'Reviewed mixed final-installer source revisions' 'source_revision does not match final qualification lane builds'
+
+    foreach ($guard in @('identity', 'lane-digest', 'inventory')) {
+        $bundle = New-MaintainerReviewBundle (New-MaintainerReviewDocuments) "reviewed-$guard-before-artifacts" $false
+        if ($guard -ceq 'identity') {
+            $bundle.Documents.Plan.required_lanes[0].identity = Copy-Document $bundle.Documents.Plan.required_lanes[0].identity
+            $bundle.Documents.Plan.required_lanes[0].identity.installation.catalog_sha256 = Get-Digest 'other-reviewed-catalog'
+            $expected = 'identity does not match its reviewed plan'
+        }
+        elseif ($guard -ceq 'lane-digest') {
+            $bundle.Documents.Plan.required_lanes[0].evidence_sha256 = Get-Digest 'other-reviewed-lane'
+            $expected = 'does not match its reviewed evidence digest'
+        }
+        else {
+            $bundle.Documents.Evidence.lanes[0].artifact_inventory[0].unexpected = 'not-in-inventory-contract'
+            $bundle.Documents.Plan.required_lanes[0].evidence_sha256 = Get-CanonicalDigest $bundle.Documents.Evidence.lanes[0]
+            $expected = 'artifact inventory entry has unexpected or missing fields'
+        }
+        Refresh-MaintainerReviewInputs $bundle
+        Assert-Rejected (Invoke-MaintainerReviewEvaluator $bundle) "Reviewed $guard guard before missing artifacts" $expected
+    }
+    $artifactTamper = New-MaintainerReviewBundle (New-MaintainerReviewDocuments 'performance') 'reviewed-artifact-tamper'
+    [IO.File]::WriteAllText((Join-Path $artifactTamper.ArtifactRoot $artifactTamper.Documents.Evidence.lanes[0].acquisition_artifact_path.Replace('/', '\')), 'tampered', $Utf8)
+    Assert-Rejected (Invoke-MaintainerReviewEvaluator $artifactTamper) 'Reviewed artifact tamper' 'digest does not match'
+
+    foreach ($forbidden in @('capture-authority', 'authorization', 'attestation')) {
+        $purpose = if ($forbidden -ceq 'capture-authority') { 'qualification' } else { 'performance' }
+        $documents = New-MaintainerReviewDocuments $purpose
+        if ($forbidden -ceq 'capture-authority') { $documents.Plan.capture_authority = [ordered]@{} }
+        elseif ($forbidden -ceq 'authorization') { $documents.Plan.authorization = [ordered]@{} }
+        else { $documents.Evidence.lanes[0].attestation = [ordered]@{} }
+        Assert-Rejected (Invoke-MaintainerReviewEvaluator (New-MaintainerReviewBundle $documents "reviewed-forbidden-$forbidden")) "Reviewed forbidden $forbidden field" 'unexpected or missing fields'
+    }
+    $legacy = New-Bundle (New-V4FixtureDocuments) 'legacy-rejects-review-arguments'
+    Assert-Rejected (Invoke-Evaluator $legacy -ExtraArguments @('-ReviewRecordPath', $shared.qualification.ReviewPath, '-ExpectedReviewSha256', $shared.qualification.ReviewSha256)) 'Legacy signed kind with review arguments'
+
+    # Fresh reviewed raw hashes bind each semantic mutation, so these exercise
+    # measurement/scenario gates rather than merely detecting a stale pin.
+    foreach ($case in @(
+        [pscustomobject]@{ Name = 'parity'; Purpose = 'qualification'; Reason = 'ac_correctness_not_equivalent'; Mutate = { param($d) $d.Evidence.lanes[0].run_sets.warm.gpu[0].transcript_sha256 = Get-Digest 'reviewed-wrong-transcript' } },
+        [pscustomobject]@{ Name = 'performance'; Purpose = 'performance'; Reason = 'battery_gpu_p95_exceeds_cpu_boundary'; Mutate = {
+            param($d)
+            # With exactly five cold runs, nearest-rank p95 is their maximum.
+            [Int64]$cpuP95 = (@($d.Evidence.lanes[0].battery.run_sets.cold.cpu | ForEach-Object { [Int64]$_.end_to_end_ms }) | Measure-Object -Maximum).Maximum
+            [Int64]$slowMs = [Math]::Floor([decimal]$cpuP95 * $d.Plan.maximum_gpu_p95_cpu_percent / 100) + 1
+            foreach ($r in @($d.Evidence.lanes[0].battery.run_sets.cold.gpu)) { $r.end_to_end_ms = $slowMs; $r.backend_ms = $slowMs - 10 }
+        } },
+        [pscustomobject]@{ Name = 'reliability'; Purpose = 'qualification'; Reason = 'ac_reliability_not_equivalent'; Mutate = { param($d) Set-RunFailure $d.Evidence.lanes[0].run_sets.warm.gpu[0] 'provider_error' } },
+        [pscustomobject]@{ Name = 'qualification-admission'; Purpose = 'qualification'; Reason = 'ac_available_memory_admission_inputs_missing'; Mutate = { param($d) $r = $d.Evidence.lanes[0].run_sets.warm.gpu[0]; $r.available_device_memory_bytes_before = $null; $r.available_device_memory_bytes_after = $null } },
+        [pscustomobject]@{ Name = 'performance-admission'; Purpose = 'performance'; Reason = 'battery_available_memory_admission_inputs_missing'; Mutate = { param($d) $r = $d.Evidence.lanes[0].battery.run_sets.warm.gpu[0]; $r.available_device_memory_bytes_before = $null; $r.available_device_memory_bytes_after = $null } },
+        [pscustomobject]@{ Name = 'scenario'; Purpose = 'qualification'; Reason = 'battery_scenario_evidence_failed'; Mutate = { param($d) @($d.Evidence.lanes[0].scenarios | Where-Object scenario -ceq 'power_battery')[0].result = 'fail' } }
+    )) {
+        $documents = New-MaintainerReviewDocuments $case.Purpose
+        & $case.Mutate $documents
+        $bundle = New-MaintainerReviewBundle $documents "reviewed-gate-$($case.Name)"
+        $result = Invoke-MaintainerReviewEvaluator $bundle
+        Assert-True ($result.ExitCode -eq 0) "Reviewed $($case.Name) was rejected before its semantic gate: $($result.Stderr)"
+        $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+        $passedField = if ($case.Purpose -ceq 'qualification') { 'qualification_passed' } else { 'performance_passed' }
+        Assert-True (-not $decision[$passedField] -and $decision.lanes[0].reasons -ccontains $case.Reason -and -not $decision.auto_eligible -and -not $decision.release_approved) "Reviewed $($case.Name) did not preserve its hard gate: $passedField=$($decision[$passedField]); reasons=$($decision.lanes[0].reasons -join ','); auto_eligible=$($decision.auto_eligible); release_approved=$($decision.release_approved)."
+        if ($case.Purpose -ceq 'qualification') { Assert-True ($null -eq $decision.lanes[0].auto_entry_projection) 'Failing reviewed qualification evidence emitted an Auto projection.' }
+        else { Assert-True ($null -eq $decision.candidate_policy -and $null -eq $decision.candidate_policy_sha256 -and $null -eq $decision.lanes[0].candidate_entry) 'Failing reviewed performance evidence emitted a proposed candidate.' }
+        if ($case.Name.EndsWith('-admission')) { Assert-True ($null -eq $decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes) 'Reviewed missing admission observations fabricated a common floor.' }
+    }
+    return $positiveCaseCount
+}
+
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-windows-gpu-qualification-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($TestRoot) | Out-Null
 try {
@@ -1032,6 +1237,12 @@ try {
     Assert-True ([IO.File]::ReadAllText($AutoManifestPath, $Utf8) -ceq $ExpectedAuto) 'Windows Auto manifest is not exact default deny.'
     Assert-True ([IO.File]::ReadAllText($AuthorityPath, $Utf8) -ceq $ExpectedAuthority) 'Windows qualification authority is not exact empty schema v2.'
     Assert-True ([IO.File]::ReadAllText($PerformanceAuthorityPath, $Utf8) -ceq $ExpectedPerformanceAuthority) 'Windows performance authority is not exact empty schema v1.'
+    if ($MaintainerReviewOnly) {
+        $reviewedPositiveCount = Invoke-MaintainerReviewContractTests
+        Assert-True ($reviewedPositiveCount -eq 4) 'Maintainer-reviewed suite did not discover all four positive power/kind shapes.'
+        Write-Output "Windows GPU maintainer-reviewed focused contract tests passed ($reviewedPositiveCount positive cases)."
+        return
+    }
     if ($V4Only) {
         $v4PositiveCaseCount = Invoke-V4ContractTests
         Assert-True ($v4PositiveCaseCount -eq 3) 'V4 focused suite did not discover every required positive final-installer case.'
@@ -1389,6 +1600,9 @@ try {
 
     $v4PositiveCaseCount = Invoke-V4ContractTests
     Assert-True ($v4PositiveCaseCount -eq 3) 'V4 focused suite did not discover every required positive final-installer case.'
+
+    $reviewedPositiveCount = Invoke-MaintainerReviewContractTests
+    Assert-True ($reviewedPositiveCount -eq 4) 'Maintainer-reviewed suite did not discover all four positive power/kind shapes.'
 
     # Strict schema separation and required/null paired-power shapes.
     $mixedSchema = New-V3FixtureDocuments; $mixedSchema.Evidence.schema_version = 2
