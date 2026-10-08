@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::worker_compatibility::{
+    FrozenGpuBackend, FrozenGpuWorkerCandidate, FrozenWorkerApproval, approve_compiled_gpu_worker,
+};
+
 pub(crate) const MANIFEST_NAME: &str = "pack-manifest.json";
 pub(crate) const SIGNATURE_NAME: &str = "pack-manifest.sig";
 pub(crate) const PACK_SCHEMA_VERSION: u16 = 1;
@@ -170,6 +174,7 @@ impl VerifiedPack {
 /// retain this value so each immutable-store ancestor remains pinned.
 pub(crate) struct VerifiedPackLease {
     verified_pack: VerifiedPack,
+    frozen_worker_approval: Option<FrozenWorkerApproval>,
     root: PinnedPackRoot,
     copy_entries: Vec<VerifiedCopyEntry>,
     _retained_files: Vec<File>,
@@ -200,6 +205,10 @@ impl VerifiedPackLease {
 
     pub(crate) fn worker_path(&self) -> PathBuf {
         self.verified_pack.worker_path()
+    }
+
+    pub(crate) fn frozen_worker_approval(&self) -> Option<&FrozenWorkerApproval> {
+        self.frozen_worker_approval.as_ref()
     }
 
     pub(crate) fn recheck(&self) -> Result<(), PackVerificationError> {
@@ -464,6 +473,13 @@ pub(crate) struct PackVerifier<'a> {
     compatibility: Compatibility<'a>,
 }
 
+type VerifiedPackContents = (
+    VerifiedPack,
+    Option<FrozenWorkerApproval>,
+    Vec<VerifiedCopyEntry>,
+    Vec<File>,
+);
+
 impl<'a> PackVerifier<'a> {
     pub(crate) fn new(trust_root: &'a dyn TrustRoot, compatibility: Compatibility<'a>) -> Self {
         Self {
@@ -473,7 +489,7 @@ impl<'a> PackVerifier<'a> {
     }
 
     pub(crate) fn verify(&self, root: &Path) -> Result<VerifiedPack, PackVerificationError> {
-        let (verified, _, _) = self.verify_inner(root, None)?;
+        let (verified, _, _, _) = self.verify_inner(root, None)?;
         Ok(verified)
     }
 
@@ -483,11 +499,12 @@ impl<'a> PackVerifier<'a> {
     ) -> Result<VerifiedPackLease, PackVerificationError> {
         root.recheck()?;
         let verification_root = root.verification_root();
-        let (verified_pack, copy_entries, retained_files) =
+        let (verified_pack, frozen_worker_approval, copy_entries, retained_files) =
             self.verify_inner(&verification_root, Some(&root))?;
         root.recheck()?;
         Ok(VerifiedPackLease {
             verified_pack,
+            frozen_worker_approval,
             root,
             copy_entries,
             _retained_files: retained_files,
@@ -500,7 +517,7 @@ impl<'a> PackVerifier<'a> {
         &self,
         root: &Path,
         pinned: Option<&PinnedPackRoot>,
-    ) -> Result<(VerifiedPack, Vec<VerifiedCopyEntry>, Vec<File>), PackVerificationError> {
+    ) -> Result<VerifiedPackContents, PackVerificationError> {
         if pinned.is_none() {
             validate_root(root)?;
         }
@@ -530,7 +547,7 @@ impl<'a> PackVerifier<'a> {
             .map_err(|_| PackVerificationError::BadSignature)?;
 
         let manifest: PackManifest = parse_canonical_json(&manifest_bytes, "manifest")?;
-        self.validate_manifest(&manifest)?;
+        let frozen_worker_approval = self.validate_manifest_with_approval(&manifest)?;
         verify_exact_tree(root, pinned, &manifest.payload)?;
         let mut retained_files = verify_payload(root, pinned, &manifest.payload)?;
         retained_files.push(manifest_file);
@@ -568,6 +585,7 @@ impl<'a> PackVerifier<'a> {
                 worker_relative_path: manifest.worker_path,
                 root: descriptor_root,
             },
+            frozen_worker_approval,
             copy_entries,
             retained_files,
         ))
@@ -581,9 +599,11 @@ impl<'a> PackVerifier<'a> {
     ) -> Result<LaunchableWorker<'lease>, PackVerificationError> {
         expected.recheck()?;
         let verification_root = expected.root.verification_root();
-        let (observed, _copy_entries, _launch_files) =
+        let (observed, frozen_worker_approval, _copy_entries, _launch_files) =
             self.verify_inner(&verification_root, Some(&expected.root))?;
-        if &observed != expected.verified_pack() {
+        if &observed != expected.verified_pack()
+            || frozen_worker_approval != expected.frozen_worker_approval
+        {
             return Err(PackVerificationError::DescriptorChanged);
         }
         expected.recheck()?;
@@ -596,7 +616,15 @@ impl<'a> PackVerifier<'a> {
         })
     }
 
+    #[cfg(test)]
     fn validate_manifest(&self, manifest: &PackManifest) -> Result<(), PackVerificationError> {
+        self.validate_manifest_with_approval(manifest).map(|_| ())
+    }
+
+    fn validate_manifest_with_approval(
+        &self,
+        manifest: &PackManifest,
+    ) -> Result<Option<FrozenWorkerApproval>, PackVerificationError> {
         if manifest.schema_version != PACK_SCHEMA_VERSION {
             return Err(PackVerificationError::UnsupportedSchema);
         }
@@ -617,11 +645,8 @@ impl<'a> PackVerifier<'a> {
         if manifest.runtime_abi_version != RUNTIME_ABI_VERSION {
             return Err(PackVerificationError::AbiMismatch);
         }
-        if manifest.app_build != self.compatibility.app_build
-            || manifest.worker_build != self.compatibility.worker_build
-        {
-            return Err(PackVerificationError::BuildMismatch);
-        }
+        let same_source_build = manifest.app_build == self.compatibility.app_build
+            && manifest.worker_build == self.compatibility.worker_build;
         if manifest.target_os != self.compatibility.target_os
             || manifest.target_arch != self.compatibility.target_arch
         {
@@ -634,6 +659,42 @@ impl<'a> PackVerifier<'a> {
         {
             return Err(PackVerificationError::BackendMismatch);
         }
+        let frozen_worker_approval = if same_source_build {
+            None
+        } else {
+            let backend = match manifest.backend {
+                PackBackend::Cuda => FrozenGpuBackend::Cuda,
+                PackBackend::Vulkan => FrozenGpuBackend::Vulkan,
+                PackBackend::Metal => return Err(PackVerificationError::BuildMismatch),
+            };
+            let worker_sha256 = manifest
+                .payload
+                .iter()
+                .find(|entry| entry.path == manifest.worker_path)
+                .map(|entry| entry.sha256.as_str())
+                .ok_or(PackVerificationError::BuildMismatch)?;
+            let candidate = FrozenGpuWorkerCandidate {
+                origin_app_build: &manifest.app_build,
+                worker_build: &manifest.worker_build,
+                worker_sha256,
+                protocol_version: crate::onnx_worker::PROTOCOL_VERSION,
+                runtime_abi_version: manifest.runtime_abi_version,
+                backend,
+                provider: &manifest.provider,
+                pack_id: manifest.pack_id.as_str(),
+                pack_version: manifest.pack_version.as_str(),
+                pack_digest: &manifest.pack_digest,
+                security_epoch: manifest.security_epoch,
+            };
+            Some(
+                approve_compiled_gpu_worker(&candidate)
+                    .filter(|approval| approval.matches_gpu(&candidate))
+                    .filter(|approval| {
+                        approval.context().origin_app_build != self.compatibility.app_build
+                    })
+                    .ok_or(PackVerificationError::BuildMismatch)?,
+            )
+        };
         validate_relative_path(&manifest.worker_path)?;
         validate_inventory(&manifest.payload)?;
         if !manifest
@@ -646,7 +707,7 @@ impl<'a> PackVerifier<'a> {
         if manifest.pack_digest != compute_pack_digest(manifest)? {
             return Err(PackVerificationError::DigestMismatch);
         }
-        Ok(())
+        Ok(frozen_worker_approval)
     }
 }
 
@@ -2133,6 +2194,86 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    fn frozen_gpu_policy(manifest: &PackManifest) -> Vec<u8> {
+        let worker_sha256 = manifest
+            .payload
+            .iter()
+            .find(|entry| entry.path == manifest.worker_path)
+            .unwrap()
+            .sha256
+            .as_str();
+        let backend = match manifest.backend {
+            PackBackend::Cuda => "cuda",
+            PackBackend::Vulkan => "vulkan",
+            PackBackend::Metal => panic!("Windows frozen-worker fixtures cannot approve Metal"),
+        };
+        format!(
+            "{{\"schema_version\":1,\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"kind\":\"gpu\",\"origin_app_build\":\"{}\",\"worker_build\":\"{}\",\"worker_sha256\":\"{}\",\"protocol_version\":{},\"runtime_abi_version\":{},\"backend\":\"{}\",\"provider\":\"{}\",\"pack_id\":\"{}\",\"pack_version\":\"{}\",\"pack_digest\":\"{}\",\"security_epoch\":{}}}]}}",
+            manifest.app_build,
+            manifest.worker_build,
+            worker_sha256,
+            crate::onnx_worker::PROTOCOL_VERSION,
+            manifest.runtime_abi_version,
+            backend,
+            manifest.provider,
+            manifest.pack_id.as_str(),
+            manifest.pack_version.as_str(),
+            manifest.pack_digest,
+            manifest.security_epoch,
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn signed_frozen_gpu_origin_is_retained_and_revalidated_fail_closed() {
+        let owner_root = temp_root("frozen-gpu-origin");
+        let source = owner_root.join("source");
+        let mut manifest = base_manifest();
+        manifest.app_build = "local-transcriber@0.9.0#approved-origin".to_owned();
+        manifest.worker_build = "scribe-inference-worker@0.9.0#approved-origin".to_owned();
+        manifest.pack_digest = compute_pack_digest(&manifest).unwrap();
+        let policy = frozen_gpu_policy(&manifest);
+        let trust = write_signed(&source, manifest);
+        let verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: crate::onnx_worker::DESKTOP_BUILD_ID,
+                worker_build: crate::onnx_worker::INFERENCE_WORKER_BUILD_ID,
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &[PackBackend::Vulkan],
+            },
+        );
+        let lease = crate::worker_compatibility::with_test_frozen_worker_policy(&policy, || {
+            let descriptor = verifier.verify(&source).unwrap();
+            let store_root = owner_root.join("workers/packs");
+            let parent = store_root
+                .join(descriptor.pack_id.as_str())
+                .join(descriptor.pack_version.as_str());
+            fs::create_dir_all(&parent).unwrap();
+            let final_root = parent.join(&descriptor.pack_digest);
+            fs::rename(&source, &final_root).unwrap();
+            let pinned = PinnedPackRoot::open(
+                &fs::canonicalize(&store_root).unwrap(),
+                [&descriptor.pack_id, &descriptor.pack_version],
+                &descriptor.pack_digest,
+            )
+            .unwrap();
+            let mut lease = verifier.verify_pinned(pinned).unwrap();
+            lease.test_reverification_trust = Some(trust);
+            assert!(lease.frozen_worker_approval().is_some());
+            verifier.launchable_worker(&lease).unwrap();
+            lease
+        });
+
+        assert!(matches!(
+            verifier.launchable_worker(&lease),
+            Err(PackVerificationError::BuildMismatch)
+        ));
+        drop(lease);
+        fs::remove_dir_all(owner_root).unwrap();
+    }
 
     #[cfg(windows)]
     fn verbatim_local_path(path: &Path) -> PathBuf {

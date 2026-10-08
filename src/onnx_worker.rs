@@ -49,6 +49,10 @@ use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
     Transcript, TranscriptSegment, TranscriptionOptions,
 };
+use crate::worker_compatibility::{
+    FrozenCpuWorkerCandidate, FrozenWorkerApproval, FrozenWorkerCompatibilityContext,
+    approve_compiled_cpu_worker, is_valid_build_identity,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -714,6 +718,11 @@ enum Control {
         challenge: String,
         expected: WorkerExpectation,
     },
+    CompatibilityHello {
+        challenge: String,
+        expected: WorkerExpectation,
+        compatibility: FrozenWorkerCompatibilityContext,
+    },
     NegotiateRuntimeObservation {
         version: u8,
     },
@@ -824,6 +833,7 @@ impl Control {
         matches!(
             self,
             Self::Hello { .. }
+                | Self::CompatibilityHello { .. }
                 | Self::NegotiateRuntimeObservation { .. }
                 | Self::BeginRuntimeObservation { .. }
                 | Self::FinishRuntimeObservation { .. }
@@ -1204,6 +1214,7 @@ struct SpawnedWorker {
     stdout: Box<dyn Read + Send>,
     process: Arc<dyn WorkerProcess>,
     expectation: WorkerExpectation,
+    frozen_worker_approval: Option<FrozenWorkerApproval>,
     pack_launch: Option<PackLaunchContext>,
 }
 
@@ -1423,6 +1434,8 @@ struct WorkerCapability {
     provider: WorkerProvider,
     artifacts: Vec<WorkerArtifactTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    compatibility: Option<FrozenWorkerCompatibilityContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pack: Option<WorkerPackCapability>,
 }
 
@@ -1503,6 +1516,7 @@ fn worker_capability_for_provider(
         role,
         provider,
         artifacts,
+        compatibility: None,
         pack,
     };
     // On Linux this closes inherited FD 3 only after the one Hello capability
@@ -2861,10 +2875,20 @@ fn sha256_reader(mut reader: impl Read) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+#[cfg(test)]
 fn validate_worker_capability(
     capability: &WorkerCapability,
     challenge: &str,
     expected: &WorkerExpectation,
+) -> Result<()> {
+    validate_worker_capability_for_hello(capability, challenge, expected, None)
+}
+
+fn validate_worker_capability_for_hello(
+    capability: &WorkerCapability,
+    challenge: &str,
+    expected: &WorkerExpectation,
+    expected_compatibility: Option<&FrozenWorkerCompatibilityContext>,
 ) -> Result<()> {
     if challenge.len() != 64
         || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -2879,6 +2903,7 @@ fn validate_worker_capability(
         || capability.abi != expected.abi
         || capability.role != expected.role
         || capability.provider != expected.provider
+        || capability.compatibility.as_ref() != expected_compatibility
         || capability.pack.as_ref().map(|pack| &pack.expectation) != expected.pack.as_ref()
     {
         bail!("worker capability is incompatible with the requesting application");
@@ -2936,6 +2961,62 @@ fn validate_worker_hello_against_local(
         bail!("worker handshake expectation is incompatible with this worker");
     }
     Ok(actual_role)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedCompatibleWorkerSession {
+    role: WorkerRole,
+    session_app_build: String,
+    worker_build: String,
+    provider: WorkerProvider,
+    compatibility: FrozenWorkerCompatibilityContext,
+}
+
+fn validate_compatible_worker_hello_against_local(
+    role: Option<WorkerRole>,
+    challenge: &str,
+    expected: &WorkerExpectation,
+    compatibility: &FrozenWorkerCompatibilityContext,
+    local: &WorkerExpectation,
+) -> Result<ValidatedCompatibleWorkerSession> {
+    if challenge.len() != 64 || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
+    }
+    let actual_role = role.unwrap_or(expected.role);
+    if actual_role != WorkerRole::Inference
+        || expected.role != WorkerRole::Inference
+        || !compatibility.validate_shape()
+        || !is_valid_build_identity(&expected.app_build)
+        || compatibility.origin_app_build != local.app_build
+        || expected.app_build == local.app_build
+        || expected.worker_build != local.worker_build
+        || expected.abi != local.abi
+        || expected.role != local.role
+        || expected.provider != local.provider
+        || expected.pack != local.pack
+    {
+        bail!("worker compatibility handshake is incompatible with this worker");
+    }
+    Ok(ValidatedCompatibleWorkerSession {
+        role: actual_role,
+        session_app_build: expected.app_build.clone(),
+        worker_build: expected.worker_build.clone(),
+        provider: expected.provider,
+        compatibility: compatibility.clone(),
+    })
+}
+
+fn compatible_worker_capability(
+    session: &ValidatedCompatibleWorkerSession,
+    challenge: String,
+    pack: Option<WorkerPackCapability>,
+) -> Result<WorkerCapability> {
+    let mut capability =
+        worker_capability_for_provider(session.role, challenge, session.provider, pack)?;
+    capability.app_build = session.session_app_build.clone();
+    capability.worker_build = session.worker_build.clone();
+    capability.compatibility = Some(session.compatibility.clone());
+    Ok(capability)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3400,6 +3481,7 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
         WorkerRole::Inference => matches!(
             control,
             Control::Hello { .. }
+                | Control::CompatibilityHello { .. }
                 | Control::NegotiateRuntimeObservation { .. }
                 | Control::BeginRuntimeObservation { .. }
                 | Control::FinishRuntimeObservation { .. }
@@ -3454,6 +3536,7 @@ struct WorkerExecutableIdentity {
 struct PackLaunchContext {
     lease: Arc<VerifiedPackLease>,
     expectation: WorkerPackExpectation,
+    frozen_worker_approval: Option<FrozenWorkerApproval>,
     expected_device: Option<BackendTarget>,
     #[cfg(unix)]
     unix_exec_authority: Arc<crate::gpu_worker_pack::UnixPackExecAuthority>,
@@ -3485,6 +3568,7 @@ impl PackLaunchContext {
 
         Self {
             expectation: pack_expectation(&lease),
+            frozen_worker_approval: lease.frozen_worker_approval().cloned(),
             lease,
             expected_device,
             #[cfg(unix)]
@@ -3651,6 +3735,7 @@ struct VerifiedWorkerExecutable {
     expected_name: std::ffi::OsString,
     expected_sha256: String,
     identity: WorkerExecutableIdentity,
+    frozen_worker_approval: Option<FrozenWorkerApproval>,
     pack_launch: Option<PackLaunchContext>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
     linux_exec_authority: Option<Arc<dyn crate::linux_worker_launch::LinuxExecAuthority>>,
@@ -3669,6 +3754,10 @@ impl std::fmt::Debug for VerifiedWorkerExecutable {
             .field("expected_name", &self.expected_name)
             .field("expected_sha256", &self.expected_sha256)
             .field("identity", &self.identity)
+            .field(
+                "has_frozen_worker_approval",
+                &self.frozen_worker_approval.is_some(),
+            )
             .field("pack_launch", &self.pack_launch);
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         debug.field(
@@ -3690,6 +3779,17 @@ impl VerifiedWorkerExecutable {
         if verified.identity != self.identity {
             bail!("worker executable identity changed before process creation");
         }
+        if let Some(approval) = &self.frozen_worker_approval
+            && (approval.worker_sha256() != verified.identity.sha256
+                || approval.protocol_version() != PROTOCOL_VERSION
+                || approval.runtime_abi_version() != WORKER_ABI_VERSION
+                || self.pack_launch.as_ref().is_none_or(|context| {
+                    context.frozen_worker_approval.as_ref() != Some(approval)
+                }) && !approval.is_cpu())
+        {
+            bail!("frozen worker approval changed before process creation");
+        }
+        verified.frozen_worker_approval = self.frozen_worker_approval.clone();
         verified.pack_launch = self.pack_launch.clone();
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         {
@@ -3815,11 +3915,32 @@ fn verify_worker_executable(
         expected_name: expected_name.to_owned(),
         expected_sha256: expected_sha256.to_owned(),
         identity,
+        frozen_worker_approval: None,
         pack_launch: None,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         linux_exec_authority: None,
         _open_file: open_file,
     })
+}
+
+fn attach_installed_cpu_compatibility(
+    mut executable: VerifiedWorkerExecutable,
+    role: WorkerRole,
+    embedded_worker_sha256: &str,
+) -> VerifiedWorkerExecutable {
+    if role == WorkerRole::Inference
+        && !embedded_worker_sha256.is_empty()
+        && executable.identity.sha256 == embedded_worker_sha256
+    {
+        executable.frozen_worker_approval =
+            approve_compiled_cpu_worker(&FrozenCpuWorkerCandidate {
+                worker_sha256: embedded_worker_sha256,
+                protocol_version: PROTOCOL_VERSION,
+                runtime_abi_version: WORKER_ABI_VERSION,
+            })
+            .filter(|approval| approval.context().origin_app_build != DESKTOP_BUILD_ID);
+    }
+    executable
 }
 
 fn worker_provider_from_pack_backend(backend: PackBackend) -> WorkerProvider {
@@ -3908,6 +4029,7 @@ fn resolve_verified_pack_executable(
     lease: Arc<VerifiedPackLease>,
     expected_device: Option<BackendTarget>,
 ) -> Result<VerifiedWorkerExecutable> {
+    let frozen_worker_approval = lease.frozen_worker_approval().cloned();
     let pack = lease.verified_pack();
     let allowed = match pack.backend {
         PackBackend::Cuda => &[PackBackend::Cuda][..],
@@ -3959,11 +4081,13 @@ fn resolve_verified_pack_executable(
     }
     executable.pack_launch = Some(PackLaunchContext {
         expectation: pack_expectation(&lease),
+        frozen_worker_approval: frozen_worker_approval.clone(),
         lease,
         expected_device,
         #[cfg(unix)]
         unix_exec_authority,
     });
+    executable.frozen_worker_approval = frozen_worker_approval;
     Ok(executable)
 }
 
@@ -4013,7 +4137,7 @@ impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
                 .context("could not retain the packaged Linux worker descriptor")?;
             let linux_exec_authority: Arc<dyn crate::linux_worker_launch::LinuxExecAuthority> =
                 authority;
-            return Ok(VerifiedWorkerExecutable {
+            let executable = VerifiedWorkerExecutable {
                 path: PathBuf::from(crate::linux_worker_launch::INSTALL_ROOT)
                     .join(crate::linux_worker_launch::WORKER_NAME),
                 root: PathBuf::from(crate::linux_worker_launch::INSTALL_ROOT),
@@ -4025,10 +4149,16 @@ impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
                     device: identity.device,
                     inode: identity.inode,
                 },
+                frozen_worker_approval: None,
                 pack_launch: None,
                 linux_exec_authority: Some(linux_exec_authority),
                 _open_file: open_file,
-            });
+            };
+            return Ok(attach_installed_cpu_compatibility(
+                executable,
+                role,
+                option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or(""),
+            ));
         }
         let current = std::fs::canonicalize(std::env::current_exe()?)
             .context("could not canonicalize the running Scribe executable")?;
@@ -4057,6 +4187,13 @@ impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
             name,
             option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or(""),
         )
+        .map(|executable| {
+            attach_installed_cpu_compatibility(
+                executable,
+                role,
+                option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or(""),
+            )
+        })
     }
 }
 
@@ -4154,6 +4291,17 @@ impl WorkerLauncher for OsWorkerLauncher {
             expectation.pack = Some(pack.expectation.clone());
             expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
         }
+        if let Some(approval) = &executable.frozen_worker_approval {
+            if self.role != WorkerRole::Inference
+                || approval.worker_sha256() != executable.identity.sha256
+                || approval.protocol_version() != PROTOCOL_VERSION
+                || approval.runtime_abi_version() != WORKER_ABI_VERSION
+                || (executable.pack_launch.is_some() == approval.is_cpu())
+            {
+                bail!("frozen worker launch approval does not match the verified executable");
+            }
+            expectation.worker_build = approval.worker_build().to_owned();
+        }
         let worker_flag = match self.role {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
@@ -4176,6 +4324,7 @@ impl WorkerLauncher for OsWorkerLauncher {
                 stdout: Box::new(launched.stdout),
                 process: Arc::new(launched.process),
                 expectation,
+                frozen_worker_approval: executable.frozen_worker_approval,
                 pack_launch: executable.pack_launch,
             });
         }
@@ -4195,6 +4344,7 @@ impl WorkerLauncher for OsWorkerLauncher {
                 stdout: Box::new(launched.stdout),
                 process: Arc::new(launched.process),
                 expectation,
+                frozen_worker_approval: executable.frozen_worker_approval,
                 pack_launch: executable.pack_launch,
             });
         }
@@ -4252,6 +4402,7 @@ impl WorkerLauncher for OsWorkerLauncher {
                 _parent_liveness: parent_liveness,
             }),
             expectation,
+            frozen_worker_approval: executable.frozen_worker_approval,
             pack_launch: executable.pack_launch,
         })
     }
@@ -4942,6 +5093,7 @@ struct CurrentGeneration {
     generation: u64,
     process: Arc<dyn WorkerProcess>,
     expectation: WorkerExpectation,
+    frozen_worker_approval: Option<FrozenWorkerApproval>,
     pack_launch: Option<PackLaunchContext>,
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
     #[cfg(feature = "windows-gpu-capture-observation")]
@@ -5582,6 +5734,7 @@ impl ProcessWorkerSupervisor {
             stdout,
             process,
             expectation,
+            frozen_worker_approval,
             pack_launch,
         } = spawned;
         let generation = {
@@ -5596,6 +5749,7 @@ impl ProcessWorkerSupervisor {
                 generation,
                 process: Arc::clone(&process),
                 expectation: expectation.clone(),
+                frozen_worker_approval: frozen_worker_approval.clone(),
                 pack_launch,
                 pack_bindings: Vec::new(),
                 #[cfg(feature = "windows-gpu-capture-observation")]
@@ -5645,14 +5799,23 @@ impl ProcessWorkerSupervisor {
         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
             diagnostic_probe.set_stage(GpuPackProbeStage::HelloAuthentication);
         }
+        let hello = if let Some(approval) = frozen_worker_approval {
+            Control::CompatibilityHello {
+                challenge,
+                expected,
+                compatibility: approval.context(),
+            }
+        } else {
+            Control::Hello {
+                challenge,
+                expected,
+            }
+        };
         if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
             0,
-            Control::Hello {
-                challenge,
-                expected,
-            },
+            hello,
             hello_timeout,
             cancelled,
         ) {
@@ -6070,7 +6233,16 @@ impl ProcessWorkerSupervisor {
             Control::Hello {
                 challenge,
                 expected,
-            } => Some((challenge.clone(), expected.clone())),
+            } => Some((challenge.clone(), expected.clone(), None)),
+            Control::CompatibilityHello {
+                challenge,
+                expected,
+                compatibility,
+            } => Some((
+                challenge.clone(),
+                expected.clone(),
+                Some(compatibility.clone()),
+            )),
             _ => None,
         };
         let correlation = Correlation {
@@ -6107,8 +6279,13 @@ impl ProcessWorkerSupervisor {
             self.await_response_with_cancellation(correlation, response, timeout, cancelled)?;
         match response.control {
             Control::Ready { capability } if hello.is_some() => {
-                let (challenge, expected) = hello.expect("checked above");
-                validate_worker_capability(&capability, &challenge, &expected)?;
+                let (challenge, expected, compatibility) = hello.expect("checked above");
+                validate_worker_capability_for_hello(
+                    &capability,
+                    &challenge,
+                    &expected,
+                    compatibility.as_ref(),
+                )?;
                 self.bind_generation_pack_capability(generation, &expected, &capability)?;
                 #[cfg(feature = "windows-gpu-capture-observation")]
                 {
@@ -6158,6 +6335,13 @@ impl ProcessWorkerSupervisor {
             .ok_or_else(|| anyhow!("process worker generation changed during Hello"))?;
         if current.expectation != *expected {
             bail!("process worker launch expectation changed during Hello");
+        }
+        let launch_compatibility = current
+            .frozen_worker_approval
+            .as_ref()
+            .map(FrozenWorkerApproval::context);
+        if capability.compatibility != launch_compatibility {
+            bail!("process worker compatibility context changed during Hello");
         }
         match (&current.pack_launch, &capability.pack) {
             (None, None) => Ok(()),
@@ -11757,6 +11941,49 @@ impl WorkerLoopIdentityPolicy {
             }
         }
     }
+
+    fn validate_compatibility_hello(
+        self,
+        role: Option<WorkerRole>,
+        challenge: &str,
+        expected: &WorkerExpectation,
+        compatibility: &FrozenWorkerCompatibilityContext,
+    ) -> Result<ValidatedCompatibleWorkerSession> {
+        if matches!(self, Self::Compiled) && !cfg!(all(windows, target_arch = "x86_64")) {
+            bail!("worker compatibility sessions are unsupported on this platform");
+        }
+        let actual_role = role.unwrap_or(expected.role);
+        let mut local = match self {
+            Self::Compiled => expected_worker(actual_role),
+            #[cfg(test)]
+            Self::FixtureCpu => expected_worker_for_provider(actual_role, WorkerProvider::Cpu),
+        };
+        local.pack = match self {
+            Self::Compiled => worker_pack_expectation_from_private_env()?,
+            #[cfg(test)]
+            Self::FixtureCpu => None,
+        };
+        validate_compatible_worker_hello_against_local(
+            role,
+            challenge,
+            expected,
+            compatibility,
+            &local,
+        )
+    }
+
+    fn compatibility_capability(
+        self,
+        session: &ValidatedCompatibleWorkerSession,
+        challenge: String,
+    ) -> Result<WorkerCapability> {
+        let pack = match self {
+            Self::Compiled => worker_pack_capability(session.role)?,
+            #[cfg(test)]
+            Self::FixtureCpu => None,
+        };
+        compatible_worker_capability(session, challenge, pack)
+    }
 }
 
 fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
@@ -11844,14 +12071,19 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
         };
         let (session_id, request_id, control) = parse_parent_control(frame)?;
         match (&control, handshake_complete) {
-            (Control::Hello { .. }, false) => {}
-            (Control::Hello { .. }, true) => {
+            (Control::Hello { .. } | Control::CompatibilityHello { .. }, false) => {}
+            (Control::Hello { .. } | Control::CompatibilityHello { .. }, true) => {
                 bail!("worker protocol permits Hello exactly once");
             }
             (_, false) => {
                 bail!("worker protocol requires Hello before any command");
             }
             (_, true) => {}
+        }
+        if matches!(&control, Control::CompatibilityHello { .. })
+            && role.is_some_and(|role| role != WorkerRole::Inference)
+        {
+            bail!("worker compatibility Hello is inference-only");
         }
         if role.is_some_and(|role| !control_allowed_for_role(&control, role)) {
             runtime_observation = None;
@@ -11896,15 +12128,35 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
             } => {
                 let provider = expected.provider;
                 let actual_role = identity_policy.validate_hello(role, &challenge, &expected)?;
+                let capability = identity_policy.capability(actual_role, challenge)?;
                 worker_provider = Some(provider);
                 handshake_complete = true;
                 write_worker_response(
                     &mut output,
                     session_id,
                     request_id,
-                    Control::Ready {
-                        capability: identity_policy.capability(actual_role, challenge)?,
-                    },
+                    Control::Ready { capability },
+                )?;
+            }
+            Control::CompatibilityHello {
+                challenge,
+                expected,
+                compatibility,
+            } => {
+                let session = identity_policy.validate_compatibility_hello(
+                    role,
+                    &challenge,
+                    &expected,
+                    &compatibility,
+                )?;
+                let capability = identity_policy.compatibility_capability(&session, challenge)?;
+                worker_provider = Some(session.provider);
+                handshake_complete = true;
+                write_worker_response(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Ready { capability },
                 )?;
             }
             Control::NegotiateRuntimeObservation { version } => {
@@ -12841,6 +13093,15 @@ fn validate_worker_response(response: &Control) -> Result<()> {
             if capability.artifacts.len() > 8 {
                 bail!("worker capability advertises too many artifact targets");
             }
+            if !is_valid_build_identity(&capability.app_build)
+                || !is_valid_build_identity(&capability.worker_build)
+                || capability
+                    .compatibility
+                    .as_ref()
+                    .is_some_and(|context| !context.validate_shape())
+            {
+                bail!("worker capability identity is malformed");
+            }
             for target in &capability.artifacts {
                 validate_nonempty_bounded_string(
                     "worker artifact target",
@@ -13568,6 +13829,11 @@ mod tests {
 
     enum TestMode {
         Normal,
+        CompatibilityNormal {
+            worker_sha256: String,
+            wrong_session_app: bool,
+        },
+        LegacyRejectCompatibility,
         CapabilityMismatch(CapabilityMismatch),
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         MalformedHello,
@@ -13639,6 +13905,8 @@ mod tests {
     struct TestLauncher {
         modes: Mutex<VecDeque<TestMode>>,
         launches: AtomicUsize,
+        frozen_worker_approval: Option<FrozenWorkerApproval>,
+        session_app_build: Option<String>,
         kill_started: Option<TestSender<()>>,
         reaped: Option<TestSender<()>>,
     }
@@ -13648,6 +13916,8 @@ mod tests {
             Self {
                 modes: Mutex::new(modes.into_iter().collect()),
                 launches: AtomicUsize::new(0),
+                frozen_worker_approval: None,
+                session_app_build: None,
                 kill_started: None,
                 reaped: None,
             }
@@ -13660,6 +13930,16 @@ mod tests {
         ) -> Self {
             self.kill_started = Some(kill_started);
             self.reaped = Some(reaped);
+            self
+        }
+
+        fn with_frozen_worker_approval(
+            mut self,
+            approval: FrozenWorkerApproval,
+            session_app_build: impl Into<String>,
+        ) -> Self {
+            self.frozen_worker_approval = Some(approval);
+            self.session_app_build = Some(session_app_build.into());
             self
         }
     }
@@ -13707,13 +13987,23 @@ mod tests {
                 let _ = worker_output_for_exit.send(PipeChunk::Eof);
             });
             *process.worker.lock().unwrap() = Some(worker);
+            let mut expectation = expected_worker(WorkerRole::Inference);
+            if let Some(approval) = &self.frozen_worker_approval {
+                expectation.app_build = self
+                    .session_app_build
+                    .clone()
+                    .expect("compatible test launcher requires a session app build");
+                expectation.worker_build = approval.worker_build().to_owned();
+                expectation.bundled_worker_sha256 = approval.worker_sha256().to_owned();
+            }
             Ok(SpawnedWorker {
                 stdin: Box::new(ChannelWriter {
                     sender: parent_input,
                 }),
                 stdout: Box::new(ChannelReader::new(parent_output)),
                 process,
-                expectation: expected_worker(WorkerRole::Inference),
+                expectation,
+                frozen_worker_approval: self.frozen_worker_approval.clone(),
                 pack_launch: None,
             })
         }
@@ -13745,25 +14035,62 @@ mod tests {
     }
 
     fn handshake(input: &mut impl Read, output: &mut impl Write) -> bool {
+        handshake_with_compatible_worker_hash(input, output, None, false)
+    }
+
+    fn handshake_with_compatible_worker_hash(
+        input: &mut impl Read,
+        output: &mut impl Write,
+        compatible_worker_sha256: Option<&str>,
+        wrong_session_app: bool,
+    ) -> bool {
         let Ok(frame) = read_frame(input) else {
             return false;
         };
         let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
-        let Control::Hello {
-            challenge,
-            expected,
-        } = control
-        else {
-            panic!("expected worker Hello");
+        let mut capability = match control {
+            Control::Hello {
+                challenge,
+                expected,
+            } => {
+                let role = validate_worker_hello(None, &challenge, &expected).unwrap();
+                worker_capability(role, challenge).unwrap()
+            }
+            Control::CompatibilityHello {
+                challenge,
+                expected,
+                compatibility,
+            } => {
+                let mut local = expected_worker(WorkerRole::Inference);
+                local.pack = worker_pack_expectation_from_private_env().unwrap();
+                let session = validate_compatible_worker_hello_against_local(
+                    None,
+                    &challenge,
+                    &expected,
+                    &compatibility,
+                    &local,
+                )
+                .unwrap();
+                compatible_worker_capability(
+                    &session,
+                    challenge,
+                    worker_pack_capability(session.role).unwrap(),
+                )
+                .unwrap()
+            }
+            _ => panic!("expected worker Hello"),
         };
-        let role = validate_worker_hello(None, &challenge, &expected).unwrap();
+        if let Some(worker_sha256) = compatible_worker_sha256 {
+            capability.bundled_worker_sha256 = worker_sha256.to_owned();
+        }
+        if wrong_session_app {
+            capability.app_build = "local-transcriber@999.0.0#wrong-session".to_owned();
+        }
         respond(
             output,
             session_id,
             request_id,
-            Control::Ready {
-                capability: worker_capability(role, challenge).unwrap(),
-            },
+            Control::Ready { capability },
         );
         true
     }
@@ -13780,6 +14107,7 @@ mod tests {
                     return;
                 }
                 Control::Hello { .. }
+                | Control::CompatibilityHello { .. }
                 | Control::Cancel { .. }
                 | Control::Unload
                 | Control::Health => respond(output, session_id, request_id, Control::Ok),
@@ -13862,6 +14190,33 @@ mod tests {
         running: &AtomicBool,
     ) {
         let mode = match mode {
+            TestMode::CompatibilityNormal {
+                worker_sha256,
+                wrong_session_app,
+            } => {
+                if handshake_with_compatible_worker_hash(
+                    &mut input,
+                    &mut output,
+                    Some(&worker_sha256),
+                    wrong_session_app,
+                ) {
+                    run_normal_worker(&mut input, &mut output);
+                }
+                return;
+            }
+            TestMode::LegacyRejectCompatibility => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::CompatibilityHello { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "legacy worker rejected unknown compatibility Hello".to_owned(),
+                    },
+                );
+                return;
+            }
             TestMode::CapabilityMismatch(mismatch) => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 let Control::Hello {
@@ -13926,6 +14281,8 @@ mod tests {
         }
         match mode {
             TestMode::DelayedLaunch { .. }
+            | TestMode::CompatibilityNormal { .. }
+            | TestMode::LegacyRejectCompatibility
             | TestMode::CapabilityMismatch(_)
             | TestMode::BlockedHello { .. } => {
                 unreachable!("launch-only test mode reached a worker")
@@ -14768,6 +15125,26 @@ mod tests {
         }
     }
 
+    fn fixture_frozen_cpu_policy(origin_app_build: &str, worker_sha256: &str) -> Vec<u8> {
+        format!(
+            "{{\"schema_version\":1,\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"kind\":\"cpu\",\"origin_app_build\":\"{origin_app_build}\",\"worker_build\":\"{INFERENCE_WORKER_BUILD_ID}\",\"worker_sha256\":\"{worker_sha256}\",\"protocol_version\":{PROTOCOL_VERSION},\"runtime_abi_version\":{WORKER_ABI_VERSION}}}]}}"
+        )
+        .into_bytes()
+    }
+
+    fn fixture_frozen_cpu_approval(worker_sha256: &str) -> FrozenWorkerApproval {
+        let policy = fixture_frozen_cpu_policy(DESKTOP_BUILD_ID, worker_sha256);
+        crate::worker_compatibility::approve_test_cpu_worker(
+            &policy,
+            &FrozenCpuWorkerCandidate {
+                worker_sha256,
+                protocol_version: PROTOCOL_VERSION,
+                runtime_abi_version: WORKER_ABI_VERSION,
+            },
+        )
+        .expect("fixture policy must approve its exact CPU worker")
+    }
+
     fn short_vad_deadlines() -> VadDeadlines {
         VadDeadlines {
             acquisition: Duration::from_millis(40),
@@ -14975,6 +15352,418 @@ mod tests {
         let mut capability = worker_capability(WorkerRole::Inference, challenge.clone()).unwrap();
         capability.bundled_worker_sha256 = expected.bundled_worker_sha256.clone();
         validate_worker_capability(&capability, &challenge, &expected).unwrap();
+    }
+
+    #[test]
+    fn legacy_hello_still_rejects_a_wrong_application_build() {
+        let challenge = "60".repeat(32);
+        let mut expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        expected.app_build = "local-transcriber@999.0.0#foreign".to_owned();
+        let local = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        assert!(
+            validate_worker_hello_against_local(
+                Some(WorkerRole::Inference),
+                &challenge,
+                &expected,
+                &local,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn compatibility_handshake_runs_through_supervisor_and_validated_worker_session() {
+        let worker_sha256 = "61".repeat(32);
+        let approval = fixture_frozen_cpu_approval(&worker_sha256);
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::CompatibilityNormal {
+                worker_sha256,
+                wrong_session_app: false,
+            }])
+            .with_frozen_worker_approval(approval, "local-transcriber@999.0.0#future-session"),
+        );
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher,
+            short_deadlines(),
+        );
+        assert_eq!(supervisor.ensure_generation().unwrap(), 1);
+        let (expected, compatibility) = {
+            let state = supervisor.inner.state.lock().unwrap();
+            let current = state.current.as_ref().unwrap();
+            (
+                current.expectation.clone(),
+                current.frozen_worker_approval.as_ref().unwrap().context(),
+            )
+        };
+        let mut capability = worker_capability_for_provider(
+            WorkerRole::Inference,
+            "67".repeat(32),
+            WorkerProvider::Cpu,
+            None,
+        )
+        .unwrap();
+        capability.app_build = expected.app_build.clone();
+        capability.worker_build = expected.worker_build.clone();
+        capability.bundled_worker_sha256 = expected.bundled_worker_sha256.clone();
+        capability.compatibility = Some(compatibility);
+        assert!(
+            supervisor
+                .bind_generation_pack_capability(2, &expected, &capability)
+                .unwrap_err()
+                .to_string()
+                .contains("generation changed")
+        );
+        supervisor.terminate_current().unwrap();
+    }
+
+    #[test]
+    fn installed_cpu_resolver_attaches_only_foreign_exact_anchor_approval() {
+        let root = test_root("frozen-cpu-resolver");
+        let path = root.join("scribe-inference-worker.exe");
+        std::fs::write(&path, b"immutable frozen CPU worker").unwrap();
+        let worker_sha256 = sha256_file(&path).unwrap();
+        let name = path.file_name().unwrap();
+
+        let executable = verify_worker_executable(&path, &root, name, &worker_sha256).unwrap();
+        let foreign_policy =
+            fixture_frozen_cpu_policy("local-transcriber@0.9.0#approved-origin", &worker_sha256);
+        let executable =
+            crate::worker_compatibility::with_test_frozen_worker_policy(&foreign_policy, || {
+                attach_installed_cpu_compatibility(
+                    executable,
+                    WorkerRole::Inference,
+                    &worker_sha256,
+                )
+            });
+        assert!(executable.frozen_worker_approval.is_some());
+        drop(executable);
+
+        let executable = verify_worker_executable(&path, &root, name, &worker_sha256).unwrap();
+        let same_source_policy = fixture_frozen_cpu_policy(DESKTOP_BUILD_ID, &worker_sha256);
+        let executable = crate::worker_compatibility::with_test_frozen_worker_policy(
+            &same_source_policy,
+            || {
+                attach_installed_cpu_compatibility(
+                    executable,
+                    WorkerRole::Inference,
+                    &worker_sha256,
+                )
+            },
+        );
+        assert!(executable.frozen_worker_approval.is_none());
+        drop(executable);
+
+        let executable = verify_worker_executable(&path, &root, name, &worker_sha256).unwrap();
+        let wrong_policy =
+            fixture_frozen_cpu_policy("local-transcriber@0.9.0#approved-origin", &"77".repeat(32));
+        let executable =
+            crate::worker_compatibility::with_test_frozen_worker_policy(&wrong_policy, || {
+                attach_installed_cpu_compatibility(
+                    executable,
+                    WorkerRole::Inference,
+                    &worker_sha256,
+                )
+            });
+        assert!(executable.frozen_worker_approval.is_none());
+        drop(executable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prelaunch_revalidation_rejects_frozen_cpu_approval_drift() {
+        let root = test_root("frozen-cpu-revalidation");
+        let path = root.join("scribe-inference-worker.exe");
+        std::fs::write(&path, b"immutable frozen CPU worker").unwrap();
+        let worker_sha256 = sha256_file(&path).unwrap();
+        let name = path.file_name().unwrap();
+        let mut executable = verify_worker_executable(&path, &root, name, &worker_sha256).unwrap();
+        executable.frozen_worker_approval = Some(fixture_frozen_cpu_approval(&"78".repeat(32)));
+        assert!(executable.revalidate().is_err());
+        drop(executable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compatibility_handshake_rejects_wrong_returned_session_app() {
+        let worker_sha256 = "62".repeat(32);
+        let approval = fixture_frozen_cpu_approval(&worker_sha256);
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::CompatibilityNormal {
+                worker_sha256,
+                wrong_session_app: true,
+            }])
+            .with_frozen_worker_approval(approval, "local-transcriber@999.0.0#future-session"),
+        );
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher,
+            short_deadlines(),
+        );
+        assert!(supervisor.ensure_generation().is_err());
+        assert_eq!(supervisor.current_generation().unwrap(), None);
+    }
+
+    #[test]
+    fn compatibility_ready_rejects_challenge_and_origin_context_substitution() {
+        let challenge = "68".repeat(32);
+        let mut expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        expected.app_build = "local-transcriber@999.0.0#future-session".to_owned();
+        let context = FrozenWorkerCompatibilityContext {
+            version: 1,
+            origin_app_build: DESKTOP_BUILD_ID.to_owned(),
+        };
+        let local = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        let session = validate_compatible_worker_hello_against_local(
+            Some(WorkerRole::Inference),
+            &challenge,
+            &expected,
+            &context,
+            &local,
+        )
+        .unwrap();
+        let mut capability =
+            compatible_worker_capability(&session, challenge.clone(), None).unwrap();
+        validate_worker_capability_for_hello(&capability, &challenge, &expected, Some(&context))
+            .unwrap();
+        capability.challenge = "69".repeat(32);
+        assert!(
+            validate_worker_capability_for_hello(
+                &capability,
+                &challenge,
+                &expected,
+                Some(&context),
+            )
+            .is_err()
+        );
+        capability.challenge = challenge.clone();
+        capability.compatibility = Some(FrozenWorkerCompatibilityContext {
+            version: 1,
+            origin_app_build: "local-transcriber@0.8.0#substituted".to_owned(),
+        });
+        assert!(
+            validate_worker_capability_for_hello(
+                &capability,
+                &challenge,
+                &expected,
+                Some(&context),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_worker_rejects_compatibility_hello_without_downgrade() {
+        let worker_sha256 = "63".repeat(32);
+        let approval = fixture_frozen_cpu_approval(&worker_sha256);
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::LegacyRejectCompatibility])
+                .with_frozen_worker_approval(approval, "local-transcriber@999.0.0#future-session"),
+        );
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        assert!(supervisor.ensure_generation().is_err());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(supervisor.current_generation().unwrap(), None);
+    }
+
+    #[test]
+    fn compatibility_hello_is_inference_only_and_vad_rejects_it() {
+        let mut expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        expected.app_build = "local-transcriber@999.0.0#future-session".to_owned();
+        let mut input = Vec::new();
+        append_control(
+            &mut input,
+            0,
+            0,
+            Control::CompatibilityHello {
+                challenge: "64".repeat(32),
+                expected,
+                compatibility: FrozenWorkerCompatibilityContext {
+                    version: 1,
+                    origin_app_build: DESKTOP_BUILD_ID.to_owned(),
+                },
+            },
+        );
+        append_control(&mut input, 0, 1, fixture_cpu_hello(WorkerRole::Vad));
+        append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 1 });
+        let mut output = Vec::new();
+        let vad_factory = FakeVadFactory::new();
+        let error = worker_loop_with_factories_as_fixture_cpu(
+            Cursor::new(input),
+            &mut output,
+            &FakeRecognizerFactory::new(),
+            &vad_factory,
+            Some(WorkerRole::Vad),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inference-only"));
+        assert!(output.is_empty());
+        assert_eq!(vad_factory.snapshot().creates, 0);
+    }
+
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    #[test]
+    fn compiled_non_windows_worker_rejects_compatibility_without_downgrade() {
+        let mut expected = expected_worker(WorkerRole::Inference);
+        expected.app_build = "local-transcriber@999.0.0#future-session".to_owned();
+        let mut input = Vec::new();
+        append_control(
+            &mut input,
+            0,
+            0,
+            Control::CompatibilityHello {
+                challenge: "71".repeat(32),
+                expected,
+                compatibility: FrozenWorkerCompatibilityContext {
+                    version: 1,
+                    origin_app_build: DESKTOP_BUILD_ID.to_owned(),
+                },
+            },
+        );
+        append_control(&mut input, 0, 1, test_hello(WorkerRole::Inference));
+        append_control(
+            &mut input,
+            0,
+            2,
+            Control::LoadRuntime {
+                artifact: WireRuntimeArtifact::Gguf(WireRuntimeModel {
+                    id: "unreachable-model".to_owned(),
+                    path: PathBuf::from("unreachable.gguf"),
+                    format: WireArtifactFormat::Gguf,
+                    expected_size_bytes: 1,
+                    expected_sha256: "72".repeat(32),
+                }),
+                preference: AccelerationPreference::Cpu,
+            },
+        );
+        let mut output = Vec::new();
+        let factory = FakeRecognizerFactory::new();
+        let error = worker_loop_with_factories(
+            Cursor::new(input),
+            &mut output,
+            &factory,
+            &FakeVadFactory::new(),
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsupported on this platform"));
+        assert!(output.is_empty());
+        assert_eq!(factory.snapshot().create_attempts, 0);
+    }
+
+    #[test]
+    fn compatibility_child_rejects_origin_build_abi_version_provider_and_pack_mismatches() {
+        let mut expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        expected.app_build = "local-transcriber@999.0.0#future-session".to_owned();
+        let context = FrozenWorkerCompatibilityContext {
+            version: 1,
+            origin_app_build: DESKTOP_BUILD_ID.to_owned(),
+        };
+        let invalid = [
+            {
+                let mut value = expected.clone();
+                value.worker_build.push_str("-wrong");
+                ("64".repeat(32), value, context.clone())
+            },
+            {
+                let mut value = expected.clone();
+                value.abi = value.abi.saturating_add(1);
+                ("64".repeat(32), value, context.clone())
+            },
+            {
+                let mut value = expected.clone();
+                value.provider = WorkerProvider::Cuda;
+                ("64".repeat(32), value, context.clone())
+            },
+            {
+                let mut value = expected.clone();
+                value.pack = Some(WorkerPackExpectation {
+                    pack_id: "wrong-pack".to_owned(),
+                    pack_version: "1.0.0".to_owned(),
+                    pack_digest: "65".repeat(32),
+                    security_epoch: 1,
+                    runtime_abi: 1,
+                    backend: WorkerProvider::Vulkan,
+                    provider: "wrong-provider".to_owned(),
+                });
+                ("64".repeat(32), value, context.clone())
+            },
+            {
+                let mut value = context.clone();
+                value.version = 2;
+                ("64".repeat(32), expected.clone(), value)
+            },
+            {
+                let mut value = context.clone();
+                value.origin_app_build = "local-transcriber@0.8.0#wrong-origin".to_owned();
+                ("64".repeat(32), expected.clone(), value)
+            },
+            (
+                "not-a-challenge".to_owned(),
+                expected.clone(),
+                context.clone(),
+            ),
+        ];
+        for (challenge, expected, compatibility) in invalid {
+            let mut input = Vec::new();
+            append_control(
+                &mut input,
+                0,
+                0,
+                Control::CompatibilityHello {
+                    challenge,
+                    expected,
+                    compatibility,
+                },
+            );
+            let mut output = Vec::new();
+            assert!(
+                worker_loop_with_factories_as_fixture_cpu(
+                    Cursor::new(input),
+                    &mut output,
+                    &FakeRecognizerFactory::new(),
+                    &FakeVadFactory::new(),
+                    Some(WorkerRole::Inference),
+                    None,
+                )
+                .is_err()
+            );
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn compatibility_hello_replay_is_rejected_before_any_model_command() {
+        let mut expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        expected.app_build = "local-transcriber@999.0.0#future-session".to_owned();
+        let hello = Control::CompatibilityHello {
+            challenge: "66".repeat(32),
+            expected,
+            compatibility: FrozenWorkerCompatibilityContext {
+                version: 1,
+                origin_app_build: DESKTOP_BUILD_ID.to_owned(),
+            },
+        };
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, hello.clone());
+        append_control(&mut input, 0, 1, hello);
+        let mut output = Vec::new();
+        let error = worker_loop_with_factories_as_fixture_cpu(
+            Cursor::new(input),
+            &mut output,
+            &FakeRecognizerFactory::new(),
+            &FakeVadFactory::new(),
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly once"));
+        let (_, _, response) =
+            parse_worker_control(read_frame(&mut Cursor::new(output)).unwrap()).unwrap();
+        assert!(matches!(response, Control::Ready { .. }));
     }
 
     #[test]
@@ -15367,6 +16156,7 @@ mod tests {
             stdout: Box::new(Cursor::new(Vec::<u8>::new())),
             process: Arc::new(DiagnosticCleanupFailureProcess),
             expectation: expected_worker(WorkerRole::Inference),
+            frozen_worker_approval: None,
             pack_launch: None,
         };
         assert!(retire_unpublished_diagnostic_worker(worker, &cleanup_state).is_err());
@@ -20325,6 +21115,7 @@ mod tests {
             generation: correlation.generation,
             process: process_trait,
             expectation: expected_worker(WorkerRole::Inference),
+            frozen_worker_approval: None,
             pack_launch: None,
             pack_bindings: Vec::new(),
             #[cfg(feature = "windows-gpu-capture-observation")]
@@ -23237,6 +24028,27 @@ mod tests {
         assert!(
             worker_role_from_args(&[std::ffi::OsString::from("--scribe-onnx-worker")]).is_err()
         );
+    }
+
+    #[test]
+    fn ordinary_hello_wire_shape_is_unchanged_and_compatibility_is_distinct() {
+        let ordinary = serde_json::to_value(test_hello(WorkerRole::Inference)).unwrap();
+        assert_eq!(ordinary["command"], "hello");
+        assert!(ordinary.get("compatibility").is_none());
+
+        let mut expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu);
+        expected.app_build = "local-transcriber@999.0.0#future-session".to_owned();
+        let compatible = serde_json::to_value(Control::CompatibilityHello {
+            challenge: "70".repeat(32),
+            expected,
+            compatibility: FrozenWorkerCompatibilityContext {
+                version: 1,
+                origin_app_build: DESKTOP_BUILD_ID.to_owned(),
+            },
+        })
+        .unwrap();
+        assert_eq!(compatible["command"], "compatibility_hello");
+        assert_eq!(compatible["compatibility"]["version"], 1);
     }
 
     #[test]

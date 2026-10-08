@@ -140,6 +140,7 @@ mod windows_gpu_probe;
     reason = "the desktop uses pack-inventory admission while the dedicated worker uses mapped-module admission"
 )]
 mod windows_vulkan_loader;
+mod worker_compatibility;
 #[allow(
     dead_code,
     reason = "the external worker boundary owns contracts used by role-specific targets and later integrations"

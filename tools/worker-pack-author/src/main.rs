@@ -28,6 +28,12 @@ mod onnx_worker {
 mod windows_cuda_link;
 #[path = "../../../src/windows_gpu_approved_signing.rs"]
 mod windows_gpu_approved_signing;
+#[allow(
+    dead_code,
+    reason = "the authoring tool reuses only GPU policy admission needed by the shared verifier"
+)]
+#[path = "../../../src/worker_compatibility.rs"]
+mod worker_compatibility;
 #[path = "../../../src/worker_identity.rs"]
 mod worker_identity;
 #[path = "../../../src/worker_pack_authoring.rs"]
