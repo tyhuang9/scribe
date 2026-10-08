@@ -304,11 +304,17 @@ custody, candidate-installer integration and unchanged-artifact promotion remain
 separate acceptance gates. Passing deterministic observer tests alone does not
 establish GPU performance or production readiness.
 
-Final-installer qualification also needs an explicitly versioned contract that
-can represent these actual observations. Legacy full-qualification schemas 2/3
-still require their older threading and memory shapes; neither transforming
-new observations into those shapes nor rebinding old evidence is a valid way
-to qualify the final installer.
+Final-installer qualification now has schema v4 for these actual observations.
+It retains the separate full-qualification installer, attestation, scenario and
+power boundaries while requiring native-default threading, the
+`windows_local_non_local_segments` identity/execution observer, sampled private
+commit, local/non-local segments, typed raw provider observations, and a
+separate numeric-or-null admission pair. Legacy full-qualification schemas 2/3
+still require their older threading and memory shapes; neither transforming old
+or unsigned observer output into v4 nor rebinding historical evidence is a valid
+way to qualify the final installer. Fresh authenticated acquisition, protected
+capture custody, candidate-installer integration and unchanged-artifact
+promotion remain separate acceptance gates.
 
 ## Development interface
 

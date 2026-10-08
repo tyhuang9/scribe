@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly)
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -281,13 +281,13 @@ function Get-RecordWithoutArtifact($Value) {
 function Sync-DeviceSetBindings($Documents) {
     $lane = $Documents.Evidence.lanes[0]
     $lane.identity.acquisition.device_set.snapshot_sha256 = Get-CanonicalDigest $lane.identity.acquisition.device_set.devices
-    foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { $run.device_set_sha256 = $lane.identity.acquisition.device_set.snapshot_sha256; if ($Documents.Plan.schema_version -eq 3) { $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.acquisition } } } }
-    if ($Documents.Plan.schema_version -eq 3 -and $null -ne $lane.identity.battery_acquisition) {
+    foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { $run.device_set_sha256 = $lane.identity.acquisition.device_set.snapshot_sha256; if ($Documents.Plan.schema_version -ge 3) { $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.acquisition } } } }
+    if ($Documents.Plan.schema_version -ge 3 -and $null -ne $lane.identity.battery_acquisition) {
         $lane.identity.battery_acquisition.device_set.snapshot_sha256 = Get-CanonicalDigest $lane.identity.battery_acquisition.device_set.devices
         foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.battery.run_sets[$mode][$target])) { $run.device_set_sha256 = $lane.identity.battery_acquisition.device_set.snapshot_sha256; $run.acquisition_sha256 = Get-CanonicalDigest $lane.identity.battery_acquisition } } }
     }
     foreach ($scenario in @($lane.scenarios)) {
-        $acquisition = if ($Documents.Plan.schema_version -eq 3 -and $scenario.power_source -ceq 'battery' -and $null -ne $lane.identity.battery_acquisition) { $lane.identity.battery_acquisition } else { $lane.identity.acquisition }
+        $acquisition = if ($Documents.Plan.schema_version -ge 3 -and $scenario.power_source -ceq 'battery' -and $null -ne $lane.identity.battery_acquisition) { $lane.identity.battery_acquisition } else { $lane.identity.acquisition }
         $scenario.device_set_sha256 = $acquisition.device_set.snapshot_sha256
     }
 }
@@ -319,7 +319,7 @@ function New-PowerCaptures($Block, $Identity, $Acquisition, [string]$PowerSource
 function Sync-Captures($Documents) {
     $lane = $Documents.Evidence.lanes[0]
     $identity = $lane.identity
-    $schema3 = $Documents.Plan.schema_version -eq 3
+    $schema3 = $Documents.Plan.schema_version -ge 3
     $lane.captures = New-PowerCaptures $lane $identity $identity.acquisition 'ac' $true $schema3
     $mixed = @($lane.scenarios | Where-Object { $_.scenario -ceq 'mixed_gpu' })[0]
     $mixedCaptures = @($lane.captures | Where-Object { $_.generation -like '*scenario:mixed_gpu:*' } | Sort-Object generation)
@@ -389,11 +389,11 @@ function Set-VulkanFixture($Documents, [string]$Vendor, [string]$VendorId) {
     $identity.gpu_worker.worker_sha256 = Get-Digest 'fixture-vulkan-worker'; $identity.pack.pack_id = 'scribe-vulkan-windows-x64'; $identity.device.vendor = $Vendor
     $driver = "vulkan:$VendorId`:00000001:00000136:00112233445566778899aabbccddeeff"
     $identity.driver.value = $driver
-    foreach ($acquisition in @($identity.acquisition, $(if ($Documents.Plan.schema_version -eq 3) { $identity.battery_acquisition })) | Where-Object { $null -ne $_ }) {
+    foreach ($acquisition in @($identity.acquisition, $(if ($Documents.Plan.schema_version -ge 3) { $identity.battery_acquisition })) | Where-Object { $null -ne $_ }) {
         foreach ($device in @($acquisition.device_set.devices | Where-Object { $_.provider_eligible })) { $device.vendor = $Vendor; $device.driver = $driver }
     }
     $runSets = @($lane.run_sets)
-    if ($Documents.Plan.schema_version -eq 3 -and $null -ne $lane.battery) { $runSets += $lane.battery.run_sets }
+    if ($Documents.Plan.schema_version -ge 3 -and $null -ne $lane.battery) { $runSets += $lane.battery.run_sets }
     foreach ($sets in $runSets) { foreach ($mode in @('cold', 'warm')) { foreach ($run in @($sets[$mode].gpu)) { $run.execution.backend = 'vulkan'; $run.execution.provider_id = 'vulkan'; $run.execution.worker_sha256 = $identity.gpu_worker.worker_sha256; $run.execution.driver = $driver } } }
     foreach ($scenario in @($lane.scenarios)) { if ($scenario.selected_backend -cne 'cpu') { $scenario.selected_backend = 'vulkan' }; $scenario.driver_after = $driver; $scenario.driver_before = if ($scenario.scenario -ceq 'driver_change') { "vulkan:$VendorId`:00000001:00000135:00112233445566778899aabbccddeeff" } else { $driver } }
     Sync-DeviceSetBindings $Documents; Sync-Captures $Documents
@@ -571,6 +571,31 @@ function ConvertTo-PerformanceRun($Run, $Identity, [string]$Target) {
     }
 }
 
+function New-V4FixtureDocuments([string]$DeviceClass = 'integrated_gpu', [int]$AcGpuColdMs = 220, [int]$AcGpuWarmMs = 110, [int]$BatteryGpuColdMs = 220, [int]$BatteryGpuWarmMs = 110, [string]$VulkanVendor = '') {
+    # Schema v4 is a fresh full-qualification shape. The fixture starts with
+    # the signed v3 installer/scenario envelope, then constructs v4's actual
+    # native-default and Windows segment observations before it is attested.
+    $documents = New-V3FixtureDocuments $DeviceClass $AcGpuColdMs $AcGpuWarmMs $BatteryGpuColdMs $BatteryGpuWarmMs
+    if ($VulkanVendor) { Set-VulkanFixture $documents $VulkanVendor $(if ($VulkanVendor -ceq 'intel') { '8086' } elseif ($VulkanVendor -ceq 'nvidia') { '10de' } else { '1002' }) }
+    $documents.Plan.schema_version = 4
+    $documents.Evidence.schema_version = 4
+    $lane = $documents.Evidence.lanes[0]
+    $lane.identity.device.memory_model = 'windows_local_non_local_segments'
+    ConvertTo-PerformanceAcquisition $lane.identity.acquisition
+    if ($null -ne $lane.identity.battery_acquisition) { ConvertTo-PerformanceAcquisition $lane.identity.battery_acquisition }
+    foreach ($mode in @('cold', 'warm')) {
+        foreach ($target in @('cpu', 'gpu')) {
+            foreach ($run in @($lane.run_sets[$mode][$target])) { ConvertTo-PerformanceRun $run $lane.identity $target }
+            if ($null -ne $lane.battery) {
+                foreach ($run in @($lane.battery.run_sets[$mode][$target])) { ConvertTo-PerformanceRun $run $lane.identity $target }
+            }
+        }
+    }
+    Sync-DeviceSetBindings $documents
+    Sync-Captures $documents
+    return $documents
+}
+
 function New-PerformanceDocuments([string]$DeviceClass = 'integrated_gpu', [int]$AcGpuColdMs = 220, [int]$AcGpuWarmMs = 110, [int]$BatteryGpuColdMs = 220, [int]$BatteryGpuWarmMs = 110, [string]$LaneId = '', [string]$VulkanVendor = '') {
     $source = New-V3FixtureDocuments $DeviceClass $AcGpuColdMs $AcGpuWarmMs $BatteryGpuColdMs $BatteryGpuWarmMs
     if ($VulkanVendor) { Set-VulkanFixture $source $VulkanVendor $(if ($VulkanVendor -ceq 'intel') { '8086' } else { '1002' }) }
@@ -740,7 +765,7 @@ function Update-Bindings($Documents, [string]$ArtifactRoot, [bool]$WriteArtifact
         foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
         foreach ($scenario in @($lane.scenarios)) { if ($WriteArtifacts) { $scenario.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($scenario.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_scenario_artifact' (Get-RecordWithoutArtifact $scenario) } }
         foreach ($capture in @($lane.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
-        if ($Documents.Plan.schema_version -eq 3 -and $null -ne $lane.battery) {
+        if ($Documents.Plan.schema_version -ge 3 -and $null -ne $lane.battery) {
             if ($WriteArtifacts) { $lane.battery.acquisition_artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($lane.battery.acquisition_artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_acquisition_artifact' $lane.identity.battery_acquisition }
             foreach ($mode in @('cold', 'warm')) { foreach ($target in @('cpu', 'gpu')) { foreach ($run in @($lane.battery.run_sets[$mode][$target])) { if ($WriteArtifacts) { $run.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($run.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_run_artifact' (Get-RecordWithoutArtifact $run) } } } }
             foreach ($capture in @($lane.battery.captures)) { if ($WriteArtifacts) { $capture.artifact_sha256 = Write-Envelope (Join-Path $ArtifactRoot ($capture.artifact_path.Replace('/', '\'))) 'windows_gpu_qualification_raw_scif_capture' (Get-RecordWithoutArtifact $capture) } }
@@ -852,6 +877,140 @@ function Invoke-FailingFixture($Documents, [string]$Name, [string]$ExpectedReaso
     return $decision
 }
 
+function Invoke-V4ContractTests {
+    # Positive final-installer shapes cover discrete CUDA, shared-memory CUDA,
+    # and the Vulkan provider. They remain fixture-only and default deny.
+    $v4Discrete = Invoke-PassingFixture (New-V4FixtureDocuments 'discrete_gpu') 'v4-discrete-cuda' 75
+    $v4Integrated = Invoke-PassingFixture (New-V4FixtureDocuments 'integrated_gpu') 'v4-integrated-cuda' 139
+    $v4Vulkan = Invoke-PassingFixture (New-V4FixtureDocuments 'integrated_gpu' 220 110 220 110 'intel') 'v4-integrated-intel-vulkan' 139
+    Assert-True ($v4Discrete.Decision.schema_version -eq 4 -and $null -eq $v4Discrete.Decision.lanes[0].metrics.battery) 'V4 discrete lane did not preserve its AC-only evidence shape.'
+    Assert-True ($v4Integrated.Decision.schema_version -eq 4 -and $null -ne $v4Integrated.Decision.lanes[0].metrics.battery) 'V4 integrated lane did not retain independent battery metrics.'
+    Assert-True ($v4Vulkan.Decision.lanes[0].backend -ceq 'vulkan') 'V4 Vulkan fixture lost its authenticated backend identity.'
+    Assert-True ((Invoke-Evaluator $v4Integrated.Bundle $true $true).ExitCode -eq 2) 'Passing V4 fixture -RequireEligible did not remain valid but ineligible under default deny.'
+    $normalLane = $v4Integrated.Decision.lanes[0]
+    $normalGpuMetrics = $normalLane.metrics.ac.cold.gpu
+    Assert-True ($normalGpuMetrics.sampled_max_private_usage_bytes.p95 -gt 0 -and $normalGpuMetrics.telemetry_sample_count.p95 -gt 0) 'V4 did not preserve sampled private commit and positive telemetry counts.'
+    Assert-True ($normalGpuMetrics.video_memory.status -ceq 'available' -and $normalGpuMetrics.video_memory.local.sampled_max_current_usage_bytes.p95 -gt 0 -and $normalGpuMetrics.video_memory.non_local.sampled_max_current_usage_bytes.p95 -gt 0) 'V4 did not preserve both Windows local and non-local segment counters.'
+    Assert-True ($normalLane.evidence_memory_floor.minimum_total_memory_bytes -eq 12000000000) 'V4 did not retain its installer identity total-memory threshold.'
+    Assert-True ($normalLane.evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'V4 did not derive its initial floor from successful GPU-run admission pairs.'
+    $fabricatedResolvedThreads = New-V4FixtureDocuments; $fabricatedResolvedThreads.Evidence.lanes[0].identity.acquisition.threading.resolved_n_threads = 8
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $fabricatedResolvedThreads 'v4-fabricated-resolved-threads')) 'V4 fabricated resolved thread count' 'resolved n_threads must be null'
+    $nondefaultThreadRequest = New-V4FixtureDocuments; $nondefaultThreadRequest.Evidence.lanes[0].identity.acquisition.threading.requested_n_threads = 1
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $nondefaultThreadRequest 'v4-nondefault-requested-threads')) 'V4 nondefault requested thread count' 'bounded JSON integer'
+    $v4LegacyDedicatedIdentity = New-V4FixtureDocuments; $v4LegacyDedicatedIdentity.Evidence.lanes[0].identity.device.memory_model = 'dedicated_vram'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $v4LegacyDedicatedIdentity 'v4-legacy-dedicated-identity-memory-model')) 'V4 legacy dedicated identity memory model' 'must be windows_local_non_local_segments'
+    $v4LegacySharedIdentity = New-V4FixtureDocuments; $v4LegacySharedIdentity.Evidence.lanes[0].identity.device.memory_model = 'shared_host_memory'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $v4LegacySharedIdentity 'v4-legacy-shared-identity-memory-model')) 'V4 legacy shared identity memory model' 'must be windows_local_non_local_segments'
+    $v3SegmentIdentity = New-V3FixtureDocuments; $v3SegmentIdentity.Evidence.lanes[0].identity.device.memory_model = 'windows_local_non_local_segments'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $v3SegmentIdentity 'v3-v4-identity-memory-model')) 'V3 V4 identity memory model' 'does not match its class'
+
+    # Raw provider readings and Windows segment counters are typed observations,
+    # not interchangeable admission values.
+    $rawZero = New-V4FixtureDocuments
+    foreach ($block in @($rawZero.Evidence.lanes[0], $rawZero.Evidence.lanes[0].battery)) {
+        foreach ($mode in @('cold', 'warm')) { foreach ($run in @($block.run_sets[$mode].gpu)) { $run.provider_memory.before.provider_reported_memory_free_bytes = [Int64]0; $run.provider_memory.after.provider_reported_memory_free_bytes = [Int64]0 } }
+    }
+    $rawZeroResult = Invoke-PassingFixture $rawZero 'v4-raw-provider-zero' 139
+    Assert-True ($rawZeroResult.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000 -and (Get-CanonicalDigest $rawZeroResult.Decision.lanes[0].checks) -ceq (Get-CanonicalDigest $normalLane.checks)) 'V4 raw provider zero changed its separate admission floor or checks.'
+    $rawUnavailable = New-V4FixtureDocuments
+    $rawUnavailable.Evidence.lanes[0].run_sets.warm.gpu[0].provider_memory = [ordered]@{
+        before = [ordered]@{ reason = 'provider_query_failed'; status = 'unavailable' }
+        after = [ordered]@{ reason = 'memory_total_unreported'; status = 'unavailable' }
+    }
+    $rawUnavailableResult = Invoke-PassingFixture $rawUnavailable 'v4-raw-provider-unavailable' 139
+    Assert-True ($rawUnavailableResult.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000 -and (Get-CanonicalDigest $rawUnavailableResult.Decision.lanes[0].checks) -ceq (Get-CanonicalDigest $normalLane.checks)) 'V4 unavailable raw provider observations changed admission evidence.'
+    $scenarioMemory = New-V4FixtureDocuments
+    @($scenarioMemory.Evidence.lanes[0].scenarios | Where-Object scenario -ceq 'clean_installer')[0].available_device_memory_bytes = [Int64]7000000000
+    $scenarioMemoryResult = Invoke-PassingFixture $scenarioMemory 'v4-scenario-memory-separate' 139
+    Assert-True ($scenarioMemoryResult.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000 -and (Get-CanonicalDigest $scenarioMemoryResult.Decision.lanes[0].checks) -ceq (Get-CanonicalDigest $normalLane.checks)) 'V4 scenario admission improperly changed the run-derived memory floor or checks.'
+
+    # V4 retains v3's conservative max(per-power minima), but derives each
+    # minimum only from successful GPU-run admission-before observations.
+    $asymmetricMemory = New-V4FixtureDocuments
+    $asymmetricLane = $asymmetricMemory.Evidence.lanes[0]
+    foreach ($mode in @('cold', 'warm')) {
+        foreach ($run in @($asymmetricLane.run_sets[$mode].gpu)) {
+            $run.available_device_memory_bytes_before = [Int64]8000000000
+            $run.available_device_memory_bytes_after = [Int64]8500000000
+        }
+        foreach ($run in @($asymmetricLane.battery.run_sets[$mode].gpu)) {
+            $run.available_device_memory_bytes_before = [Int64]9000000000
+            $run.available_device_memory_bytes_after = [Int64]8500000000
+        }
+    }
+    $asymmetricLane.identity.device.qualified_minimum_available_memory_bytes = [Int64]9000000000
+    $asymmetricDecision = (Invoke-PassingFixture $asymmetricMemory 'v4-asymmetric-run-admission-floor' 139).Decision
+    $asymmetricFloor = $asymmetricDecision.lanes[0].evidence_memory_floor
+    Assert-True ($asymmetricFloor.per_power_minimum_available_memory_bytes.ac -eq 8000000000 -and $asymmetricFloor.per_power_minimum_available_memory_bytes.battery -eq 9000000000 -and $asymmetricFloor.common_minimum_available_memory_bytes -eq 9000000000 -and $asymmetricDecision.lanes[0].auto_entry_projection.minimum_available_memory_bytes -eq 9000000000) 'V4 run admission floor did not retain max(per-power minima) or its projection.'
+    $lowerDeclaredFloor = Copy-Document $asymmetricMemory
+    $lowerDeclaredFloor.Evidence.lanes[0].identity.device.qualified_minimum_available_memory_bytes = [Int64]8000000000
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $lowerDeclaredFloor 'v4-lower-declared-run-admission-floor')) 'V4 lower declared conservative run-admission floor' 'conservative maximum'
+
+    # A successful GPU request must provide the bounded pair as a pair. A
+    # missing pair yields an ineligible decision instead of borrowing scenario,
+    # raw-provider, or segment data.
+    $oneMissingAcAdmission = New-V4FixtureDocuments
+    $oneMissingAcAdmission.Evidence.lanes[0].run_sets.warm.gpu[0].available_device_memory_bytes_before = $null
+    $oneMissingAcAdmission.Evidence.lanes[0].run_sets.warm.gpu[0].available_device_memory_bytes_after = $null
+    $oneMissingAcDecision = Invoke-FailingFixture $oneMissingAcAdmission 'v4-one-missing-ac-admission' 'ac_available_memory_admission_inputs_missing'
+    Assert-True ($null -eq $oneMissingAcDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -and $null -eq $oneMissingAcDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -and $oneMissingAcDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery -eq 9000000000 -and $null -eq $oneMissingAcDecision.lanes[0].auto_entry_projection) 'V4 one missing AC admission pair did not suppress the affected/common floor and projection.'
+    $missingAcAdmission = New-V4FixtureDocuments
+    foreach ($mode in @('cold', 'warm')) { foreach ($run in @($missingAcAdmission.Evidence.lanes[0].run_sets[$mode].gpu)) { $run.available_device_memory_bytes_before = $null; $run.available_device_memory_bytes_after = $null } }
+    $missingAcDecision = Invoke-FailingFixture $missingAcAdmission 'v4-missing-ac-admission' 'ac_available_memory_admission_inputs_missing'
+    Assert-True ($null -eq $missingAcDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -and $null -eq $missingAcDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -and $missingAcDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery -eq 9000000000 -and $null -eq $missingAcDecision.lanes[0].auto_entry_projection) 'V4 missing AC admission did not suppress its common floor and projection.'
+    $missingBatteryAdmission = New-V4FixtureDocuments
+    foreach ($mode in @('cold', 'warm')) { foreach ($run in @($missingBatteryAdmission.Evidence.lanes[0].battery.run_sets[$mode].gpu)) { $run.available_device_memory_bytes_before = $null; $run.available_device_memory_bytes_after = $null } }
+    $missingBatteryDecision = Invoke-FailingFixture $missingBatteryAdmission 'v4-missing-battery-admission' 'battery_available_memory_admission_inputs_missing'
+    Assert-True ($null -eq $missingBatteryDecision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -and $missingBatteryDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -eq 9000000000 -and $null -eq $missingBatteryDecision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.battery) 'V4 missing battery admission did not retain only its independent AC diagnostic floor.'
+    $oneSidedAdmission = New-V4FixtureDocuments; $oneSidedAdmission.Evidence.lanes[0].run_sets.warm.gpu[0].available_device_memory_bytes_after = $null
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $oneSidedAdmission 'v4-one-sided-admission')) 'V4 one-sided admission pair' 'must both be numeric or both be null'
+
+    # V4 is a new exact shape: legacy peaks cannot be added, and old schemas
+    # cannot accept the v4 sampled-observation fields by relabeling them.
+    $legacyAlias = New-V4FixtureDocuments; $legacyAlias.Evidence.lanes[0].run_sets.warm.gpu[0].peak_vram_bytes = [Int64]0
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $legacyAlias 'v4-legacy-peak-alias')) 'V4 legacy dedicated/shared peak alias' 'unexpected or missing fields'
+    $legacySharedAlias = New-V4FixtureDocuments; $legacySharedAlias.Evidence.lanes[0].run_sets.warm.gpu[0].peak_shared_device_memory_bytes = [Int64]0
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $legacySharedAlias 'v4-legacy-shared-peak-alias')) 'V4 legacy shared-memory peak alias' 'unexpected or missing fields'
+    $v3WithV4Run = New-V3FixtureDocuments; ConvertTo-PerformanceRun $v3WithV4Run.Evidence.lanes[0].run_sets.warm.gpu[0] $v3WithV4Run.Evidence.lanes[0].identity 'gpu'
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $v3WithV4Run 'v3-v4-run-relabel')) 'V3 relabeled V4 run' 'unexpected or missing fields'
+    $wrongVersion = New-V4FixtureDocuments; $wrongVersion.Evidence.schema_version = 3
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $wrongVersion 'v4-wrong-evidence-version')) 'V4 plan/evidence version mismatch' 'schema versions differ'
+
+    # Rebinding must fail before a diagnostic/unsigned observer can become a
+    # qualification lane. The helper signs first; all mutations happen after
+    # that binding and are never auto-resigned.
+    $unsignedObserver = New-Bundle (New-V4FixtureDocuments) 'v4-unsigned-observer-relabel'
+    $unsignedObserver.Documents.Evidence.kind = 'windows_gpu_capture_observation'
+    $unsignedObserver.Documents.Evidence.lanes[0].unsigned = $true
+    Rewrite-BundleEvidence $unsignedObserver
+    Assert-Rejected (Invoke-Evaluator $unsignedObserver) 'V4 unsigned observer report relabel' 'evidence kind is unsupported'
+    $missingAttestation = New-Bundle (New-V4FixtureDocuments) 'v4-missing-lane-attestation'
+    $missingAttestation.Documents.Evidence.lanes[0].Remove('attestation')
+    Rewrite-BundleEvidence $missingAttestation
+    Assert-Rejected (Invoke-Evaluator $missingAttestation) 'V4 missing lane attestation' 'unexpected or missing fields'
+    $staleScenario = New-Bundle (New-V4FixtureDocuments) 'v4-stale-scenario-attestation'
+    @($staleScenario.Documents.Evidence.lanes[0].scenarios | Where-Object scenario -ceq 'clean_installer')[0].available_device_memory_bytes = [Int64]7000000000
+    Rewrite-BundleEvidence $staleScenario
+    Assert-Rejected (Invoke-Evaluator $staleScenario) 'V4 stale scenario attestation' 'attestation record does not bind'
+    $inventoryTamper = New-Bundle (New-V4FixtureDocuments) 'v4-inventory-tamper'
+    $inventoryTamperPath = $inventoryTamper.Documents.Evidence.lanes[0].run_sets.warm.gpu[0].artifact_path
+    [IO.File]::WriteAllText((Join-Path $inventoryTamper.ArtifactRoot ($inventoryTamperPath.Replace('/', '\'))), 'tampered', $Utf8)
+    Assert-Rejected (Invoke-Evaluator $inventoryTamper) 'V4 signed inventory artifact tamper' 'digest does not match'
+    $crossPowerScenario = New-V4FixtureDocuments
+    $batteryScenario = @($crossPowerScenario.Evidence.lanes[0].scenarios | Where-Object scenario -ceq 'power_battery')[0]
+    $batteryScenario.selected_capture_sha256 = Get-CanonicalDigest (Get-RecordWithoutArtifact @($crossPowerScenario.Evidence.lanes[0].captures | Where-Object { $_.generation -like '*:warm:gpu' })[0])
+    Assert-Rejected (Invoke-Evaluator (New-Bundle $crossPowerScenario 'v4-cross-power-scenario-capture')) 'V4 battery scenario borrowed AC capture' 'matching power acquisition'
+
+    # Correctness, reliability, and p95 remain independent hard gates.
+    $parity = New-V4FixtureDocuments; $parity.Evidence.lanes[0].run_sets.warm.gpu[0].transcript_sha256 = Get-Digest 'v4-wrong-transcript'
+    $null = Invoke-FailingFixture $parity 'v4-parity' 'ac_correctness_not_equivalent'
+    $slow = New-V4FixtureDocuments; foreach ($run in @($slow.Evidence.lanes[0].run_sets.warm.gpu)) { $run.end_to_end_ms = 111; $run.backend_ms = 101 }
+    $null = Invoke-FailingFixture $slow 'v4-slow' 'ac_gpu_p95_exceeds_cpu_boundary'
+    $unreliable = New-V4FixtureDocuments; Set-RunFailure $unreliable.Evidence.lanes[0].run_sets.warm.gpu[0] 'provider_error'
+    $null = Invoke-FailingFixture $unreliable 'v4-unreliable' 'ac_reliability_not_equivalent'
+    return 3
+}
+
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-windows-gpu-qualification-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($TestRoot) | Out-Null
 try {
@@ -873,6 +1032,12 @@ try {
     Assert-True ([IO.File]::ReadAllText($AutoManifestPath, $Utf8) -ceq $ExpectedAuto) 'Windows Auto manifest is not exact default deny.'
     Assert-True ([IO.File]::ReadAllText($AuthorityPath, $Utf8) -ceq $ExpectedAuthority) 'Windows qualification authority is not exact empty schema v2.'
     Assert-True ([IO.File]::ReadAllText($PerformanceAuthorityPath, $Utf8) -ceq $ExpectedPerformanceAuthority) 'Windows performance authority is not exact empty schema v1.'
+    if ($V4Only) {
+        $v4PositiveCaseCount = Invoke-V4ContractTests
+        Assert-True ($v4PositiveCaseCount -eq 3) 'V4 focused suite did not discover every required positive final-installer case.'
+        Write-Output "Windows GPU qualification schema-v4 focused contract tests passed ($v4PositiveCaseCount positive cases)."
+        return
+    }
     $performanceSmoke = Invoke-PassingPerformanceFixture (New-PerformanceDocuments 'integrated_gpu') 'performance-integrated-smoke' 128
     Assert-True ($performanceSmoke.Decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) 'Performance smoke did not derive its memory floor exclusively from successful GPU starts.'
     $invalidPerformanceSignature = New-Bundle (New-PerformanceDocuments 'integrated_gpu') 'performance-invalid-authorization-signature'
@@ -1221,6 +1386,9 @@ try {
     $null = Invoke-PassingFixture $v3IntelDocuments 'v3-integrated-intel-vulkan' 139
     $v3ProductionRelabel = New-V3FixtureDocuments; $v3ProductionRelabel.Plan.fixture_only = $false; $v3ProductionRelabel.Plan.capture_authority.Remove('fixture_capture_public_key_spki_base64'); $v3ProductionRelabel.Evidence.fixture_only = $false
     Assert-Rejected (Invoke-Evaluator (New-Bundle $v3ProductionRelabel 'v3-fixture-production-relabel') $false) 'V3 fixture relabeled production' 'not approved by the protected production authority'
+
+    $v4PositiveCaseCount = Invoke-V4ContractTests
+    Assert-True ($v4PositiveCaseCount -eq 3) 'V4 focused suite did not discover every required positive final-installer case.'
 
     # Strict schema separation and required/null paired-power shapes.
     $mixedSchema = New-V3FixtureDocuments; $mixedSchema.Evidence.schema_version = 2
