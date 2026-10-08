@@ -344,8 +344,8 @@ impl FrozenWorkerPolicy {
     }
 }
 
-fn compiled_policy() -> Option<FrozenWorkerPolicy> {
-    FrozenWorkerPolicy::parse(COMPILED_WINDOWS_X64_POLICY)
+fn compiled_policy() -> Result<FrozenWorkerPolicy, ()> {
+    FrozenWorkerPolicy::parse(COMPILED_WINDOWS_X64_POLICY).ok_or(())
 }
 
 #[cfg(test)]
@@ -370,7 +370,7 @@ pub(crate) fn approve_compiled_cpu_worker(
     if !cfg!(all(windows, target_arch = "x86_64")) {
         return None;
     }
-    compiled_policy()?.approve_cpu(candidate)
+    compiled_policy().ok()?.approve_cpu(candidate)
 }
 
 pub(crate) fn approve_compiled_gpu_worker(
@@ -383,7 +383,129 @@ pub(crate) fn approve_compiled_gpu_worker(
     if !cfg!(all(windows, target_arch = "x86_64")) {
         return None;
     }
-    compiled_policy()?.approve_gpu(candidate)
+    compiled_policy().ok()?.approve_gpu(candidate)
+}
+
+/// The fixed, non-caller-controlled CPU-worker expectation compiled into the
+/// desktop. A strict same-source expectation describes the desktop's own
+/// build identity; it cannot attest the origin of arbitrary bytes that merely
+/// match the embedded hash anchor.
+#[allow(
+    dead_code,
+    reason = "the bounded admission report is consumed only by the desktop executable"
+)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct FrozenCpuWorkerAdmissionReport {
+    pub(crate) schema_version: u8,
+    pub(crate) desktop_build_id: String,
+    pub(crate) bundled_worker_sha256: String,
+    pub(crate) protocol_version: u8,
+    pub(crate) worker_abi_version: u16,
+    pub(crate) worker_origin_app_build: String,
+    pub(crate) worker_build_id: String,
+    pub(crate) admission_kind: FrozenCpuWorkerAdmissionKind,
+}
+
+#[allow(
+    dead_code,
+    reason = "the bounded admission report is consumed only by the desktop executable"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FrozenCpuWorkerAdmissionKind {
+    StrictLegacySameSource,
+    CompiledForeignApproval,
+}
+
+#[allow(
+    dead_code,
+    reason = "the bounded admission report is consumed only by the desktop executable"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrozenCpuWorkerAdmissionError {
+    UnsupportedPlatform,
+    MissingOrMalformedAnchor,
+    MalformedCompiledPolicy,
+}
+
+/// Resolves the immutable CPU-worker expectation exclusively from the
+/// desktop's compiled hash anchor and compatibility map. There are no policy,
+/// path, build-ID, or hash inputs from the command line.
+#[allow(
+    dead_code,
+    reason = "the bounded admission report is consumed only by the desktop executable"
+)]
+fn cpu_worker_admission_report_from_policy(
+    policy: &FrozenWorkerPolicy,
+    bundled_worker_sha256: &str,
+    desktop_build_id: &str,
+    worker_build_id: &str,
+    protocol_version: u8,
+    worker_abi_version: u16,
+) -> FrozenCpuWorkerAdmissionReport {
+    let candidate = FrozenCpuWorkerCandidate {
+        worker_sha256: bundled_worker_sha256,
+        protocol_version,
+        runtime_abi_version: worker_abi_version,
+    };
+    let foreign_approval = policy
+        .approve_cpu(&candidate)
+        .filter(|approval| approval.context().origin_app_build != desktop_build_id);
+    let (worker_origin_app_build, worker_build_id, admission_kind) = match foreign_approval {
+        Some(approval) => (
+            approval.context().origin_app_build,
+            approval.worker_build().to_owned(),
+            FrozenCpuWorkerAdmissionKind::CompiledForeignApproval,
+        ),
+        None => (
+            desktop_build_id.to_owned(),
+            worker_build_id.to_owned(),
+            FrozenCpuWorkerAdmissionKind::StrictLegacySameSource,
+        ),
+    };
+    FrozenCpuWorkerAdmissionReport {
+        schema_version: 1,
+        desktop_build_id: desktop_build_id.to_owned(),
+        bundled_worker_sha256: bundled_worker_sha256.to_owned(),
+        protocol_version,
+        worker_abi_version,
+        worker_origin_app_build,
+        worker_build_id,
+        admission_kind,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the bounded admission report is consumed only by the desktop executable"
+)]
+pub(crate) fn compiled_cpu_worker_admission_report(
+    bundled_worker_sha256: Option<&str>,
+    desktop_build_id: &str,
+    worker_build_id: &str,
+    protocol_version: u8,
+    worker_abi_version: u16,
+) -> Result<FrozenCpuWorkerAdmissionReport, FrozenCpuWorkerAdmissionError> {
+    if !cfg!(all(windows, target_arch = "x86_64")) {
+        return Err(FrozenCpuWorkerAdmissionError::UnsupportedPlatform);
+    }
+    let Some(bundled_worker_sha256) = bundled_worker_sha256 else {
+        return Err(FrozenCpuWorkerAdmissionError::MissingOrMalformedAnchor);
+    };
+    if !is_canonical_sha256(bundled_worker_sha256) {
+        return Err(FrozenCpuWorkerAdmissionError::MissingOrMalformedAnchor);
+    }
+
+    let policy =
+        compiled_policy().map_err(|_| FrozenCpuWorkerAdmissionError::MalformedCompiledPolicy)?;
+    Ok(cpu_worker_admission_report_from_policy(
+        &policy,
+        bundled_worker_sha256,
+        desktop_build_id,
+        worker_build_id,
+        protocol_version,
+        worker_abi_version,
+    ))
 }
 
 pub(crate) fn is_valid_build_identity(value: &str) -> bool {
@@ -577,7 +699,7 @@ mod tests {
     #[test]
     fn compiled_empty_policy_denies_foreign_workers() {
         let hash = "11".repeat(32);
-        assert!(compiled_policy().is_some());
+        assert!(compiled_policy().is_ok());
         assert!(
             compiled_policy()
                 .unwrap()
@@ -587,6 +709,89 @@ mod tests {
                     runtime_abi_version: 1,
                 })
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn compiled_cpu_admission_uses_strict_same_source_expectation_without_an_approval() {
+        let desktop = "local-transcriber@0.1.0#desktop";
+        let worker = "scribe-inference-worker@0.1.0#desktop";
+        let report = cpu_worker_admission_report_from_policy(
+            &compiled_policy().unwrap(),
+            &"11".repeat(32),
+            desktop,
+            worker,
+            5,
+            1,
+        );
+        assert_eq!(report.desktop_build_id, desktop);
+        assert_eq!(report.worker_origin_app_build, desktop);
+        assert_eq!(report.worker_build_id, worker);
+        assert_eq!(
+            report.admission_kind,
+            FrozenCpuWorkerAdmissionKind::StrictLegacySameSource
+        );
+    }
+
+    #[test]
+    fn compiled_cpu_admission_reports_the_exact_test_compiled_foreign_approval() {
+        let hash = "11".repeat(32);
+        let report = cpu_worker_admission_report_from_policy(
+            &FrozenWorkerPolicy::parse(&cpu_policy()).unwrap(),
+            &hash,
+            "local-transcriber@0.1.0#desktop",
+            "scribe-inference-worker@0.1.0#desktop",
+            5,
+            1,
+        );
+        assert_eq!(
+            report.worker_origin_app_build,
+            "local-transcriber@0.1.0#origin"
+        );
+        assert_eq!(
+            report.worker_build_id,
+            "scribe-inference-worker@0.1.0#origin"
+        );
+        assert_eq!(
+            report.admission_kind,
+            FrozenCpuWorkerAdmissionKind::CompiledForeignApproval
+        );
+    }
+
+    #[test]
+    fn compiled_cpu_admission_reports_unsupported_platform_or_rejects_bad_anchors() {
+        if !cfg!(all(windows, target_arch = "x86_64")) {
+            assert_eq!(
+                compiled_cpu_worker_admission_report(
+                    Some(&"11".repeat(32)),
+                    "local-transcriber@0.1.0#desktop",
+                    "scribe-inference-worker@0.1.0#desktop",
+                    5,
+                    1,
+                ),
+                Err(FrozenCpuWorkerAdmissionError::UnsupportedPlatform)
+            );
+            return;
+        }
+        assert_eq!(
+            compiled_cpu_worker_admission_report(
+                None,
+                "local-transcriber@0.1.0#desktop",
+                "scribe-inference-worker@0.1.0#desktop",
+                5,
+                1,
+            ),
+            Err(FrozenCpuWorkerAdmissionError::MissingOrMalformedAnchor)
+        );
+        assert_eq!(
+            compiled_cpu_worker_admission_report(
+                Some("not-a-digest"),
+                "local-transcriber@0.1.0#desktop",
+                "scribe-inference-worker@0.1.0#desktop",
+                5,
+                1,
+            ),
+            Err(FrozenCpuWorkerAdmissionError::MissingOrMalformedAnchor)
         );
     }
 

@@ -161,10 +161,79 @@ enum LinuxDisplayBackend {
     Wayland,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrozenWorkerAdmissionCommand {
+    Absent,
+    Exact,
+    Invalid,
+}
+
+fn frozen_worker_admission_command(
+    arguments: &[std::ffi::OsString],
+) -> FrozenWorkerAdmissionCommand {
+    const COMMAND: &str = "--scribe-frozen-worker-admission";
+    let command_count = arguments
+        .iter()
+        .filter(|argument| argument.as_os_str() == std::ffi::OsStr::new(COMMAND))
+        .count();
+    if command_count == 0 {
+        FrozenWorkerAdmissionCommand::Absent
+    } else if command_count != 1 || arguments.len() != 1 {
+        FrozenWorkerAdmissionCommand::Invalid
+    } else {
+        FrozenWorkerAdmissionCommand::Exact
+    }
+}
+
+fn maybe_run_frozen_worker_admission() -> Option<i32> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match frozen_worker_admission_command(&arguments) {
+        FrozenWorkerAdmissionCommand::Absent => return None,
+        FrozenWorkerAdmissionCommand::Invalid => {
+            eprintln!("Frozen worker admission accepts exactly one command argument.");
+            return Some(2);
+        }
+        FrozenWorkerAdmissionCommand::Exact => {}
+    }
+    match worker_compatibility::compiled_cpu_worker_admission_report(
+        option_env!("SCRIBE_BUNDLED_WORKER_SHA256"),
+        worker_identity::DESKTOP_BUILD_ID,
+        worker_identity::INFERENCE_WORKER_BUILD_ID,
+        worker_identity::PROTOCOL_VERSION,
+        worker_identity::WORKER_ABI_VERSION,
+    ) {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(serialized) => {
+                println!("{serialized}");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("Frozen worker admission report serialization failed: {error}");
+                Some(2)
+            }
+        },
+        Err(worker_compatibility::FrozenCpuWorkerAdmissionError::UnsupportedPlatform) => {
+            eprintln!("Frozen worker admission is unsupported on this platform.");
+            Some(2)
+        }
+        Err(worker_compatibility::FrozenCpuWorkerAdmissionError::MissingOrMalformedAnchor) => {
+            eprintln!("Frozen worker admission requires a compiled CPU worker SHA-256 anchor.");
+            Some(2)
+        }
+        Err(worker_compatibility::FrozenCpuWorkerAdmissionError::MalformedCompiledPolicy) => {
+            eprintln!("Frozen worker admission found a malformed compiled compatibility policy.");
+            Some(2)
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     if let Err(error) = onnx_worker::harden_windows_dll_search() {
         eprintln!("Scribe could not harden native library loading: {error:#}");
         std::process::exit(1);
+    }
+    if let Some(exit_code) = maybe_run_frozen_worker_admission() {
+        std::process::exit(exit_code);
     }
     #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
     if std::env::args_os().skip(1).any(|arg| {
@@ -439,6 +508,44 @@ fn print_linux_display_help(_err: &eframe::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admission_arguments(values: &[&str]) -> Vec<std::ffi::OsString> {
+        values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn frozen_worker_admission_command_is_absent_without_its_flag() {
+        assert_eq!(
+            frozen_worker_admission_command(&admission_arguments(&["--other-command"])),
+            FrozenWorkerAdmissionCommand::Absent
+        );
+    }
+
+    #[test]
+    fn frozen_worker_admission_command_accepts_only_its_exact_flag() {
+        assert_eq!(
+            frozen_worker_admission_command(&admission_arguments(&[
+                "--scribe-frozen-worker-admission"
+            ])),
+            FrozenWorkerAdmissionCommand::Exact
+        );
+    }
+
+    #[test]
+    fn frozen_worker_admission_command_rejects_duplicates_and_extra_arguments() {
+        for arguments in [
+            admission_arguments(&[
+                "--scribe-frozen-worker-admission",
+                "--scribe-frozen-worker-admission",
+            ]),
+            admission_arguments(&["--scribe-frozen-worker-admission", "--unexpected"]),
+        ] {
+            assert_eq!(
+                frozen_worker_admission_command(&arguments),
+                FrozenWorkerAdmissionCommand::Invalid
+            );
+        }
+    }
 
     #[test]
     fn native_window_is_resizable_and_minimum_sized() {
