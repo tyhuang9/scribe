@@ -144,6 +144,18 @@ bounded, ordered heap inventory records index, flags, size, budget and usage.
 `device_local_heaps` selects device-local heaps for discrete devices.
 Other device classes and unsupported or ambiguous mappings remain unavailable.
 
+These are single-physical-device observations. The pinned native provider
+creates a singleton logical device without `VkDeviceGroupDeviceCreateInfo`.
+`VK_MEMORY_HEAP_MULTI_INSTANCE_BIT` describes a heap's behavior when a logical
+device represents multiple physical devices; its presence alone does not mean
+Scribe uses such a device group. Preserve this capability bit in the inventory
+and apply the same heap-selection rules without aggregating other physical
+devices. Malformed LUID node masks and unknown heap flag bits remain rejected.
+Future native device-group allocation requires a separate scope review. See
+the Vulkan contracts for
+[heap flags](https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryHeapFlagBits.html)
+and [logical-device groups](https://docs.vulkan.org/refpages/latest/refpages/source/VkDeviceGroupDeviceCreateInfo.html).
+
 Headroom is the checked sum of `max(budget - usage, 0)` for the selected
 heaps. Usage at or above budget yields zero headroom while preserving both
 original counters. Active heap budgets must be positive and no larger than

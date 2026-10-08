@@ -1066,7 +1066,6 @@ impl WorkerMemoryAvailability {
                     if usize::from(heap.heap_index) != index
                         || heap.size_bytes == 0
                         || heap.flags & !0b11 != 0
-                        || heap.flags & 0b10 != 0
                         || heap.budget_bytes == 0
                         || heap.budget_bytes > heap.size_bytes
                     {
@@ -1846,7 +1845,7 @@ struct VulkanMemoryDeviceSnapshot {
     stable_device_identity: Option<String>,
     pci_location: Option<(u32, u32, u32)>,
     device_class: DeviceClass,
-    linked_nodes: bool,
+    invalid_luid_node_mask: bool,
     memory_budget_supported: bool,
     heaps: Vec<VulkanMemoryHeapObservation>,
     unused_budget_or_usage_nonzero: bool,
@@ -1889,7 +1888,10 @@ fn derive_vulkan_memory_availability(
             },
         };
     };
-    if snapshot.linked_nodes || snapshot.heaps.iter().any(|heap| heap.flags & 0b10 != 0) {
+    // The pinned inference backend creates a singleton logical device. A heap's
+    // MULTI_INSTANCE capability does not make this per-physical-device query a
+    // device-group aggregate. Keep rejecting malformed OS identity metadata.
+    if snapshot.invalid_luid_node_mask {
         return WorkerMemoryAvailability::Unavailable {
             reason: WorkerMemoryUnavailableReason::MultiInstanceUnsupported,
         };
@@ -2055,7 +2057,9 @@ fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> 
             } else {
                 None
             };
-        let linked_nodes =
+        // A valid LUID's mask identifies one node, even on a linked adapter;
+        // it is not the number of physical devices used by a logical device.
+        let invalid_luid_node_mask =
             id.device_luid_valid == vk::TRUE && id.device_node_mask.count_ones() != 1;
         let pci_location = pci_bus_info_supported.then(|| {
             bounded_vulkan_pci_location(
@@ -2108,7 +2112,7 @@ fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> 
             stable_device_identity,
             pci_location,
             device_class,
-            linked_nodes,
+            invalid_luid_node_mask,
             memory_budget_supported,
             heaps,
             unused_budget_or_usage_nonzero,
@@ -20231,7 +20235,7 @@ mod tests {
             stable_device_identity: Some(stable_device_identity.to_owned()),
             pci_location: None,
             device_class,
-            linked_nodes: false,
+            invalid_luid_node_mask: false,
             memory_budget_supported: true,
             heaps,
             unused_budget_or_usage_nonzero: false,
@@ -20325,6 +20329,69 @@ mod tests {
             }
         ));
         exhausted.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn capture_observation_vulkan_memory_budget_preserves_single_device_multi_instance_heaps() {
+        let luid = "native:luid:0102030405060708";
+        let uuid = "native:uuid:00112233445566778899aabbccddeeff";
+        for (native_identity, selected_identity, pci_location) in [
+            (luid, luid, None),
+            (uuid, uuid, None),
+            (luid, "native:0000:01:00.0", Some((1, 0, 0))),
+        ] {
+            for (device_class, heap_selection, total) in [
+                (
+                    DeviceClass::IntegratedGpu,
+                    VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                    300,
+                ),
+                (
+                    DeviceClass::DiscreteGpu,
+                    VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                    200,
+                ),
+            ] {
+                let heaps = vec![
+                    vulkan_heap(0, 100, 0b10, 80, 90),
+                    vulkan_heap(1, 200, 0b11, 180, 20),
+                ];
+                let mut snapshot =
+                    vulkan_memory_snapshot(native_identity, device_class, heaps.clone());
+                snapshot.pci_location = pci_location;
+                let availability = derive_vulkan_memory_availability(
+                    &[snapshot],
+                    "transcribe-cpp-ggml-vulkan",
+                    selected_identity,
+                    device_class,
+                );
+                match &availability {
+                    WorkerMemoryAvailability::Observed {
+                        stable_device,
+                        memory_total_bytes,
+                        available_memory_bytes,
+                        source:
+                            WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                                heap_selection: actual_selection,
+                                heaps: actual_heaps,
+                            },
+                        ..
+                    } => {
+                        assert_eq!(stable_device, selected_identity);
+                        assert_eq!(*memory_total_bytes, total);
+                        assert_eq!(*available_memory_bytes, 160);
+                        assert_eq!(*actual_selection, heap_selection);
+                        assert_eq!(*actual_heaps, heaps);
+                    }
+                    other => panic!("expected singleton heap observation, got {other:?}"),
+                }
+                availability.validate_shape().unwrap();
+                let encoded = serde_json::to_vec(&availability).unwrap();
+                let decoded: WorkerMemoryAvailability = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(decoded, availability);
+                decoded.validate_shape().unwrap();
+            }
+        }
     }
 
     #[test]
@@ -20573,16 +20640,10 @@ mod tests {
             unavailable_reason(wrong_class),
             WorkerMemoryUnavailableReason::MemoryBudgetInvalid
         );
-        let mut linked_nodes = selected();
-        linked_nodes.linked_nodes = true;
+        let mut invalid_node_mask = selected();
+        invalid_node_mask.invalid_luid_node_mask = true;
         assert_eq!(
-            unavailable_reason(linked_nodes),
-            WorkerMemoryUnavailableReason::MultiInstanceUnsupported
-        );
-        let mut multi_instance_heap = selected();
-        multi_instance_heap.heaps[0].flags = 0b11;
-        assert_eq!(
-            unavailable_reason(multi_instance_heap),
+            unavailable_reason(invalid_node_mask),
             WorkerMemoryUnavailableReason::MultiInstanceUnsupported
         );
     }
@@ -20624,18 +20685,20 @@ mod tests {
             unavailable_reason(&[missing_extension], stable),
             WorkerMemoryUnavailableReason::MemoryBudgetExtensionUnavailable
         );
-        let mut linked = valid.clone();
-        linked.linked_nodes = true;
+        let mut invalid_node_mask = valid.clone();
+        invalid_node_mask.invalid_luid_node_mask = true;
         assert_eq!(
-            unavailable_reason(&[linked], stable),
+            unavailable_reason(&[invalid_node_mask], stable),
             WorkerMemoryUnavailableReason::MultiInstanceUnsupported
         );
-        let mut multi_instance = valid.clone();
-        multi_instance.heaps[0].flags = 0b11;
-        assert_eq!(
-            unavailable_reason(&[multi_instance], stable),
-            WorkerMemoryUnavailableReason::MultiInstanceUnsupported
-        );
+        for flags in [0, 0b10] {
+            let mut no_device_local_heap = valid.clone();
+            no_device_local_heap.heaps[0].flags = flags;
+            assert_eq!(
+                unavailable_reason(&[no_device_local_heap], stable),
+                WorkerMemoryUnavailableReason::MemoryBudgetInvalid
+            );
+        }
 
         let mut zero_budget = valid.clone();
         zero_budget.heaps[0].budget_bytes = 0;
@@ -20825,7 +20888,6 @@ mod tests {
             ("zero size", (0, 0, 1, 80)),
             ("zero budget", (0, 100, 1, 0)),
             ("unknown flags", (0, 100, 0b101, 80)),
-            ("multi-instance flags", (0, 100, 0b11, 80)),
         ] {
             let mut value = observed();
             let WorkerMemoryAvailability::Observed { source, .. } = &mut value else {

@@ -1131,6 +1131,26 @@ mod tests {
         validate_capture_worker_memory(&observed, AccelerationPreference::Gpu, Some(&identity))
             .unwrap();
 
+        for flags in [0b10, 0b11] {
+            let mut singleton_heap = observed.clone();
+            if let WorkerMemoryAvailability::Observed {
+                source:
+                    crate::onnx_worker::WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                        heaps, ..
+                    },
+                ..
+            } = &mut singleton_heap
+            {
+                heaps[0].flags = flags;
+            }
+            validate_capture_worker_memory(
+                &singleton_heap,
+                AccelerationPreference::Gpu,
+                Some(&identity),
+            )
+            .unwrap();
+        }
+
         let mut wrong_device = observed.clone();
         if let WorkerMemoryAvailability::Observed { stable_device, .. } = &mut wrong_device {
             *stable_device = "native:luid:ffffffffffffffff".to_owned();
