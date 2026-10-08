@@ -89,11 +89,14 @@ That bounded, no-native command takes no policy, path, hash, or build-ID input;
 its one JSON report comes from the desktop's compiled compatibility parser and
 embedded CPU digest. A malformed map, missing anchor, unsupported platform,
 extra argument, timeout, nonzero exit, or mismatch against the expected M/R
-identities rejects the bundle. With the checked-in empty map, only the strict
-same-source expectation is reported; it does not attest the origin of arbitrary
-bytes that happen to match the embedded anchor. A foreign R therefore needs an
-exact compiled approval and cannot be admitted by a PowerShell map or caller
-argument.
+identities rejects the bundle. The checked-in map admits only the exact LOCAL
+CPU/CUDA/Vulkan diagnostic cohort described in
+[GPU worker packs](GPU_WORKER_PACKS.md#frozen-windows-worker-session-compatibility).
+An empty map permits only the strict same-source expectation. Neither case
+attests the origin of arbitrary bytes that happen to match the embedded anchor.
+A foreign R still needs an exact compiled approval and cannot be admitted by a
+PowerShell map or caller argument. This local mapping does not grant production
+provenance or Auto eligibility.
 
 The freeze directory has exactly three files: the worker, its JSON record, and
 `WINDOWS-FROZEN-CPU-WORKER-LOCAL-ONLY.txt`. The record is bounded to 64 KiB and
@@ -114,8 +117,9 @@ mixed-source assembly, run the producer from retained R and the three consumers
 (`build-windows-release.ps1`, `build-windows-frozen-test-installer.ps1`, and
 `verify-windows-local-frozen-test-installer.ps1`) from M, passing
 `-FrozenCpuWorkerSourceRoot C:\ScribeLocal\retained-worker-source` to each
-consumer. The checked-in empty compatibility map rejects a different worker
-origin; this option alone cannot authorize it.
+consumer. The checked-in compatibility map rejects any different worker origin
+outside its exact LOCAL diagnostic cohort; this option alone cannot authorize
+it.
 
 ```powershell
 pwsh -NoProfile -File scripts/new-windows-frozen-cpu-worker.ps1 `
