@@ -1973,6 +1973,44 @@ fn derive_vulkan_memory_availability(
     }
 }
 
+// The parent reconciles this Hello's native total with its selected target, so
+// retain that native value verbatim. A Vulkan budget can replace only the
+// volatile availability scalar when its selected heap scope has the same
+// capacity. The helper deliberately has no native free-memory input: a failed
+// or mismatched Vulkan query must not fall back to a backend-defined raw value.
+#[cfg(any(
+    test,
+    all(windows, feature = "inference-worker", feature = "vulkan-acceleration")
+))]
+fn vulkan_hello_memory_available_bytes(
+    snapshots: Option<&[VulkanMemoryDeviceSnapshot]>,
+    provider_id: &str,
+    stable_device: &str,
+    expected_class: DeviceClass,
+    native_memory_total_bytes: u64,
+) -> u64 {
+    let Some(snapshots) = snapshots else {
+        // Query failure projects into the existing scalar Hello field as
+        // conservative unavailable-or-exhausted headroom.
+        return 0;
+    };
+    match derive_vulkan_memory_availability(snapshots, provider_id, stable_device, expected_class) {
+        WorkerMemoryAvailability::Observed {
+            memory_total_bytes,
+            available_memory_bytes,
+            source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget { .. },
+            ..
+        } if memory_total_bytes == native_memory_total_bytes => available_memory_bytes,
+        // Keep the typed unavailability reason in the observation path. The
+        // authenticated Hello has only its existing scalar availability field,
+        // for which every missing, invalid, ambiguous, or mismatched budget is
+        // conservatively zero.
+        WorkerMemoryAvailability::Observed { .. }
+        | WorkerMemoryAvailability::Unavailable { .. } => 0,
+        WorkerMemoryAvailability::NotApplicable { .. } => 0,
+    }
+}
+
 #[cfg(all(windows, feature = "vulkan-acceleration"))]
 fn collect_vulkan_memory_snapshots() -> Result<Vec<VulkanMemoryDeviceSnapshot>> {
     use ash::vk;
@@ -2595,6 +2633,13 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         .then(|| VulkanDeviceCatalog::discover(true))
         .transpose()
         .context("could not obtain Vulkan LUID/UUID identity")?;
+    #[cfg(all(windows, feature = "vulkan-acceleration"))]
+    // A worker Hello has one fresh, bounded physical-device inventory. Reuse
+    // it only for the already-resolved provider devices in this Hello; do not
+    // issue a query per device or retain it across worker launches.
+    let vulkan_memory_snapshots = (expectation.backend == WorkerProvider::Vulkan)
+        .then(collect_vulkan_memory_snapshots)
+        .and_then(Result::ok);
     #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
     if expectation.backend == WorkerProvider::Metal {
         let provider = provider_devices
@@ -2705,6 +2750,19 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
                 let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
                 (stable_device_identity, driver_version)
             };
+        let memory_available_bytes = device.memory_free.min(device.memory_total);
+        #[cfg(all(windows, feature = "vulkan-acceleration"))]
+        let memory_available_bytes = if expectation.backend == WorkerProvider::Vulkan {
+            vulkan_hello_memory_available_bytes(
+                vulkan_memory_snapshots.as_deref(),
+                &expectation.provider,
+                &stable_device_identity,
+                device_class,
+                device.memory_total,
+            )
+        } else {
+            memory_available_bytes
+        };
         devices.push(WorkerPackDeviceCapability {
             stable_device_identity,
             process_index,
@@ -2713,7 +2771,7 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
             device_class,
             vendor,
             memory_total_bytes: device.memory_total,
-            memory_available_bytes: device.memory_free.min(device.memory_total),
+            memory_available_bytes,
         });
     }
     finish_worker_pack_capability(expectation, expected_device_id, devices)
@@ -10707,25 +10765,15 @@ impl InferenceWorkerRegistry {
         })?;
         match route.supervisor.load(artifact, AccelerationPreference::Gpu) {
             Ok(mut execution) => {
-                if execution
-                    .diagnostics
-                    .resolved_acceleration
-                    .selection
-                    .is_none()
-                {
-                    execution.diagnostics.resolved_acceleration.selection =
-                        Some(BackendSelection {
-                            requested: AccelerationPreference::Gpu,
-                            reason: BackendSelectionReason::RequestedGpu,
-                            target: target.clone(),
-                            power_source: PowerSource::current(),
-                            power_policy: PowerPolicyDecision::NotApplied,
-                            qualification_policy_version: AUTO_QUALIFICATION_POLICY_VERSION,
-                            fallback_targets: Vec::new(),
-                            fallback_history: Vec::new(),
-                            skipped_targets: plan.skipped_targets.clone(),
-                        });
-                }
+                Self::project_route_diagnostics(
+                    &mut execution.diagnostics,
+                    route,
+                    AccelerationPreference::Gpu,
+                    PowerSource::current(),
+                    Vec::new(),
+                    &[],
+                    &plan.skipped_targets,
+                );
                 append_pack_diagnostic(
                     &mut execution.diagnostics.resolved_acceleration,
                     plan.diagnostic.as_deref(),
@@ -10773,36 +10821,62 @@ impl InferenceWorkerRegistry {
         }
     }
 
-    fn project_auto_route_diagnostics(
+    fn project_route_diagnostics(
         diagnostics: &mut NativeRuntimeDiagnostics,
         route: &InferenceWorkerRoute,
+        requested: AccelerationPreference,
         power_source: PowerSource,
         fallback_targets: Vec<BackendTarget>,
         fallback_history: &[BackendFallback],
         skipped_targets: &[SkippedBackend],
     ) {
-        let target = route.target.clone().unwrap_or_else(BackendTarget::cpu);
-        diagnostics.resolved_acceleration.requested = AccelerationPreference::Auto;
+        let target = if requested == AccelerationPreference::Gpu {
+            // The catalog can outlive a provider enumeration. Reconciliation
+            // restores the actual launch's remapped index and volatile facts;
+            // do not replace them with the earlier probe's target.
+            diagnostics
+                .resolved_acceleration
+                .selection
+                .as_ref()
+                .map(|selection| selection.target.clone())
+                .or_else(|| route.target.clone())
+                .unwrap_or_else(BackendTarget::cpu)
+        } else {
+            route.target.clone().unwrap_or_else(BackendTarget::cpu)
+        };
+        // Supervisor success has already reconciled the selected device with
+        // its verified launch binding. Selection context belongs to the parent:
+        // raw child discovery cannot describe its candidates or fallback chain.
+        diagnostics.resolved_acceleration.requested = requested;
         diagnostics.resolved_acceleration.selection = Some(BackendSelection {
-            requested: AccelerationPreference::Auto,
-            reason: if target.backend == BackendKind::Cpu {
-                BackendSelectionReason::AutoCpuFallback
-            } else {
-                BackendSelectionReason::AutoPriority
+            requested,
+            reason: match requested {
+                AccelerationPreference::Gpu => BackendSelectionReason::RequestedGpu,
+                AccelerationPreference::Cpu => BackendSelectionReason::RequestedCpu,
+                AccelerationPreference::Auto if target.backend == BackendKind::Cpu => {
+                    BackendSelectionReason::AutoCpuFallback
+                }
+                AccelerationPreference::Auto => BackendSelectionReason::AutoPriority,
             },
             target,
             power_source,
-            power_policy: match power_source {
-                PowerSource::Battery => PowerPolicyDecision::BatteryEfficientGpuOnly,
-                PowerSource::Unknown => PowerPolicyDecision::UnknownConservativeGpuOnly,
-                PowerSource::Ac => PowerPolicyDecision::Unrestricted,
+            power_policy: if requested == AccelerationPreference::Auto {
+                match power_source {
+                    PowerSource::Battery => PowerPolicyDecision::BatteryEfficientGpuOnly,
+                    PowerSource::Unknown => PowerPolicyDecision::UnknownConservativeGpuOnly,
+                    PowerSource::Ac => PowerPolicyDecision::Unrestricted,
+                }
+            } else {
+                PowerPolicyDecision::NotApplied
             },
             qualification_policy_version: AUTO_QUALIFICATION_POLICY_VERSION,
             fallback_targets,
             fallback_history: fallback_history.to_vec(),
             skipped_targets: skipped_targets.to_vec(),
         });
-        if let Some(evidence_id) = route.auto_evidence_id.as_deref() {
+        if requested == AccelerationPreference::Auto
+            && let Some(evidence_id) = route.auto_evidence_id.as_deref()
+        {
             let evidence = format!("Auto qualification selected release evidence {evidence_id}");
             append_pack_diagnostic(
                 &mut diagnostics.resolved_acceleration,
@@ -10876,16 +10950,20 @@ impl InferenceWorkerRegistry {
                 Self::worker_preference_for_route(route, preference),
             ) {
                 Ok(mut execution) => {
-                    if preference == AccelerationPreference::Auto {
-                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
-                            self.retain_auto_live_admission(catalog, route, &artifact)?;
-                        }
-                        Self::project_auto_route_diagnostics(
+                    if preference == AccelerationPreference::Auto
+                        && let Some(catalog) = plan.auto_live_admission.as_ref()
+                    {
+                        self.retain_auto_live_admission(catalog, route, &artifact)?;
+                    }
+                    if preference != AccelerationPreference::Cpu {
+                        Self::project_route_diagnostics(
                             &mut execution.diagnostics,
                             route,
+                            preference,
                             execution_power_source.unwrap_or_else(PowerSource::current),
                             plan.routes
                                 .iter()
+                                .take(MAX_INFERENCE_ROUTE_ATTEMPTS)
                                 .skip(route_index + 1)
                                 .filter_map(|candidate| candidate.target.clone())
                                 .collect(),
@@ -11050,16 +11128,20 @@ impl InferenceWorkerRegistry {
                 cancellation_generation,
             ) {
                 Ok(mut execution) => {
-                    if preference == AccelerationPreference::Auto {
-                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
-                            self.retain_auto_live_admission(catalog, route, &artifact)?;
-                        }
-                        Self::project_auto_route_diagnostics(
+                    if preference == AccelerationPreference::Auto
+                        && let Some(catalog) = plan.auto_live_admission.as_ref()
+                    {
+                        self.retain_auto_live_admission(catalog, route, &artifact)?;
+                    }
+                    if preference != AccelerationPreference::Cpu {
+                        Self::project_route_diagnostics(
                             &mut execution.diagnostics,
                             route,
+                            preference,
                             execution_power_source.unwrap_or_else(PowerSource::current),
                             plan.routes
                                 .iter()
+                                .take(MAX_INFERENCE_ROUTE_ATTEMPTS)
                                 .skip(route_index + 1)
                                 .filter_map(|candidate| candidate.target.clone())
                                 .collect(),
@@ -13526,6 +13608,7 @@ mod tests {
         },
         RuntimeFailureOnLoad(RuntimeError),
         RuntimeLoad,
+        RuntimeDiagnostics(Box<WireRuntimeDiagnostics>),
         RuntimeLoadThenExit,
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         RuntimeObservationWrongBefore {
@@ -14010,6 +14093,58 @@ mod tests {
                         },
                     },
                 );
+                run_normal_worker(&mut input, &mut output);
+            }
+            TestMode::RuntimeDiagnostics(diagnostics) => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                match control {
+                    Control::LoadRuntime { .. } => respond(
+                        &mut output,
+                        session_id,
+                        request_id,
+                        Control::RuntimeLoaded {
+                            execution: WireRuntimeLoadExecution {
+                                diagnostics: *diagnostics,
+                                detected_architecture: "test-runtime".to_owned(),
+                                capabilities: RuntimeCapabilities::default(),
+                            },
+                        },
+                    ),
+                    Control::BeginBatch { .. } => {
+                        respond(&mut output, session_id, request_id, Control::Ok);
+                        let (audio_session, audio_request, control) =
+                            read_parent_control(&mut input);
+                        assert!(matches!(control, Control::AudioChunk));
+                        let pcm = read_frame(&mut input).unwrap();
+                        assert_eq!(pcm.kind, FrameKind::Pcm);
+                        assert_eq!(
+                            (pcm.session_id, pcm.request_id),
+                            (audio_session, audio_request)
+                        );
+                        respond(&mut output, audio_session, audio_request, Control::Ok);
+                        let (end_session, end_request, control) = read_parent_control(&mut input);
+                        assert!(matches!(control, Control::EndBatch));
+                        assert_eq!(end_session, session_id);
+                        respond(
+                            &mut output,
+                            end_session,
+                            end_request,
+                            Control::RuntimeTranscript {
+                                execution: WireRuntimeExecution {
+                                    transcript: WireTranscript {
+                                        text: "fixture transcript".to_owned(),
+                                        segments: Vec::new(),
+                                        detected_language: None,
+                                        duration_ms: Some(1),
+                                    },
+                                    diagnostics: *diagnostics,
+                                    processing_duration_ms: 1,
+                                },
+                            },
+                        );
+                    }
+                    _ => panic!("expected runtime load or batch request"),
+                }
                 run_normal_worker(&mut input, &mut output);
             }
             TestMode::RuntimeLoadThenExit => {
@@ -16602,6 +16737,26 @@ mod tests {
         }
     }
 
+    fn diagnostics_with_child_gpu_context(mut target: BackendTarget) -> WireRuntimeDiagnostics {
+        let mut diagnostics = diagnostics_with_typed_backend_selection();
+        // Keep the deliberately child-local skips/history, but use the correct
+        // selected stable identity. Process index is not serialized on the wire.
+        target.process_index = None;
+        diagnostics.resolved_acceleration.requested = AccelerationPreference::Gpu;
+        diagnostics.resolved_acceleration.resolved = ComputeDevice::Gpu {
+            name: target.display_name.clone(),
+        };
+        let selection = diagnostics
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap();
+        selection.requested = AccelerationPreference::Gpu;
+        selection.reason = BackendSelectionReason::RequestedGpu;
+        selection.target = target;
+        diagnostics
+    }
+
     #[test]
     fn typed_backend_selection_round_trips_within_worker_wire_bounds() {
         let diagnostics = diagnostics_with_typed_backend_selection();
@@ -16995,10 +17150,28 @@ mod tests {
 
     #[test]
     fn explicit_gpu_retry_loads_only_the_exact_target_without_cpu_fallback() {
-        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let mut runtime_target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )
+        .target
+        .unwrap();
+        runtime_target.display_name = "fresh launch display name".to_owned();
+        runtime_target.memory_available_bytes -= 1024;
+        runtime_target.process_index = None;
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeDiagnostics(Box::new(
+            diagnostics_with_child_gpu_context(runtime_target.clone()),
+        ))]));
         let cpu_launcher = Arc::new(TestLauncher::new([]));
-        let (registry, target) =
+        let (registry, mut target) =
             explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        // Retained identity still matches, but non-identity facts may have
+        // changed since the user opened diagnostics. Use the fresh route.
+        target.display_name = "stale display name".to_owned();
+        target.process_index = Some(9);
+        target.memory_available_bytes = 1;
 
         let artifact = gguf_artifact_fixture("explicit-gpu-retry-success");
         let execution = registry
@@ -17009,9 +17182,13 @@ mod tests {
             .resolved_acceleration
             .selection
             .expect("exact retry should publish a typed selection");
-        assert_eq!(selection.target, target);
+        assert_eq!(selection.target, runtime_target);
         assert_eq!(selection.requested, AccelerationPreference::Gpu);
+        assert_eq!(selection.reason, BackendSelectionReason::RequestedGpu);
         assert_eq!(selection.power_policy, PowerPolicyDecision::NotApplied);
+        assert!(selection.fallback_targets.is_empty());
+        assert!(selection.fallback_history.is_empty());
+        assert!(selection.skipped_targets.is_empty());
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
         assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
     }
@@ -19027,6 +19204,78 @@ mod tests {
     }
 
     #[test]
+    fn explicit_gpu_diagnostics_replace_raw_child_context_with_verified_parent_facts() {
+        let mut route = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        route.auto_evidence_id = Some("not-selected-through-auto".to_owned());
+        let other_target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            "windows-display:32.0.16.1088",
+            'b',
+        )
+        .target
+        .unwrap();
+        let parent_skips = vec![SkippedBackend {
+            target: other_target.clone(),
+            reason: BackendSkipReason::Quarantined,
+        }];
+        let parent_history = vec![BackendFallback {
+            target: other_target,
+            category: BackendFailureCategory::OutOfMemory,
+        }];
+        let mut runtime_target = route.target.clone().unwrap();
+        runtime_target.process_index = Some(7);
+        runtime_target.display_name = "fresh launch name".to_owned();
+        runtime_target.memory_available_bytes -= 1024;
+        for power_source in [PowerSource::Ac, PowerSource::Battery, PowerSource::Unknown] {
+            let mut child_diagnostics = diagnostics_with_child_gpu_context(runtime_target.clone());
+            let child = child_diagnostics
+                .resolved_acceleration
+                .selection
+                .as_mut()
+                .unwrap();
+            child.skipped_targets[0].target.device_id = DeviceIdentity::new("derived:raw-child");
+            child.skipped_targets[0].reason = BackendSkipReason::Incompatible;
+            reconcile_verified_pack_target(
+                &mut child_diagnostics.resolved_acceleration,
+                runtime_target.clone(),
+            )
+            .expect("selected identity must be reconciled before parent projection");
+            let mut diagnostics: NativeRuntimeDiagnostics = child_diagnostics.into();
+
+            InferenceWorkerRegistry::project_route_diagnostics(
+                &mut diagnostics,
+                &route,
+                AccelerationPreference::Gpu,
+                power_source,
+                Vec::new(),
+                &parent_history,
+                &parent_skips,
+            );
+
+            assert_eq!(
+                diagnostics.resolved_acceleration.requested,
+                AccelerationPreference::Gpu
+            );
+            assert!(diagnostics.resolved_acceleration.diagnostic.is_none());
+            let selection = diagnostics.resolved_acceleration.selection.unwrap();
+            assert_eq!(selection.target, runtime_target);
+            assert_eq!(selection.requested, AccelerationPreference::Gpu);
+            assert_eq!(selection.reason, BackendSelectionReason::RequestedGpu);
+            assert_eq!(selection.power_source, power_source);
+            assert_eq!(selection.power_policy, PowerPolicyDecision::NotApplied);
+            assert_eq!(selection.fallback_history, parent_history);
+            assert_eq!(selection.skipped_targets, parent_skips);
+            assert!(selection.fallback_targets.is_empty());
+        }
+    }
+
+    #[test]
     fn auto_diagnostics_preserve_the_selection_time_power_source() {
         let route = verified_gpu_route(
             BackendKind::Cuda,
@@ -19037,9 +19286,10 @@ mod tests {
         let mut diagnostics: NativeRuntimeDiagnostics =
             diagnostics_with_typed_backend_selection().into();
 
-        InferenceWorkerRegistry::project_auto_route_diagnostics(
+        InferenceWorkerRegistry::project_route_diagnostics(
             &mut diagnostics,
             &route,
+            AccelerationPreference::Auto,
             PowerSource::Battery,
             Vec::new(),
             &[],
@@ -19523,6 +19773,113 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn explicit_gpu_diagnostics_preserve_parent_fallback_context_for_load_and_transcribe() {
+        for transcribe in [false, true] {
+            let cpu = Arc::new(TestLauncher::new([]));
+            let first = Arc::new(TestLauncher::new([if transcribe {
+                TestMode::CapabilityMismatch(CapabilityMismatch::Challenge)
+            } else {
+                TestMode::RuntimeFailureOnLoad(RuntimeError::OutOfMemory(
+                    "fixture GPU allocation failed".to_owned(),
+                ))
+            }]));
+            let unused = Arc::new(TestLauncher::new([]));
+            let mut routes = (0..5)
+                .map(|index| {
+                    verified_gpu_route(
+                        BackendKind::Vulkan,
+                        &format!("native:pci:0000:0{}:00.0", index + 1),
+                        "windows-display:32.0.16.1088",
+                        char::from(b'a' + index as u8),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut expected_winner = routes[1].target.clone().unwrap();
+            expected_winner.display_name = "fresh winning GPU name".to_owned();
+            expected_winner.memory_available_bytes -= 1024;
+            expected_winner.process_index = None;
+            let winner = Arc::new(TestLauncher::new([TestMode::RuntimeDiagnostics(Box::new(
+                diagnostics_with_child_gpu_context(expected_winner.clone()),
+            ))]));
+            for (index, route) in routes.iter_mut().enumerate() {
+                route.supervisor = inference_supervisor_with_launcher(Arc::clone(match index {
+                    0 => &first,
+                    1 => &winner,
+                    _ => &unused,
+                }));
+            }
+            let expected_remaining = routes[2..4]
+                .iter()
+                .filter_map(|route| route.target.clone())
+                .collect::<Vec<_>>();
+            let failed_target = routes[0].target.clone().unwrap();
+            let mut catalog = verified_gpu_catalog(routes);
+            let parent_skips = vec![SkippedBackend {
+                target: backend_target(BackendKind::Vulkan, "native:pci:0000:06:00.0", Some(5)),
+                reason: BackendSkipReason::Quarantined,
+            }];
+            catalog.skipped_targets = parent_skips.clone();
+            let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+                inference_supervisor_with_launcher(Arc::clone(&cpu)),
+            );
+            registry.gpu_routes_for_testing = Some(catalog);
+            let artifact = gguf_artifact_fixture("gpu-parent-fallback-diagnostics");
+            let diagnostics = if transcribe {
+                let audio =
+                    PreparedAudio::from_captured_mono(vec![0.1; 4], PREPARED_SAMPLE_RATE, 1, 4)
+                        .unwrap();
+                let execution = registry
+                    .transcribe(
+                        artifact.artifact.clone(),
+                        AccelerationPreference::Gpu,
+                        &audio,
+                        TranscriptionOptions::default(),
+                        0,
+                        &std::sync::atomic::AtomicU64::new(0),
+                    )
+                    .expect("second GPU should transcribe after a pre-output worker failure");
+                assert_eq!(execution.transcript.text, "fixture transcript");
+                execution.diagnostics
+            } else {
+                registry
+                    .load(artifact.artifact.clone(), AccelerationPreference::Gpu)
+                    .expect("second GPU should load after a pre-output OOM")
+                    .diagnostics
+            };
+            let selection = diagnostics.resolved_acceleration.selection.unwrap();
+            assert_eq!(selection.target, expected_winner);
+            assert_eq!(selection.requested, AccelerationPreference::Gpu);
+            assert_eq!(selection.reason, BackendSelectionReason::RequestedGpu);
+            assert_eq!(selection.power_policy, PowerPolicyDecision::NotApplied);
+            assert_eq!(selection.fallback_targets, expected_remaining);
+            assert_eq!(selection.skipped_targets, parent_skips);
+            assert_eq!(
+                selection.fallback_history,
+                vec![BackendFallback {
+                    target: failed_target,
+                    category: if transcribe {
+                        BackendFailureCategory::WorkerFailed
+                    } else {
+                        BackendFailureCategory::OutOfMemory
+                    },
+                }]
+            );
+            assert_eq!(first.launches.load(Ordering::Acquire), 1);
+            assert_eq!(winner.launches.load(Ordering::Acquire), 1);
+            assert_eq!(cpu.launches.load(Ordering::Acquire), 0);
+            assert_eq!(unused.launches.load(Ordering::Acquire), 0);
+            assert_eq!(
+                registry.gpu_routes_for_testing.as_ref().unwrap().routes[0]
+                    .supervisor
+                    .transport
+                    .current_generation()
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[test]
@@ -20329,6 +20686,155 @@ mod tests {
             }
         ));
         exhausted.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn vulkan_hello_memory_projects_equal_scope_capacity_for_discrete_and_integrated_devices() {
+        let provider = "transcribe-cpp-ggml-vulkan";
+        for (stable_device, device_class, heaps, expected_available) in [
+            (
+                "native:luid:0102030405060708",
+                DeviceClass::DiscreteGpu,
+                // MULTI_INSTANCE remains a valid singleton physical-device
+                // heap capability; it is not an instruction to aggregate
+                // another device's heaps.
+                vec![vulkan_heap(0, 100, 0b11, 80, 80)],
+                0,
+            ),
+            (
+                "native:uuid:00112233445566778899aabbccddeeff",
+                DeviceClass::IntegratedGpu,
+                vec![
+                    vulkan_heap(0, 70, 0b10, 60, 10),
+                    vulkan_heap(1, 30, 0b11, 20, 10),
+                ],
+                60,
+            ),
+        ] {
+            let snapshots = [vulkan_memory_snapshot(stable_device, device_class, heaps)];
+            assert_eq!(
+                vulkan_hello_memory_available_bytes(
+                    Some(&snapshots),
+                    provider,
+                    stable_device,
+                    device_class,
+                    100,
+                ),
+                expected_available,
+                "{stable_device}"
+            );
+        }
+    }
+
+    #[test]
+    fn vulkan_hello_memory_uses_exact_luid_uuid_or_pci_snapshot_not_order_or_other_devices() {
+        let provider = "transcribe-cpp-ggml-vulkan";
+        for (stable_device, snapshot_identity, target_pci) in [
+            (
+                "native:luid:0102030405060708",
+                "native:luid:0102030405060708",
+                None,
+            ),
+            (
+                "native:uuid:00112233445566778899aabbccddeeff",
+                "native:uuid:00112233445566778899aabbccddeeff",
+                None,
+            ),
+            (
+                "native:0000:01:00.0",
+                "native:luid:1112131415161718",
+                Some((1, 0, 0)),
+            ),
+        ] {
+            let mut target = vulkan_memory_snapshot(
+                snapshot_identity,
+                DeviceClass::DiscreteGpu,
+                vec![vulkan_heap(0, 100, 0b1, 80, 25)],
+            );
+            target.pci_location = target_pci;
+            let mut unrelated = vulkan_memory_snapshot(
+                "native:uuid:ffeeddccbbaa99887766554433221100",
+                DeviceClass::DiscreteGpu,
+                vec![vulkan_heap(0, 900, 0b1, 800, 100)],
+            );
+            unrelated.pci_location = Some((2, 0, 0));
+
+            for snapshots in [
+                vec![unrelated.clone(), target.clone()],
+                vec![target.clone(), unrelated.clone()],
+            ] {
+                assert_eq!(
+                    vulkan_hello_memory_available_bytes(
+                        Some(&snapshots),
+                        provider,
+                        stable_device,
+                        DeviceClass::DiscreteGpu,
+                        100,
+                    ),
+                    55,
+                    "{stable_device}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vulkan_hello_memory_projects_query_mapping_heap_and_capacity_failures_to_zero() {
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let stable_device = "native:luid:0102030405060708";
+        let valid = vulkan_memory_snapshot(
+            stable_device,
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 0b1, 80, 20)],
+        );
+        let project = |snapshots, native_memory_total_bytes| {
+            vulkan_hello_memory_available_bytes(
+                snapshots,
+                provider,
+                stable_device,
+                DeviceClass::DiscreteGpu,
+                native_memory_total_bytes,
+            )
+        };
+
+        // The helper intentionally accepts no native raw-free value, so none
+        // of these failures can be repaired by a positive provider snapshot.
+        assert_eq!(project(None, 100), 0, "query failure");
+        let missing = [vulkan_memory_snapshot(
+            "native:luid:1112131415161718",
+            DeviceClass::DiscreteGpu,
+            vec![vulkan_heap(0, 100, 0b1, 80, 20)],
+        )];
+        assert_eq!(project(Some(&missing), 100), 0, "missing stable mapping");
+        let duplicate = [valid.clone(), valid.clone()];
+        assert_eq!(
+            project(Some(&duplicate), 100),
+            0,
+            "duplicate stable mapping"
+        );
+
+        let mut no_extension = valid.clone();
+        no_extension.memory_budget_supported = false;
+        let no_extension_snapshots = [no_extension];
+        assert_eq!(
+            project(Some(&no_extension_snapshots), 100),
+            0,
+            "missing extension"
+        );
+        let mut invalid_heaps = valid.clone();
+        invalid_heaps.heaps[0].budget_bytes = 101;
+        let invalid_heap_snapshots = [invalid_heaps];
+        assert_eq!(
+            project(Some(&invalid_heap_snapshots), 100),
+            0,
+            "invalid heap budget"
+        );
+        let valid_snapshots = [valid];
+        assert_eq!(
+            project(Some(&valid_snapshots), 99),
+            0,
+            "scope capacity mismatch"
+        );
     }
 
     #[test]

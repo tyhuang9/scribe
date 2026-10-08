@@ -165,6 +165,21 @@ reading. Vulkan budgets and usage are changing process-level estimates, not
 physical free VRAM. See the
 [Vulkan memory-budget specification](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceMemoryBudgetPropertiesEXT.html).
 
+For an authenticated Windows Vulkan worker Hello, the worker collects one
+fresh bounded Vulkan snapshot inventory for that Hello and applies this same
+exact stable-identity/class/heap derivation to each already-resolved provider
+device. The native `memory_total_bytes` remains the parent identity and
+reconciliation input. The Hello advertises derived headroom only when the
+selected Vulkan heap capacity exactly equals that unchanged native total;
+query failure, absent extension, invalid heap data, missing or ambiguous
+mapping, and capacity mismatch all project into its existing availability
+scalar as `0`. There is no raw provider-free fallback or mismatch clamp. That
+scalar zero is conservative unavailable-or-exhausted state, while this
+observation extension retains its typed `unavailable` reasons and a valid
+measured zero remains `observed`. Positive policy floors consequently reject
+the scalar zero. Snapshot inventories are not cached across worker launches,
+and CPU, CUDA, Metal, non-Windows, and desktop behavior is unchanged.
+
 Both methods retain the existing generation/model/batch correlation and
 before/after validation. Cancellation, stale completion or device changes
 cannot reuse an earlier pair. No availability observation establishes that a
@@ -272,6 +287,11 @@ branch supplied the unchanged raw snapshot. Qualification and runtime
 admission must use consistent measurement semantics before such observations
 can affect Auto; there is no evaluator adapter in this observer.
 
+The Hello headroom projection is likewise an authenticated worker fact, not
+unsigned capture custody, a native-memory acquisition proof, hardware
+validation, or a qualification result. Existing production trust and
+default-deny Auto policy remain unchanged.
+
 The paired warm campaign retains one CPU worker and one GPU worker, executing
 inference serially. This exception stays private to the collector and is bounded
 to two workers; ordinary application residency is unchanged. Retained-model
@@ -307,6 +327,9 @@ an independently trusted collector executable. `CollectorPath` and
 the inputs above. Keep the executable and its parent directories in a trusted,
 operator-controlled location. The wrapper's supplied digest does not establish
 build provenance or grant pack trust. It performs no build, download or signing.
+It explicitly waits for the GUI collector and checks that process's exit code,
+independently of PowerShell's `$LASTEXITCODE`. Its verified-executable read lock
+remains held until termination, and a failed capture's report is preserved.
 
 The schema-3 report kind is `windows_gpu_capture_observation`, with
 `unsigned:true`, `unqualified:true`, `auto_eligible:false` and
@@ -435,13 +458,20 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and nine test groups: collector, native telemetry, paired campaigns,
+discovery and ten test groups: collector, native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
-observation controls/leases, provider-memory snapshots, capture architecture
-guards and probe architecture guards.
-`-ScriptOnly` provides the fast inner-loop check: script parsing and
-nineteen prelaunch argument/file-rejection cases without invoking any
-executable. The three tiny owned fixture files are removed after use.
+observation controls/leases, authenticated Vulkan Hello memory projection,
+provider-memory snapshots, capture architecture guards and probe architecture
+guards.
+`-ScriptOnly` provides the fast inner-loop check: script parsing, nineteen
+prelaunch argument/file-rejection cases, and four local GUI-process cases.
+The latter compile a tiny x64 GUI fixture using the Windows .NET Framework C#
+compiler (also required by the installer fixture tests). Event gates and bounded
+watchdogs exercise waiting, absent/stale exit status, nonzero exits, literal
+Unicode/metacharacter arguments, report preservation and executable-lock release.
+They do not run Scribe, models, GPU providers or Cargo and do not access the
+Scribe profile. Generated fixtures are removed on success; failure cleanup
+retention is reported without hiding the original assertion failure.
 Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo
