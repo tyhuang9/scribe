@@ -458,10 +458,11 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and nine test groups: collector, native telemetry, paired campaigns,
+discovery and ten test groups: collector, native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
-observation controls/leases, provider-memory snapshots, capture architecture
-guards and probe architecture guards.
+observation controls/leases, authenticated Vulkan Hello memory projection,
+provider-memory snapshots, capture architecture guards and probe architecture
+guards.
 `-ScriptOnly` provides the fast inner-loop check: script parsing, nineteen
 prelaunch argument/file-rejection cases, and four local GUI-process cases.
 The latter compile a tiny x64 GUI fixture using the Windows .NET Framework C#
