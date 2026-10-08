@@ -176,6 +176,7 @@ try {
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',
+            'windows_gpu_capture::public_fixture_parity::tests',
             'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
             'onnx_worker::tests::capture_observation', 'onnx_worker::tests::vulkan_hello_memory',
             'embedded_runtime::tests::provider_memory_observation',

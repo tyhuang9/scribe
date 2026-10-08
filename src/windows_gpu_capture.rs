@@ -5,6 +5,8 @@
 //! bytes plus bounded native telemetry, and publishes an unqualified report.
 
 mod campaign;
+#[cfg(test)]
+mod public_fixture_parity;
 mod telemetry;
 
 use std::ffi::{OsStr, OsString};
@@ -445,6 +447,8 @@ fn build_worker_report(
         elapsed_ms,
     } = measurements;
     let normalized = normalize_transcript(&execution.transcript.text);
+    #[cfg(test)]
+    public_fixture_parity::record_normalized_transcript(gpu, &normalized)?;
     let normalized_transcript_sha256 = format!("{:x}", Sha256::digest(normalized.as_bytes()));
     let video_memory = match (gpu, telemetry.video_memory) {
         (true, Some(VideoMemorySummary { local, non_local })) => {

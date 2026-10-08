@@ -34,6 +34,45 @@ Observation-only raw-frame buffers, retained handshake state, duplicated
 process handles and lease APIs are compiled out of ordinary builds. The
 existing IPC frame format and protocol version are unchanged.
 
+## Test-only public-fixture parity diagnostic
+
+The ignored
+`windows_gpu_capture::public_fixture_parity::tests::reproduces_public_fixture_cpu_cuda_parity_mismatch`
+test is a local diagnosis tool for the independently verified public CPU/CUDA
+transcript mismatch. It is not a collector command, runtime switch, report
+schema change, release check, qualification path, or Auto-policy input.
+
+Build the hardware diagnostic with Cargo's optimized `--release` test profile,
+the existing frozen CPU anchor and pinned toolchain. Keep the ordinary fixed
+provider-discovery deadline and all pack revalidation checks; do not lengthen
+the deadline or bypass admission to accommodate a debug test build.
+
+The test discovers a fresh `public-parity-fixture` directory beside its compiled
+test binary. The surrounding test-binary directory retains the accepted bundled
+model `whisper-base.en-Q8_0.gguf` and verified workers; the fixture directory
+contains the public `jfk.wav`, a metadata-only `failed-observation.json`, and no
+`diagnostic-observation.json`. It verifies the fixed public model and WAV
+SHA-256 values before enabling its in-memory sink.
+The ordinary collector then creates `diagnostic-observation.json` through its
+existing no-replace publication path; pre-existing output is refused.
+
+The prior report supplies only reproduction metadata: the exact CUDA
+pack/backend/stable-device selector and prior hashes. It supplies no path, pack
+root, key, signature, inventory, epoch, worker binary, or launch override.
+Existing executable-directory production catalog, signature, inventory, epoch,
+CPU anchor, stable-device and shutdown admission remains mandatory.
+
+The sink is thread-local, disabled by default, removed from non-test binaries,
+and RAII-cleared on every failure. It accepts at most one normalized CPU string
+and one normalized GPU string, each at most 8 KiB of UTF-8, rejecting duplicate
+or oversized input rather than truncating it. No raw text enters either JSON
+report or an error before `run_single_capture` has returned successfully and
+the new ordinary report plus the failed report have reproduced both transcript
+hashes under the same authenticated CUDA binding. Only then does the test print
+bounded JSON-escaped normalized public text, lengths, and first differing token
+and character locally. It deliberately remains a failing strict-parity test;
+its output is diagnosis, not acceptance or an explanation of the mismatch.
+
 ## Production-trust pack probe
 
 Collector builds also expose a narrower, probe-only command:
@@ -458,7 +497,8 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and ten test groups: collector, native telemetry, paired campaigns,
+discovery and eleven test groups: collector, native telemetry, paired campaigns,
+test-only public-fixture parity safeguards,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, authenticated Vulkan Hello memory projection,
 provider-memory snapshots, capture architecture guards and probe architecture
