@@ -790,6 +790,13 @@ const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
 #[test]
 fn windows_gpu_capture_stays_opt_in_and_out_of_release_builds() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let observer_source = include_str!("windows_gpu_capture.rs").replace("\r\n", "\n");
+    assert!(observer_source.contains("#[cfg(test)]\nmod public_fixture_parity;"));
+    let production_observer = production_source(&observer_source);
+    assert!(
+        !production_observer.contains("public_fixture_parity"),
+        "public-fixture transcript sink and diagnostic must remain test-only"
+    );
     let manifest = fs::read_to_string(repository.join("Cargo.toml")).unwrap();
     assert!(
         manifest
