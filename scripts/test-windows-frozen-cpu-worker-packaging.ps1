@@ -95,6 +95,9 @@ function New-TestReviewedPe([string]$Path, [uint16]$Subsystem) {
 function Reset-TestCalls {
     $global:WindowsFrozenCpuWorkerTestCargoCalls = [System.Collections.Generic.List[object]]::new()
     $global:WindowsFrozenCpuWorkerTestNativeCalls = [System.Collections.Generic.List[object]]::new()
+    if (Test-Path -LiteralPath 'Variable:global:WindowsFrozenCpuWorkerTestAdmissionCalls') {
+        $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Clear()
+    }
 }
 
 function Assert-DesktopCargoArguments([psobject]$Call, [string]$Features, [string]$Description) {
@@ -171,12 +174,43 @@ function Copy-FrozenFixture([string]$Name) {
     return $destination
 }
 
-function Invoke-FrozenConsumer([string]$RecordPath, [string]$BundlePath) {
-    & $fixtureBuilder `
-        -ModelSource $modelSource `
-        -BundlePath $BundlePath `
-        -InstallerPackAllowlistPath $installerAllowlist `
-        -FrozenCpuWorkerRecordPath $RecordPath
+function Invoke-FrozenConsumer(
+    [string]$RecordPath,
+    [string]$BundlePath,
+    [string]$FrozenCpuWorkerSourceRoot
+) {
+    $parameters = @{
+        ModelSource = $modelSource
+        BundlePath = $BundlePath
+        InstallerPackAllowlistPath = $installerAllowlist
+        FrozenCpuWorkerRecordPath = $RecordPath
+    }
+    if ($PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot')) {
+        $parameters.FrozenCpuWorkerSourceRoot = $FrozenCpuWorkerSourceRoot
+    }
+    & $fixtureBuilder @parameters
+}
+
+function New-ForeignFrozenWorkerSource([string]$Destination) {
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    foreach ($item in @(Get-ChildItem -LiteralPath $fixtureRoot -Force)) {
+        if ($item.Name -ceq '.git') { continue }
+        Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
+    }
+    # The M builder must treat R as data. If it ever invokes R's builder rather
+    # than merely deriving its source context, this fixture fails immediately.
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Destination 'scripts\build-windows-release.ps1'),
+        "throw 'foreign frozen worker source must not be executed'`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    & git -C $Destination init --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Could not initialize foreign frozen worker source fixture.' }
+    & git -C $Destination add --all
+    if ($LASTEXITCODE -ne 0) { throw 'Could not stage foreign frozen worker source fixture.' }
+    & git -C $Destination commit --quiet -m foreign-fixture
+    if ($LASTEXITCODE -ne 0) { throw 'Could not commit foreign frozen worker source fixture.' }
+    return $Destination
 }
 
 function Set-FixtureNativeSmokeSeam([string]$BuilderPath) {
@@ -205,6 +239,54 @@ function Invoke-NativeProcess(
 '@
     $source = $source.Substring(0, $start) + $fixtureSmoke + $source.Substring($end)
     [System.IO.File]::WriteAllText($BuilderPath, $source, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Set-FixtureCompiledAdmissionSeam([string]$IntegrityPath) {
+    $source = Get-Content -LiteralPath $IntegrityPath -Raw
+    $start = $source.IndexOf('function Invoke-WindowsFrozenCpuWorkerAdmissionProcess')
+    $end = $source.IndexOf('function Assert-WindowsFrozenCpuWorkerCompiledAdmission', $start)
+    if ($start -lt 0 -or $end -le $start) {
+        throw 'Could not isolate the fixture-only compiled admission seam.'
+    }
+    $fixtureAdmission = @'
+function Invoke-WindowsFrozenCpuWorkerAdmissionProcess([string]$Executable) {
+    if ($null -eq $global:WindowsFrozenCpuWorkerTestAdmissionResponse) {
+        throw 'Fixture compiled admission response was not configured.'
+    }
+    $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Add($Executable)
+    return $global:WindowsFrozenCpuWorkerTestAdmissionResponse
+}
+
+'@
+    $source = $source.Substring(0, $start) + $fixtureAdmission + $source.Substring($end)
+    [System.IO.File]::WriteAllText($IntegrityPath, $source, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Set-FixtureCompiledAdmissionResponse(
+    [psobject]$DesktopContext,
+    [psobject]$WorkerContext,
+    [psobject]$Record
+) {
+    $kind = if (Test-WindowsFrozenCpuWorkerSameSourceContext $DesktopContext $WorkerContext) {
+        'strict_legacy_same_source'
+    }
+    else {
+        'compiled_foreign_approval'
+    }
+    $global:WindowsFrozenCpuWorkerTestAdmissionResponse = [pscustomobject]@{
+        ExitCode = 0
+        Stdout = ([ordered]@{
+            schema_version = 1
+            desktop_build_id = $DesktopContext.DesktopBuildId
+            bundled_worker_sha256 = $Record.worker_sha256
+            protocol_version = $DesktopContext.ProtocolVersion
+            worker_abi_version = $DesktopContext.WorkerAbiVersion
+            worker_origin_app_build = $WorkerContext.DesktopBuildId
+            worker_build_id = $WorkerContext.WorkerBuildId
+            admission_kind = $kind
+        } | ConvertTo-Json -Compress)
+        Stderr = ''
+    }
 }
 
 function Remove-TestRootSafely([string]$Path) {
@@ -364,6 +446,7 @@ try {
     [System.IO.File]::WriteAllText($fixtureManifestPath, ($fixtureManifest | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $fixtureRoot '.gitignore'), "target/`r`n", [System.Text.UTF8Encoding]::new($false))
     Set-FixtureNativeSmokeSeam (Join-Path $fixtureRoot 'scripts\build-windows-release.ps1')
+    Set-FixtureCompiledAdmissionSeam (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
     & git -C $fixtureRoot init --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Could not initialize frozen worker test fixture Git repository.' }
     & git -C $fixtureRoot add --all
@@ -721,6 +804,8 @@ try {
     $env:GITHUB_ACTIONS = $null
     $env:CI = $null
     Reset-TestCalls
+    $global:WindowsFrozenCpuWorkerTestAdmissionCalls = [System.Collections.Generic.List[string]]::new()
+    $global:WindowsFrozenCpuWorkerTestAdmissionResponse = $null
     $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $false
     $global:WindowsFrozenCpuWorkerTestFailDesktopBuild = $false
     $global:WindowsFrozenCpuWorkerTestRaceFreezeOutput = $null
@@ -842,6 +927,8 @@ try {
     finally {
         $validatedFrozenWorker.WorkerStream.Dispose()
     }
+    $producerRecord = Get-Content -LiteralPath $producerRecordPath -Raw | ConvertFrom-Json
+    Set-FixtureCompiledAdmissionResponse $fixtureContext $fixtureContext $producerRecord
     $producerCallsBeforeExistingOutput = $global:WindowsFrozenCpuWorkerTestCargoCalls.Count
     Invoke-ExpectedFailure { & $fixtureProducer -OutputDirectory $producerOutput } 'already exists'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count $producerCallsBeforeExistingOutput 'Existing freeze output invoked Cargo'
@@ -1052,12 +1139,234 @@ try {
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Frozen consumer exact build revision'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].BuildingWorker $null 'Frozen consumer worker marker clearing'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest $record.worker_sha256 'Frozen consumer exact worker anchor'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Count 1 'Frozen consumer compiled admission invocation count'
     Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Frozen consumer revision environment restoration'
     Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64 -join '') 'Frozen consumer digest environment restoration'
     Assert-Equal $env:SCRIBE_BUILDING_WORKER 'inherited-worker-flag' 'Frozen consumer worker marker environment restoration'
     Assert-True (Test-Path -LiteralPath (Join-Path $frozenBundle (Get-WindowsFrozenCpuWorkerMarkerFileName))) 'Frozen bundle omitted its local-only marker.'
     $stagedWorker = Join-Path $frozenBundle (Get-WindowsFrozenCpuWorkerExecutableRelativePath)
     Assert-Equal (Get-WindowsFrozenCpuWorkerFileSha256 $stagedWorker) $record.worker_sha256 'Frozen consumer staged exact worker bytes'
+
+    # A distinct retained R may have the exact same revision/contracts as M;
+    # containment is a checkout-root property, not an identity-label property.
+    $sameCommitWorkerSourceRoot = Join-Path $testRoot 'same-commit-worker-source'
+    & git clone --quiet --no-local $fixtureRoot $sameCommitWorkerSourceRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create same-commit retained worker source fixture.' }
+    $previousFixtureTemp = [Environment]::GetEnvironmentVariable('TEMP')
+    $sameCommitIgnoredTemp = Join-Path $sameCommitWorkerSourceRoot 'target\temporary-output'
+    try {
+        [Environment]::SetEnvironmentVariable('TEMP', $sameCommitIgnoredTemp)
+        Set-FixtureCompiledAdmissionResponse $fixtureContext $fixtureContext $record
+        Reset-TestCalls
+        Invoke-ExpectedFailure {
+            Invoke-FrozenConsumer $producerRecordPath (Join-Path $testRoot 'same-commit-r-temp-bundle') $sameCommitWorkerSourceRoot
+        } 'cannot contain temporary output paths'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Same-commit foreign temporary-root rejection invoked Cargo'
+        Assert-True (-not (Test-Path -LiteralPath $sameCommitIgnoredTemp)) 'Same-commit foreign temporary-root rejection wrote ignored R output.'
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('TEMP', $previousFixtureTemp)
+    }
+
+    # A relative TEMP/TMP would be rebased by the builder's later Push-Location
+    # to M. Reject both relative and drive-relative values before resolving a
+    # temporary root, invoking Cargo, or creating an M output directory.
+    $previousFixtureTemp = [Environment]::GetEnvironmentVariable('TEMP')
+    $previousFixtureTmp = [Environment]::GetEnvironmentVariable('TMP')
+    try {
+        foreach ($temporaryCase in @(
+            @{ Name = 'TEMP'; Value = 'relative-frozen-worker-temp' },
+            @{ Name = 'TMP'; Value = 'C:drive-relative-frozen-worker-temp' }
+        )) {
+            [Environment]::SetEnvironmentVariable('TEMP', $previousFixtureTemp)
+            [Environment]::SetEnvironmentVariable('TMP', $previousFixtureTmp)
+            [Environment]::SetEnvironmentVariable($temporaryCase.Name, $temporaryCase.Value)
+            $relativeTemporaryBundle = Join-Path $testRoot "same-commit-r-$($temporaryCase.Name.ToLowerInvariant())-relative-temp-bundle"
+            Reset-TestCalls
+            Invoke-ExpectedFailure {
+                Invoke-FrozenConsumer $producerRecordPath $relativeTemporaryBundle $sameCommitWorkerSourceRoot
+            } 'fully qualified temporary output paths'
+            Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 "$($temporaryCase.Name) relative temporary-root rejection invoked Cargo"
+            Assert-True (-not (Test-Path -LiteralPath $relativeTemporaryBundle)) "$($temporaryCase.Name) relative temporary-root rejection created an M output directory"
+        }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('TEMP', $previousFixtureTemp)
+        [Environment]::SetEnvironmentVariable('TMP', $previousFixtureTmp)
+    }
+
+    # M builds the desktop while R is a separately clean, data-only worker
+    # source. Its local builder is deliberately poisoned: any execution of R
+    # instead of M would fail this synthetic assembly seam.
+    $foreignWorkerSourceRoot = New-ForeignFrozenWorkerSource (Join-Path $testRoot 'foreign-worker-source')
+    $foreignWorkerContext = Get-WindowsFrozenCpuWorkerSourceContext $foreignWorkerSourceRoot
+    Assert-True (-not (Test-WindowsFrozenCpuWorkerSameSourceContext $fixtureContext $foreignWorkerContext)) 'Foreign worker source did not receive an independent identity.'
+    $foreignFreeze = Join-Path $testRoot 'foreign-worker-freeze'
+    New-Item -ItemType Directory -Path $foreignFreeze | Out-Null
+    $foreignWorkerPath = Join-Path $foreignFreeze (Get-WindowsFrozenCpuWorkerExecutableRelativePath)
+    Copy-Item -LiteralPath $workerPath -Destination $foreignWorkerPath
+    $foreignWorkerHash = Get-WindowsFrozenCpuWorkerFileSha256 $foreignWorkerPath
+    Write-CanonicalFrozenRecord $foreignFreeze $foreignWorkerContext (Get-Item -LiteralPath $foreignWorkerPath).Length $foreignWorkerHash
+    $foreignRecordPath = Join-Path $foreignFreeze (Get-WindowsFrozenCpuWorkerRecordFileName)
+    $foreignRecord = Get-Content -LiteralPath $foreignRecordPath -Raw | ConvertFrom-Json
+
+    # A distinct R must stay read-only even for Git-ignored locations. Reject
+    # all M outputs before creating directories or invoking Cargo.
+    $previousFixtureCargoTarget = $env:CARGO_TARGET_DIR
+    $foreignIgnoredCargoTarget = Join-Path $foreignWorkerSourceRoot 'target\m-build-output'
+    try {
+        $env:CARGO_TARGET_DIR = $foreignIgnoredCargoTarget
+        Reset-TestCalls
+        Invoke-ExpectedFailure {
+            Invoke-FrozenConsumer $foreignRecordPath (Join-Path $testRoot 'foreign-r-target-bundle') $foreignWorkerSourceRoot
+        } 'cannot contain Cargo build output'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Foreign ignored Cargo target rejection invoked Cargo'
+        Assert-True (-not (Test-Path -LiteralPath $foreignIgnoredCargoTarget)) 'Foreign ignored Cargo target rejection wrote R.'
+    }
+    finally { $env:CARGO_TARGET_DIR = $previousFixtureCargoTarget }
+    $foreignParentCargoTarget = Split-Path -Parent $foreignWorkerSourceRoot
+    $foreignParentTargetBundle = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-foreign-parent-target-$([guid]::NewGuid().ToString('N'))"
+    try {
+        $env:CARGO_TARGET_DIR = $foreignParentCargoTarget
+        Reset-TestCalls
+        Invoke-ExpectedFailure {
+            Invoke-FrozenConsumer $foreignRecordPath $foreignParentTargetBundle $foreignWorkerSourceRoot
+        } 'cannot contain Cargo build output'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Foreign parent Cargo target rejection invoked Cargo'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $foreignWorkerSourceRoot 'x86_64-pc-windows-msvc'))) 'Foreign parent Cargo target rejection wrote R.'
+        Assert-True (-not (Test-Path -LiteralPath $foreignParentTargetBundle)) 'Foreign parent Cargo target rejection created its external bundle output.'
+    }
+    finally { $env:CARGO_TARGET_DIR = $previousFixtureCargoTarget }
+    Reset-TestCalls
+    $foreignBundleOutput = Join-Path $foreignWorkerSourceRoot 'bundle-output'
+    Invoke-ExpectedFailure {
+        Invoke-FrozenConsumer $foreignRecordPath $foreignBundleOutput $foreignWorkerSourceRoot
+    } 'cannot contain bundle, staging, or installer-allowlist outputs'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Foreign bundle output rejection invoked Cargo'
+    Assert-True (-not (Test-Path -LiteralPath $foreignBundleOutput)) 'Foreign bundle output rejection wrote R.'
+    $foreignAllowlistOutput = Join-Path $foreignWorkerSourceRoot 'worker-pack-allowlist.iss'
+    Reset-TestCalls
+    Invoke-ExpectedFailure {
+        & $fixtureBuilder `
+            -ModelSource $modelSource `
+            -BundlePath (Join-Path $testRoot 'foreign-r-allowlist-bundle') `
+            -InstallerPackAllowlistPath $foreignAllowlistOutput `
+            -FrozenCpuWorkerRecordPath $foreignRecordPath `
+            -FrozenCpuWorkerSourceRoot $foreignWorkerSourceRoot
+    } 'cannot contain bundle, staging, or installer-allowlist outputs'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Foreign installer-allowlist rejection invoked Cargo'
+    Assert-True (-not (Test-Path -LiteralPath $foreignAllowlistOutput)) 'Foreign installer-allowlist rejection wrote R.'
+    Assert-Equal (@(git -C $foreignWorkerSourceRoot status --porcelain=v1 --untracked-files=all)).Count 0 'Foreign worker source changed during rejected M output requests'
+
+    # The retained R checkout must stay read-only even when a hostile ambient
+    # temporary root points at its Git-ignored target directory.
+    $previousFixtureTemp = [Environment]::GetEnvironmentVariable('TEMP')
+    $foreignIgnoredTemp = Join-Path $foreignWorkerSourceRoot 'target\temporary-output'
+    try {
+        [Environment]::SetEnvironmentVariable('TEMP', $foreignIgnoredTemp)
+        Reset-TestCalls
+        Invoke-ExpectedFailure {
+            Invoke-FrozenConsumer $foreignRecordPath (Join-Path $testRoot 'foreign-r-temp-bundle') $foreignWorkerSourceRoot
+        } 'cannot contain temporary output paths'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Foreign temporary-root rejection invoked Cargo'
+        Assert-True (-not (Test-Path -LiteralPath $foreignIgnoredTemp)) 'Foreign temporary-root rejection wrote ignored R output.'
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('TEMP', $previousFixtureTemp)
+    }
+
+    # Source-context discovery must reject an external Git clean/process filter
+    # before status can consult anything defined by R's checkout configuration.
+    try {
+        & git -C $foreignWorkerSourceRoot config filter.fixture.clean 'C:\fixture-filter-must-not-run.exe'
+        if ($LASTEXITCODE -ne 0) { throw 'Could not configure foreign fixture Git filter.' }
+        Reset-TestCalls
+        Invoke-ExpectedFailure {
+            Invoke-FrozenConsumer $foreignRecordPath (Join-Path $testRoot 'foreign-r-filter-bundle') $foreignWorkerSourceRoot
+        } 'contains an external clean or process filter'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Foreign Git-filter rejection invoked Cargo'
+    }
+    finally {
+        & git -C $foreignWorkerSourceRoot config --unset-all filter.fixture.clean
+        if ($LASTEXITCODE -ne 0) { throw 'Could not clear foreign fixture Git filter.' }
+    }
+
+    # An empty compiled map reports only M's strict legacy expectation. It
+    # cannot admit a foreign R before the desktop build reaches publication.
+    Set-FixtureCompiledAdmissionResponse $fixtureContext $fixtureContext $foreignRecord
+    Reset-TestCalls
+    $defaultEmptyForeignBundle = Join-Path $testRoot 'default-empty-foreign-bundle'
+    Invoke-ExpectedFailure {
+        Invoke-FrozenConsumer $foreignRecordPath $defaultEmptyForeignBundle $foreignWorkerSourceRoot
+    } 'compiled admission does not match'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Default-empty foreign admission rebuilt a worker or skipped the desktop build'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'local-transcriber' 'Default-empty foreign admission did not build only M'
+    Assert-True (-not (Test-Path -LiteralPath $defaultEmptyForeignBundle)) 'Default-empty foreign admission published a bundle.'
+
+    # A synthetic report stands in for an exact compiled foreign approval. The
+    # fixture proves M owns the build revision and R's worker bytes remain
+    # unchanged without running any R helper.
+    Set-FixtureCompiledAdmissionResponse $fixtureContext $foreignWorkerContext $foreignRecord
+    Reset-TestCalls
+    $foreignBundle = Join-Path $testRoot 'foreign-worker-bundle'
+    Invoke-FrozenConsumer $foreignRecordPath $foreignBundle $foreignWorkerSourceRoot
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Foreign frozen assembly did not build exactly one desktop'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'local-transcriber' 'Foreign frozen assembly rebuilt the worker'
+    Assert-DesktopCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'ui-harness' 'Foreign frozen assembly built a non-M desktop'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Foreign frozen assembly inherited R or caller revision'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Count 1 'Foreign frozen assembly did not gate publication on compiled admission'
+    Assert-Equal (Get-WindowsFrozenCpuWorkerFileSha256 (Join-Path $foreignBundle (Get-WindowsFrozenCpuWorkerExecutableRelativePath))) $foreignRecord.worker_sha256 'Foreign frozen assembly changed R worker bytes'
+
+    foreach ($mismatch in @(
+        @{ Name = 'desktop M'; Property = 'desktop_build_id'; Value = 'local-transcriber@0.1.0#wrong-m'; Expected = 'compiled admission does not match' },
+        @{ Name = 'worker R'; Property = 'worker_origin_app_build'; Value = 'local-transcriber@0.1.0#wrong-r'; Expected = 'compiled admission does not match' },
+        @{ Name = 'worker hash'; Property = 'bundled_worker_sha256'; Value = ('0' * 64); Expected = 'compiled admission does not match' },
+        @{ Name = 'protocol'; Property = 'protocol_version'; Value = [int64]4; Expected = 'compiled admission does not match' },
+        @{ Name = 'worker hash array'; Property = 'bundled_worker_sha256'; Value = @($foreignRecord.worker_sha256); Expected = 'must be a string' }
+    )) {
+        $mismatchedReport = $global:WindowsFrozenCpuWorkerTestAdmissionResponse.Stdout | ConvertFrom-Json
+        $mismatchedReport.($mismatch.Property) = $mismatch.Value
+        $global:WindowsFrozenCpuWorkerTestAdmissionResponse = [pscustomobject]@{
+            ExitCode = 0
+            Stdout = ($mismatchedReport | ConvertTo-Json -Compress)
+            Stderr = ''
+        }
+        Reset-TestCalls
+        $mismatchBundle = Join-Path $testRoot ("foreign-admission-mismatch-" + ($mismatch.Name -replace ' ', '-'))
+        Invoke-ExpectedFailure {
+            Invoke-FrozenConsumer $foreignRecordPath $mismatchBundle $foreignWorkerSourceRoot
+        } $mismatch.Expected
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 "Foreign $($mismatch.Name) mismatch rebuilt a worker or skipped M"
+        Assert-True (-not (Test-Path -LiteralPath $mismatchBundle)) "Foreign $($mismatch.Name) mismatch published a bundle."
+        Set-FixtureCompiledAdmissionResponse $fixtureContext $foreignWorkerContext $foreignRecord
+    }
+
+    $admissionObjectReport = $global:WindowsFrozenCpuWorkerTestAdmissionResponse.Stdout
+    $global:WindowsFrozenCpuWorkerTestAdmissionResponse = [pscustomobject]@{
+        ExitCode = 0
+        Stdout = "[$admissionObjectReport]"
+        Stderr = ''
+    }
+    Reset-TestCalls
+    $arrayReportBundle = Join-Path $testRoot 'foreign-admission-array-report'
+    Invoke-ExpectedFailure {
+        Invoke-FrozenConsumer $foreignRecordPath $arrayReportBundle $foreignWorkerSourceRoot
+    } 'must be one JSON object'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Array-shaped foreign admission report rebuilt a worker or skipped M'
+    Assert-True (-not (Test-Path -LiteralPath $arrayReportBundle)) 'Array-shaped foreign admission report published a bundle.'
+    Set-FixtureCompiledAdmissionResponse $fixtureContext $foreignWorkerContext $foreignRecord
+
+    $global:WindowsFrozenCpuWorkerTestSourceDriftPath = Join-Path $foreignWorkerSourceRoot 'source-drift.txt'
+    Reset-TestCalls
+    $foreignSourceDriftBundle = Join-Path $testRoot 'foreign-source-drift-bundle'
+    Invoke-ExpectedFailure {
+        Invoke-FrozenConsumer $foreignRecordPath $foreignSourceDriftBundle $foreignWorkerSourceRoot
+    } 'requires a clean source workspace'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Foreign source drift was not rechecked after M desktop build'
+    Assert-True (-not (Test-Path -LiteralPath $foreignSourceDriftBundle)) 'Foreign source drift published a bundle.'
+    Remove-Item -LiteralPath $global:WindowsFrozenCpuWorkerTestSourceDriftPath -Force
+    $global:WindowsFrozenCpuWorkerTestSourceDriftPath = $null
+    Set-FixtureCompiledAdmissionResponse $fixtureContext $fixtureContext $record
 
     Reset-TestCalls
     $observationBundle = Join-Path $testRoot 'frozen-observation-bundle'
@@ -1161,6 +1470,12 @@ try {
             -FrozenCpuWorkerRecordPath ' '
     } 'explicitly supplied'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Explicit blank frozen record path invoked Cargo.'
+
+    Reset-TestCalls
+    Invoke-ExpectedFailure {
+        Invoke-FrozenConsumer $producerRecordPath (Join-Path $testRoot 'blank-frozen-source-root') ' '
+    } 'explicitly supplied'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Explicit blank frozen worker source root invoked Cargo.'
 
     $blankObservationBundle = Join-Path $testRoot 'blank-observation-frozen-path'
     Invoke-ExpectedFailure {

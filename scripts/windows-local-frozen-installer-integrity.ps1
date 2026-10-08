@@ -187,6 +187,21 @@ function Get-WindowsLocalFrozenVerifiedInventoryFile(
     }
 }
 
+function Assert-WindowsLocalFrozenBundleCompiledAdmission(
+    [psobject]$Bundle,
+    [psobject]$DesktopContext,
+    [psobject]$FrozenCpuWorker
+) {
+    $desktop = Get-WindowsLocalFrozenVerifiedInventoryFile $Bundle 'local-transcriber.exe'
+    $desktopPath = Join-Path $Bundle.Root ($desktop.RelativePath -replace '/', '\')
+    return Assert-WindowsFrozenCpuWorkerCompiledAdmission `
+        -Executable $desktopPath `
+        -ExpectedSize $desktop.SizeBytes `
+        -ExpectedSha256 $desktop.Sha256 `
+        -DesktopContext $DesktopContext `
+        -FrozenCpuWorker $FrozenCpuWorker
+}
+
 function Get-WindowsLocalFrozenCapturePackBinding(
     [psobject]$Bundle,
     [string]$PackId,
@@ -1116,33 +1131,100 @@ function Invoke-WindowsLocalFrozenCampaignProcess(
 
 function Assert-WindowsLocalFrozenInstallerRecord(
     [string]$Path,
+    [psobject]$DesktopContext,
     [psobject]$FrozenCpuWorker,
     [psobject]$Bundle,
     [string]$Installer
 ) {
     $recordFile = Read-WindowsFrozenCpuWorkerBoundedUtf8File $Path 65536
     try {
-        $record = $recordFile.Text | ConvertFrom-Json -Depth 5
+        $record = ConvertFrom-Json -InputObject $recordFile.Text -Depth 5 -NoEnumerate
     }
     catch {
         throw "Local frozen installer record is not valid JSON: $($_.Exception.Message)"
     }
-    Assert-WindowsLocalFrozenExactProperties $record @(
-        'schema_version', 'kind', 'local_only', 'release_approved',
-        'source_revision', 'app_version', 'target_triple',
-        'frozen_record_sha256', 'bundle_inventory_sha256',
-        'installer_filename', 'installer_size_bytes', 'installer_sha256',
-        'local_test_token', 'install_relative_path'
-    ) 'Local frozen installer record'
-    if ((($record.schema_version -isnot [int64] -and $record.schema_version -isnot [int32]) -or
-        [int]$record.schema_version -ne 1 -or $record.kind -cne 'windows-local-frozen-test-installer' -or
+    if ($record -is [array] -or $record -isnot [pscustomobject]) {
+        throw 'Local frozen installer record must be one JSON object.'
+    }
+    if ($record.schema_version -isnot [int64] -and $record.schema_version -isnot [int32]) {
+        throw 'Local frozen installer record has an unsupported schema.'
+    }
+    if ($record.kind -isnot [string]) {
+        throw 'Local frozen installer record kind must be a string.'
+    }
+    $schemaVersion = [int]$record.schema_version
+    if ($schemaVersion -eq 1) {
+        Assert-WindowsLocalFrozenExactProperties $record @(
+            'schema_version', 'kind', 'local_only', 'release_approved',
+            'source_revision', 'app_version', 'target_triple',
+            'frozen_record_sha256', 'bundle_inventory_sha256',
+            'installer_filename', 'installer_size_bytes', 'installer_sha256',
+            'local_test_token', 'install_relative_path'
+        ) 'Local frozen installer record'
+        foreach ($field in @(
+            'source_revision', 'app_version', 'target_triple',
+            'frozen_record_sha256', 'bundle_inventory_sha256'
+        )) {
+            if ($record.$field -isnot [string]) {
+                throw "Local frozen installer schema-1 record field '$field' must be a string."
+            }
+        }
+        if (-not (Test-WindowsFrozenCpuWorkerSameSourceContext $DesktopContext $FrozenCpuWorker.Context)) {
+            throw 'Local frozen installer schema-1 record cannot represent distinct desktop and worker sources.'
+        }
+        if ($record.source_revision -cne $FrozenCpuWorker.Record.source_revision -or
+            $record.app_version -cne $FrozenCpuWorker.Record.app_version -or
+            $record.target_triple -cne $FrozenCpuWorker.Record.target_triple -or
+            $record.frozen_record_sha256 -cne $FrozenCpuWorker.RecordSha256 -or
+            $record.bundle_inventory_sha256 -cne $Bundle.InventorySha256) {
+            throw 'Local frozen installer schema-1 record does not bind the exact frozen worker and bundle identities.'
+        }
+    }
+    elseif ($schemaVersion -eq 2) {
+        Assert-WindowsLocalFrozenExactProperties $record @(
+            'schema_version', 'kind', 'local_only', 'release_approved',
+            'desktop_source_revision', 'desktop_app_version', 'desktop_build_id', 'target_triple',
+            'frozen_record_sha256', 'worker_source_revision', 'worker_app_version',
+            'worker_origin_app_build', 'worker_build_id', 'bundled_cpu_worker_sha256',
+            'bundle_inventory_sha256', 'installer_filename', 'installer_size_bytes',
+            'installer_sha256', 'local_test_token', 'install_relative_path'
+        ) 'Local frozen installer mixed-source record'
+        foreach ($field in @(
+            'desktop_source_revision', 'desktop_app_version', 'desktop_build_id',
+            'target_triple', 'frozen_record_sha256', 'worker_source_revision',
+            'worker_app_version', 'worker_origin_app_build', 'worker_build_id',
+            'bundled_cpu_worker_sha256', 'bundle_inventory_sha256'
+        )) {
+            if ($record.$field -isnot [string]) {
+                throw "Local frozen installer mixed-source record field '$field' must be a string."
+            }
+        }
+        if ((Test-WindowsFrozenCpuWorkerSameSourceContext $DesktopContext $FrozenCpuWorker.Context) -or
+            $record.desktop_source_revision -cne $DesktopContext.SourceRevision -or
+            $record.desktop_app_version -cne $DesktopContext.AppVersion -or
+            $record.desktop_build_id -cne $DesktopContext.DesktopBuildId -or
+            $record.target_triple -cne $DesktopContext.TargetTriple -or
+            $record.frozen_record_sha256 -cne $FrozenCpuWorker.RecordSha256 -or
+            $record.worker_source_revision -cne $FrozenCpuWorker.Record.source_revision -or
+            $record.worker_app_version -cne $FrozenCpuWorker.Record.app_version -or
+            $record.worker_origin_app_build -cne $FrozenCpuWorker.Context.DesktopBuildId -or
+            $record.worker_build_id -cne $FrozenCpuWorker.Context.WorkerBuildId -or
+            $record.bundled_cpu_worker_sha256 -cne $FrozenCpuWorker.Record.worker_sha256 -or
+            $record.bundle_inventory_sha256 -cne $Bundle.InventorySha256) {
+            throw 'Local frozen installer mixed-source record does not bind the exact desktop and frozen worker identities.'
+        }
+        foreach ($field in @(
+            'frozen_record_sha256', 'bundled_cpu_worker_sha256', 'bundle_inventory_sha256'
+        )) {
+            Assert-WindowsFrozenCpuWorkerDigest $record.$field "Local frozen installer mixed-source $field"
+        }
+    }
+    else {
+        throw 'Local frozen installer record has an unsupported schema.'
+    }
+    if ($record.kind -cne 'windows-local-frozen-test-installer' -or
         $record.local_only -isnot [bool] -or -not $record.local_only -or
-        $record.release_approved -isnot [bool] -or $record.release_approved -or
-        $record.source_revision -cne $FrozenCpuWorker.Record.source_revision -or
-        $record.app_version -cne $FrozenCpuWorker.Record.app_version -or
-        $record.target_triple -cne $FrozenCpuWorker.Record.target_triple -or
-        $record.frozen_record_sha256 -cne $FrozenCpuWorker.RecordSha256 -or
-        $record.bundle_inventory_sha256 -cne $Bundle.InventorySha256)) {
+        $record.release_approved -isnot [bool] -or $record.release_approved) {
         throw 'Local frozen installer record does not bind the exact local frozen bundle and worker identities.'
     }
     if ($record.installer_filename -isnot [string] -or
@@ -1151,6 +1233,7 @@ function Assert-WindowsLocalFrozenInstallerRecord(
         $record.installer_sha256 -isnot [string] -or $record.installer_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $record.local_test_token -isnot [string] -or $record.local_test_token -cnotmatch '^[0-9a-f]{32}$' -or
         $record.installer_filename -cne "Scribe-LOCAL-Frozen-Test-$($record.local_test_token).exe" -or
+        $record.install_relative_path -isnot [string] -or
         $record.install_relative_path -cne "Scribe/LOCAL-Frozen-Test/$($record.local_test_token)") {
         throw 'Local frozen installer record has an invalid installer or local-test identity.'
     }

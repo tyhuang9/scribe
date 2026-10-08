@@ -3,6 +3,7 @@ param(
     [string]$BundlePath,
     [Parameter(Mandatory = $true)]
     [string]$FrozenCpuWorkerRecordPath,
+    [string]$FrozenCpuWorkerSourceRoot,
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
     [Parameter(Mandatory = $true)]
@@ -52,10 +53,10 @@ function Assert-WindowsLocalFrozenObservationOutputDestination(
     return $output
 }
 
-function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path) {
+function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path, [string]$TemporaryBaseRoot) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $root = Get-WindowsLocalFrozenNormalizedFullPath $Path
-    $temp = Get-WindowsLocalFrozenNormalizedFullPath ([System.IO.Path]::GetTempPath())
+    $temp = Get-WindowsLocalFrozenNormalizedFullPath $TemporaryBaseRoot
     if ((Split-Path -Parent $root) -cne $temp -or
         (Split-Path -Leaf $root) -cnotmatch '^scribe-local-frozen-installer-verification-[0-9a-f]{32}$') {
         throw 'Refused local frozen installer verifier cleanup outside its exact temporary root.'
@@ -73,22 +74,37 @@ function Remove-WindowsLocalFrozenVerifierTemporaryRoot([string]$Path) {
 
 Assert-WindowsFrozenCpuWorkerLocalOnlyEnvironment
 $repositoryRoot = Get-WindowsLocalFrozenNormalizedFullPath (Split-Path -Parent $PSScriptRoot)
+if ($PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot') -and [string]::IsNullOrWhiteSpace($FrozenCpuWorkerSourceRoot)) {
+    throw 'FrozenCpuWorkerSourceRoot was explicitly supplied but is empty or whitespace.'
+}
+$resolvedFrozenWorkerSourceRoot = if ($PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot')) {
+    Get-WindowsLocalFrozenNormalizedFullPath $FrozenCpuWorkerSourceRoot
+}
+else {
+    $repositoryRoot
+}
 $frozenCpuWorker = $null
+$desktopSourceContext = $null
 $temporaryRoot = $null
+$temporaryBaseRoot = $null
 $installedRoot = $null
 $uninstaller = $null
 $payloadParityConfirmed = $false
 $observationRequest = Get-WindowsLocalFrozenCaptureObservationRequest $PSBoundParameters
 $observationReport = $null
 try {
-    $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $repositoryRoot
+    $desktopSourceContext = Get-WindowsFrozenCpuWorkerSourceContext $repositoryRoot
+    $frozenCpuWorker = Open-ValidatedWindowsFrozenCpuWorker $FrozenCpuWorkerRecordPath $resolvedFrozenWorkerSourceRoot
+    Assert-WindowsFrozenCpuWorkerCompatibleSourceContexts $desktopSourceContext $frozenCpuWorker.Context
+    $temporaryBaseRoot = Get-WindowsFrozenCpuWorkerSafeTemporaryRoot $desktopSourceContext $frozenCpuWorker
     $bundle = Assert-WindowsLocalFrozenBundle $BundlePath $frozenCpuWorker
+    Assert-WindowsLocalFrozenBundleCompiledAdmission $bundle $desktopSourceContext $frozenCpuWorker | Out-Null
     $installer = Get-WindowsLocalFrozenNormalizedFullPath $InstallerPath
     $recordPath = Get-WindowsLocalFrozenNormalizedFullPath $InstallerRecordPath
     if ((Split-Path -Parent $installer) -cne (Split-Path -Parent $recordPath)) {
         throw 'Local frozen installer and its record must be sibling files.'
     }
-    $record = Assert-WindowsLocalFrozenInstallerRecord $recordPath $frozenCpuWorker $bundle $installer
+    $record = Assert-WindowsLocalFrozenInstallerRecord $recordPath $desktopSourceContext $frozenCpuWorker $bundle $installer
     $expectedInstallerDirectory = Get-WindowsLocalFrozenNormalizedFullPath (Split-Path -Parent $installer)
     $expectedRecordPath = Join-Path $expectedInstallerDirectory 'windows-local-frozen-test-installer-record.json'
     if ($recordPath -cne $expectedRecordPath) {
@@ -114,20 +130,20 @@ try {
             -Request $observationRequest `
             -ForbiddenRoots @(
                 $repositoryRoot, $bundle.Root, $installedRoot,
-                $frozenCpuWorker.Root,
+                $resolvedFrozenWorkerSourceRoot, $frozenCpuWorker.Root,
                 (Split-Path -Parent $installer),
                 (Split-Path -Parent $recordPath),
                 $observationRequest.WavPath
             )
     }
     $token = [guid]::NewGuid().ToString('N')
-    $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-local-frozen-installer-verification-$token"
+    $temporaryRoot = Join-Path $temporaryBaseRoot "scribe-local-frozen-installer-verification-$token"
     Assert-WindowsFrozenCpuWorkerNoReparseAncestors $temporaryRoot
     New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
     if ($null -ne $observationRequest) {
         $observationOutput = Assert-WindowsLocalFrozenObservationOutputDestination `
             -Request $observationRequest `
-            -ForbiddenRoots @($repositoryRoot, $bundle.Root, $installedRoot, $temporaryRoot)
+            -ForbiddenRoots @($repositoryRoot, $resolvedFrozenWorkerSourceRoot, $bundle.Root, $installedRoot, $temporaryRoot)
     }
     $installLog = Join-Path $temporaryRoot 'install.log'
     $install = Invoke-WindowsLocalFrozenInstallerProcess $installer @(
@@ -137,6 +153,7 @@ try {
         throw "Local frozen installer exited with $($install.ExitCode): $($install.Stderr.Trim())"
     }
     $installedBundle = Assert-WindowsLocalFrozenPayloadParity $bundle.Root $installedRoot
+    Assert-WindowsLocalFrozenBundleCompiledAdmission $installedBundle $desktopSourceContext $frozenCpuWorker | Out-Null
     $payloadParityConfirmed = $true
     $uninstaller = Join-Path $installedRoot 'unins000.exe'
     $modelManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'runtime-manifests\whisper-base-en-q8_0-windows-x64.json') -Raw | ConvertFrom-Json
@@ -222,7 +239,7 @@ try {
             throw "Installed local frozen GPU observation failed with exit code $($observation.ExitCode): $($observation.Stderr.Trim())"
         }
         $expectedObservation = [pscustomobject]@{
-            CollectorBuildRevision = $frozenCpuWorker.Record.source_revision
+            CollectorBuildRevision = $desktopSourceContext.SourceRevision
             ModelSha256 = $model.Sha256
             WavSha256 = $observationRequest.WavSha256
             PackId = $installedPack.PackId
@@ -255,12 +272,13 @@ try {
     }
     Wait-WindowsLocalFrozenInstallRootRemoved $installedRoot
     $uninstaller = $null
+    Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
     Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
     if ($null -ne $observationReport) {
         # The capture bytes are already retained in memory.  Remove every
         # verifier-owned scratch file before making a caller-visible report so
         # a cleanup failure cannot look like a successful observation.
-        Remove-WindowsLocalFrozenVerifierTemporaryRoot $temporaryRoot
+        Remove-WindowsLocalFrozenVerifierTemporaryRoot $temporaryRoot $temporaryBaseRoot
         $temporaryRoot = $null
         $publishedReport = Publish-WindowsLocalFrozenNewReport `
             $observationOutput `
@@ -296,7 +314,7 @@ finally {
         Write-Warning "Local frozen installer verification retained the untrusted token-bound installation for inspection: $installedRoot"
     }
     if ($null -ne $temporaryRoot) {
-        Remove-WindowsLocalFrozenVerifierTemporaryRoot $temporaryRoot
+        Remove-WindowsLocalFrozenVerifierTemporaryRoot $temporaryRoot $temporaryBaseRoot
     }
     if ($null -ne $frozenCpuWorker -and $null -ne $frozenCpuWorker.WorkerStream) {
         $frozenCpuWorker.WorkerStream.Dispose()
