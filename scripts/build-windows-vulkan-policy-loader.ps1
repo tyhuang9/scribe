@@ -131,6 +131,12 @@ function Invoke-LoaderNative([string]$Executable, [string[]]$Arguments) {
     if ($result.Stderr) { Write-Verbose $result.Stderr }
 }
 
+function Invoke-LoaderPatch([string]$Git, [string]$Loader, [string]$PatchPath) {
+    # The manifest pins CRLF patched bytes, independent of caller Git defaults.
+    Invoke-LoaderNative $Git @('-C', $Loader, '-c', 'core.autocrlf=true', 'apply', '--check', $PatchPath)
+    Invoke-LoaderNative $Git @('-C', $Loader, '-c', 'core.autocrlf=true', 'apply', $PatchPath)
+}
+
 function Assert-NoLoaderBuildOverrides([Collections.IDictionary]$Environment) {
     # The shared preflight rejects compiler/SDK overrides. Also reject CMake's
     # environment initializers (including compiler/linker launchers), before a
@@ -242,8 +248,7 @@ try {
     Expand-LoaderSource $streams[1] $manifest.headers.root $buildRoot
     $loader = Join-Path $buildRoot $manifest.loader.root
     $headers = Join-Path $buildRoot $manifest.headers.root
-    Invoke-LoaderNative $git @('-C', $loader, 'apply', '--check', $patchPath)
-    Invoke-LoaderNative $git @('-C', $loader, 'apply', $patchPath)
+    Invoke-LoaderPatch $git $loader $patchPath
     foreach ($patched in $manifest.patch.patched_files) {
         $verified = Open-LoaderInput (Join-Path $loader $patched.path) $patched.sha256
         $verified.Dispose()

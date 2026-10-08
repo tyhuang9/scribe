@@ -13,11 +13,14 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($builderPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw 'Vulkan policy builder did not parse.' }
 # Exercise the actual pure/input helpers without executing the native builder.
-foreach ($name in @('Assert-LoaderProperties', 'Open-LoaderInput', 'Expand-LoaderSource', 'Assert-NoLoaderBuildOverrides')) {
+$loaderPatchDefinition = $null
+foreach ($name in @('Assert-LoaderProperties', 'Open-LoaderInput', 'Expand-LoaderSource', 'Assert-NoLoaderBuildOverrides',
+    'Invoke-LoaderNative', 'Invoke-LoaderPatch')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $false))
     if ($definitions.Count -ne 1) { throw "Expected exactly one tested helper: $name" }
+    if ($name -ceq 'Invoke-LoaderPatch') { $loaderPatchDefinition = $definitions[0] }
     . ([scriptblock]::Create($definitions[0].Extent.Text))
 }
 
@@ -55,6 +58,40 @@ Assert-ScribeGpuWorkerNoReparse $scratch
 if (Test-Path -LiteralPath $scratch) { throw 'Expected fresh test directory.' }
 [IO.Directory]::CreateDirectory($scratch) | Out-Null
 try {
+    $patchCalls = @($loaderPatchDefinition.Body.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Invoke-LoaderNative'
+    }, $true))
+    $normalizedPatchCalls = @($patchCalls | ForEach-Object { ($_.Extent.Text -replace '\s+', ' ').Trim() })
+    Assert-Policy ($normalizedPatchCalls.Count -eq 2) 'Expected checked and applied Vulkan policy patch calls.'
+    Assert-Policy ($normalizedPatchCalls[0] -ceq "Invoke-LoaderNative `$Git @('-C', `$Loader, '-c', 'core.autocrlf=true', 'apply', '--check', `$PatchPath)") 'Vulkan policy patch check must pin CRLF checkout conversion.'
+    Assert-Policy ($normalizedPatchCalls[1] -ceq "Invoke-LoaderNative `$Git @('-C', `$Loader, '-c', 'core.autocrlf=true', 'apply', `$PatchPath)") 'Vulkan policy patch application must pin CRLF checkout conversion.'
+    $originalLoaderNative = ${function:Invoke-LoaderNative}
+    $script:loaderPatchSpyCalls = [Collections.Generic.List[object]]::new()
+    $script:loaderPatchSpyRejectCheck = $false
+    function Invoke-LoaderNative([string]$Executable, [string[]]$Arguments) {
+        $script:loaderPatchSpyCalls.Add([pscustomobject]@{
+            Executable = $Executable
+            Arguments = @($Arguments)
+        }) | Out-Null
+        if ($script:loaderPatchSpyRejectCheck -and $Arguments -contains '--check') {
+            throw 'Synthetic Vulkan policy patch check failure.'
+        }
+    }
+    try {
+        Invoke-LoaderPatch 'git.exe' 'loader-root' 'policy.patch'
+        Assert-Policy ($script:loaderPatchSpyCalls.Count -eq 2) 'Vulkan policy patch helper did not make both native calls.'
+        Assert-Policy (($script:loaderPatchSpyCalls[0].Arguments -join '|') -ceq '-C|loader-root|-c|core.autocrlf=true|apply|--check|policy.patch') 'Vulkan policy patch check arguments drifted.'
+        Assert-Policy (($script:loaderPatchSpyCalls[1].Arguments -join '|') -ceq '-C|loader-root|-c|core.autocrlf=true|apply|policy.patch') 'Vulkan policy patch application arguments drifted.'
+        $script:loaderPatchSpyCalls.Clear()
+        $script:loaderPatchSpyRejectCheck = $true
+        Assert-PolicyRejected { Invoke-LoaderPatch 'git.exe' 'loader-root' 'policy.patch' } 'Vulkan policy patch helper ignored a failed check.'
+        Assert-Policy ($script:loaderPatchSpyCalls.Count -eq 1) 'Vulkan policy patch helper applied after a failed check.'
+    } finally {
+        Set-Item -LiteralPath Function:Invoke-LoaderNative -Value $originalLoaderNative
+        Remove-Variable -Name loaderPatchSpyCalls -Scope Script
+        Remove-Variable -Name loaderPatchSpyRejectCheck -Scope Script
+    }
+
     $inputPath = Join-Path $scratch 'input.txt'
     [IO.File]::WriteAllText($inputPath, 'authenticated build input', [Text.UTF8Encoding]::new($false))
     $hash = (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -120,6 +157,81 @@ try {
         } finally { $zip.Dispose() }
     }
 
+    $git = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source
+    $expectedPatchedBytes = [Text.Encoding]::ASCII.GetBytes("patched`r`n")
+    $expectedPatchedHex = [Convert]::ToHexString($expectedPatchedBytes)
+    $expectedPatchedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($expectedPatchedBytes)).ToLowerInvariant()
+    $gitConfigEnvironment = @{}
+    foreach ($name in @('GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0')) {
+        $gitConfigEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        foreach ($autocrlf in @('false', 'input', 'true')) {
+            $caseRoot = Join-Path $scratch "patch-line-endings-$autocrlf"
+            [IO.Directory]::CreateDirectory($caseRoot) | Out-Null
+            $sourcePath = Join-Path $caseRoot 'line-endings.c'
+            $patchPath = Join-Path $caseRoot 'line-endings.patch'
+            [IO.File]::WriteAllBytes($sourcePath, [Text.Encoding]::ASCII.GetBytes("original`r`n"))
+            [IO.File]::WriteAllText($patchPath, (@(
+                'diff --git a/line-endings.c b/line-endings.c'
+                '--- a/line-endings.c'
+                '+++ b/line-endings.c'
+                '@@ -1 +1 @@'
+                '-original'
+                '+patched'
+                ''
+            ) -join "`n"), [Text.UTF8Encoding]::new($false))
+            # These environment entries emulate conflicting caller command-scope
+            # configuration without reading or modifying personal Git settings.
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_NOSYSTEM', '1', 'Process')
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_GLOBAL', (Join-Path $scratch 'absent-global.gitconfig'), 'Process')
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_COUNT', '1', 'Process')
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_KEY_0', 'core.autocrlf', 'Process')
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_VALUE_0', $autocrlf, 'Process')
+            Invoke-LoaderPatch $git $caseRoot $patchPath
+            Assert-Policy ([Environment]::GetEnvironmentVariable('GIT_CONFIG_NOSYSTEM', 'Process') -ceq '1') "Pinned patch helper changed GIT_CONFIG_NOSYSTEM for core.autocrlf=$autocrlf."
+            Assert-Policy ([Environment]::GetEnvironmentVariable('GIT_CONFIG_GLOBAL', 'Process') -ceq (Join-Path $scratch 'absent-global.gitconfig')) "Pinned patch helper changed GIT_CONFIG_GLOBAL for core.autocrlf=$autocrlf."
+            Assert-Policy ([Environment]::GetEnvironmentVariable('GIT_CONFIG_COUNT', 'Process') -ceq '1') "Pinned patch helper changed GIT_CONFIG_COUNT for core.autocrlf=$autocrlf."
+            Assert-Policy ([Environment]::GetEnvironmentVariable('GIT_CONFIG_KEY_0', 'Process') -ceq 'core.autocrlf') "Pinned patch helper changed GIT_CONFIG_KEY_0 for core.autocrlf=$autocrlf."
+            Assert-Policy ([Environment]::GetEnvironmentVariable('GIT_CONFIG_VALUE_0', 'Process') -ceq $autocrlf) "Pinned patch helper changed GIT_CONFIG_VALUE_0 for core.autocrlf=$autocrlf."
+            $actualPatchedBytes = [IO.File]::ReadAllBytes($sourcePath)
+            $actualPatchedHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Policy ([Convert]::ToHexString($actualPatchedBytes) -ceq $expectedPatchedHex) "Pinned patch conversion did not produce CRLF bytes for core.autocrlf=$autocrlf."
+            Assert-Policy ($actualPatchedHash -ceq $expectedPatchedHash) "Pinned patch conversion did not produce the expected CRLF hash for core.autocrlf=$autocrlf."
+        }
+
+        $rejectedRoot = Join-Path $scratch 'patch-check-rejected'
+        [IO.Directory]::CreateDirectory($rejectedRoot) | Out-Null
+        $rejectedSource = Join-Path $rejectedRoot 'line-endings.c'
+        $rejectedPatch = Join-Path $rejectedRoot 'line-endings.patch'
+        $unchangedBytes = [Text.Encoding]::ASCII.GetBytes("original`r`n")
+        [IO.File]::WriteAllBytes($rejectedSource, $unchangedBytes)
+        $unchangedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($unchangedBytes)).ToLowerInvariant()
+        [IO.File]::WriteAllText($rejectedPatch, (@(
+            'diff --git a/line-endings.c b/line-endings.c'
+            '--- a/line-endings.c'
+            '+++ b/line-endings.c'
+            '@@ -1 +1 @@'
+            '-missing'
+            '+patched'
+            ''
+        ) -join "`n"), [Text.UTF8Encoding]::new($false))
+        Assert-PolicyRejected { Invoke-LoaderPatch $git $rejectedRoot $rejectedPatch } 'A failed Vulkan policy patch check applied the patch.'
+        Assert-Policy ((Get-FileHash -LiteralPath $rejectedSource -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $unchangedHash) 'A failed Vulkan policy patch check changed the source hash.'
+        Assert-Policy ([Convert]::ToHexString([IO.File]::ReadAllBytes($rejectedSource)) -ceq [Convert]::ToHexString($unchangedBytes)) 'A failed Vulkan policy patch check changed the source bytes.'
+    } finally {
+        foreach ($entry in $gitConfigEnvironment.GetEnumerator()) {
+            if ($null -eq $entry.Value) {
+                Remove-Item -LiteralPath "Env:$($entry.Key)" -Force -ErrorAction SilentlyContinue
+            } else {
+                [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+            }
+        }
+    }
+    foreach ($entry in $gitConfigEnvironment.GetEnumerator()) {
+        Assert-Policy ([Environment]::GetEnvironmentVariable($entry.Key, 'Process') -ceq $entry.Value) "Synthetic Git patch test changed caller environment $($entry.Key)."
+    }
+
     $policyRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'native\vulkan-policy-loader'
     $manifest = Get-Content -LiteralPath (Join-Path $policyRoot 'source-manifest.json') -Raw | ConvertFrom-Json
     $patch = Join-Path $policyRoot 'no-layers-or-settings.patch'
@@ -138,7 +250,7 @@ try {
         Assert-PolicyRejected { Assert-NoLoaderBuildOverrides $hostileEnvironment } "Ambient override $name was accepted."
         Assert-Policy ($hostileEnvironment.Count -eq 2 -and $hostileEnvironment[$name] -ceq 'untrusted value') 'Environment rejection mutated caller input.'
     }
-    Assert-Policy ($script:checks -ge 104) 'Expected policy tests were not executed.'
+    Assert-Policy ($script:checks -ge 141) 'Expected policy tests were not executed.'
     Write-Output "Windows Vulkan policy loader input tests passed ($script:checks checks)."
 } finally {
     # Delete only this invocation's exact physical scratch tree. Do not follow
