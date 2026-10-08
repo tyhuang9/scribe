@@ -40,24 +40,27 @@ candidate-policy embedding and production acceptance remain later integration.
 
 The runtime now has a separate compile-time Windows-x64 compatibility map and a
 versioned, inference-only session handshake for exact frozen R workers. The
-checked-in map is canonical and empty, so it grants no foreign worker or pack.
-It is an admission mechanism only: it does not build, acquire, capture, qualify,
-sign, package, enable Auto for, or publish a candidate. Workers built before
-that handshake existed cannot gain support retroactively. Populating the map
-and integrating authenticated frozen inputs into an exact candidate installer
-remain separately reviewed work.
+checked-in map contains exactly three verified LOCAL diagnostic entries: the
+CPU worker and the CUDA and Vulkan worker packs. Unknown, old or mixed worker
+and pack identities remain denied. It is an admission mechanism only: it does
+not build, acquire, capture, qualify, sign, package, enable Auto for, or publish
+a candidate. Workers built before
+that handshake existed cannot gain support retroactively. Replacing or adding
+an exact tuple requires a separately reviewed source change. Integrating
+authenticated frozen inputs into an exact production candidate installer
+remains later work.
 
 The LOCAL frozen-worker assembly path may ask its already verified desktop M
 for a bounded compiled admission report before it packages or observes R. That
 report is a local consistency gate, not a new authority: it cannot populate the
-empty map, authenticate an unknown hash origin, approve a GPU pack, or enable
+compiled map, authenticate an unknown hash origin, approve a GPU pack, or enable
 Auto. CUDA and Vulkan descriptor admission remain on their existing compiled
 signature/epoch path.
 
 A complete authenticated campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
 CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct
-campaign schema 1). The campaign executes five cold and twenty warm pairs,
+campaign schema 2). The campaign executes five cold and twenty warm pairs,
 with two separate priming records, authenticated handshake frames, sampled
 process/device memory and request-bound raw and source-defined availability
 observations. These unsigned diagnostic reports are not performance bundles;
