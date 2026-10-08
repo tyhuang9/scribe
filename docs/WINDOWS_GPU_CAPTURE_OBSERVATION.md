@@ -42,6 +42,11 @@ test is a local diagnosis tool for the independently verified public CPU/CUDA
 transcript mismatch. It is not a collector command, runtime switch, report
 schema change, release check, qualification path, or Auto-policy input.
 
+Build the hardware diagnostic with Cargo's optimized `--release` test profile,
+the existing frozen CPU anchor and pinned toolchain. Keep the ordinary fixed
+provider-discovery deadline and all pack revalidation checks; do not lengthen
+the deadline or bypass admission to accommodate a debug test build.
+
 The test discovers a fresh `public-parity-fixture` directory beside its compiled
 test binary. The surrounding test-binary directory retains the accepted bundled
 model `whisper-base.en-Q8_0.gguf` and verified workers; the fixture directory
