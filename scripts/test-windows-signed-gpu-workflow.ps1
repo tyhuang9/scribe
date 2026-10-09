@@ -47,7 +47,7 @@ $environmentNames = @(
     'GPU_INPUTS_REQUESTED', 'GITHUB_SHA', 'GITHUB_WORKSPACE', 'RUNNER_TEMP', 'GITHUB_ENV', 'GITHUB_OUTPUT',
     'GPU_SIGNING_RUN_ID', 'GPU_SIGNING_RUN_ATTEMPT', 'GPU_SIGNED_ARTIFACT_ID',
     'EXPECTED_GPU_ARTIFACT_SHA256', 'EXPECTED_GPU_POLICY_SHA256', 'EXPECTED_GPU_SIGNER_PINS_SHA256',
-    'GPU_WORKER_SOURCE_REVISION', 'EXPECTED_GPU_WORKER_SOURCE_REVISION', 'SCRIBE_BUILD_REVISION'
+    'GPU_WORKER_SOURCE_REVISION', 'EXPECTED_GPU_WORKER_SOURCE_REVISION', 'SCRIBE_BUILD_REVISION', 'CPU_INPUTS_REQUESTED'
 )
 $savedEnvironment = @{}
 foreach ($name in $environmentNames) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
@@ -106,6 +106,7 @@ if ($env:GPU_INPUTS_REQUESTED -ceq 'true') {
         $global:LASTEXITCODE = $global:SignedGpuWorkflowCargoExit
     }
     $env:GITHUB_SHA = 'd' * 40
+    $env:CPU_INPUTS_REQUESTED = 'false'
     $env:GITHUB_WORKSPACE = $testRoot; $env:RUNNER_TEMP = $testRoot
     $env:GITHUB_ENV = Join-Path $testRoot 'environment.txt'; $env:GITHUB_OUTPUT = Join-Path $testRoot 'output.txt'
     $env:GPU_SIGNING_RUN_ID = '100'; $env:GPU_SIGNING_RUN_ATTEMPT = '2'; $env:GPU_SIGNED_ARTIFACT_ID = '300'

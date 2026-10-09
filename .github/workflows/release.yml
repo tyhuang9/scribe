@@ -25,6 +25,22 @@ on:
         description: Exact GPU worker source revision (omit to use the installer revision)
         required: false
         type: string
+      cpu_worker_source_revision:
+        description: Exact verified CPU worker revision (all four CPU inputs or none)
+        required: false
+        type: string
+      cpu_worker_producer_run_id:
+        description: Completed protected CPU worker producer run ID
+        required: false
+        type: string
+      cpu_worker_producer_run_attempt:
+        description: Exact successful latest CPU producer attempt
+        required: false
+        type: string
+      cpu_worker_artifact_id:
+        description: Immutable verified CPU worker artifact ID
+        required: false
+        type: string
   push:
     branches: [main]
     tags: ["v*"]
@@ -46,6 +62,10 @@ env:
   GPU_SIGNING_RUN_ATTEMPT: ${{ inputs.gpu_signing_run_attempt }}
   GPU_SIGNED_ARTIFACT_ID: ${{ inputs.gpu_signed_artifact_id }}
   GPU_WORKER_SOURCE_REVISION: ${{ inputs.gpu_worker_source_revision }}
+  CPU_WORKER_SOURCE_REVISION: ${{ inputs.cpu_worker_source_revision }}
+  CPU_WORKER_PRODUCER_RUN_ID: ${{ inputs.cpu_worker_producer_run_id }}
+  CPU_WORKER_PRODUCER_RUN_ATTEMPT: ${{ inputs.cpu_worker_producer_run_attempt }}
+  CPU_WORKER_ARTIFACT_ID: ${{ inputs.cpu_worker_artifact_id }}
 
 jobs:
   build:
@@ -63,6 +83,13 @@ jobs:
       gpu_signing_policy_sha256: ${{ steps.gpu-input-preflight.outputs.policy_sha256 }}
       gpu_signer_pins_sha256: ${{ steps.gpu-input-preflight.outputs.signer_pins_sha256 }}
       gpu_worker_source_revision: ${{ steps.gpu-input-preflight.outputs.worker_source_revision }}
+      cpu_inputs_requested: ${{ steps.cpu-input-policy.outputs.requested }}
+      cpu_worker_source_revision: ${{ steps.cpu-input-preflight.outputs.worker_source_revision }}
+      cpu_worker_producer_run_id: ${{ steps.cpu-input-preflight.outputs.producer_run_id }}
+      cpu_worker_producer_run_attempt: ${{ steps.cpu-input-preflight.outputs.producer_run_attempt }}
+      cpu_worker_artifact_id: ${{ steps.cpu-input-preflight.outputs.artifact_id }}
+      cpu_worker_artifact_sha256: ${{ steps.cpu-input-preflight.outputs.artifact_sha256 }}
+      cpu_worker_artifact_size_bytes: ${{ steps.cpu-input-preflight.outputs.artifact_size_bytes }}
 
     steps:
       - name: Check out source
@@ -92,6 +119,67 @@ jobs:
         shell: pwsh
         run: |
           & .\scripts\test-windows-release-packaging.ps1
+
+      - name: Validate optional verified CPU worker request
+        id: cpu-input-policy
+        shell: pwsh
+        run: |
+          $values = @($env:CPU_WORKER_SOURCE_REVISION, $env:CPU_WORKER_PRODUCER_RUN_ID,
+            $env:CPU_WORKER_PRODUCER_RUN_ATTEMPT, $env:CPU_WORKER_ARTIFACT_ID)
+          $present = @($values | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count
+          if ($present -ne 0 -and $present -ne 4) { throw 'Supply all four verified CPU inputs or none.' }
+          $requested = $present -eq 4
+          if ($requested) {
+            if ($env:GITHUB_REPOSITORY -cne 'tyhuang9/scribe' -or
+                $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -cne 'refs/heads/main') {
+              throw 'CPU reuse is restricted to the fixed repository protected manual main workflow.'
+            }
+            if ($env:CPU_WORKER_SOURCE_REVISION -cnotmatch '\A[0-9a-f]{40}\z' -or
+                $env:CPU_WORKER_PRODUCER_RUN_ID -cnotmatch '\A[1-9][0-9]*\z' -or
+                $env:CPU_WORKER_PRODUCER_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]*\z' -or
+                $env:CPU_WORKER_ARTIFACT_ID -cnotmatch '\A[1-9][0-9]*\z') {
+              throw 'Verified CPU input identities must be canonical, nonblank scalars.'
+            }
+          }
+          "requested=$($requested.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Authenticate exact verified CPU input
+        id: cpu-input-preflight
+        if: steps.cpu-input-policy.outputs.requested == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cpu = & .\scripts\resolve-windows-cpu-worker-inputs.ps1 `
+            -Mode Preflight -SourceRevision $env:GITHUB_SHA `
+            -WorkerSourceRevision $env:CPU_WORKER_SOURCE_REVISION `
+            -ProducerRunId $env:CPU_WORKER_PRODUCER_RUN_ID `
+            -ProducerRunAttempt $env:CPU_WORKER_PRODUCER_RUN_ATTEMPT -ArtifactId $env:CPU_WORKER_ARTIFACT_ID
+          "worker_source_revision=$($cpu.WorkerSourceRevision)" >> $env:GITHUB_OUTPUT
+          "producer_run_id=$($cpu.ProducerRunId)" >> $env:GITHUB_OUTPUT
+          "producer_run_attempt=$($cpu.ProducerRunAttempt)" >> $env:GITHUB_OUTPUT
+          "artifact_id=$($cpu.ArtifactId)" >> $env:GITHUB_OUTPUT
+          "artifact_sha256=$($cpu.ArtifactSha256)" >> $env:GITHUB_OUTPUT
+          "artifact_size_bytes=$($cpu.ArtifactSizeBytes)" >> $env:GITHUB_OUTPUT
+
+      - name: Download authenticated raw CPU worker archive
+        if: steps.cpu-input-policy.outputs.requested == 'true'
+        shell: pwsh
+        env:
+          EXPECTED_CPU_WORKER_SOURCE_REVISION: ${{ steps.cpu-input-preflight.outputs.worker_source_revision }}
+          EXPECTED_CPU_PRODUCER_RUN_ID: ${{ steps.cpu-input-preflight.outputs.producer_run_id }}
+          EXPECTED_CPU_PRODUCER_RUN_ATTEMPT: ${{ steps.cpu-input-preflight.outputs.producer_run_attempt }}
+          EXPECTED_CPU_ARTIFACT_ID: ${{ steps.cpu-input-preflight.outputs.artifact_id }}
+          EXPECTED_CPU_ARTIFACT_SHA256: ${{ steps.cpu-input-preflight.outputs.artifact_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          & .\scripts\resolve-windows-cpu-worker-inputs.ps1 `
+            -Mode Download -SourceRevision $env:GITHUB_SHA `
+            -WorkerSourceRevision $env:EXPECTED_CPU_WORKER_SOURCE_REVISION `
+            -ProducerRunId $env:EXPECTED_CPU_PRODUCER_RUN_ID `
+            -ProducerRunAttempt $env:EXPECTED_CPU_PRODUCER_RUN_ATTEMPT -ArtifactId $env:EXPECTED_CPU_ARTIFACT_ID `
+            -ExpectedArtifactSha256 $env:EXPECTED_CPU_ARTIFACT_SHA256 `
+            -ArchivePath (Join-Path $env:RUNNER_TEMP 'scribe-ci-cpu-worker.zip') | Out-Null
 
       - name: Authenticate exact signed GPU inputs without signing authority
         id: gpu-input-preflight
@@ -435,6 +523,12 @@ jobs:
         shell: pwsh
         env:
           GPU_INPUTS_REQUESTED: ${{ steps.gpu-release-policy.outputs.signed_gpu_inputs_requested }}
+          CPU_INPUTS_REQUESTED: ${{ steps.cpu-input-policy.outputs.requested }}
+          EXPECTED_CPU_WORKER_SOURCE_REVISION: ${{ steps.cpu-input-preflight.outputs.worker_source_revision }}
+          EXPECTED_CPU_PRODUCER_RUN_ID: ${{ steps.cpu-input-preflight.outputs.producer_run_id }}
+          EXPECTED_CPU_PRODUCER_RUN_ATTEMPT: ${{ steps.cpu-input-preflight.outputs.producer_run_attempt }}
+          EXPECTED_CPU_ARTIFACT_ID: ${{ steps.cpu-input-preflight.outputs.artifact_id }}
+          EXPECTED_CPU_ARTIFACT_SHA256: ${{ steps.cpu-input-preflight.outputs.artifact_sha256 }}
           EXPECTED_GPU_ARTIFACT_SHA256: ${{ steps.gpu-input-preflight.outputs.artifact_sha256 }}
           EXPECTED_GPU_POLICY_SHA256: ${{ steps.gpu-input-preflight.outputs.policy_sha256 }}
           EXPECTED_GPU_SIGNER_PINS_SHA256: ${{ steps.gpu-input-preflight.outputs.signer_pins_sha256 }}
@@ -447,6 +541,15 @@ jobs:
           $releaseArguments = @{
             ModelSource = '.ci-release-inputs\model\whisper-base.en-Q8_0.gguf'
             BundlePath = 'dist\portable'
+          }
+          if ($env:CPU_INPUTS_REQUESTED -ceq 'true') {
+            $releaseArguments.CiCpuWorkerSourceRevision = $env:EXPECTED_CPU_WORKER_SOURCE_REVISION
+            $releaseArguments.CiCpuWorkerProducerRunId = $env:EXPECTED_CPU_PRODUCER_RUN_ID
+            $releaseArguments.CiCpuWorkerProducerRunAttempt = $env:EXPECTED_CPU_PRODUCER_RUN_ATTEMPT
+            $releaseArguments.CiCpuWorkerArtifactId = $env:EXPECTED_CPU_ARTIFACT_ID
+            $releaseArguments.CiCpuWorkerExpectedArtifactSha256 = $env:EXPECTED_CPU_ARTIFACT_SHA256
+            $releaseArguments.CiCpuWorkerArchivePath = Join-Path $env:RUNNER_TEMP 'scribe-ci-cpu-worker.zip'
+            $releaseArguments.CiCpuWorkerOutputDirectory = Join-Path $env:RUNNER_TEMP 'scribe-ci-cpu-worker-inputs'
           }
           if ($env:GPU_INPUTS_REQUESTED -ceq 'true') {
             $env:SCRIBE_BUILD_REVISION = $env:GITHUB_SHA
@@ -636,7 +739,7 @@ jobs:
       # Export only the CPU bytes that already passed portable/installed parity.
       # This is a reusable CI input, not a release or a local freeze promotion.
       - name: Export verified CPU worker for immutable reuse
-        if: github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        if: github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && steps.cpu-input-policy.outputs.requested != 'true'
         shell: pwsh
         run: |
           & .\scripts\export-windows-cpu-worker-artifact.ps1 `
@@ -644,7 +747,7 @@ jobs:
             -OutputDirectory (Join-Path $env:RUNNER_TEMP 'scribe-verified-cpu-worker-input')
 
       - name: Upload immutable verified CPU worker
-        if: github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        if: github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && steps.cpu-input-policy.outputs.requested != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-cpu-worker-${{ github.run_id }}-${{ github.run_attempt }}
@@ -671,6 +774,28 @@ jobs:
             -ExpectedArtifactSha256 $env:EXPECTED_GPU_ARTIFACT_SHA256 `
             -ExpectedPolicySha256 $env:EXPECTED_GPU_POLICY_SHA256 `
             -ExpectedSignerPinsSha256 $env:EXPECTED_GPU_SIGNER_PINS_SHA256 | Out-Null
+
+      - name: Recheck verified CPU provenance before asset upload
+        if: steps.cpu-input-policy.outputs.requested == 'true'
+        shell: pwsh
+        env:
+          EXPECTED_CPU_WORKER_SOURCE_REVISION: ${{ steps.cpu-input-preflight.outputs.worker_source_revision }}
+          EXPECTED_CPU_PRODUCER_RUN_ID: ${{ steps.cpu-input-preflight.outputs.producer_run_id }}
+          EXPECTED_CPU_PRODUCER_RUN_ATTEMPT: ${{ steps.cpu-input-preflight.outputs.producer_run_attempt }}
+          EXPECTED_CPU_ARTIFACT_ID: ${{ steps.cpu-input-preflight.outputs.artifact_id }}
+          EXPECTED_CPU_ARTIFACT_SHA256: ${{ steps.cpu-input-preflight.outputs.artifact_sha256 }}
+          EXPECTED_CPU_ARTIFACT_SIZE_BYTES: ${{ steps.cpu-input-preflight.outputs.artifact_size_bytes }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cpu = & .\scripts\resolve-windows-cpu-worker-inputs.ps1 `
+            -Mode Preflight -SourceRevision $env:GITHUB_SHA `
+            -WorkerSourceRevision $env:EXPECTED_CPU_WORKER_SOURCE_REVISION `
+            -ProducerRunId $env:EXPECTED_CPU_PRODUCER_RUN_ID `
+            -ProducerRunAttempt $env:EXPECTED_CPU_PRODUCER_RUN_ATTEMPT -ArtifactId $env:EXPECTED_CPU_ARTIFACT_ID
+          if ($cpu.ArtifactSha256 -cne $env:EXPECTED_CPU_ARTIFACT_SHA256 -or
+              [string]$cpu.ArtifactSizeBytes -cne $env:EXPECTED_CPU_ARTIFACT_SIZE_BYTES) {
+            throw 'Verified CPU artifact bytes changed after preflight.'
+          }
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -824,6 +949,28 @@ jobs:
             -ExpectedArtifactSha256 $env:EXPECTED_GPU_ARTIFACT_SHA256 `
             -ExpectedPolicySha256 $env:EXPECTED_GPU_POLICY_SHA256 `
             -ExpectedSignerPinsSha256 $env:EXPECTED_GPU_SIGNER_PINS_SHA256 | Out-Null
+
+      - name: Recheck verified CPU provenance before release publication
+        if: needs.build.outputs.cpu_inputs_requested == 'true'
+        shell: pwsh
+        env:
+          EXPECTED_CPU_WORKER_SOURCE_REVISION: ${{ needs.build.outputs.cpu_worker_source_revision }}
+          EXPECTED_CPU_PRODUCER_RUN_ID: ${{ needs.build.outputs.cpu_worker_producer_run_id }}
+          EXPECTED_CPU_PRODUCER_RUN_ATTEMPT: ${{ needs.build.outputs.cpu_worker_producer_run_attempt }}
+          EXPECTED_CPU_ARTIFACT_ID: ${{ needs.build.outputs.cpu_worker_artifact_id }}
+          EXPECTED_CPU_ARTIFACT_SHA256: ${{ needs.build.outputs.cpu_worker_artifact_sha256 }}
+          EXPECTED_CPU_ARTIFACT_SIZE_BYTES: ${{ needs.build.outputs.cpu_worker_artifact_size_bytes }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cpu = & .\scripts\resolve-windows-cpu-worker-inputs.ps1 `
+            -Mode Preflight -SourceRevision $env:GITHUB_SHA `
+            -WorkerSourceRevision $env:EXPECTED_CPU_WORKER_SOURCE_REVISION `
+            -ProducerRunId $env:EXPECTED_CPU_PRODUCER_RUN_ID `
+            -ProducerRunAttempt $env:EXPECTED_CPU_PRODUCER_RUN_ATTEMPT -ArtifactId $env:EXPECTED_CPU_ARTIFACT_ID
+          if ($cpu.ArtifactSha256 -cne $env:EXPECTED_CPU_ARTIFACT_SHA256 -or
+              [string]$cpu.ArtifactSizeBytes -cne $env:EXPECTED_CPU_ARTIFACT_SIZE_BYTES) {
+            throw 'Verified CPU artifact bytes changed after preflight.'
+          }
 
       - name: Create release with generated notes
         shell: pwsh

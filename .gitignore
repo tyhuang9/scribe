@@ -18,3 +18,9 @@
 
 # Reviewed native archives are downloaded locally by the release workflow.
 /.ci-native/
+
+# Generated Windows release inputs, tools, and payloads; never source inputs.
+/.ci-release-inputs/
+/.ci-tools/
+/dist/
+/release-assets/

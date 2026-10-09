@@ -17,11 +17,14 @@ not use it as a release input.
 
 The installer workflow can also export its **already built and verified** CPU
 worker as a reusable CI artifact. This is a separate input path, not a conversion
-of a local freeze record. It does not yet connect that input to desktop assembly.
-The normal builder and all local-only restrictions below remain unchanged.
+of a local freeze record. The protected manual workflow can consume that exact
+artifact in desktop assembly without rebuilding the worker. The default fresh
+builder path and all local-only restrictions below remain unchanged.
 
 Only a manual run of `.github/workflows/release.yml` on `tyhuang9/scribe` main
-exports the worker, after portable/installed payload parity verification. The
+exports a freshly built worker, after portable/installed payload parity
+verification. A run reusing an existing worker skips both export and upload;
+it must never relabel worker R as newly produced at desktop revision M. The
 exporter independently checks the physical source context, bundle inventory,
 reviewed PE imports and the desktop's compiled same-source CPU anchor. It copies
 the existing worker without rebuilding it. The immutable artifact is named
@@ -43,7 +46,15 @@ nonexpired artifact identity/name/digest/size, R ancestry in M, M ancestry in
 current main, and the physical M checkout. There is no latest-artifact search or
 caller-selected repository/workflow.
 
-`-Mode Resolve` repeats those checks and requires the preflight
+`-Mode Download` repeats preflight and requires its independently retained
+`-ExpectedArtifactSha256`, plus a new raw `-ArchivePath` outside the checkout.
+It requests only the fixed repository's artifact REST endpoint, authenticates
+that request, and follows exactly one HTTPS storage redirect using a separate
+credential-free client. Redirects, headers, streaming bytes and total elapsed
+time are bounded. Exact size/hash validation precedes a no-replace rename;
+failure removes only its owned partial file. No downloaded executable runs.
+
+`-Mode Resolve` repeats preflight and requires the retained
 `-ExpectedArtifactSha256`, the **raw downloaded artifact ZIP** as `-ArchivePath`,
 and a new `-OutputDirectory`. The archive is held and hashed before ZIP parsing;
 an arbitrary extracted directory is never an authenticated input. This matches
@@ -59,13 +70,62 @@ Existing outputs, unsafe paths, links, alternate streams, unexpected files,
 duplicate entries, changed provenance or changed bytes fail closed. The returned
 `WorkerStream` is a held read handle owned by the caller and must be disposed.
 
-Acquisition is not runtime admission. A later desktop-builder integration must
-embed this exact CPU digest and independently apply the existing compiled
-same-source or exact foreign-worker approval. No compatibility-map entry, Auto
+Acquisition is not runtime admission. The desktop builder embeds this exact CPU
+digest and independently applies the existing compiled same-source or exact
+foreign-worker approval. No compatibility-map entry, Auto
 eligibility, release authority, private key or local-marker exception is added.
 Real protected-main production/acquisition remains unverified until this source
 is merged and an authorized main run produces an artifact; offline fixtures
 prove contracts, not hosted artifact availability or hardware compatibility.
+
+### CI desktop assembly with retained CPU bytes
+
+The manual workflow accepts all four optional `cpu_worker_*` identity inputs
+or none: source revision, producer run, producer attempt and artifact ID.
+Initial preflight pins every identity scalar, archive digest and byte size.
+Download, assembly and late upload/publication checks use those authenticated
+outputs, never newly read dispatch text. Publication gates remain unchanged.
+
+The builder's CI interface is exactly seven scalar inputs:
+
+```powershell
+  -CiCpuWorkerSourceRevision <R> `
+  -CiCpuWorkerProducerRunId <run-id> `
+  -CiCpuWorkerProducerRunAttempt <attempt> `
+  -CiCpuWorkerArtifactId <artifact-id> `
+  -CiCpuWorkerExpectedArtifactSha256 <preflight-archive-sha256> `
+  -CiCpuWorkerArchivePath <raw-artifact-zip> `
+  -CiCpuWorkerOutputDirectory <fresh-resolved-directory>
+```
+
+All seven must be explicitly supplied and nonblank. CI reuse cannot be combined
+with either local frozen input or local GPU observation. There is no trusted
+object, extracted-root, skip-validation or admission-approval argument. M comes
+from the clean physical checkout and must equal `GITHUB_SHA`. The resolver runs
+inside the builder before Cargo and retains the worker's read handle until the
+outermost cleanup, including failure paths.
+
+Reuse skips worker Cargo and its native baseline build. Only the desktop is
+built, with the authenticated worker digest and forced revision M; inherited
+build environment is restored afterward. The existing bounded compiled
+admission report must approve the exact M/R/digest/protocol/ABI combination.
+Foreign provenance alone never grants that approval. Staging copies the held
+stream and checks its size/hash, PE imports, exact inventory, normal CPU smoke
+and cancellation. Producer provenance, source context, retained metadata and
+worker bytes are checked again after Cargo and immediately before atomic
+no-replace bundle activation. CI metadata stays outside the payload; local
+markers are neither produced nor admitted by this path.
+
+The root-level `.ci-release-inputs`, `.ci-tools`, `dist` and `release-assets`
+directories contain only generated pipeline inputs/tools/outputs and are
+explicitly ignored by Git. They must not be source authorities. Clean-source
+validation still rejects unrelated untracked files and tracked modifications;
+generated payload bytes are independently validated by hashes and inventory.
+
+Rollback is to omit all four workflow inputs (or all seven builder inputs),
+retaining the established fresh CPU build. This change establishes offline
+orchestration contracts, not a real protected-main reuse run, pinned installer
+acceptance, hardware qualification, Auto enablement or release approval.
 
 ### Local integrity records
 
