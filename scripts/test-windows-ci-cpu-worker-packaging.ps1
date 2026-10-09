@@ -499,7 +499,11 @@ try {
             catch { $global:CiCpuWorkerBuilderMutationWasBlocked = $true }
         }
         if ($global:CiCpuWorkerBuilderSourceDriftPath) {
-            [IO.File]::WriteAllText($global:CiCpuWorkerBuilderSourceDriftPath, 'untracked source drift', $script:Utf8)
+            [IO.File]::WriteAllText(
+                $global:CiCpuWorkerBuilderSourceDriftPath,
+                'untracked source drift',
+                [Text.UTF8Encoding]::new($false)
+            )
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$global:CiCpuWorkerBuilderPostCargoMutation)) {
             $env:SCRIBE_CI_CPU_FIXTURE_POST_CARGO_MUTATION = $global:CiCpuWorkerBuilderPostCargoMutation
@@ -661,6 +665,7 @@ try {
     Reset-Scenario
     $global:CiCpuWorkerBuilderSourceDriftPath = Join-Path $fixtureRoot 'untracked-source-drift.txt'
     Assert-Rejected 'M source drift after desktop Cargo' { Invoke-CiBuilder }
+    Assert-True (Test-Path -LiteralPath $global:CiCpuWorkerBuilderSourceDriftPath -PathType Leaf) 'M source drift fixture did not write its untracked sentinel after desktop Cargo.'
     Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'M source drift did not occur after desktop Cargo.'
     Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'M source drift published a bundle.'
     Remove-Item -LiteralPath $global:CiCpuWorkerBuilderSourceDriftPath -Force
