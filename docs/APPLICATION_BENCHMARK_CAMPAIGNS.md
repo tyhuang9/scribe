@@ -21,6 +21,14 @@ admission. A caller-supplied hash does not authorize an arbitrary model. The
 fixture and model are validated before measurement; input paths are not emitted.
 An existing output is never overwritten.
 
+Before decoding, fixture headers must declare 1–8 channels, 8–192 kHz, no more
+than 32 million interleaved source samples, and no more than the application's
+600-second recording limit (9.6 million prepared mono samples). The declared
+sample payload must fit the retained file. Encoded WAVs are also capped at
+256 MiB. These bounds limit preparation memory and resampling work; a correct
+hash alone is not a resource limit. The ordinary decoder still validates the
+actual format and sample data.
+
 Run CPU and GPU as separate lane invocations with the same inputs. `auto` is
 intentionally unavailable: this tool must not depend on, modify, or enable Auto
 qualification. GPU mode keeps the production rule that a GPU must be used or

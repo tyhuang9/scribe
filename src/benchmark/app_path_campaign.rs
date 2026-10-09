@@ -17,7 +17,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt as _;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -32,6 +32,10 @@ const COMMAND_FLAG: &str = "--benchmark-campaign";
 const COLD_RUNS: u8 = 5;
 const WARM_RUNS: u8 = 20;
 const MAX_WAV_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SOURCE_SAMPLES: u64 = 32_000_000;
+const MIN_SOURCE_RATE: u32 = 8_000;
+const MAX_SOURCE_RATE: u32 = 192_000;
+const MAX_SOURCE_CHANNELS: u16 = 8;
 const MAX_MODEL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_REPORT_BYTES: usize = 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -218,8 +222,7 @@ fn run(args: &[OsString]) -> Result<()> {
     )?;
     require_retained_digest(&mut model, "model")?;
     require_retained_digest(&mut fixture, "fixture")?;
-    let audio = PreparedAudio::from_wav_reader(&mut fixture.file)
-        .context("campaign fixture is not a supported non-empty WAV")?;
+    let audio = prepare_campaign_audio(&mut fixture.file, fixture.size_bytes)?;
     require_retained_digest(&mut fixture, "fixture")?;
 
     let mut config = AppConfig::default();
@@ -274,6 +277,85 @@ fn run(args: &[OsString]) -> Result<()> {
         runs: result.runs,
     };
     write_report_new(&options.output, &report)
+}
+
+fn prepare_campaign_audio<R: Read + Seek>(
+    reader: &mut R,
+    size_bytes: u64,
+) -> Result<PreparedAudio> {
+    validate_campaign_wav(reader, size_bytes)?;
+    PreparedAudio::from_wav_reader(reader)
+        .context("campaign fixture is not a supported non-empty WAV")
+}
+
+/// Bound both decoding and rate conversion before PreparedAudio reserves sample buffers.
+/// The encoded-file cap alone cannot constrain a forged sample count or a very low rate.
+fn validate_campaign_wav<R: Read + Seek>(reader: &mut R, size_bytes: u64) -> Result<()> {
+    reader
+        .rewind()
+        .context("campaign fixture could not rewind")?;
+    let wav = hound::WavReader::new(&mut *reader)
+        .map_err(|_| anyhow!("campaign fixture has an invalid WAV header"))?;
+    let spec = wav.spec();
+    let source_samples = u64::from(wav.len());
+    let data_offset = wav
+        .into_inner()
+        .stream_position()
+        .context("campaign fixture data position is unavailable")?;
+    ensure!(
+        (1..=MAX_SOURCE_CHANNELS).contains(&spec.channels),
+        "campaign fixture channel count is outside 1..=8"
+    );
+    ensure!(
+        (MIN_SOURCE_RATE..=MAX_SOURCE_RATE).contains(&spec.sample_rate),
+        "campaign fixture sample rate is outside 8000..=192000 Hz"
+    );
+    ensure!(
+        match spec.sample_format {
+            hound::SampleFormat::Int => matches!(spec.bits_per_sample, 8 | 16 | 24 | 32),
+            hound::SampleFormat::Float => spec.bits_per_sample == 32,
+        },
+        "campaign fixture has an unsupported sample format"
+    );
+    ensure!(
+        (1..=MAX_SOURCE_SAMPLES).contains(&source_samples),
+        "campaign fixture exceeds the decoded sample bound or is empty"
+    );
+    let channels = u64::from(spec.channels);
+    ensure!(
+        source_samples.is_multiple_of(channels),
+        "campaign fixture has incomplete channel frames"
+    );
+    let frames = source_samples / channels;
+    let max_seconds = u64::from(crate::config::MAX_RECORDING_SECONDS);
+    ensure!(
+        frames <= u64::from(spec.sample_rate) * max_seconds,
+        "campaign fixture exceeds the recording duration bound"
+    );
+    let prepared_samples = frames
+        .checked_mul(u64::from(crate::prepared_audio::PREPARED_SAMPLE_RATE))
+        .and_then(|scaled| scaled.checked_add(u64::from(spec.sample_rate / 2)))
+        .map(|rounded| rounded / u64::from(spec.sample_rate))
+        .ok_or_else(|| anyhow!("campaign fixture prepared length overflowed"))?;
+    ensure!(
+        prepared_samples <= u64::from(crate::prepared_audio::PREPARED_SAMPLE_RATE) * max_seconds,
+        "campaign fixture exceeds the prepared sample bound"
+    );
+    // Extensible PCM can use padded sample containers. This is a necessary lower
+    // bound, not a replacement for the decoder's exact format/data validation.
+    let minimum_payload = source_samples
+        .checked_mul(u64::from(spec.bits_per_sample.div_ceil(8)))
+        .ok_or_else(|| anyhow!("campaign fixture payload length overflowed"))?;
+    ensure!(
+        size_bytes
+            .checked_sub(data_offset)
+            .is_some_and(|remaining| remaining >= minimum_payload),
+        "campaign fixture declares more sample data than its retained file contains"
+    );
+    reader
+        .rewind()
+        .context("campaign fixture could not rewind")?;
+    Ok(())
 }
 
 impl CampaignExecutor for ApplicationExecutor {
@@ -757,6 +839,118 @@ mod tests {
     use super::*;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn pcm_header(rate: u32, channels: u16, frames: u32) -> Vec<u8> {
+        let payload = frames.checked_mul(u32::from(channels)).unwrap() * 2;
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(payload + 36).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16_u32.to_le_bytes());
+        header.extend_from_slice(&1_u16.to_le_bytes());
+        header.extend_from_slice(&channels.to_le_bytes());
+        header.extend_from_slice(&rate.to_le_bytes());
+        header.extend_from_slice(&(rate * u32::from(channels) * 2).to_le_bytes());
+        header.extend_from_slice(&(channels * 2).to_le_bytes());
+        header.extend_from_slice(&16_u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&payload.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn wav_preflight_rejects_resampling_amplification_before_reading_samples() {
+        for rate in [0, 1, MIN_SOURCE_RATE - 1, MAX_SOURCE_RATE + 1] {
+            let mut input = std::io::Cursor::new(pcm_header(rate, 1, 100));
+            let error = prepare_campaign_audio(&mut input, 244).unwrap_err();
+            assert!(error.to_string().contains("sample rate"));
+            assert_eq!(input.position(), 44);
+        }
+    }
+
+    #[test]
+    fn wav_preflight_bounds_declared_decode_and_duration_without_allocating_payloads() {
+        let max_seconds = crate::config::MAX_RECORDING_SECONDS;
+        let cases = [
+            (192_000, 8, 4_000_001, "decoded sample bound"),
+            (16_000, 1, 16_000 * max_seconds + 1, "duration bound"),
+            (8_000, 1, 8_000 * max_seconds + 1, "duration bound"),
+            (16_000, 1, 0, "empty"),
+            (16_000, 9, 1, "channel count"),
+        ];
+        for (rate, channels, frames, reason) in cases {
+            let mut input = std::io::Cursor::new(pcm_header(rate, channels, frames));
+            let error = validate_campaign_wav(&mut input, MAX_WAV_BYTES).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(input.position(), 44);
+        }
+    }
+
+    #[test]
+    fn wav_preflight_accepts_exact_header_bounds_and_rewinds_without_decoding() {
+        // Header-only tests explicitly supply a hypothetical retained length;
+        // they exercise admission arithmetic, not a claim that truncated WAVs decode.
+        let max_seconds = crate::config::MAX_RECORDING_SECONDS;
+        for (rate, channels, frames) in [
+            (8_000, 1, 8_000 * max_seconds),
+            (16_000, 1, 16_000 * max_seconds),
+            (44_100, 1, 44_100 * max_seconds),
+            (48_000, 1, 48_000 * max_seconds),
+            (192_000, 1, 32_000_000),
+            (192_000, 8, 4_000_000),
+        ] {
+            let header = pcm_header(rate, channels, frames);
+            let size = 44 + u64::from(frames) * u64::from(channels) * 2;
+            let mut input = std::io::Cursor::new(header);
+            validate_campaign_wav(&mut input, size).unwrap();
+            assert_eq!(input.position(), 0);
+        }
+    }
+
+    #[test]
+    fn wav_preflight_rejects_forged_payload_lengths_before_decoding() {
+        for size in [0, 43, 44, 243] {
+            let mut input = std::io::Cursor::new(pcm_header(16_000, 1, 100));
+            let error = prepare_campaign_audio(&mut input, size).unwrap_err();
+            assert!(error.to_string().contains("retained file contains"));
+            assert_eq!(input.position(), 44);
+        }
+        let mut huge = pcm_header(16_000, 1, 100);
+        huge[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(prepare_campaign_audio(&mut std::io::Cursor::new(huge), 244).is_err());
+    }
+
+    #[test]
+    fn wav_preflight_preserves_normal_rates_and_channel_preparation() {
+        for rate in [8_000, 16_000, 44_100, 48_000, 192_000] {
+            for channels in 1..=MAX_SOURCE_CHANNELS {
+                let mut bytes = pcm_header(rate, channels, 48);
+                bytes.resize(44 + usize::from(channels) * 48 * 2, 0);
+                let size = bytes.len() as u64;
+                let prepared =
+                    prepare_campaign_audio(&mut std::io::Cursor::new(bytes), size).unwrap();
+                assert_eq!(prepared.source_frames, 48);
+                assert_eq!(prepared.source_sample_rate, rate);
+                assert_eq!(prepared.source_channels, channels);
+                assert_eq!(
+                    prepared.samples.len(),
+                    ((48 * 16_000 + rate / 2) / rate) as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wav_preflight_rejects_malformed_headers_and_decoder_still_checks_data() {
+        for bytes in [b"not a wav".to_vec(), pcm_header(16_000, 0, 1)] {
+            let size = bytes.len() as u64;
+            assert!(prepare_campaign_audio(&mut std::io::Cursor::new(bytes), size).is_err());
+        }
+        // Even if a caller lies about retained length, the decoder rejects missing data.
+        let mut input = std::io::Cursor::new(pcm_header(16_000, 1, 100));
+        let error = prepare_campaign_audio(&mut input, 244).unwrap_err();
+        assert!(error.to_string().contains("supported non-empty WAV"));
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ServiceEvent {
