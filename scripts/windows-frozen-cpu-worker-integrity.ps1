@@ -616,14 +616,18 @@ function Stop-WindowsFrozenCpuWorkerAdmissionProcess(
     }
 }
 
-function Invoke-WindowsFrozenCpuWorkerAdmissionProcess([string]$Executable) {
+function Invoke-WindowsFrozenCpuWorkerAdmissionProcess(
+    [string]$Executable,
+    [ValidateSet('--scribe-frozen-worker-admission', '--scribe-windows-gpu-auto-policy-identity')]
+    [string]$Command = '--scribe-frozen-worker-admission'
+) {
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = Get-WindowsFrozenCpuWorkerNormalizedFullPath $Executable
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.ArgumentList.Add('--scribe-frozen-worker-admission')
+    $startInfo.ArgumentList.Add($Command)
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $started = $false

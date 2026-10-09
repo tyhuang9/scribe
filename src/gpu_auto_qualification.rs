@@ -56,6 +56,30 @@ pub(crate) enum AutoQualificationError {
     Parse(String),
 }
 
+/// A bounded identity for the exact Windows Auto policy compiled into the
+/// desktop. The report intentionally carries no policy contents, paths, or
+/// caller-controlled policy material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CompiledWindowsAutoPolicyIdentityReport {
+    pub(crate) schema_version: u8,
+    pub(crate) desktop_build_id: String,
+    pub(crate) policy_schema_version: u16,
+    pub(crate) policy_version: u16,
+    pub(crate) target_os: &'static str,
+    pub(crate) target_arch: &'static str,
+    pub(crate) mode: &'static str,
+    pub(crate) entry_count: usize,
+    pub(crate) embedded_manifest_size_bytes: usize,
+    pub(crate) embedded_manifest_sha256: String,
+    pub(crate) runtime_manifest_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompiledWindowsAutoPolicyIdentityError {
+    UnsupportedPlatform,
+    MalformedCompiledPolicy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QualificationDenial {
     ManifestNotForCurrentPlatform,
@@ -424,6 +448,68 @@ impl AutoQualificationPolicy {
     }
 }
 
+fn windows_auto_policy_identity_report_from_validated_policy(
+    policy: &AutoQualificationPolicy,
+    embedded_manifest: &str,
+    desktop_build_id: &str,
+) -> Result<CompiledWindowsAutoPolicyIdentityReport, AutoQualificationError> {
+    if policy.document.target_os != WINDOWS_X64_OS
+        || policy.document.target_arch != WINDOWS_X64_ARCH
+    {
+        return Err(AutoQualificationError::UnsupportedPlatform);
+    }
+    let mode = match policy.document.mode {
+        QualificationMode::DefaultDeny => "default_deny",
+    };
+
+    Ok(CompiledWindowsAutoPolicyIdentityReport {
+        schema_version: 1,
+        desktop_build_id: desktop_build_id.to_owned(),
+        policy_schema_version: policy.document.schema_version,
+        policy_version: policy.policy_version(),
+        target_os: WINDOWS_X64_OS,
+        target_arch: WINDOWS_X64_ARCH,
+        mode,
+        entry_count: policy.document.entries.len(),
+        embedded_manifest_size_bytes: embedded_manifest.len(),
+        embedded_manifest_sha256: format!("{:x}", Sha256::digest(embedded_manifest.as_bytes())),
+        runtime_manifest_sha256: policy.manifest_digest(),
+    })
+}
+
+/// Reports the identity of the exact Windows x86_64 Auto policy embedded in
+/// this binary. No manifest, path, digest, feature, or override is accepted
+/// from the caller.
+pub(crate) fn compiled_windows_auto_policy_identity_report(
+    desktop_build_id: &str,
+) -> Result<CompiledWindowsAutoPolicyIdentityReport, CompiledWindowsAutoPolicyIdentityError> {
+    if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        return Err(CompiledWindowsAutoPolicyIdentityError::UnsupportedPlatform);
+    }
+
+    let policy = AutoQualificationPolicy::embedded_windows_x64()
+        .map_err(|_| CompiledWindowsAutoPolicyIdentityError::MalformedCompiledPolicy)?;
+    windows_auto_policy_identity_report_from_validated_policy(
+        policy,
+        EMBEDDED_WINDOWS_X64_MANIFEST,
+        desktop_build_id,
+    )
+    .map_err(|_| CompiledWindowsAutoPolicyIdentityError::MalformedCompiledPolicy)
+}
+
+#[cfg(test)]
+fn windows_auto_policy_identity_report_from_manifest_for_test(
+    embedded_manifest: &str,
+    desktop_build_id: &str,
+) -> Result<CompiledWindowsAutoPolicyIdentityReport, AutoQualificationError> {
+    let policy = AutoQualificationPolicy::from_canonical_json(embedded_manifest)?;
+    windows_auto_policy_identity_report_from_validated_policy(
+        &policy,
+        embedded_manifest,
+        desktop_build_id,
+    )
+}
+
 fn entry_matches_pack(
     entry: &QualificationEntry,
     backend: BackendKind,
@@ -623,6 +709,148 @@ mod tests {
 
     fn canonical_fixture_json() -> String {
         serde_json::to_string(&fixture_document()).unwrap()
+    }
+
+    #[test]
+    fn identity_report_serializes_exact_embedded_windows_policy_fields() {
+        let report = windows_auto_policy_identity_report_from_manifest_for_test(
+            EMBEDDED_WINDOWS_X64_MANIFEST,
+            "desktop-test-build-123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "schema_version": 1,
+                "desktop_build_id": "desktop-test-build-123",
+                "policy_schema_version": 2,
+                "policy_version": 3,
+                "target_os": "windows",
+                "target_arch": "x86_64",
+                "mode": "default_deny",
+                "entry_count": 0,
+                "embedded_manifest_size_bytes": 101,
+                "embedded_manifest_sha256": "14789ee66980f7b5af70b5a229595e7b07a939a15c79862614154db9dcdecdb3",
+                "runtime_manifest_sha256": "2b6d88bc4b9738145e6a79ec599c9eb3457550f08f93231078f54597593e0bba",
+            })
+        );
+    }
+
+    #[test]
+    fn identity_report_raw_hash_tracks_optional_lf_while_runtime_hash_does_not() {
+        let canonical = canonical_fixture_json();
+        let without_lf = windows_auto_policy_identity_report_from_manifest_for_test(
+            &canonical,
+            "desktop-test-build-123",
+        )
+        .unwrap();
+        let with_lf = windows_auto_policy_identity_report_from_manifest_for_test(
+            &(canonical + "\n"),
+            "desktop-test-build-123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            with_lf.embedded_manifest_size_bytes,
+            without_lf.embedded_manifest_size_bytes + 1
+        );
+        assert_ne!(
+            with_lf.embedded_manifest_sha256,
+            without_lf.embedded_manifest_sha256
+        );
+        assert_eq!(
+            with_lf.runtime_manifest_sha256,
+            without_lf.runtime_manifest_sha256
+        );
+    }
+
+    #[test]
+    fn identity_report_rejects_crlf_and_malformed_policy_input() {
+        let canonical = canonical_fixture_json();
+        assert_eq!(
+            windows_auto_policy_identity_report_from_manifest_for_test(
+                &(canonical + "\r\n"),
+                "desktop-test-build-123",
+            ),
+            Err(AutoQualificationError::NonCanonical)
+        );
+        assert!(matches!(
+            windows_auto_policy_identity_report_from_manifest_for_test(
+                "{\"schema_version\":2}",
+                "desktop-test-build-123",
+            ),
+            Err(AutoQualificationError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn identity_report_rejects_valid_policy_for_a_non_windows_target() {
+        let mut document = fixture_document();
+        document.target_os = LINUX_X64_OS.to_owned();
+        document.target_arch = LINUX_X64_ARCH.to_owned();
+        let manifest = serde_json::to_string(&document).unwrap();
+
+        assert_eq!(
+            windows_auto_policy_identity_report_from_manifest_for_test(
+                &manifest,
+                "desktop-test-build-123",
+            ),
+            Err(AutoQualificationError::UnsupportedPlatform)
+        );
+    }
+
+    #[test]
+    fn identity_report_keeps_embedded_policy_default_deny_unchanged() {
+        let policy = AutoQualificationPolicy::embedded_windows_x64().unwrap();
+        let target = fixture_target();
+        let before = policy.qualify_target_on_platform(
+            WINDOWS_X64_OS,
+            WINDOWS_X64_ARCH,
+            &target,
+            MODEL_DIGEST,
+        );
+
+        let report = windows_auto_policy_identity_report_from_manifest_for_test(
+            EMBEDDED_WINDOWS_X64_MANIFEST,
+            "desktop-test-build-123",
+        )
+        .unwrap();
+        let after = policy.qualify_target_on_platform(
+            WINDOWS_X64_OS,
+            WINDOWS_X64_ARCH,
+            &target,
+            MODEL_DIGEST,
+        );
+
+        assert_eq!(report.mode, "default_deny");
+        assert_eq!(report.entry_count, 0);
+        assert_eq!(before, after);
+        assert_eq!(
+            after,
+            QualificationDecision::Denied(QualificationDenial::NoMatchingPackEvidence)
+        );
+    }
+
+    #[test]
+    fn compiled_windows_identity_report_is_gated_to_windows_x86_64() {
+        let result = compiled_windows_auto_policy_identity_report("desktop-test-build-123");
+
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert_eq!(
+                result.unwrap(),
+                windows_auto_policy_identity_report_from_manifest_for_test(
+                    EMBEDDED_WINDOWS_X64_MANIFEST,
+                    "desktop-test-build-123",
+                )
+                .unwrap()
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(CompiledWindowsAutoPolicyIdentityError::UnsupportedPlatform)
+            );
+        }
     }
 
     fn fixture_target() -> BackendTarget {

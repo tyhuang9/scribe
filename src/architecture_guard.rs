@@ -822,7 +822,7 @@ fn windows_gpu_capture_stays_opt_in_and_out_of_release_builds() {
         "[switch]$LocalFrozenGpuObservation\n)",
         "if ($frozenCpuWorkerRequested) {\nAssert-WindowsFrozenCpuWorkerLocalOnlyEnvironment\n$resolvedFrozenWorkerSourceRoot = if ($frozenCpuWorkerSourceRootWasExplicit) {",
         "if ($LocalFrozenGpuObservation -and -not $frozenCpuWorkerRequested) {\nthrow 'LocalFrozenGpuObservation is available only with a local frozen CPU worker record.'\n}",
-        "$desktopFeatures = @('ui-harness')\nif ($LocalFrozenGpuObservation) {\n$desktopFeatures += 'windows-gpu-capture-observation'\n}\n& cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple --manifest-path (Join-Path $repositoryRoot \"Cargo.toml\")",
+        "$desktopFeatures = @('ui-harness')\nif ($LocalFrozenGpuObservation) {\n$desktopFeatures += 'windows-gpu-capture-observation'\n}\n$gpuAutoPolicyDesktopBuildId = Get-WindowsGpuAutoPolicyDesktopBuildId `\n-RepositoryRoot $repositoryRoot -BuildRevisionOverride $env:SCRIBE_BUILD_REVISION\n& cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple --manifest-path (Join-Path $repositoryRoot \"Cargo.toml\")",
     ] {
         assert!(
             build_commands.contains(required),

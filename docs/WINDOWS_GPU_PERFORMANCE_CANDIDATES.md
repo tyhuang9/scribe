@@ -37,7 +37,11 @@ The intended release sequence is:
 This delivery implements the evidence boundary in steps 2–3, including an
 explicit candidate-only maintainer-reviewed audit route, not the protected
 approval service, candidate builder, final qualification or publication flow.
-The normal release builder still builds its CPU worker. The separate
+The default release builder still builds its CPU worker. The protected manual
+workflow can now acquire an independently authenticated immutable CPU artifact
+and assemble only the desktop around its retained bytes, with independent
+compiled worker admission and late provenance checks. This does not authorize
+candidate policy construction. The separate
 [local frozen-worker packaging path](WINDOWS_FROZEN_CPU_WORKER_PACKAGING.md)
 can retain exact CPU-worker bytes across desktop construction, but its unsigned
 local integrity record and explicitly non-publishing bundle are not production
@@ -53,8 +57,8 @@ not build, acquire, capture, qualify, sign, package, enable Auto for, or publish
 a candidate. Workers built before
 that handshake existed cannot gain support retroactively. Replacing or adding
 an exact tuple requires a separately reviewed source change. Integrating
-authenticated frozen inputs into an exact production candidate installer
-remains later work.
+authenticated frozen inputs and an authorized policy into an exact production
+candidate installer remains later work.
 
 The LOCAL frozen-worker assembly path may ask its already verified desktop M
 for a bounded compiled admission report before it packages or observes R. That
@@ -62,6 +66,31 @@ report is a local consistency gate, not a new authority: it cannot populate the
 compiled map, authenticate an unknown hash origin, approve a GPU pack, or enable
 Auto. CUDA and Vulkan descriptor admission remain on their existing compiled
 signature/epoch path.
+
+### Compiled policy identity
+
+Windows x64 desktops expose the side-effect-free, sole-argument
+`--scribe-windows-gpu-auto-policy-identity` command. It runs after process-local
+DLL hardening but before application, settings, history, model, or worker
+startup. It reports the actual embedded policy's schema/version, target, mode,
+entry count, exact UTF-8 byte size/hash, canonical runtime fingerprint, and
+desktop build identity. It accepts no policy, path, digest, or override. Extra
+or duplicate arguments and unsupported platforms fail without opening the UI.
+
+Packaging holds the checked-in policy from desktop source M before Cargo, then
+checks the compiled report from the built desktop, its staged copy, and again
+before activation. The same original policy and executable pins remain
+authoritative; later reads cannot replace them. Missing, malformed, oversized,
+timed-out, or mismatched reports fail packaging. The bounded report runner is
+shared with CPU admission, whose existing command and report remain separate.
+
+The transport hash includes an optional trailing LF; the runtime fingerprint
+hashes canonical serialization without that terminator. Both must match their
+independently calculated source expectations. This gate verifies what was
+compiled, not whether it was qualified or approved: it does not embed a
+candidate, authorize construction, modify the empty default-deny manifest, or
+enable Auto. Caller-supplied decision hashes and `performance_passed` claims
+alone are not construction authority.
 
 A complete signed campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial

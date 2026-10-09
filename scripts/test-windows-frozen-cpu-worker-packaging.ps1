@@ -11,6 +11,19 @@ $producerOutput = Join-Path $testRoot 'frozen-worker'
 $installerAllowlist = Join-Path $testRoot 'worker-pack-allowlist.iss'
 $script:FocusedFrozenCpuWorkerAssertions = 0
 $global:WindowsFrozenCpuWorkerTestBaselineTargetRoots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$policyFixtureGlobalNames = @(
+    'WindowsFrozenCpuWorkerTestPolicyCalls',
+    'WindowsFrozenCpuWorkerTestPolicyResponse',
+    'WindowsFrozenCpuWorkerTestPolicyResponses'
+)
+$savedPolicyFixtureGlobals = @{}
+foreach ($name in $policyFixtureGlobalNames) {
+    $saved = Get-Variable -Name $name -Scope Global -ErrorAction SilentlyContinue
+    $savedPolicyFixtureGlobals[$name] = [pscustomobject]@{
+        Exists = $null -ne $saved
+        Value = if ($null -ne $saved) { $saved.Value } else { $null }
+    }
+}
 
 function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     $script:FocusedFrozenCpuWorkerAssertions++
@@ -97,6 +110,12 @@ function Reset-TestCalls {
     $global:WindowsFrozenCpuWorkerTestNativeCalls = [System.Collections.Generic.List[object]]::new()
     if (Test-Path -LiteralPath 'Variable:global:WindowsFrozenCpuWorkerTestAdmissionCalls') {
         $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Clear()
+    }
+    if (Test-Path -LiteralPath 'Variable:global:WindowsFrozenCpuWorkerTestPolicyCalls') {
+        $global:WindowsFrozenCpuWorkerTestPolicyCalls.Clear()
+    }
+    if (Test-Path -LiteralPath 'Variable:global:WindowsFrozenCpuWorkerTestPolicyResponses') {
+        $global:WindowsFrozenCpuWorkerTestPolicyResponses.Clear()
     }
 }
 
@@ -249,12 +268,28 @@ function Set-FixtureCompiledAdmissionSeam([string]$IntegrityPath) {
         throw 'Could not isolate the fixture-only compiled admission seam.'
     }
     $fixtureAdmission = @'
-function Invoke-WindowsFrozenCpuWorkerAdmissionProcess([string]$Executable) {
-    if ($null -eq $global:WindowsFrozenCpuWorkerTestAdmissionResponse) {
-        throw 'Fixture compiled admission response was not configured.'
+function Invoke-WindowsFrozenCpuWorkerAdmissionProcess(
+    [string]$Executable,
+    [ValidateSet('--scribe-frozen-worker-admission', '--scribe-windows-gpu-auto-policy-identity')]
+    [string]$Command = '--scribe-frozen-worker-admission'
+) {
+    if ($Command -ceq '--scribe-frozen-worker-admission') {
+        if ($null -eq $global:WindowsFrozenCpuWorkerTestAdmissionResponse) {
+            throw 'Fixture compiled admission response was not configured.'
+        }
+        $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Add($Executable)
+        return $global:WindowsFrozenCpuWorkerTestAdmissionResponse
     }
-    $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Add($Executable)
-    return $global:WindowsFrozenCpuWorkerTestAdmissionResponse
+    $global:WindowsFrozenCpuWorkerTestPolicyCalls.Add([pscustomobject]@{ Executable = $Executable; Command = $Command })
+    if ($global:WindowsFrozenCpuWorkerTestPolicyResponses.Count -gt 0) {
+        $response = $global:WindowsFrozenCpuWorkerTestPolicyResponses[0]
+        $global:WindowsFrozenCpuWorkerTestPolicyResponses.RemoveAt(0)
+        return $response
+    }
+    if ($null -eq $global:WindowsFrozenCpuWorkerTestPolicyResponse) {
+        throw 'Fixture GPU Auto policy identity response was not configured.'
+    }
+    return $global:WindowsFrozenCpuWorkerTestPolicyResponse
 }
 
 '@
@@ -286,6 +321,38 @@ function Set-FixtureCompiledAdmissionResponse(
             admission_kind = $kind
         } | ConvertTo-Json -Compress)
         Stderr = ''
+    }
+}
+
+function Set-FixturePolicyIdentityResponse([string]$DesktopBuildId, [string]$Mutation = '') {
+    $policyIdentity = Open-WindowsGpuAutoPolicyIdentity $fixtureRoot
+    try {
+        $report = [ordered]@{
+            schema_version = [int64]1
+            desktop_build_id = $DesktopBuildId
+            policy_schema_version = [int64]$policyIdentity.PolicySchemaVersion
+            policy_version = [int64]$policyIdentity.PolicyVersion
+            target_os = [string]$policyIdentity.TargetOs
+            target_arch = [string]$policyIdentity.TargetArch
+            mode = [string]$policyIdentity.Mode
+            entry_count = [int64]$policyIdentity.EntryCount
+            embedded_manifest_size_bytes = [int64]$policyIdentity.EmbeddedManifestSizeBytes
+            embedded_manifest_sha256 = [string]$policyIdentity.EmbeddedManifestSha256
+            runtime_manifest_sha256 = [string]$policyIdentity.RuntimeManifestSha256
+        }
+        $response = [pscustomobject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+        switch ($Mutation) {
+            '' { }
+            'malformed' { $response.Stdout = '{fixture-malformed' }
+            'wrong-digest' { $report.embedded_manifest_sha256 = '0' * 64 }
+            default { throw "Unknown frozen-fixture GPU Auto policy mutation: $Mutation" }
+        }
+        if ($Mutation -cne 'malformed') { $response.Stdout = $report | ConvertTo-Json -Compress }
+        $global:WindowsFrozenCpuWorkerTestPolicyResponses.Clear()
+        $global:WindowsFrozenCpuWorkerTestPolicyResponse = $response
+    }
+    finally {
+        $policyIdentity.ManifestStream.Dispose()
     }
 }
 
@@ -414,7 +481,8 @@ try {
     foreach ($relativePath in @(
         'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'build.rs', 'src/worker_identity.rs',
         'scripts/build-windows-release.ps1', 'scripts/new-windows-frozen-cpu-worker.ps1',
-        'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1',
+        'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-gpu-auto-policy-identity.ps1',
+        'scripts/report-windows-gpu-auto-qualification.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1',
         'scripts/windows-pe-imports.ps1',
         'scripts/stage-verified-worker-packs.ps1',
         'resources/licenses/Apache-2.0.txt', 'resources/licenses/OpenAI-Whisper-MIT.txt',
@@ -422,7 +490,8 @@ try {
         'native/transcribe-cpp-v0.1.3/LICENSE', 'native/transcribe-cpp-v0.1.3/PROVENANCE.md',
         'native/whisper-f049fff/LICENSE', 'native/whisper-f049fff/PROVENANCE.md',
         'native/sherpa-onnx-v1.13.5/PROVENANCE.md', 'resources/silero-vad/LICENSE',
-        'resources/silero-vad/PROVENANCE.md'
+        'resources/silero-vad/PROVENANCE.md',
+        'runtime-manifests/gpu-auto-qualification-windows-x64.json'
     )) {
         Copy-FixtureSourceFile $relativePath
     }
@@ -457,6 +526,7 @@ try {
     $fixtureBuilder = Join-Path $fixtureRoot 'scripts\build-windows-release.ps1'
     $fixtureProducer = Join-Path $fixtureRoot 'scripts\new-windows-frozen-cpu-worker.ps1'
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
+    . (Join-Path $fixtureRoot 'scripts\windows-gpu-auto-policy-identity.ps1')
     . (Join-Path $fixtureRoot 'scripts\windows-cpu-worker-native-baseline.ps1')
 
     $baselineEvidenceTarget = Join-Path $testRoot 'baseline-evidence'
@@ -806,6 +876,9 @@ try {
     Reset-TestCalls
     $global:WindowsFrozenCpuWorkerTestAdmissionCalls = [System.Collections.Generic.List[string]]::new()
     $global:WindowsFrozenCpuWorkerTestAdmissionResponse = $null
+    $global:WindowsFrozenCpuWorkerTestPolicyCalls = [System.Collections.Generic.List[object]]::new()
+    $global:WindowsFrozenCpuWorkerTestPolicyResponses = [System.Collections.Generic.List[object]]::new()
+    $global:WindowsFrozenCpuWorkerTestPolicyResponse = $null
     $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $false
     $global:WindowsFrozenCpuWorkerTestFailDesktopBuild = $false
     $global:WindowsFrozenCpuWorkerTestRaceFreezeOutput = $null
@@ -813,6 +886,7 @@ try {
     $global:WindowsFrozenCpuWorkerTestSourceDriftPath = $null
     $global:WindowsFrozenCpuWorkerTestMutateWorkerPath = $null
     $global:WindowsFrozenCpuWorkerTestMutationWasBlocked = $false
+    Set-FixturePolicyIdentityResponse (Get-WindowsGpuAutoPolicyDesktopBuildId $fixtureRoot $env:SCRIBE_BUILD_REVISION)
 
     function global:cargo {
         param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
@@ -898,6 +972,10 @@ try {
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[1].BuildingWorker)) 'Normal desktop build inherited the worker build marker.'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].WorkerDigest (Get-FileHash -LiteralPath (Join-Path $normalBundle 'scribe-inference-worker.exe') -Algorithm SHA256).Hash.ToLowerInvariant() 'Normal desktop embeds the exact packaged worker digest'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $normalBundle (Get-WindowsFrozenCpuWorkerMarkerFileName)))) 'Normal packaging unexpectedly staged the local-only marker.'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestPolicyCalls.Count 3 'Normal packaging did not verify compiled GPU Auto policy identity at built, staged, and pre-activation boundaries.'
+    foreach ($call in $global:WindowsFrozenCpuWorkerTestPolicyCalls) {
+        Assert-Equal $call.Command '--scribe-windows-gpu-auto-policy-identity' 'Normal packaging policy identity command'
+    }
     Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Normal packaging revision environment restoration'
     Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64 -join '') 'Normal packaging worker digest environment restoration'
     Assert-Equal $env:SCRIBE_BUILDING_WORKER 'inherited-worker-flag' 'Normal packaging worker marker environment restoration'
@@ -929,6 +1007,7 @@ try {
     }
     $producerRecord = Get-Content -LiteralPath $producerRecordPath -Raw | ConvertFrom-Json
     Set-FixtureCompiledAdmissionResponse $fixtureContext $fixtureContext $producerRecord
+    Set-FixturePolicyIdentityResponse $fixtureContext.DesktopBuildId
     $producerCallsBeforeExistingOutput = $global:WindowsFrozenCpuWorkerTestCargoCalls.Count
     Invoke-ExpectedFailure { & $fixtureProducer -OutputDirectory $producerOutput } 'already exists'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count $producerCallsBeforeExistingOutput 'Existing freeze output invoked Cargo'
@@ -1140,6 +1219,10 @@ try {
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].BuildingWorker $null 'Frozen consumer worker marker clearing'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest $record.worker_sha256 'Frozen consumer exact worker anchor'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Count 1 'Frozen consumer compiled admission invocation count'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestPolicyCalls.Count 3 'Frozen consumer did not retain all three compiled GPU Auto policy identity gates.'
+    foreach ($call in $global:WindowsFrozenCpuWorkerTestPolicyCalls) {
+        Assert-Equal $call.Command '--scribe-windows-gpu-auto-policy-identity' 'Frozen consumer policy identity command'
+    }
     Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Frozen consumer revision environment restoration'
     Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64 -join '') 'Frozen consumer digest environment restoration'
     Assert-Equal $env:SCRIBE_BUILDING_WORKER 'inherited-worker-flag' 'Frozen consumer worker marker environment restoration'
@@ -1315,6 +1398,10 @@ try {
     Assert-DesktopCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'ui-harness' 'Foreign frozen assembly built a non-M desktop'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Foreign frozen assembly inherited R or caller revision'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestAdmissionCalls.Count 1 'Foreign frozen assembly did not gate publication on compiled admission'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestPolicyCalls.Count 3 'Foreign frozen assembly did not retain all three compiled GPU Auto policy identity gates.'
+    foreach ($call in $global:WindowsFrozenCpuWorkerTestPolicyCalls) {
+        Assert-Equal $call.Command '--scribe-windows-gpu-auto-policy-identity' 'Foreign frozen assembly policy identity command'
+    }
     Assert-Equal (Get-WindowsFrozenCpuWorkerFileSha256 (Join-Path $foreignBundle (Get-WindowsFrozenCpuWorkerExecutableRelativePath))) $foreignRecord.worker_sha256 'Foreign frozen assembly changed R worker bytes'
 
     foreach ($mismatch in @(
@@ -1523,6 +1610,15 @@ finally {
     }
     foreach ($name in $previousGitEnvironment.Keys) {
         Set-Item -LiteralPath "Env:$name" -Value $previousGitEnvironment[$name]
+    }
+    foreach ($name in $policyFixtureGlobalNames) {
+        $saved = $savedPolicyFixtureGlobals[$name]
+        if ($saved.Exists) {
+            Set-Variable -Name $name -Scope Global -Value $saved.Value -Force
+        }
+        else {
+            Remove-Variable -Name $name -Scope Global -Force -ErrorAction SilentlyContinue
+        }
     }
     try {
         Assert-Equal (Get-CommandIdentity 'cargo') $originalCargoCommandIdentity 'Synthetic Cargo seam command restoration'

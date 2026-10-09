@@ -34,12 +34,15 @@ $savedGlobalCargo = Get-Item -LiteralPath Function:global:cargo -ErrorAction Sil
 $savedGlobalCargoScriptBlock = if ($null -ne $savedGlobalCargo) { $savedGlobalCargo.ScriptBlock } else { $null }
 $fixtureGlobalVariableNames = @(
     'CiCpuWorkerBuilderCargoCalls', 'CiCpuWorkerBuilderNativeCalls', 'CiCpuWorkerBuilderAdmissionCalls',
+    'CiCpuWorkerBuilderPolicyCalls', 'CiCpuWorkerBuilderPolicyResponse', 'CiCpuWorkerBuilderPolicyResponses',
     'CiCpuWorkerBuilderGitHubCalls', 'CiCpuWorkerBuilderFailDesktop', 'CiCpuWorkerBuilderFailSmoke',
     'CiCpuWorkerBuilderRaceBundle', 'CiCpuWorkerBuilderMutateWorkerPath',
     'CiCpuWorkerBuilderMutationWasBlocked', 'CiCpuWorkerBuilderMutateStagedWorker',
     'CiCpuWorkerBuilderStagedWorkerMutationAttempted', 'CiCpuWorkerBuilderStagedWorkerMutationSucceeded',
     'CiCpuWorkerBuilderSourceDriftPath', 'CiCpuWorkerBuilderAdmissionResponse',
-    'CiCpuWorkerBuilderPostCargoMutation', 'CiCpuWorkerBuilderActivationMutation'
+    'CiCpuWorkerBuilderPostCargoMutation', 'CiCpuWorkerBuilderActivationMutation',
+    'CiCpuWorkerBuilderMutateStagedDesktop', 'CiCpuWorkerBuilderStagedDesktopMutationAttempted',
+    'CiCpuWorkerBuilderStagedDesktopMutationSucceeded'
 )
 $savedFixtureGlobals = @{}
 foreach ($name in $fixtureGlobalVariableNames) {
@@ -204,6 +207,11 @@ function Invoke-NativeProcess([string]$ExecutablePath, [string[]]$Arguments) {
         [IO.File]::WriteAllBytes($stagedWorker, [byte[]](0x66))
         $global:CiCpuWorkerBuilderStagedWorkerMutationSucceeded = $true
     }
+    if ($global:CiCpuWorkerBuilderMutateStagedDesktop) {
+        $global:CiCpuWorkerBuilderStagedDesktopMutationAttempted = $true
+        [IO.File]::WriteAllBytes($ExecutablePath, [byte[]](0x67))
+        $global:CiCpuWorkerBuilderStagedDesktopMutationSucceeded = $true
+    }
     if ($global:CiCpuWorkerBuilderFailSmoke) {
         return [pscustomobject]@{ ExitCode = 1; Stdout = ''; Stderr = 'fixture smoke failure' }
     }
@@ -224,12 +232,28 @@ function Set-FixtureCompiledAdmissionSeam([string]$IntegrityPath) {
     $end = $source.IndexOf('function Assert-WindowsFrozenCpuWorkerCompiledAdmission', $start)
     if ($start -lt 0 -or $end -le $start) { throw 'Could not isolate fixture compiled-admission seam.' }
     $fixtureAdmission = @'
-function Invoke-WindowsFrozenCpuWorkerAdmissionProcess([string]$Executable) {
-    $global:CiCpuWorkerBuilderAdmissionCalls.Add($Executable)
-    if ($null -eq $global:CiCpuWorkerBuilderAdmissionResponse) {
-        throw 'Fixture compiled admission response was not configured.'
+function Invoke-WindowsFrozenCpuWorkerAdmissionProcess(
+    [string]$Executable,
+    [ValidateSet('--scribe-frozen-worker-admission', '--scribe-windows-gpu-auto-policy-identity')]
+    [string]$Command = '--scribe-frozen-worker-admission'
+) {
+    if ($Command -ceq '--scribe-frozen-worker-admission') {
+        $global:CiCpuWorkerBuilderAdmissionCalls.Add($Executable)
+        if ($null -eq $global:CiCpuWorkerBuilderAdmissionResponse) {
+            throw 'Fixture compiled admission response was not configured.'
+        }
+        return $global:CiCpuWorkerBuilderAdmissionResponse
     }
-    return $global:CiCpuWorkerBuilderAdmissionResponse
+    $global:CiCpuWorkerBuilderPolicyCalls.Add([pscustomobject]@{ Executable = $Executable; Command = $Command })
+    if ($global:CiCpuWorkerBuilderPolicyResponses.Count -gt 0) {
+        $response = $global:CiCpuWorkerBuilderPolicyResponses[0]
+        $global:CiCpuWorkerBuilderPolicyResponses.RemoveAt(0)
+        return $response
+    }
+    if ($null -eq $global:CiCpuWorkerBuilderPolicyResponse) {
+        throw 'Fixture GPU Auto policy identity response was not configured.'
+    }
+    return $global:CiCpuWorkerBuilderPolicyResponse
 }
 
 '@
@@ -353,6 +377,51 @@ function Set-AdmissionResponse([psobject]$DesktopContext, [psobject]$WorkerConte
     $global:CiCpuWorkerBuilderAdmissionResponse = [pscustomobject]@{ ExitCode = 0; Stdout = ($report | ConvertTo-Json -Compress); Stderr = '' }
 }
 
+function New-PolicyIdentityResponse([psobject]$DesktopContext, [string]$Mutation = '') {
+    $policyIdentity = Open-WindowsGpuAutoPolicyIdentity $fixtureRoot
+    try {
+        $report = [ordered]@{
+            schema_version = [int64]1
+            desktop_build_id = $DesktopContext.DesktopBuildId
+            policy_schema_version = [int64]$policyIdentity.PolicySchemaVersion
+            policy_version = [int64]$policyIdentity.PolicyVersion
+            target_os = [string]$policyIdentity.TargetOs
+            target_arch = [string]$policyIdentity.TargetArch
+            mode = [string]$policyIdentity.Mode
+            entry_count = [int64]$policyIdentity.EntryCount
+            embedded_manifest_size_bytes = [int64]$policyIdentity.EmbeddedManifestSizeBytes
+            embedded_manifest_sha256 = [string]$policyIdentity.EmbeddedManifestSha256
+            runtime_manifest_sha256 = [string]$policyIdentity.RuntimeManifestSha256
+        }
+        $response = [pscustomobject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+        switch ($Mutation) {
+            '' { }
+            'wrong-digest' { $report.embedded_manifest_sha256 = '0' * 64 }
+            'malformed' { }
+            'nonzero' { $response.ExitCode = 19; $response.Stderr = 'fixture policy process failure' }
+            default { throw "Unknown GPU Auto policy identity mutation: $Mutation" }
+        }
+        $response.Stdout = if ($Mutation -ceq 'malformed') { '{fixture-malformed' } else { $report | ConvertTo-Json -Compress }
+        return $response
+    }
+    finally {
+        $policyIdentity.ManifestStream.Dispose()
+    }
+}
+
+function Set-PolicyIdentityResponse([psobject]$DesktopContext, [string]$Mutation = '') {
+    $global:CiCpuWorkerBuilderPolicyResponses.Clear()
+    $global:CiCpuWorkerBuilderPolicyResponse = New-PolicyIdentityResponse $DesktopContext $Mutation
+}
+
+function Set-PreactivationPolicyIdentityResponse([psobject]$DesktopContext) {
+    $global:CiCpuWorkerBuilderPolicyResponses.Clear()
+    $global:CiCpuWorkerBuilderPolicyResponses.Add((New-PolicyIdentityResponse $DesktopContext))
+    $global:CiCpuWorkerBuilderPolicyResponses.Add((New-PolicyIdentityResponse $DesktopContext))
+    $global:CiCpuWorkerBuilderPolicyResponses.Add((New-PolicyIdentityResponse $DesktopContext 'malformed'))
+    $global:CiCpuWorkerBuilderPolicyResponse = New-PolicyIdentityResponse $DesktopContext
+}
+
 function Reset-Scenario([string]$WorkerRevision = '') {
     $script:ScenarioCount++
     $desktop = Get-WindowsFrozenCpuWorkerSourceContext $fixtureRoot
@@ -386,15 +455,19 @@ function Reset-Scenario([string]$WorkerRevision = '') {
     $env:SCRIBE_CI_CPU_FIXTURE_ARCHIVE_SHA256 = $script:Scenario.ArchiveHash
     $env:SCRIBE_CI_CPU_FIXTURE_ARCHIVE_SIZE = [string](Get-Item -LiteralPath $archivePath -Force).Length
     $env:SCRIBE_CI_CPU_FIXTURE_POST_CARGO_MUTATION = $null
-    $global:CiCpuWorkerBuilderCargoCalls.Clear(); $global:CiCpuWorkerBuilderNativeCalls.Clear(); $global:CiCpuWorkerBuilderAdmissionCalls.Clear(); $global:CiCpuWorkerBuilderGitHubCalls.Clear()
+    $global:CiCpuWorkerBuilderCargoCalls.Clear(); $global:CiCpuWorkerBuilderNativeCalls.Clear(); $global:CiCpuWorkerBuilderAdmissionCalls.Clear(); $global:CiCpuWorkerBuilderPolicyCalls.Clear(); $global:CiCpuWorkerBuilderPolicyResponses.Clear(); $global:CiCpuWorkerBuilderGitHubCalls.Clear()
     $global:CiCpuWorkerBuilderFailDesktop = $false; $global:CiCpuWorkerBuilderFailSmoke = $false
     $global:CiCpuWorkerBuilderRaceBundle = $null; $global:CiCpuWorkerBuilderMutateWorkerPath = $null
     $global:CiCpuWorkerBuilderMutationWasBlocked = $false; $global:CiCpuWorkerBuilderSourceDriftPath = $null
     $global:CiCpuWorkerBuilderMutateStagedWorker = $false
     $global:CiCpuWorkerBuilderStagedWorkerMutationAttempted = $false
     $global:CiCpuWorkerBuilderStagedWorkerMutationSucceeded = $false
+    $global:CiCpuWorkerBuilderMutateStagedDesktop = $false
+    $global:CiCpuWorkerBuilderStagedDesktopMutationAttempted = $false
+    $global:CiCpuWorkerBuilderStagedDesktopMutationSucceeded = $false
     $global:CiCpuWorkerBuilderPostCargoMutation = $null; $global:CiCpuWorkerBuilderActivationMutation = $null
     Set-AdmissionResponse $desktop $workerContext $record
+    Set-PolicyIdentityResponse $desktop
 }
 
 function Get-CiInputParameters {
@@ -450,12 +523,14 @@ try {
     foreach ($relativePath in @(
         '.gitignore', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'build.rs', 'src/worker_identity.rs',
         '.github/workflows/release.yml', 'scripts/build-windows-release.ps1', 'scripts/resolve-windows-cpu-worker-inputs.ps1',
-        'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1', 'scripts/windows-pe-imports.ps1',
+        'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-gpu-auto-policy-identity.ps1',
+        'scripts/report-windows-gpu-auto-qualification.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1', 'scripts/windows-pe-imports.ps1',
         'scripts/new-windows-frozen-cpu-worker.ps1', 'scripts/invoke-windows-gpu-approved-signing.ps1', 'scripts/stage-verified-worker-packs.ps1',
         'resources/licenses/Apache-2.0.txt', 'resources/licenses/OpenAI-Whisper-MIT.txt', 'resources/licenses/Whisper-Base-En-NOTICE.txt',
         'resources/licenses/THIRD-PARTY-NOTICES.txt', 'native/transcribe-cpp-v0.1.3/LICENSE', 'native/transcribe-cpp-v0.1.3/PROVENANCE.md',
         'native/whisper-f049fff/LICENSE', 'native/whisper-f049fff/PROVENANCE.md', 'native/sherpa-onnx-v1.13.5/PROVENANCE.md',
-        'resources/silero-vad/LICENSE', 'resources/silero-vad/PROVENANCE.md'
+        'resources/silero-vad/LICENSE', 'resources/silero-vad/PROVENANCE.md',
+        'runtime-manifests/gpu-auto-qualification-windows-x64.json'
     )) { Copy-FixtureSourceFile $relativePath }
     [IO.File]::WriteAllBytes($fixtureModel, [byte[]](1, 2, 3, 4))
     $modelHash = Get-TestHash ([IO.File]::ReadAllBytes($fixtureModel))
@@ -478,9 +553,13 @@ try {
 
     $fixtureBuilder = Join-Path $fixtureRoot 'scripts\build-windows-release.ps1'
     . (Join-Path $fixtureRoot 'scripts\windows-frozen-cpu-worker-integrity.ps1')
+    . (Join-Path $fixtureRoot 'scripts\windows-gpu-auto-policy-identity.ps1')
     $global:CiCpuWorkerBuilderCargoCalls = [Collections.Generic.List[object]]::new()
     $global:CiCpuWorkerBuilderNativeCalls = [Collections.Generic.List[object]]::new()
     $global:CiCpuWorkerBuilderAdmissionCalls = [Collections.Generic.List[string]]::new()
+    $global:CiCpuWorkerBuilderPolicyCalls = [Collections.Generic.List[object]]::new()
+    $global:CiCpuWorkerBuilderPolicyResponses = [Collections.Generic.List[object]]::new()
+    $global:CiCpuWorkerBuilderPolicyResponse = $null
     $global:CiCpuWorkerBuilderGitHubCalls = [Collections.Generic.List[string]]::new()
 
     function global:cargo {
@@ -540,6 +619,10 @@ try {
     Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64) 'CI builder did not restore caller worker digest.'
     Assert-Equal $env:SCRIBE_BUILDING_WORKER 'hostile-caller-worker-flag' 'CI builder did not restore caller worker marker.'
     Assert-Equal $global:CiCpuWorkerBuilderAdmissionCalls.Count 1 'CI same-source build did not use compiled admission exactly once.'
+    Assert-Equal $global:CiCpuWorkerBuilderPolicyCalls.Count 3 'CI same-source build did not verify compiled GPU Auto policy identity at built, staged, and pre-activation boundaries.'
+    foreach ($call in $global:CiCpuWorkerBuilderPolicyCalls) {
+        Assert-Equal $call.Command '--scribe-windows-gpu-auto-policy-identity' 'CI same-source policy identity command'
+    }
     Assert-Equal $global:CiCpuWorkerBuilderNativeCalls.Count 1 'CI same-source build did not run the staged smoke exactly once.'
     Assert-Equal (Get-TestHash ([IO.File]::ReadAllBytes((Join-Path $script:Scenario.BundlePath 'scribe-inference-worker.exe')))) $script:Scenario.Record.worker_sha256 'CI bundle did not copy held worker bytes.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $script:Scenario.BundlePath 'WINDOWS-FROZEN-CPU-WORKER-LOCAL-ONLY.txt'))) 'CI bundle emitted a local-only frozen marker.'
@@ -551,6 +634,10 @@ try {
     Invoke-CiBuilder | Out-Null
     Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'Compiled foreign CI worker did not build exactly one desktop.'
     Assert-Equal $global:CiCpuWorkerBuilderCargoCalls[0].Revision $script:Scenario.DesktopContext.SourceRevision 'Compiled foreign CI worker changed M desktop identity.'
+    Assert-Equal $global:CiCpuWorkerBuilderPolicyCalls.Count 3 'Compiled foreign CI worker did not retain all three GPU Auto policy identity gates.'
+    foreach ($call in $global:CiCpuWorkerBuilderPolicyCalls) {
+        Assert-Equal $call.Command '--scribe-windows-gpu-auto-policy-identity' 'Compiled foreign policy identity command'
+    }
     Assert-Equal (Get-TestHash ([IO.File]::ReadAllBytes((Join-Path $script:Scenario.BundlePath 'scribe-inference-worker.exe')))) $script:Scenario.Record.worker_sha256 'Compiled foreign CI worker did not copy R bytes.'
     Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Compiled foreign CI consumer'
 
@@ -560,6 +647,35 @@ try {
     Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'Compiled foreign worker refusal did not stop after one desktop build.'
     Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'Compiled foreign worker refusal published a bundle.'
     Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Compiled foreign worker refusal'
+
+    # A report mismatch at the first compiled-policy checkpoint must reject both
+    # same-source and foreign R assembly after M-only desktop Cargo, before any
+    # staging output can publish.
+    foreach ($policyMutation in @('malformed', 'wrong-digest', 'nonzero')) {
+        foreach ($workerRevision in @('', ('a' * 40))) {
+            Reset-Scenario $workerRevision
+            Set-PolicyIdentityResponse $script:Scenario.DesktopContext $policyMutation
+            Assert-Rejected "compiled GPU Auto policy $policyMutation ($workerRevision)" { Invoke-CiBuilder }
+            Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 "Compiled GPU Auto policy $policyMutation did not stop after M desktop Cargo."
+            Assert-Equal $global:CiCpuWorkerBuilderPolicyCalls.Count 1 "Compiled GPU Auto policy $policyMutation did not fail at the built-desktop gate."
+            Assert-Equal $global:CiCpuWorkerBuilderAdmissionCalls.Count 0 "Compiled GPU Auto policy $policyMutation reached CPU admission."
+            Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) "Compiled GPU Auto policy $policyMutation published a bundle."
+            Assert-WorkerReleased $script:Scenario.ResolvedRoot "Compiled GPU Auto policy $policyMutation"
+        }
+    }
+
+    # The final identity report remains a gate immediately before activation,
+    # rather than a one-time build-time observation.
+    foreach ($workerRevision in @('', ('a' * 40))) {
+        Reset-Scenario $workerRevision
+        Set-PreactivationPolicyIdentityResponse $script:Scenario.DesktopContext
+        Assert-Rejected "pre-activation compiled GPU Auto policy report ($workerRevision)" { Invoke-CiBuilder }
+        Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'Pre-activation GPU Auto policy report failure rebuilt or skipped M desktop Cargo.'
+        Assert-Equal $global:CiCpuWorkerBuilderNativeCalls.Count 1 'Pre-activation GPU Auto policy report failure did not reach the staged smoke boundary.'
+        Assert-Equal $global:CiCpuWorkerBuilderPolicyCalls.Count 3 'Pre-activation GPU Auto policy report failure did not reach the final gate.'
+        Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'Pre-activation GPU Auto policy report failure published a bundle.'
+        Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Pre-activation GPU Auto policy report failure'
+    }
 
     foreach ($missing in @((Get-CiInputParameters).Keys)) {
         Reset-Scenario
@@ -664,14 +780,16 @@ try {
         Assert-WorkerReleased $script:Scenario.ResolvedRoot "final activation producer $drift drift"
     }
 
-    Reset-Scenario
-    $global:CiCpuWorkerBuilderSourceDriftPath = Join-Path $fixtureRoot 'untracked-source-drift.txt'
-    Assert-Rejected 'M source drift after desktop Cargo' { Invoke-CiBuilder }
-    Assert-True (Test-Path -LiteralPath $global:CiCpuWorkerBuilderSourceDriftPath -PathType Leaf) 'M source drift fixture did not write its untracked sentinel after desktop Cargo.'
-    Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'M source drift did not occur after desktop Cargo.'
-    Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'M source drift published a bundle.'
-    Remove-Item -LiteralPath $global:CiCpuWorkerBuilderSourceDriftPath -Force
-    Assert-WorkerReleased $script:Scenario.ResolvedRoot 'M source drift'
+    foreach ($workerRevision in @('', ('a' * 40))) {
+        Reset-Scenario $workerRevision
+        $global:CiCpuWorkerBuilderSourceDriftPath = Join-Path $fixtureRoot 'untracked-source-drift.txt'
+        Assert-Rejected "M source drift after desktop Cargo ($workerRevision)" { Invoke-CiBuilder }
+        Assert-True (Test-Path -LiteralPath $global:CiCpuWorkerBuilderSourceDriftPath -PathType Leaf) 'M source drift fixture did not write its untracked sentinel after desktop Cargo.'
+        Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'M source drift did not occur after desktop Cargo.'
+        Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'M source drift published a bundle.'
+        Remove-Item -LiteralPath $global:CiCpuWorkerBuilderSourceDriftPath -Force
+        Assert-WorkerReleased $script:Scenario.ResolvedRoot 'M source drift'
+    }
 
     Reset-Scenario
     $global:CiCpuWorkerBuilderMutateWorkerPath = Join-Path $script:Scenario.ResolvedRoot 'scribe-inference-worker.exe'
@@ -687,6 +805,21 @@ try {
     Assert-Equal $global:CiCpuWorkerBuilderNativeCalls.Count 1 'Staged worker mutation did not run exactly one smoke invocation.'
     Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'Staged worker mutation published a bundle.'
     Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Staged worker mutation'
+
+    # The final policy recheck must bind the staged desktop's original bytes;
+    # the smoke seam mutates that desktop after the staged identity report and
+    # before the final activation gate.
+    foreach ($workerRevision in @('', ('a' * 40))) {
+        Reset-Scenario $workerRevision
+        $global:CiCpuWorkerBuilderMutateStagedDesktop = $true
+        Assert-Rejected "staged desktop mutation before policy activation ($workerRevision)" { Invoke-CiBuilder }
+        Assert-True $global:CiCpuWorkerBuilderStagedDesktopMutationAttempted 'Staged desktop mutation did not reach the smoke boundary.'
+        Assert-True $global:CiCpuWorkerBuilderStagedDesktopMutationSucceeded 'Staged desktop mutation fixture did not alter the staged executable.'
+        Assert-Equal $global:CiCpuWorkerBuilderNativeCalls.Count 1 'Staged desktop mutation did not run exactly one smoke invocation.'
+        Assert-Equal $global:CiCpuWorkerBuilderPolicyCalls.Count 2 'Staged desktop mutation reached the final policy process despite changed bytes.'
+        Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'Staged desktop mutation published a bundle.'
+        Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Staged desktop mutation'
+    }
 
     Reset-Scenario
     $global:CiCpuWorkerBuilderRaceBundle = $script:Scenario.BundlePath
@@ -704,7 +837,11 @@ try {
     Remove-Item -LiteralPath $untracked -Force
 
     # Count the explicit scenarios, not filesystem-dependent cleanup assertions.
-    Assert-Equal $script:ScenarioCount 44 'Expected CI CPU worker consumer scenarios were not all discovered.'
+    # Eleven explicit GPU Auto policy identity scenarios were added: six
+    # built-desktop report failures, two final-preactivation report failures,
+    # one additional foreign-R source-drift case, and two staged-desktop drift
+    # cases replace the former same-source-only source-drift coverage.
+    Assert-Equal $script:ScenarioCount 55 'Expected CI CPU worker consumer scenarios were not all discovered.'
 }
 catch {
     $primaryFailure = $_
