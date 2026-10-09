@@ -194,6 +194,9 @@ function Reset-TestFixture {
     Write-TestJson $catalogPath $catalog
     $script:Fixture = [ordered]@{
         Source = $source
+        WorkerSource = $source
+        WorkerSourcePin = $null
+        WorkerComparison = [ordered]@{ merge_base_commit = [ordered]@{ sha = $source }; status = 'identical' }
         SigningRunId = $signingRunId
         SigningAttempt = $signingAttempt
         SignedArtifactId = $signedArtifactId
@@ -236,9 +239,20 @@ function Reset-TestFixture {
     $env:GITHUB_SHA = $source
 }
 
+function Set-DistinctWorkerSourceFixture {
+    $script:Fixture.WorkerSource = '6' * 40
+    $script:Fixture.WorkerSourcePin = $script:Fixture.WorkerSource
+    foreach ($run in @($script:Fixture.SignRun, $script:Fixture.SignLatest, $script:Fixture.ProducerRun, $script:Fixture.ProducerLatest)) { $run.head_sha = $script:Fixture.WorkerSource }
+    $script:Fixture.SignArtifact.workflow_run.head_sha = $script:Fixture.WorkerSource
+    $script:Fixture.ProducerArtifact.workflow_run.head_sha = $script:Fixture.WorkerSource
+    $script:Fixture.Receipt.source_revision = $script:Fixture.WorkerSource
+    $script:Fixture.WorkerComparison = [ordered]@{ merge_base_commit = [ordered]@{ sha = $script:Fixture.WorkerSource }; status = 'ahead' }
+}
+
 function Invoke-SigningGitHubGet([string]$Path) {
     $script:GitHubCalls.Add($Path)
     $prefix = '/repos/tyhuang9/scribe'
+    if ($null -ne $script:Fixture.WorkerSourcePin -and $script:Fixture.WorkerSourcePin -cne $script:Fixture.Source -and $Path -ceq "$prefix/compare/$($script:Fixture.WorkerSourcePin)...$($script:Fixture.Source)") { return $script:Fixture.WorkerComparison }
     switch -CaseSensitive ($Path) {
         "$prefix/actions/runs/$($script:Fixture.SigningRunId)/attempts/$($script:Fixture.SigningAttempt)" { return $script:Fixture.SignRun }
         "$prefix/actions/runs/$($script:Fixture.SigningRunId)" { return $script:Fixture.SignLatest }
@@ -275,13 +289,15 @@ function Invoke-WindowsGpuSignedSetVerifier(
     [string]$Executable,
     [string]$ArtifactRoot,
     [string]$LocalPolicyPath,
-    [string]$LocalToolchainPath
+    [string]$LocalToolchainPath,
+    [string]$ExpectedWorkerSourceRevision
 ) {
     $script:NativeCalls.Add([pscustomobject]@{
         Executable = $Executable
         ArtifactRoot = $ArtifactRoot
         PolicyPath = $LocalPolicyPath
         ToolchainPath = $LocalToolchainPath
+        WorkerSourceRevision = $ExpectedWorkerSourceRevision
     })
     if ($script:Fixture.NativeFailure) { throw 'Deterministic native rejection.' }
     if ($null -ne $script:Fixture.NativeOutput) { return $script:Fixture.NativeOutput }
@@ -297,6 +313,7 @@ function Invoke-TestResolver([string]$Mode, [bool]$Expected = $true) {
         SignedArtifactId = $script:Fixture.SignedArtifactId
         PolicyPath = $script:Fixture.PolicyPath
     }
+    if ($null -ne $script:Fixture.WorkerSourcePin) { $arguments.WorkerSourceRevision = $script:Fixture.WorkerSourcePin }
     if ($Expected) {
         $arguments.ExpectedArtifactSha256 = $script:Fixture.SignedDigest
         $arguments.ExpectedPolicySha256 = $script:Fixture.PolicyDigest
@@ -343,6 +360,7 @@ try {
     Assert-Test ($preflight.ArtifactSha256 -ceq $script:Fixture.SignedDigest) 'Preflight did not return the authenticated signed artifact digest.'
     Assert-Test ($preflight.PolicySha256 -ceq $script:Fixture.PolicyDigest) 'Preflight did not return the current byte-identical policy digest.'
     Assert-Test ($preflight.SignerPinsSha256 -ceq $script:Fixture.PinsDigest) 'Preflight did not return the complete reviewed signer-pin digest.'
+    Assert-Test ($preflight.WorkerSourceRevision -ceq $script:Fixture.Source) 'Omitted worker source did not resolve to desktop M in Preflight.'
     Assert-Test ($script:NativeCalls.Count -eq 0) 'Preflight invoked the native verifier.'
 
     Reset-TestFixture
@@ -359,11 +377,78 @@ try {
     Assert-Test ($resolved.Receipt.run_id -ceq $script:Fixture.ProducerRunId -and $resolved.Receipt.run_id -cne $script:Fixture.SigningRunId) 'Resolve confused the original producer identity with the signing run.'
     Assert-Test ($script:NativeCalls.Count -eq 1 -and $script:NativeCalls[0].ArtifactRoot -ceq (Get-WindowsGpuNormalizedPath $script:Fixture.SignedRoot)) 'Resolve did not invoke the trusted verifier exactly once over the signed root.'
     Assert-Test ($script:NativeCalls[0].PolicyPath -ceq (Get-WindowsGpuNormalizedPath $script:Fixture.PolicyPath) -and $script:NativeCalls[0].ToolchainPath -ceq (Get-WindowsGpuNormalizedPath $script:Fixture.ToolchainPath)) 'Resolve did not forward the exact policy/toolchain checkout paths.'
+    Assert-Test ($resolved.WorkerSourceRevision -ceq $script:Fixture.Source -and [string]::IsNullOrEmpty($script:NativeCalls[0].WorkerSourceRevision)) 'Omitted worker source changed the compatible native default-M call.'
 
     Reset-TestFixture
     $verified = Invoke-TestResolver 'VerifyCatalog' $true
     Assert-Test ($verified.Included -is [bool] -and $verified.Included) 'VerifyCatalog did not report inclusion only after catalog validation.'
     Assert-Test (($verified.PackRoots -join '|') -ceq ($expectedRoots -join '|')) 'VerifyCatalog changed the trusted root ordering.'
+    Assert-Test ($verified.WorkerSourceRevision -ceq $script:Fixture.Source) 'Omitted worker source did not resolve to desktop M in VerifyCatalog.'
+
+    # These offline stubs establish argument/provenance plumbing, not real
+    # native compiled-source admission; the Rust verifier tests cover that.
+    foreach ($mode in @('Preflight', 'Resolve', 'VerifyCatalog')) {
+        Reset-TestFixture
+        Set-DistinctWorkerSourceFixture
+        $origin = Invoke-TestResolver $mode $true
+        Assert-Test ($origin.WorkerSourceRevision -ceq $script:Fixture.WorkerSource -and $script:Fixture.WorkerSource -cne $env:GITHUB_SHA) "$mode did not preserve independent worker R and desktop M."
+        Assert-Test ($script:GitHubCalls.Contains("/repos/tyhuang9/scribe/compare/$($script:Fixture.WorkerSource)...$($script:Fixture.Source)")) "$mode omitted the fixed-repository R...M ancestry comparison."
+        Assert-Test ($script:GitHubCalls.Contains("/repos/tyhuang9/scribe/contents/runtime-manifests/windows-gpu-signing-policy.json?ref=$($script:Fixture.Source)")) "$mode checked current policy at R instead of desktop M."
+        if ($mode -cne 'Preflight') {
+            Assert-Test ($script:NativeCalls.Count -eq 1 -and $script:NativeCalls[0].WorkerSourceRevision -ceq $script:Fixture.WorkerSource -and $script:NativeCalls[0].Executable -ceq [IO.Path]::GetFullPath((Join-Path $script:TestRoot 'trusted/scribe-worker-pack-tool.exe'))) "$mode did not forward explicit R to the independent trusted verifier."
+            Assert-Test ($origin.Receipt.source_revision -ceq $script:Fixture.WorkerSource -and $script:Fixture.PolicyContentCalls -ge 2) "$mode confused receipt origin R or omitted current-M policy rechecks."
+        }
+    }
+    Reset-TestFixture
+    $script:Fixture.WorkerSourcePin = $script:Fixture.Source
+    $sameSource = Invoke-TestResolver 'Resolve' $true
+    Assert-Test ($sameSource.WorkerSourceRevision -ceq $script:Fixture.Source -and $script:NativeCalls[0].WorkerSourceRevision -ceq $script:Fixture.Source) 'Explicit same-source pin was not forwarded to native verification.'
+
+    foreach ($badPin in @('', ('A' * 40), ('6' * 39), ('g' * 40))) {
+        Reset-TestFixture
+        $script:Fixture.WorkerSourcePin = $badPin
+        Assert-Rejected 'explicit blank/noncanonical worker source' { Invoke-TestResolver 'Preflight' $true }
+        Assert-Test ($script:GitHubCalls.Count -eq 0 -and $script:NativeCalls.Count -eq 0) 'Invalid worker source reached provenance/artifact access.'
+    }
+    Reset-TestFixture
+    Set-DistinctWorkerSourceFixture
+    $script:Fixture.WorkerSourcePin = '8' * 40
+    $script:Fixture.WorkerComparison.merge_base_commit.sha = $script:Fixture.WorkerSourcePin
+    Assert-Rejected 'worker pin differs from signing run' { Invoke-TestResolver 'Preflight' $true }
+    Assert-Test (@($script:GitHubCalls | Where-Object { $_ -like '*/actions/artifacts/*' }).Count -eq 0 -and $script:NativeCalls.Count -eq 0) 'Wrong worker pin reached artifact lookup or native verification.'
+
+    foreach ($case in @(
+        @{ Name = 'worker R outside M history'; Apply = { $script:Fixture.WorkerComparison.status = 'diverged' } },
+        @{ Name = 'reversed worker comparison'; Apply = { $script:Fixture.WorkerComparison.status = 'behind' } },
+        @{ Name = 'wrong worker merge base'; Apply = { $script:Fixture.WorkerComparison.merge_base_commit.sha = $script:Fixture.Source } },
+        @{ Name = 'missing worker merge base'; Apply = { $script:Fixture.WorkerComparison.Remove('merge_base_commit') } },
+        @{ Name = 'signing run binds M instead of R'; Apply = { $script:Fixture.SignRun.head_sha = $script:Fixture.Source } },
+        @{ Name = 'signed artifact binds M instead of R'; Apply = { $script:Fixture.SignArtifact.workflow_run.head_sha = $script:Fixture.Source } },
+        @{ Name = 'distinct-origin signing attempt drift'; Apply = { $script:Fixture.SignLatest.run_attempt = [int64]3 } },
+        @{ Name = 'distinct-origin signed digest drift'; Apply = { $script:Fixture.SignedDigest = '9' * 64 } },
+        @{ Name = 'distinct-origin desktop workflow mismatch'; Apply = { $env:GITHUB_SHA = $script:Fixture.WorkerSource } },
+        @{ Name = 'distinct-origin physical checkout mismatch'; Apply = { $script:Fixture.GitHead = $script:Fixture.WorkerSource } }
+    )) {
+        Reset-TestFixture
+        Set-DistinctWorkerSourceFixture
+        & $case.Apply
+        Assert-Rejected $case.Name { Invoke-TestResolver 'Preflight' $true }
+        Assert-Test ($script:NativeCalls.Count -eq 0) "$($case.Name) reached native verification."
+    }
+    foreach ($case in @(
+        @{ Name = 'receipt binds M instead of R'; Apply = { $script:Fixture.Receipt.source_revision = $script:Fixture.Source } },
+        @{ Name = 'unsigned producer binds M instead of R'; Apply = { $script:Fixture.ProducerRun.head_sha = $script:Fixture.Source } },
+        @{ Name = 'unsigned artifact binds M instead of R'; Apply = { $script:Fixture.ProducerArtifact.workflow_run.head_sha = $script:Fixture.Source } },
+        @{ Name = 'distinct-origin producer attempt drift'; Apply = { $script:Fixture.ProducerLatest.run_attempt = [int64]2 } },
+        @{ Name = 'distinct-origin original artifact digest drift'; Apply = { $script:Fixture.ProducerArtifact.digest = 'sha256:' + ('9' * 64) } },
+        @{ Name = 'distinct-origin toolchain mismatch'; Apply = { $script:Fixture.Receipt.toolchain_manifest_sha256 = '9' * 64 } }
+    )) {
+        Reset-TestFixture
+        Set-DistinctWorkerSourceFixture
+        & $case.Apply
+        Assert-Rejected $case.Name { Invoke-TestResolver 'Resolve' $true }
+        Assert-Test ($script:NativeCalls.Count -eq 1) "$($case.Name) did not reach the intended post-native receipt boundary."
+    }
 
     Reset-TestFixture
     Assert-Rejected 'partial expected hash set' {
@@ -496,6 +581,14 @@ try {
     $badIdExit = [int]$LASTEXITCODE
     Assert-Test ($badIdExit -ne 0 -and ($badIdOutput -join "`n").Contains('Signing run ID is not a canonical GitHub ID.')) 'Actual entrypoint did not reject a bad signing ID before provenance access.'
 
+    foreach ($badWorker in @('', ('A' * 40))) {
+        $workerOutput = @(& pwsh -NoProfile -File $entrypoint -Mode Preflight `
+            -SourceRevision $script:Fixture.Source -WorkerSourceRevision $badWorker `
+            -SigningRunId $script:Fixture.SigningRunId -SigningRunAttempt $script:Fixture.SigningAttempt `
+            -SignedArtifactId $script:Fixture.SignedArtifactId 2>&1)
+        Assert-Test ($LASTEXITCODE -ne 0 -and ($workerOutput -join "`n").Contains('Worker source revision')) 'Actual entrypoint lost explicit blank/noncanonical worker-source rejection.'
+    }
+
     $savedRepository = [string]$env:GITHUB_REPOSITORY
     try {
         $env:GITHUB_REPOSITORY = 'attacker/fork'
@@ -517,7 +610,7 @@ try {
     Assert-Test ($source.Contains(".Environment.Remove('GH_TOKEN')") -and $source.Contains(".Environment.Remove('GITHUB_TOKEN')") -and $source.Contains(".Environment.Remove('SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64')")) 'Production verifier subprocess does not strip GitHub/signing secrets.'
     Assert-Test ($source.Contains('WaitForExit(120000)') -and $source.Contains('$errorText.Length -le 65536')) 'Production verifier subprocess is missing time/output bounds.'
     Assert-Test (-not $source.Contains('Write-Error $errorText') -and -not $source.Contains('Write-Output $errorText')) 'Production verifier relays child stderr.'
-    Assert-Test ($script:SignedInputTestCount -ge 100) 'Expected signed-input boundary cases were not discovered.'
+    Assert-Test ($script:SignedInputTestCount -ge 160) 'Expected signed-input and independent worker-origin boundary cases were not discovered.'
     Write-Output "Windows signed GPU installer input tests passed ($script:SignedInputTestCount cases; offline, no keys, workers, GPU execution, or network)."
 }
 finally {

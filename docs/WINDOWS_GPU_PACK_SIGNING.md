@@ -29,6 +29,32 @@ signer identity, and policy digest. The signer derives the application/worker
 build IDs from the approved app version and source revision; it does not require
 the separately pinned tool to have been built from the candidate revision.
 
+## Independent GPU worker origin
+
+For GPU-pack acquisition only, the installer desktop revision **M** and signed
+worker origin **R** are independently bound. Omitting
+`gpu_worker_source_revision` preserves the original same-source rule, so
+`R = M`. When supplied, the worker-source pin must be a nonblank, canonical
+lowercase 40-hex revision. Preflight authenticates the signing run and signed
+artifact at R; the signing receipt, both worker manifests, and the original
+unsigned producer must also identify R. It obtains the fixed-repository
+comparison `R...M` and accepts only `merge_base_commit.sha = R` with status
+`ahead` or `identical`.
+
+The reviewed signing policy remains bound to desktop M and is fetched again at
+the existing recheck points. The native verifier validates compiled desktop
+identity M independently, then requires receipt and manifest application/worker
+build origins R. It deliberately constructs `PackVerifier` compatibility from
+compiled M, so a foreign R pack is usable only when the existing compiled
+`FrozenGpuWorkerCandidate` policy approves its complete worker, provider, pack
+and epoch identity. The source pin is not an approval mechanism, and it cannot
+admit an arbitrary signed pack.
+
+This is not a general mixed-source release design: it covers CUDA/Vulkan worker
+acquisition only. CPU worker provenance, final candidate construction,
+qualification, Auto, publication, and all existing no-local-promotion guards
+remain unchanged and separately gated.
+
 ## Key bootstrap and protected release setup
 
 ### Public-key bootstrap (2026-09-29)
@@ -153,20 +179,25 @@ private key. Ordinary pull requests, pushes, tags, and manual runs without GPU
 inputs remain CPU-only (or fail when an official GPU-required release has no
 eligible inputs). Nothing in this adapter provisions trust or changes Auto.
 
-1. Keep the installer checkout at the exact source revision recorded in the
-   signed receipt. If `main` has advanced beyond that candidate, prepare and
-   sign a new candidate; the workflow will not silently select an older source.
+1. Keep the installer checkout at the intended desktop revision M. The default
+   is still a receipt with the same worker origin (`R = M`). An explicitly
+   selected worker origin R must be an authenticated, canonical ancestor of M;
+   do not substitute an older signed pair merely because it is available. The
+   compiled desktop must already contain the exact frozen-worker approval for
+   that foreign CUDA/Vulkan pair.
 2. Through maintainer-controlled repository configuration, select
    `SCRIBE_GPU_PACK_RELEASE_POLICY=gpu_packs_required`. Keep the independently
    reviewed public signer pins configured as described above. This document and
    its PR do not change that repository setting or authorize publication.
-3. Dispatch `release.yml` on `main` with all three string inputs:
+3. Dispatch `release.yml` on `main` with all three required string inputs:
    `gpu_signing_run_id`, `gpu_signing_run_attempt`, and
    `gpu_signed_artifact_id`. These identify the **completed signing run** and its
    `windows-gpu-signed-<run ID>-<attempt>` artifact, not the unsigned producer.
-   Start with `publish_release=false` to validate an installer without creating
-   a GitHub Release. Partial inputs, candidate branches, and other repositories
-   are rejected. GPU-required tag releases do not infer an artifact automatically.
+   Optionally supply `gpu_worker_source_revision` as the exact R; omitting it
+   preserves `R = M`. Start with `publish_release=false` to validate an
+   installer without creating a GitHub Release. Partial inputs, candidate
+   branches, and other repositories are rejected. GPU-required tag releases do
+   not infer an artifact automatically.
 4. Require the entire workflow to pass, including native verification of the
    complete signed pair, both staged pack identities, per-pack size reporting,
    installer maintenance checks, and portable/installer payload parity. The job
@@ -179,19 +210,23 @@ eligible inputs). Nothing in this adapter provisions trust or changes Auto.
 
 The controller validates both the chosen signing run/artifact and, independently,
 the original unsigned producer identities inside the receipt. These run IDs and
-artifact IDs are deliberately different. It rejects rerun/stale attempts,
-expired or mismatched artifacts, changed policy or signer pins, and incompatible
-source/toolchain identities. Only fixed `cuda` and `vulkan` roots returned after
-whole-pair native verification reach the existing pack staging path. No downloaded
-worker/provider is executed during input verification. Staging still invokes
-the compiled desktop verifier before and after copying each pack. Fresh current
+artifact IDs are deliberately different. For an explicit worker-origin R, all
+three provenance records bind R while the current signing policy remains bound
+to M. It rejects rerun/stale attempts, expired or mismatched artifacts, changed
+policy or signer pins, a non-ancestor R, and incompatible source/toolchain
+identities. Only fixed `cuda` and `vulkan` roots returned after whole-pair native
+verification reach the existing pack staging path. No downloaded worker/provider
+is executed during input verification. Staging still invokes the compiled
+desktop verifier before and after copying each pack. Fresh current
 policy/provenance checks also precede asset upload and release publication.
 
 The keyless native command is `verify-signed-windows-set --signed-root <path>
---policy <path> --toolchain-manifest <path>`. Its production entry point has no
-fixture-key override. Offline tests inject private test trust only inside the
-Rust test module; mocked workflow/process tests are not production-signing or
-clean-machine hardware evidence.
+--policy <path> --toolchain-manifest <path> [--worker-source-revision <R>]`.
+Its omitted option preserves same-source compatibility; an explicit R must be
+canonical and match the receipt and both manifests. Its production entry point
+has no fixture-key override. Offline tests inject private test trust only inside
+the Rust test module; mocked workflow/process tests are not production-signing
+or clean-machine hardware evidence.
 
 Rollback: return the repository policy to the explicit
 `temporary_cpu_only_stage4` setting and omit all GPU artifact inputs, or revert
@@ -221,7 +256,8 @@ provide additional installation/rollback enforcement.
 
 ## Failure behavior and recovery
 
-- Wrong source, artifact, signer, policy, key, app/worker identity, protocol, ABI,
+- Wrong source, noncanonical/blank worker origin, non-ancestor worker origin,
+  artifact, signer, policy, key, app/worker identity, protocol, ABI,
   backend/provider, or epoch: reject; do not publish a signed pair.
 - Corrupt, missing, extra, linked, traversal/ADS, or changed payload: reject. The
   existing bounded physical inventory and signature verifier remain mandatory.

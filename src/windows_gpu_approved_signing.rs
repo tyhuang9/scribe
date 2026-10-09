@@ -195,6 +195,11 @@ struct ReleaseIdentity<'a> {
     worker_abi_version: u16,
 }
 
+struct WorkerOriginIdentity {
+    app_build: String,
+    worker_build: String,
+}
+
 struct ValidatedSet {
     approval: ApprovedWindowsPackSet,
     policy: WindowsSigningPolicy,
@@ -239,6 +244,20 @@ pub(crate) fn verify_signed_windows_set(
     policy_path: &Path,
     toolchain_manifest_path: &Path,
 ) -> Result<WindowsPackSigningReceipt> {
+    verify_signed_windows_set_for_worker_source(
+        signed_root,
+        policy_path,
+        toolchain_manifest_path,
+        env!("SCRIBE_BUILD_REVISION"),
+    )
+}
+
+pub(crate) fn verify_signed_windows_set_for_worker_source(
+    signed_root: &Path,
+    policy_path: &Path,
+    toolchain_manifest_path: &Path,
+    worker_source_revision: &str,
+) -> Result<WindowsPackSigningReceipt> {
     verify_signed_windows_set_with_trust(
         signed_root,
         policy_path,
@@ -252,6 +271,7 @@ pub(crate) fn verify_signed_windows_set(
             protocol_version: crate::worker_identity::PROTOCOL_VERSION as u16,
             worker_abi_version: crate::worker_identity::WORKER_ABI_VERSION,
         },
+        worker_source_revision,
     )
 }
 
@@ -261,7 +281,9 @@ fn verify_signed_windows_set_with_trust(
     toolchain_manifest_path: &Path,
     trust: &dyn TrustRoot,
     identity: ReleaseIdentity<'_>,
+    worker_source_revision: &str,
 ) -> Result<WindowsPackSigningReceipt> {
+    validate_revision(worker_source_revision, "expected worker source revision")?;
     validate_signed_root(signed_root)?;
 
     let receipt_bytes = read_bounded_control(&signed_root.join(RECEIPT_NAME), "signing receipt")?;
@@ -284,7 +306,8 @@ fn verify_signed_windows_set_with_trust(
         bail!("signing receipt does not match the authoritative signing policy");
     }
 
-    validate_release_identity(&receipt, &policy, identity)?;
+    validate_compiled_release_identity(&policy, identity)?;
+    let worker_origin = validate_worker_origin(&receipt, &policy, worker_source_revision)?;
     let toolchain_bytes = read_bounded_regular(
         toolchain_manifest_path,
         "toolchain manifest",
@@ -311,6 +334,7 @@ fn verify_signed_windows_set_with_trust(
             &policy,
             trust,
             identity,
+            &worker_origin,
         )?;
     }
     Ok(receipt)
@@ -490,8 +514,7 @@ fn validate_policy(policy: &WindowsSigningPolicy, trust: &dyn TrustRoot) -> Resu
     Ok(())
 }
 
-fn validate_release_identity(
-    receipt: &WindowsPackSigningReceipt,
+fn validate_compiled_release_identity(
     policy: &WindowsSigningPolicy,
     identity: ReleaseIdentity<'_>,
 ) -> Result<()> {
@@ -507,14 +530,40 @@ fn validate_release_identity(
     if identity.app_build != expected_app_build || identity.worker_build != expected_worker_build {
         bail!("compiled worker identity is inconsistent with its release source and version");
     }
-    if receipt.source_revision != identity.source_revision
-        || policy.app_version != identity.app_version
+    if policy.app_version != identity.app_version
         || policy.protocol_version != identity.protocol_version
         || policy.worker_abi_version != identity.worker_abi_version
     {
-        bail!("signed pack set is not bound to this verifier's compiled release identity");
+        bail!("compiled verifier identity is incompatible with the reviewed signing policy");
     }
     Ok(())
+}
+
+fn validate_worker_origin(
+    receipt: &WindowsPackSigningReceipt,
+    policy: &WindowsSigningPolicy,
+    worker_source_revision: &str,
+) -> Result<WorkerOriginIdentity> {
+    validate_revision(worker_source_revision, "expected worker source revision")?;
+    let app_build = format!(
+        "local-transcriber@{}#{}",
+        policy.app_version, worker_source_revision
+    );
+    let worker_build = format!(
+        "scribe-inference-worker@{}#{}",
+        policy.app_version, worker_source_revision
+    );
+    validate_build_identity(&app_build, "expected worker-origin app build")?;
+    validate_build_identity(&worker_build, "expected worker-origin worker build")?;
+    if receipt.source_revision != worker_source_revision {
+        bail!(
+            "signed pack set is not bound to this verifier's compiled release identity or expected worker source"
+        );
+    }
+    Ok(WorkerOriginIdentity {
+        app_build,
+        worker_build,
+    })
 }
 
 fn approval_from_receipt(receipt: &WindowsPackSigningReceipt) -> ApprovedWindowsPackSet {
@@ -787,6 +836,7 @@ fn verify_signed_pack(
     policy: &WindowsSigningPolicy,
     trust: &dyn TrustRoot,
     identity: ReleaseIdentity<'_>,
+    worker_origin: &WorkerOriginIdentity,
 ) -> Result<()> {
     let expected_backend = match rule.backend.as_str() {
         "cuda" => PackBackend::Cuda,
@@ -842,8 +892,8 @@ fn verify_signed_pack(
         || manifest.app_protocol_version != policy.protocol_version
         || manifest.worker_protocol_version != policy.protocol_version
         || manifest.runtime_abi_version != policy.worker_abi_version
-        || manifest.app_build != identity.app_build
-        || manifest.worker_build != identity.worker_build
+        || manifest.app_build != worker_origin.app_build
+        || manifest.worker_build != worker_origin.worker_build
         || manifest.worker_path != rule.worker_path
         || sha256_hex(&manifest_bytes) != inspected.manifest_sha256
         || manifest.payload.len() != inspected.payload_files
@@ -1184,6 +1234,7 @@ mod tests {
     use crate::manifest::{PackManifest, PayloadEntry, StoreComponent, compute_pack_digest};
 
     const CANDIDATE_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DESKTOP_REVISION: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const SIGNER_REVISION: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const KEY_ID: &str = "scribe-test-production-v1";
 
@@ -1455,11 +1506,122 @@ mod tests {
                 protocol_version: 5,
                 worker_abi_version: 1,
             },
+            CANDIDATE_REVISION,
         )
     }
 
     fn verify_fixture(fixture: &Fixture) -> Result<WindowsPackSigningReceipt> {
         verify_fixture_with_trust(fixture, &fixture.trust)
+    }
+
+    fn verify_fixture_for_worker_source(
+        fixture: &Fixture,
+        worker_source_revision: &str,
+    ) -> Result<WindowsPackSigningReceipt> {
+        let app_build = format!("local-transcriber@9.8.7#{DESKTOP_REVISION}");
+        let worker_build = format!("scribe-inference-worker@9.8.7#{DESKTOP_REVISION}");
+        verify_signed_windows_set_with_trust(
+            &fixture.output,
+            &fixture.policy,
+            &fixture.toolchain,
+            &fixture.trust,
+            ReleaseIdentity {
+                app_version: "9.8.7",
+                source_revision: DESKTOP_REVISION,
+                app_build: &app_build,
+                worker_build: &worker_build,
+                protocol_version: 5,
+                worker_abi_version: 1,
+            },
+            worker_source_revision,
+        )
+    }
+
+    fn foreign_worker_policy(fixture: &Fixture) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct TestFrozenWorkerPolicy {
+            schema_version: u8,
+            target_os: String,
+            target_arch: String,
+            entries: Vec<TestFrozenGpuEntry>,
+        }
+
+        #[derive(Serialize)]
+        struct TestFrozenGpuEntry {
+            kind: &'static str,
+            origin_app_build: String,
+            worker_build: String,
+            worker_sha256: String,
+            protocol_version: u8,
+            runtime_abi_version: u16,
+            backend: String,
+            provider: String,
+            pack_id: String,
+            pack_version: String,
+            pack_digest: String,
+            security_epoch: u64,
+        }
+
+        let entries = ["cuda", "vulkan"]
+            .into_iter()
+            .map(|root| {
+                let manifest: PackManifest = serde_json::from_slice(
+                    &fs::read(fixture.output.join(root).join(MANIFEST_NAME)).unwrap(),
+                )
+                .unwrap();
+                let worker_sha256 = manifest
+                    .payload
+                    .iter()
+                    .find(|entry| entry.path == manifest.worker_path)
+                    .unwrap()
+                    .sha256
+                    .clone();
+                TestFrozenGpuEntry {
+                    kind: "gpu",
+                    origin_app_build: manifest.app_build,
+                    worker_build: manifest.worker_build,
+                    worker_sha256,
+                    protocol_version: u8::try_from(manifest.worker_protocol_version).unwrap(),
+                    runtime_abi_version: manifest.runtime_abi_version,
+                    backend: root.to_owned(),
+                    provider: manifest.provider,
+                    pack_id: manifest.pack_id.as_str().to_owned(),
+                    pack_version: manifest.pack_version.as_str().to_owned(),
+                    pack_digest: manifest.pack_digest,
+                    security_epoch: manifest.security_epoch,
+                }
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&TestFrozenWorkerPolicy {
+            schema_version: 1,
+            target_os: "windows".to_owned(),
+            target_arch: "x86_64".to_owned(),
+            entries,
+        })
+        .unwrap()
+    }
+
+    fn synchronize_receipt_to_signed_manifests(fixture: &Fixture) {
+        let mut receipt = read_receipt(fixture);
+        for inspected in &mut receipt.packs {
+            let manifest_bytes = fs::read(
+                fixture
+                    .output
+                    .join(&inspected.pack_root)
+                    .join(MANIFEST_NAME),
+            )
+            .unwrap();
+            let manifest: PackManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+            inspected.pack_digest = manifest.pack_digest;
+            inspected.manifest_sha256 = sha256_hex(&manifest_bytes);
+        }
+        let approval = approval_from_receipt(&receipt);
+        let handoff = handoff_from_approval(&approval);
+        receipt.release_set_digest = release_set_digest(&handoff);
+        let receipt_approval = approval_from_receipt(&receipt);
+        let receipt_handoff = handoff_from_approval(&receipt_approval);
+        receipt.handoff_sha256 = sha256_hex(&serde_json::to_vec(&receipt_handoff).unwrap());
+        write_receipt(fixture, &receipt);
     }
 
     fn read_receipt(fixture: &Fixture) -> WindowsPackSigningReceipt {
@@ -1743,13 +1905,106 @@ mod tests {
     }
 
     #[test]
+    fn source_aware_verifier_admits_only_an_exact_compiled_foreign_worker_approval() {
+        let fixture = fixture("verify-foreign-worker-origin");
+        sign_fixture(&fixture);
+        let policy = foreign_worker_policy(&fixture);
+        let verified = crate::worker_compatibility::with_test_frozen_worker_policy(&policy, || {
+            verify_fixture_for_worker_source(&fixture, CANDIDATE_REVISION)
+        })
+        .unwrap();
+        assert_eq!(verified.source_revision, CANDIDATE_REVISION);
+        assert_eq!(verified.packs.len(), 2);
+
+        let unadmitted = verify_fixture_for_worker_source(&fixture, CANDIDATE_REVISION)
+            .unwrap_err()
+            .to_string();
+        assert!(unadmitted.contains("full verification"));
+    }
+
+    #[test]
+    fn source_aware_verifier_rejects_receipt_and_manifest_origin_substitution() {
+        let receipt = fixture("verify-foreign-worker-receipt-substitution");
+        sign_fixture(&receipt);
+        mutate_receipt(&receipt, |value| {
+            value.source_revision = "d".repeat(40);
+        });
+        assert!(
+            verify_fixture_for_worker_source(&receipt, CANDIDATE_REVISION)
+                .unwrap_err()
+                .to_string()
+                .contains("expected worker source")
+        );
+
+        let mixed = fixture("verify-foreign-worker-mixed-source");
+        sign_fixture(&mixed);
+        rewrite_manifest_and_signature(&mixed, "vulkan", KEY_ID, &mixed.private_key, |manifest| {
+            manifest.app_build = format!("local-transcriber@9.8.7#{DESKTOP_REVISION}");
+            manifest.worker_build = format!("scribe-inference-worker@9.8.7#{DESKTOP_REVISION}");
+            manifest.pack_digest = compute_pack_digest(manifest).unwrap();
+        });
+        synchronize_receipt_to_signed_manifests(&mixed);
+        let policy = foreign_worker_policy(&mixed);
+        assert!(
+            crate::worker_compatibility::with_test_frozen_worker_policy(&policy, || {
+                verify_fixture_for_worker_source(&mixed, CANDIDATE_REVISION)
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("facts do not match")
+        );
+    }
+
+    #[test]
+    fn source_aware_verifier_rejects_a_compiled_desktop_incompatible_with_policy() {
+        let fixture = fixture("verify-foreign-worker-compiled-desktop-mismatch");
+        sign_fixture(&fixture);
+        let app_build = format!("local-transcriber@9.8.8#{DESKTOP_REVISION}");
+        let worker_build = format!("scribe-inference-worker@9.8.8#{DESKTOP_REVISION}");
+        let error = verify_signed_windows_set_with_trust(
+            &fixture.output,
+            &fixture.policy,
+            &fixture.toolchain,
+            &fixture.trust,
+            ReleaseIdentity {
+                app_version: "9.8.8",
+                source_revision: DESKTOP_REVISION,
+                app_build: &app_build,
+                worker_build: &worker_build,
+                protocol_version: 5,
+                worker_abi_version: 1,
+            },
+            CANDIDATE_REVISION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("compiled verifier identity is incompatible"));
+    }
+
+    #[test]
     fn production_wrapper_never_accepts_test_trust() {
         let fixture = fixture("verify-production-trust");
         sign_fixture(&fixture);
+        // A canonical explicit worker pin reaches production trust even when
+        // a non-Windows test lane uses a diagnostic compiled build label.
+        let error = verify_signed_windows_set_for_worker_source(
+            &fixture.output,
+            &fixture.policy,
+            &fixture.toolchain,
+            CANDIDATE_REVISION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("separately reviewed production trust entry"));
+
         let error = verify_signed_windows_set(&fixture.output, &fixture.policy, &fixture.toolchain)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("separately reviewed production trust entry"));
+        if validate_revision(env!("SCRIBE_BUILD_REVISION"), "compiled revision").is_ok() {
+            assert!(error.contains("separately reviewed production trust entry"));
+        } else {
+            assert!(error.contains("expected worker source revision"));
+        }
     }
 
     #[test]

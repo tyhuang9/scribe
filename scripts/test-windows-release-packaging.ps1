@@ -300,6 +300,18 @@ function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
             throw 'Valid exact GPU inputs must request verification without claiming unverified pack inclusion.'
         }
     }
+    $pinnedGpuInputs = $gpuInputs.Clone(); $pinnedGpuInputs.WorkerSourceRevision = 'a' * 40
+    $pinned = & $Script @pinnedGpuInputs
+    if (-not $pinned.signed_gpu_inputs_requested -or $pinned.include_gpu_worker_packs) {
+        throw 'Pinned worker origin must request verification without claiming inclusion.'
+    }
+    foreach ($invalidSource in @(' ', ('A' * 40), ('a' * 39), (('a' * 40) + ' '), '../source')) {
+        $invalid = $gpuInputs.Clone(); $invalid.WorkerSourceRevision = $invalidSource
+        Invoke-ExpectedFailure { & $Script @invalid } 'exact signed GPU inputs and a canonical revision'
+    }
+    Invoke-ExpectedFailure {
+        & $Script -EventName 'push' -Ref 'refs/heads/main' -Policy '' -WorkerSourceRevision ('a' * 40)
+    } 'exact signed GPU inputs and a canonical revision'
     foreach ($mutation in @(
         @{ Field = 'SigningRunId'; Value = '' },
         @{ Field = 'SigningRunAttempt'; Value = '' },
