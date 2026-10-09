@@ -168,6 +168,72 @@ enum FrozenWorkerAdmissionCommand {
     Invalid,
 }
 
+const WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND: &str = "--scribe-windows-gpu-auto-policy-identity";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsGpuAutoPolicyIdentityCommand {
+    Absent,
+    Exact,
+    Invalid,
+}
+
+fn windows_gpu_auto_policy_identity_command(
+    arguments: &[std::ffi::OsString],
+) -> WindowsGpuAutoPolicyIdentityCommand {
+    let command_count = arguments
+        .iter()
+        .filter(|argument| {
+            argument.as_os_str() == std::ffi::OsStr::new(WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND)
+        })
+        .count();
+    if command_count == 0 {
+        WindowsGpuAutoPolicyIdentityCommand::Absent
+    } else if command_count != 1 || arguments.len() != 1 {
+        WindowsGpuAutoPolicyIdentityCommand::Invalid
+    } else {
+        WindowsGpuAutoPolicyIdentityCommand::Exact
+    }
+}
+
+fn maybe_run_windows_gpu_auto_policy_identity() -> Option<i32> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match windows_gpu_auto_policy_identity_command(&arguments) {
+        WindowsGpuAutoPolicyIdentityCommand::Absent => return None,
+        WindowsGpuAutoPolicyIdentityCommand::Invalid => {
+            eprintln!("Windows GPU Auto policy identity accepts exactly one command argument.");
+            return Some(2);
+        }
+        WindowsGpuAutoPolicyIdentityCommand::Exact => {}
+    }
+
+    match gpu_auto_qualification::compiled_windows_auto_policy_identity_report(
+        worker_identity::DESKTOP_BUILD_ID,
+    ) {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(serialized) => {
+                println!("{serialized}");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("Windows GPU Auto policy identity serialization failed: {error}");
+                Some(2)
+            }
+        },
+        Err(
+            gpu_auto_qualification::CompiledWindowsAutoPolicyIdentityError::UnsupportedPlatform,
+        ) => {
+            eprintln!("Windows GPU Auto policy identity is unsupported on this platform.");
+            Some(2)
+        }
+        Err(
+            gpu_auto_qualification::CompiledWindowsAutoPolicyIdentityError::MalformedCompiledPolicy,
+        ) => {
+            eprintln!("Windows GPU Auto policy identity found a malformed compiled policy.");
+            Some(2)
+        }
+    }
+}
+
 fn frozen_worker_admission_command(
     arguments: &[std::ffi::OsString],
 ) -> FrozenWorkerAdmissionCommand {
@@ -231,6 +297,9 @@ fn main() -> eframe::Result<()> {
     if let Err(error) = onnx_worker::harden_windows_dll_search() {
         eprintln!("Scribe could not harden native library loading: {error:#}");
         std::process::exit(1);
+    }
+    if let Some(exit_code) = maybe_run_windows_gpu_auto_policy_identity() {
+        std::process::exit(exit_code);
     }
     if let Some(exit_code) = maybe_run_frozen_worker_admission() {
         std::process::exit(exit_code);
@@ -511,6 +580,96 @@ mod tests {
 
     fn admission_arguments(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_argument() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+
+        std::ffi::OsString::from_wide(&[0xd800])
+    }
+
+    #[cfg(unix)]
+    fn non_unicode_argument() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        std::ffi::OsString::from_vec(vec![0xff])
+    }
+
+    #[test]
+    fn windows_gpu_auto_policy_identity_command_is_absent_without_its_flag() {
+        for arguments in [
+            admission_arguments(&[]),
+            admission_arguments(&["--other-command"]),
+            admission_arguments(&["--scribe-frozen-worker-admission"]),
+        ] {
+            assert_eq!(
+                windows_gpu_auto_policy_identity_command(&arguments),
+                WindowsGpuAutoPolicyIdentityCommand::Absent
+            );
+        }
+    }
+
+    #[test]
+    fn windows_gpu_auto_policy_identity_command_accepts_only_its_exact_flag() {
+        assert_eq!(
+            windows_gpu_auto_policy_identity_command(&admission_arguments(&[
+                WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND,
+            ])),
+            WindowsGpuAutoPolicyIdentityCommand::Exact
+        );
+    }
+
+    #[test]
+    fn windows_gpu_auto_policy_identity_command_rejects_duplicates_and_extra_arguments() {
+        for arguments in [
+            admission_arguments(&[
+                WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND,
+                WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND,
+            ]),
+            admission_arguments(&[WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND, "--unexpected"]),
+            admission_arguments(&["--unexpected", WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND]),
+        ] {
+            assert_eq!(
+                windows_gpu_auto_policy_identity_command(&arguments),
+                WindowsGpuAutoPolicyIdentityCommand::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn windows_gpu_auto_policy_identity_command_rejects_mixed_cpu_admission_in_either_order() {
+        for arguments in [
+            admission_arguments(&[
+                WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND,
+                "--scribe-frozen-worker-admission",
+            ]),
+            admission_arguments(&[
+                "--scribe-frozen-worker-admission",
+                WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND,
+            ]),
+        ] {
+            assert_eq!(
+                windows_gpu_auto_policy_identity_command(&arguments),
+                WindowsGpuAutoPolicyIdentityCommand::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn windows_gpu_auto_policy_identity_command_handles_non_unicode_without_lossy_matching() {
+        let non_unicode = non_unicode_argument();
+        assert_eq!(
+            windows_gpu_auto_policy_identity_command(std::slice::from_ref(&non_unicode)),
+            WindowsGpuAutoPolicyIdentityCommand::Absent
+        );
+        assert_eq!(
+            windows_gpu_auto_policy_identity_command(&[
+                std::ffi::OsString::from(WINDOWS_GPU_AUTO_POLICY_IDENTITY_COMMAND),
+                non_unicode,
+            ]),
+            WindowsGpuAutoPolicyIdentityCommand::Invalid
+        );
     }
 
     #[test]

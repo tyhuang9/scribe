@@ -37,6 +37,7 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 . (Join-Path $PSScriptRoot "windows-frozen-cpu-worker-integrity.ps1")
+. (Join-Path $PSScriptRoot "windows-gpu-auto-policy-identity.ps1")
 . (Join-Path $PSScriptRoot "windows-cpu-worker-native-baseline.ps1")
 
 $targetTriple = "x86_64-pc-windows-msvc"
@@ -684,7 +685,11 @@ $frozenCpuWorker = $null
 $ciCpuWorker = $null
 $desktopSourceContext = $null
 $cpuWorkerBaseline = $null
+$gpuAutoPolicyIdentity = $null
+$gpuAutoPolicyExecutableStream = $null
+$gpuAutoPolicyDesktopBuildId = $null
 try {
+    $gpuAutoPolicyIdentity = Open-WindowsGpuAutoPolicyIdentity $repositoryRoot
     if ($frozenCpuWorkerRequested -or $ciCpuWorkerRequested) {
         # M is the physical clean installer checkout. CI CPU metadata supplies
         # only R and provenance; it can never replace this local source identity.
@@ -783,6 +788,8 @@ try {
             # not select a provider or alter normal desktop feature argv.
             $desktopFeatures += 'windows-gpu-capture-observation'
         }
+        $gpuAutoPolicyDesktopBuildId = Get-WindowsGpuAutoPolicyDesktopBuildId `
+            -RepositoryRoot $repositoryRoot -BuildRevisionOverride $env:SCRIBE_BUILD_REVISION
         & cargo build --locked --offline --release --bin local-transcriber --features ($desktopFeatures -join ',') --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
         if ($LASTEXITCODE -ne 0) {
             throw "The locked offline Windows x64 desktop release build failed."
@@ -822,6 +829,15 @@ try {
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
 $null = Assert-ReviewedWindowsPe $sourceExecutable
+$gpuAutoPolicyExecutableStream = Open-WindowsFrozenCpuWorkerReadHandle $sourceExecutable
+$gpuAutoPolicyExecutableSize = [int64]$gpuAutoPolicyExecutableStream.Length
+$gpuAutoPolicyExecutableSha256 = Get-WindowsFrozenCpuWorkerOpenStreamSha256 $gpuAutoPolicyExecutableStream
+Assert-WindowsGpuAutoPolicyCompiledIdentity `
+    -Executable $sourceExecutable `
+    -ExpectedSize $gpuAutoPolicyExecutableSize `
+    -ExpectedSha256 $gpuAutoPolicyExecutableSha256 `
+    -ExpectedDesktopBuildId $gpuAutoPolicyDesktopBuildId `
+    -PolicyIdentity $gpuAutoPolicyIdentity | Out-Null
 if (-not $ciCpuWorkerRequested) {
     Assert-Amd64Pe $sourceInferenceWorker
     $null = Assert-ReviewedWindowsPe $sourceInferenceWorker 3
@@ -843,6 +859,12 @@ try {
     $stagedExecutable = Join-Path $stagingBundle "local-transcriber.exe"
     $stagedInferenceWorker = Join-Path $stagingBundle "scribe-inference-worker.exe"
     Copy-Item -LiteralPath $sourceExecutable -Destination $stagedExecutable
+    Assert-WindowsGpuAutoPolicyCompiledIdentity `
+        -Executable $stagedExecutable `
+        -ExpectedSize $gpuAutoPolicyExecutableSize `
+        -ExpectedSha256 $gpuAutoPolicyExecutableSha256 `
+        -ExpectedDesktopBuildId $gpuAutoPolicyDesktopBuildId `
+        -PolicyIdentity $gpuAutoPolicyIdentity | Out-Null
     if ($frozenCpuWorkerRequested) {
         Copy-WindowsFrozenCpuWorkerOpenHandle $frozenCpuWorker.WorkerStream $stagedInferenceWorker
     }
@@ -1077,6 +1099,17 @@ try {
             -ExpectedSize ([int64]$ciCpuWorker.Record.worker_size_bytes) `
             -ExpectedHash ([string]$ciCpuWorker.Record.worker_sha256)
     }
+    # Reuse original pins, never a newly read executable or policy expectation.
+    Assert-WindowsGpuAutoPolicyCompiledIdentity `
+        -Executable $stagedExecutable `
+        -ExpectedSize $gpuAutoPolicyExecutableSize `
+        -ExpectedSha256 $gpuAutoPolicyExecutableSha256 `
+        -ExpectedDesktopBuildId $gpuAutoPolicyDesktopBuildId `
+        -PolicyIdentity $gpuAutoPolicyIdentity | Out-Null
+    if ($gpuAutoPolicyExecutableStream.Length -ne $gpuAutoPolicyExecutableSize -or
+        (Get-WindowsFrozenCpuWorkerOpenStreamSha256 $gpuAutoPolicyExecutableStream) -cne $gpuAutoPolicyExecutableSha256) {
+        throw 'The original desktop executable changed before bundle activation.'
+    }
     if (Test-Path -LiteralPath $finalBundle) {
         throw "Final release bundle appeared during staging; refusing to replace it: $finalBundle"
     }
@@ -1101,6 +1134,8 @@ catch {
 }
 }
 finally {
+    if ($null -ne $gpuAutoPolicyExecutableStream) { $gpuAutoPolicyExecutableStream.Dispose() }
+    if ($null -ne $gpuAutoPolicyIdentity) { $gpuAutoPolicyIdentity.ManifestStream.Dispose() }
     if ($null -ne $frozenCpuWorker -and $null -ne $frozenCpuWorker.WorkerStream) {
         $frozenCpuWorker.WorkerStream.Dispose()
     }

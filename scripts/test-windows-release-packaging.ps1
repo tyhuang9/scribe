@@ -1934,6 +1934,7 @@ Set-StrictMode -Version Latest
     & (Join-Path $PSScriptRoot 'test-windows-cpu-worker-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-cpu-worker-workflow.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-ci-cpu-worker-download.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-gpu-auto-policy-identity.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-ci-cpu-worker-packaging.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-ci-cpu-worker-workflow.ps1')
     # The nested fixture runs in this process: it must clear its own overrides
