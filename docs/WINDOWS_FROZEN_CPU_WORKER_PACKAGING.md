@@ -13,6 +13,62 @@ not use it as a release input.
 
 ## Integrity and authority
 
+### Separate authenticated CI acquisition
+
+The installer workflow can also export its **already built and verified** CPU
+worker as a reusable CI artifact. This is a separate input path, not a conversion
+of a local freeze record. It does not yet connect that input to desktop assembly.
+The normal builder and all local-only restrictions below remain unchanged.
+
+Only a manual run of `.github/workflows/release.yml` on `tyhuang9/scribe` main
+exports the worker, after portable/installed payload parity verification. The
+exporter independently checks the physical source context, bundle inventory,
+reviewed PE imports and the desktop's compiled same-source CPU anchor. It copies
+the existing worker without rebuilding it. The immutable artifact is named
+`windows-cpu-worker-<run-id>-<run-attempt>` and contains exactly:
+
+- `scribe-inference-worker.exe`
+- `windows-ci-cpu-worker.json`
+
+The distinct schema-1 `windows-ci-cpu-worker` metadata binds source/build
+contracts, target, version, protocol, ABI, build IDs, byte size and worker digest
+to the producer workflow/run/attempt. The metadata is not itself a signature or
+permission to release. It acquires producer provenance only through the
+authenticated GitHub artifact and its independent archive digest.
+
+`resolve-windows-cpu-worker-inputs.ps1 -Mode Preflight` requires explicit desktop
+source M, worker source R, producer run, attempt and artifact IDs. It checks the
+fixed successful default-branch producer, the successful latest attempt, exact
+nonexpired artifact identity/name/digest/size, R ancestry in M, M ancestry in
+current main, and the physical M checkout. There is no latest-artifact search or
+caller-selected repository/workflow.
+
+`-Mode Resolve` repeats those checks and requires the preflight
+`-ExpectedArtifactSha256`, the **raw downloaded artifact ZIP** as `-ArchivePath`,
+and a new `-OutputDirectory`. The archive is held and hashed before ZIP parsing;
+an arbitrary extracted directory is never an authenticated input. This matches
+GitHub's [artifact download implementation](https://github.com/actions/toolkit/blob/main/packages/artifact/src/internal/download/download-artifact.ts),
+which hashes the downloaded archive stream before extraction. Keep the raw
+archive bytes unchanged when downloading from the fixed repository's artifact
+REST endpoint.
+
+The resolver validates the exact two-entry archive, bounded strict metadata,
+compatibility and worker size/hash, then stages only fixed sibling filenames
+and atomically publishes a new directory. It never executes downloaded content.
+Existing outputs, unsafe paths, links, alternate streams, unexpected files,
+duplicate entries, changed provenance or changed bytes fail closed. The returned
+`WorkerStream` is a held read handle owned by the caller and must be disposed.
+
+Acquisition is not runtime admission. A later desktop-builder integration must
+embed this exact CPU digest and independently apply the existing compiled
+same-source or exact foreign-worker approval. No compatibility-map entry, Auto
+eligibility, release authority, private key or local-marker exception is added.
+Real protected-main production/acquisition remains unverified until this source
+is merged and an authorized main run produces an artifact; offline fixtures
+prove contracts, not hosted artifact availability or hardware compatibility.
+
+### Local integrity records
+
 `new-windows-frozen-cpu-worker.ps1` builds the CPU worker from the current clean
 checkout using the existing locked, offline release command. Its output binds
 the actual source revision and build contracts, application version, Windows

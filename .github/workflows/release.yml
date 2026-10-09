@@ -633,6 +633,26 @@ jobs:
             dist/gpu-pack-evidence
           if-no-files-found: warn
 
+      # Export only the CPU bytes that already passed portable/installed parity.
+      # This is a reusable CI input, not a release or a local freeze promotion.
+      - name: Export verified CPU worker for immutable reuse
+        if: github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          & .\scripts\export-windows-cpu-worker-artifact.ps1 `
+            -BundlePath dist\portable `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'scribe-verified-cpu-worker-input')
+
+      - name: Upload immutable verified CPU worker
+        if: github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-cpu-worker-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/scribe-verified-cpu-worker-input/scribe-inference-worker.exe
+            ${{ runner.temp }}/scribe-verified-cpu-worker-input/windows-ci-cpu-worker.json
+          if-no-files-found: error
+
       - name: Recheck signed GPU provenance before asset upload
         if: steps.gpu-catalog.outputs.included == 'true'
         shell: pwsh

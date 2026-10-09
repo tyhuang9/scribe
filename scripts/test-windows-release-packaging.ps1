@@ -1912,6 +1912,8 @@ Set-StrictMode -Version Latest
 
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-cpu-worker-inputs.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-cpu-worker-workflow.ps1')
     # The nested fixture runs in this process: it must clear its own overrides
     # temporarily without losing a caller's native-toolchain environment.
     $cpuFixtureToolchainSentinels = [ordered]@{
