@@ -63,6 +63,18 @@ transcript hashing, report serialization, and final service shutdown are outside
 that timer. This is not microphone-to-UI end-to-end latency, a purged filesystem
 cache measurement, or a native-kernel-only measurement.
 
+Each run also preserves `worker_model_load_duration_ms` and
+`worker_backend_processing_duration_ms` from the returned application outcome.
+These are raw worker-reported intervals: unavailable values remain `null`, zero
+remains zero, and values outside the report's `u64` range reject the campaign.
+They are not additive startup stages. The native model-load timer excludes
+preceding artifact admission/hash verification, and GGUF batch completion can
+report a reused model even when the request initially loaded it. Processing
+wraps native transcription, not just GPU kernels. In particular, subtracting
+these fields from application latency does not measure provider discovery,
+pack verification, IPC, or driver startup separately. Older reports omit these
+two optional fields; they must not be backfilled with invented values.
+
 Separate lanes preserve the normal one-active-worker rule. Alternating CPU and
 GPU while retaining both models would measure a different residency policy.
 Control and record run order and host conditions when comparing lanes; the

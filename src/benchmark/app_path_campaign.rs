@@ -147,6 +147,8 @@ struct RunRecord {
     index: u8,
     measured: bool,
     application_transcription_latency_ms: u64,
+    worker_model_load_duration_ms: Option<u64>,
+    worker_backend_processing_duration_ms: Option<u64>,
     warm_model_reused: bool,
     normalized_transcript_sha256: String,
 }
@@ -154,6 +156,8 @@ struct RunRecord {
 #[derive(Clone)]
 struct RunObservation {
     latency_ms: u64,
+    worker_model_load_duration_ms: Option<u64>,
+    worker_backend_processing_duration_ms: Option<u64>,
     warm_model_reused: bool,
     normalized_transcript_sha256: String,
     requested: AccelerationPreference,
@@ -395,6 +399,12 @@ impl CampaignExecutor for ApplicationExecutor {
         let normalized_transcript_sha256 = normalized_transcript_sha256(&outcome.transcript.text);
         Ok(RunObservation {
             latency_ms,
+            worker_model_load_duration_ms: reported_worker_duration_ms(
+                outcome.model_load_duration_ms,
+            )?,
+            worker_backend_processing_duration_ms: reported_worker_duration_ms(
+                outcome.processing_duration_ms,
+            )?,
             warm_model_reused: outcome.warm_model_reused,
             normalized_transcript_sha256,
             requested: resolved.requested,
@@ -406,6 +416,15 @@ impl CampaignExecutor for ApplicationExecutor {
     fn shutdown(&mut self, service: &Self::Service) -> bool {
         service.shutdown_runtime_and_wait(SHUTDOWN_TIMEOUT)
     }
+}
+
+// Preserve unavailable timings and reject overflow rather than fabricating zero
+// or truncating. These are raw worker intervals, not an additive startup profile.
+fn reported_worker_duration_ms(value: Option<u128>) -> Result<Option<u64>> {
+    value
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| anyhow!("application transcription worker timing exceeded report bounds"))
 }
 
 fn run_campaign<E: CampaignExecutor>(executor: &mut E, lane: Lane) -> Result<CampaignResult> {
@@ -531,6 +550,8 @@ fn validate_observation(
         index: spec.index,
         measured: spec.phase != Phase::Prime,
         application_transcription_latency_ms: observation.latency_ms,
+        worker_model_load_duration_ms: observation.worker_model_load_duration_ms,
+        worker_backend_processing_duration_ms: observation.worker_backend_processing_duration_ms,
         warm_model_reused: observation.warm_model_reused,
         normalized_transcript_sha256: observation.normalized_transcript_sha256,
     })
@@ -1023,6 +1044,8 @@ mod tests {
         fn observation(&self, spec: RunSpec) -> RunObservation {
             RunObservation {
                 latency_ms: u64::from(spec.index),
+                worker_model_load_duration_ms: None,
+                worker_backend_processing_duration_ms: None,
                 warm_model_reused: spec.phase == Phase::Warm,
                 normalized_transcript_sha256: self.transcript_sha256.clone(),
                 requested: self.lane.preference(),
@@ -1277,6 +1300,60 @@ mod tests {
                 .collect();
             let error = run_campaign(&mut executor, Lane::Cpu).unwrap_err();
             assert!(error.to_string().contains("warm-state"));
+        }
+    }
+
+    #[test]
+    fn reported_worker_durations_preserve_missing_zero_and_u64_boundaries() {
+        assert_eq!(reported_worker_duration_ms(None).unwrap(), None);
+        for value in [0, 1, 42, u64::MAX] {
+            assert_eq!(
+                reported_worker_duration_ms(Some(u128::from(value))).unwrap(),
+                Some(value)
+            );
+        }
+        for value in [u128::from(u64::MAX) + 1, u128::MAX] {
+            let error = reported_worker_duration_ms(Some(value)).unwrap_err();
+            assert!(error.to_string().contains("worker timing exceeded"));
+        }
+    }
+
+    #[test]
+    fn run_records_preserve_raw_worker_intervals_without_deriving_startup_cost() {
+        let spec = RunSpec {
+            phase: Phase::Cold,
+            index: 1,
+        };
+        for (load, processing) in [
+            (None, None),
+            (Some(0), Some(42)),
+            (Some(u64::MAX), None),
+            (None, Some(u64::MAX)),
+        ] {
+            let mut observation = FakeExecutor::new(Lane::Cpu).observation(spec);
+            observation.worker_model_load_duration_ms = load;
+            observation.worker_backend_processing_duration_ms = processing;
+            let record = validate_observation(
+                &mut ValidationState::default(),
+                Lane::Cpu,
+                spec,
+                observation,
+            )
+            .unwrap();
+            assert_eq!(record.application_transcription_latency_ms, 1);
+            assert_eq!(record.worker_model_load_duration_ms, load);
+            assert_eq!(record.worker_backend_processing_duration_ms, processing);
+            let json = serde_json::to_value(&record).unwrap();
+            assert_eq!(
+                json["worker_model_load_duration_ms"],
+                serde_json::json!(load)
+            );
+            assert_eq!(
+                json["worker_backend_processing_duration_ms"],
+                serde_json::json!(processing)
+            );
+            assert!(json.get("startup_overhead_ms").is_none());
+            assert!(json.get("provider_discovery_ms").is_none());
         }
     }
 
@@ -1675,6 +1752,8 @@ mod tests {
                 index: 1,
                 measured: true,
                 application_transcription_latency_ms: 2,
+                worker_model_load_duration_ms: Some(0),
+                worker_backend_processing_duration_ms: None,
                 warm_model_reused: false,
                 normalized_transcript_sha256: HASH.to_owned(),
             }],
@@ -1693,6 +1772,8 @@ mod tests {
         assert!(json.contains("\"unsigned\":true"));
         assert!(json.contains("\"auto_eligible\":false"));
         assert!(json.contains("application_transcription_latency_ms"));
+        assert!(json.contains("\"worker_model_load_duration_ms\":0"));
+        assert!(json.contains("\"worker_backend_processing_duration_ms\":null"));
     }
 
     #[test]
