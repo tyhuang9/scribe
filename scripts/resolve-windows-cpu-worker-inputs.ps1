@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Preflight', 'Resolve')][string]$Mode,
+    [ValidateSet('Preflight', 'Download', 'Resolve')][string]$Mode,
     [string]$SourceRevision,
     [string]$WorkerSourceRevision,
     [string]$ProducerRunId,
@@ -26,6 +26,11 @@ $windowsCpuInputEntryArguments = [ordered]@{
     OutputDirectory = $OutputDirectory
 }
 $windowsCpuInputExplicit = [ordered]@{
+    SourceRevision = $PSBoundParameters.ContainsKey('SourceRevision')
+    WorkerSourceRevision = $PSBoundParameters.ContainsKey('WorkerSourceRevision')
+    ProducerRunId = $PSBoundParameters.ContainsKey('ProducerRunId')
+    ProducerRunAttempt = $PSBoundParameters.ContainsKey('ProducerRunAttempt')
+    ArtifactId = $PSBoundParameters.ContainsKey('ArtifactId')
     ExpectedArtifactSha256 = $PSBoundParameters.ContainsKey('ExpectedArtifactSha256')
     ArchivePath = $PSBoundParameters.ContainsKey('ArchivePath')
     OutputDirectory = $PSBoundParameters.ContainsKey('OutputDirectory')
@@ -47,6 +52,8 @@ $script:WindowsCpuInputRecordName = 'windows-ci-cpu-worker.json'
 $script:WindowsCpuInputWorkerName = 'scribe-inference-worker.exe'
 $script:WindowsCpuInputMaximumRecordBytes = [int64]65536
 $script:WindowsCpuInputMaximumArchiveBytes = [int64](Get-WindowsFrozenCpuWorkerMaximumBytes) + [int64](4MB)
+$script:WindowsCpuInputMaximumResponseHeaderBytes = [int64]65536
+$script:WindowsCpuInputDownloadDeadline = [TimeSpan]::FromSeconds(120)
 
 function Assert-WindowsCpuWorkerInputCondition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -118,6 +125,62 @@ function Get-WindowsCpuWorkerInputSourceContext([string]$RepositoryRoot) {
 
 function Invoke-WindowsCpuWorkerInputGitHubGet([string]$Path) {
     return Invoke-SigningGitHubGet $Path
+}
+
+function New-WindowsCpuWorkerInputHttpClient([bool]$Authenticated) {
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $handler.MaxResponseHeadersLength = [int]($script:WindowsCpuInputMaximumResponseHeaderBytes / 1024)
+    $client = [Net.Http.HttpClient]::new($handler, $true)
+    $client.Timeout = $script:WindowsCpuInputDownloadDeadline
+    if ($Authenticated) {
+        Assert-WindowsCpuWorkerInputCondition `
+            (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) `
+            'Read-only GitHub token is missing.'
+        $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $env:GH_TOKEN)
+        $client.DefaultRequestHeaders.Add('Accept', 'application/vnd.github+json')
+        $client.DefaultRequestHeaders.Add('X-GitHub-Api-Version', '2022-11-28')
+        $client.DefaultRequestHeaders.Add('User-Agent', 'scribe-ci-cpu-worker-input')
+    }
+    return $client
+}
+
+function Assert-WindowsCpuWorkerInputResponseHeaders([Net.Http.HttpResponseMessage]$Response) {
+    $total = [int64]0
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $headerCollections = @($Response.Headers)
+    if ($null -ne $Response.Content) {
+        $headerCollections += @($Response.Content.Headers)
+    }
+    foreach ($headers in $headerCollections) {
+        foreach ($header in $headers) {
+            $total += [int64]$encoding.GetByteCount([string]$header.Key)
+            foreach ($value in $header.Value) {
+                $total += [int64]$encoding.GetByteCount([string]$value)
+            }
+            Assert-WindowsCpuWorkerInputCondition `
+                ($total -le $script:WindowsCpuInputMaximumResponseHeaderBytes) `
+                'CPU worker download response headers exceed the fixed bound.'
+        }
+    }
+}
+
+function Remove-WindowsCpuWorkerInputOwnedDownload([string]$Path, [string]$Destination) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $full = Get-WindowsFrozenCpuWorkerNormalizedFullPath $Path
+    $destinationFull = Get-WindowsFrozenCpuWorkerNormalizedFullPath $Destination
+    $parent = Split-Path -Parent $destinationFull
+    $expectedPrefix = ".$(Split-Path -Leaf $destinationFull).download-"
+    Assert-WindowsCpuWorkerInputCondition `
+        ((Split-Path -Parent $full) -ceq $parent -and
+            (Split-Path -Leaf $full).StartsWith($expectedPrefix, [StringComparison]::Ordinal)) `
+        'Refusing to clean an unowned CPU worker download staging file.'
+    Assert-WindowsFrozenCpuWorkerNoReparseAncestors $full
+    $item = Assert-WindowsCpuWorkerInputUnlinkedFile $full 'CPU worker download staging file'
+    Assert-WindowsCpuWorkerInputCondition `
+        ($item.Length -ge 0 -and $item.Length -le $script:WindowsCpuInputMaximumArchiveBytes) `
+        'Refusing to clean an oversized CPU worker download staging file.'
+    Remove-Item -LiteralPath $full -Force
 }
 
 function Assert-WindowsCpuWorkerInputProductionContext([string]$Revision) {
@@ -194,6 +257,194 @@ function Invoke-WindowsCpuWorkerInputPreflight {
         CurrentMainRevision = $currentMain
         Context = $production.Context
         RepositoryRoot = $production.RepositoryRoot
+    }
+}
+
+function Assert-WindowsCpuWorkerInputPreflightMatchesRequest(
+    [psobject]$Preflight,
+    [string]$SourceRevision,
+    [string]$WorkerSourceRevision,
+    [string]$ProducerRunId,
+    [string]$ProducerRunAttempt,
+    [string]$ArtifactId,
+    [string]$ExpectedArtifactSha256 = ''
+) {
+    Assert-WindowsCpuWorkerInputCondition ($null -ne $Preflight) 'CPU worker provenance preflight returned no result.'
+    foreach ($pair in @(
+        @('SourceRevision', $SourceRevision),
+        @('WorkerSourceRevision', $WorkerSourceRevision),
+        @('ProducerRunId', $ProducerRunId),
+        @('ProducerRunAttempt', $ProducerRunAttempt),
+        @('ArtifactId', $ArtifactId)
+    )) {
+        Assert-WindowsCpuWorkerInputCondition `
+            ([string]$Preflight.($pair[0]) -ceq [string]$pair[1]) `
+            "CPU worker provenance preflight changed the requested $($pair[0])."
+    }
+    Assert-SigningHash ([string]$Preflight.ArtifactSha256) 'CPU worker provenance preflight archive SHA-256'
+    Assert-WindowsCpuWorkerInputCondition `
+        ([int64]$Preflight.ArtifactSizeBytes -gt 0 -and [int64]$Preflight.ArtifactSizeBytes -le $script:WindowsCpuInputMaximumArchiveBytes) `
+        'CPU worker provenance preflight archive size is outside the fixed bound.'
+    if (-not [string]::IsNullOrEmpty($ExpectedArtifactSha256)) {
+        Assert-SigningHash $ExpectedArtifactSha256 'Expected CPU worker archive SHA-256'
+        Assert-WindowsCpuWorkerInputCondition `
+            ([string]$Preflight.ArtifactSha256 -ceq $ExpectedArtifactSha256) `
+            'CPU worker archive digest changed after independent preflight.'
+    }
+}
+
+function Invoke-WindowsCpuWorkerInputDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRevision,
+        [Parameter(Mandatory = $true)][string]$WorkerSourceRevision,
+        [Parameter(Mandatory = $true)][string]$ProducerRunId,
+        [Parameter(Mandatory = $true)][string]$ProducerRunAttempt,
+        [Parameter(Mandatory = $true)][string]$ArtifactId,
+        [Parameter(Mandatory = $true)][string]$ExpectedArtifactSha256,
+        [Parameter(Mandatory = $true)][string]$ArchivePath
+    )
+
+    Assert-SigningHash $ExpectedArtifactSha256 'Expected CPU worker archive SHA-256'
+    Assert-WindowsCpuWorkerInputCondition (-not [string]::IsNullOrWhiteSpace($ArchivePath)) 'ArchivePath is required.'
+    $preflight = Invoke-WindowsCpuWorkerInputPreflight `
+        -SourceRevision $SourceRevision `
+        -WorkerSourceRevision $WorkerSourceRevision `
+        -ProducerRunId $ProducerRunId `
+        -ProducerRunAttempt $ProducerRunAttempt `
+        -ArtifactId $ArtifactId
+    Assert-WindowsCpuWorkerInputPreflightMatchesRequest `
+        -Preflight $preflight `
+        -SourceRevision $SourceRevision `
+        -WorkerSourceRevision $WorkerSourceRevision `
+        -ProducerRunId $ProducerRunId `
+        -ProducerRunAttempt $ProducerRunAttempt `
+        -ArtifactId $ArtifactId `
+        -ExpectedArtifactSha256 $ExpectedArtifactSha256
+
+    $archiveFull = Get-WindowsFrozenCpuWorkerNormalizedFullPath $ArchivePath
+    $parent = Split-Path -Parent $archiveFull
+    Assert-WindowsCpuWorkerInputCondition (-not [string]::IsNullOrWhiteSpace($parent)) 'CPU worker archive destination requires a parent directory.'
+    Assert-WindowsFrozenCpuWorkerNoReparseAncestors $parent
+    Assert-WindowsCpuWorkerInputCondition (Test-Path -LiteralPath $parent -PathType Container) 'CPU worker archive destination parent must already exist.'
+    Assert-WindowsCpuWorkerInputCondition (-not (Test-Path -LiteralPath $archiveFull)) 'CPU worker archive destination must be fresh.'
+    $staging = Join-Path $parent ".$(Split-Path -Leaf $archiveFull).download-$PID-$([guid]::NewGuid().ToString('N'))"
+    Assert-WindowsCpuWorkerInputCondition (-not (Test-Path -LiteralPath $staging)) 'CPU worker archive download staging file unexpectedly exists.'
+
+    $apiClient = $null
+    $downloadClient = $null
+    $apiRequest = $null
+    $apiResponse = $null
+    $downloadRequest = $null
+    $downloadResponse = $null
+    $downloadStream = $null
+    $outputStream = $null
+    $hash = $null
+    $deadline = [Threading.CancellationTokenSource]::new($script:WindowsCpuInputDownloadDeadline)
+    $success = $false
+    try {
+        $apiClient = New-WindowsCpuWorkerInputHttpClient $true
+        $apiRequest = [Net.Http.HttpRequestMessage]::new(
+            [Net.Http.HttpMethod]::Get,
+            "https://api.github.com/repos/$script:WindowsCpuInputRepository/actions/artifacts/$ArtifactId/zip"
+        )
+        $apiResponse = $apiClient.SendAsync(
+            $apiRequest,
+            [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $deadline.Token
+        ).GetAwaiter().GetResult()
+        Assert-WindowsCpuWorkerInputResponseHeaders $apiResponse
+        Assert-WindowsCpuWorkerInputCondition `
+            ($apiResponse.StatusCode -eq [Net.HttpStatusCode]::Found) `
+            'CPU worker artifact endpoint did not return the required redirect.'
+        $location = $apiResponse.Headers.Location
+        Assert-WindowsCpuWorkerInputCondition `
+            ($null -ne $location -and $location.IsAbsoluteUri -and
+                $location.Scheme -ceq 'https' -and
+                -not [string]::IsNullOrWhiteSpace($location.Host) -and
+                [string]::IsNullOrEmpty($location.UserInfo)) `
+            'CPU worker artifact redirect is not a credential-free HTTPS URL.'
+
+        $downloadClient = New-WindowsCpuWorkerInputHttpClient $false
+        Assert-WindowsCpuWorkerInputCondition `
+            ($null -eq $downloadClient.DefaultRequestHeaders.Authorization) `
+            'CPU worker redirect client unexpectedly contains credentials.'
+        $downloadRequest = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $location)
+        $downloadResponse = $downloadClient.SendAsync(
+            $downloadRequest,
+            [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $deadline.Token
+        ).GetAwaiter().GetResult()
+        Assert-WindowsCpuWorkerInputResponseHeaders $downloadResponse
+        Assert-WindowsCpuWorkerInputCondition `
+            ($downloadResponse.StatusCode -eq [Net.HttpStatusCode]::OK -and $null -ne $downloadResponse.Content) `
+            'CPU worker artifact redirect did not return a successful archive response.'
+        # PowerShell unboxes Nullable<Int64> response headers: an absent length
+        # is `$null`, while a present length is already an Int64 (so HasValue /
+        # Value are not reliable member accesses here).
+        $reportedContentLength = $downloadResponse.Content.Headers.ContentLength
+        if ($null -ne $reportedContentLength) {
+            Assert-WindowsCpuWorkerInputCondition `
+                ([int64]$reportedContentLength -eq [int64]$preflight.ArtifactSizeBytes) `
+                'CPU worker archive response length does not match authenticated artifact metadata.'
+        }
+
+        $downloadStream = $downloadResponse.Content.ReadAsStreamAsync($deadline.Token).GetAwaiter().GetResult()
+        $outputStream = [IO.File]::Open($staging, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+        $buffer = [byte[]]::new(1048576)
+        $total = [int64]0
+        while ($true) {
+            $deadline.Token.ThrowIfCancellationRequested()
+            $count = $downloadStream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token).GetAwaiter().GetResult()
+            if ($count -eq 0) { break }
+            $total += [int64]$count
+            Assert-WindowsCpuWorkerInputCondition `
+                ($total -le [int64]$preflight.ArtifactSizeBytes -and $total -le $script:WindowsCpuInputMaximumArchiveBytes) `
+                'CPU worker archive download exceeds its authenticated size bound.'
+            $hash.AppendData($buffer, 0, $count)
+            $outputStream.Write($buffer, 0, $count)
+        }
+        $deadline.Token.ThrowIfCancellationRequested()
+        Assert-WindowsCpuWorkerInputCondition `
+            ($total -eq [int64]$preflight.ArtifactSizeBytes) `
+            'CPU worker archive download ended before its authenticated size.'
+        $digest = [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+        Assert-WindowsCpuWorkerInputCondition `
+            ($digest -ceq $ExpectedArtifactSha256 -and $digest -ceq $preflight.ArtifactSha256) `
+            'CPU worker archive download digest does not match authenticated metadata.'
+        $outputStream.Flush($true)
+        $outputStream.Dispose()
+        $outputStream = $null
+        Assert-WindowsCpuWorkerInputCondition (-not (Test-Path -LiteralPath $archiveFull)) 'CPU worker archive destination appeared during download.'
+        [IO.File]::Move($staging, $archiveFull)
+        $staging = $null
+        $success = $true
+        return [pscustomobject]@{
+            SourceRevision = $preflight.SourceRevision
+            WorkerSourceRevision = $preflight.WorkerSourceRevision
+            ProducerRunId = $preflight.ProducerRunId
+            ProducerRunAttempt = $preflight.ProducerRunAttempt
+            ArtifactId = $preflight.ArtifactId
+            ArchivePath = $archiveFull
+            ArtifactSha256 = $preflight.ArtifactSha256
+            ArtifactSizeBytes = $preflight.ArtifactSizeBytes
+        }
+    }
+    finally {
+        if ($null -ne $hash) { $hash.Dispose() }
+        if ($null -ne $outputStream) { $outputStream.Dispose() }
+        if ($null -ne $downloadStream) { $downloadStream.Dispose() }
+        if ($null -ne $downloadResponse) { $downloadResponse.Dispose() }
+        if ($null -ne $downloadRequest) { $downloadRequest.Dispose() }
+        if ($null -ne $apiResponse) { $apiResponse.Dispose() }
+        if ($null -ne $apiRequest) { $apiRequest.Dispose() }
+        if ($null -ne $downloadClient) { $downloadClient.Dispose() }
+        if ($null -ne $apiClient) { $apiClient.Dispose() }
+        $deadline.Dispose()
+        if (-not $success -and $null -ne $staging) {
+            Remove-WindowsCpuWorkerInputOwnedDownload $staging $archiveFull
+        }
     }
 }
 
@@ -469,9 +720,14 @@ function Resolve-WindowsCpuWorkerInputs {
         -ProducerRunId $ProducerRunId `
         -ProducerRunAttempt $ProducerRunAttempt `
         -ArtifactId $ArtifactId
-    Assert-WindowsCpuWorkerInputCondition `
-        ($preflight.ArtifactSha256 -ceq $ExpectedArtifactSha256) `
-        'CPU worker archive digest changed after independent preflight.'
+    Assert-WindowsCpuWorkerInputPreflightMatchesRequest `
+        -Preflight $preflight `
+        -SourceRevision $SourceRevision `
+        -WorkerSourceRevision $WorkerSourceRevision `
+        -ProducerRunId $ProducerRunId `
+        -ProducerRunAttempt $ProducerRunAttempt `
+        -ArtifactId $ArtifactId `
+        -ExpectedArtifactSha256 $ExpectedArtifactSha256
 
     $archiveFull = Get-WindowsFrozenCpuWorkerNormalizedFullPath $ArchivePath
     $archiveItem = Assert-WindowsCpuWorkerInputUnlinkedFile $archiveFull 'Retained raw CPU worker ZIP'
@@ -493,6 +749,7 @@ function Resolve-WindowsCpuWorkerInputs {
         $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Read, $true)
         $entries = Assert-WindowsCpuWorkerInputZipEntries $archive
         $recordBytes = Read-WindowsCpuWorkerInputZipRecord $entries[$script:WindowsCpuInputRecordName]
+        $recordSha256 = ConvertTo-WindowsFrozenCpuWorkerSha256 $recordBytes
         $record = ConvertFrom-SigningJson $recordBytes
         Assert-WindowsCpuWorkerInputRecord $record $recordBytes $preflight
 
@@ -543,6 +800,14 @@ function Resolve-WindowsCpuWorkerInputs {
             -ProducerRunId $ProducerRunId `
             -ProducerRunAttempt $ProducerRunAttempt `
             -ArtifactId $ArtifactId
+        Assert-WindowsCpuWorkerInputPreflightMatchesRequest `
+            -Preflight $latePreflight `
+            -SourceRevision $SourceRevision `
+            -WorkerSourceRevision $WorkerSourceRevision `
+            -ProducerRunId $ProducerRunId `
+            -ProducerRunAttempt $ProducerRunAttempt `
+            -ArtifactId $ArtifactId `
+            -ExpectedArtifactSha256 $ExpectedArtifactSha256
         Assert-WindowsCpuWorkerInputCondition `
             ($latePreflight.ArtifactSha256 -ceq $ExpectedArtifactSha256 -and
                 $latePreflight.ArtifactSha256 -ceq $preflight.ArtifactSha256 -and
@@ -572,6 +837,8 @@ function Resolve-WindowsCpuWorkerInputs {
             ArtifactSizeBytes = $preflight.ArtifactSizeBytes
             Root = $output
             RecordPath = $finalRecordPath
+            RecordBytes = $recordBytes
+            RecordSha256 = $recordSha256
             Record = $record
             Context = ConvertTo-WindowsCpuWorkerInputContext $record
             WorkerPath = $finalWorkerPath
@@ -603,6 +870,26 @@ if (-not $windowsCpuInputFunctionsOnly) {
             -ProducerRunAttempt $windowsCpuInputEntryArguments.ProducerRunAttempt `
             -ArtifactId $windowsCpuInputEntryArguments.ArtifactId
     }
+    elseif ($windowsCpuInputEntryArguments.Mode -ceq 'Download') {
+        Assert-WindowsCpuWorkerInputCondition `
+            ($windowsCpuInputExplicit.SourceRevision -and
+                $windowsCpuInputExplicit.WorkerSourceRevision -and
+                $windowsCpuInputExplicit.ProducerRunId -and
+                $windowsCpuInputExplicit.ProducerRunAttempt -and
+                $windowsCpuInputExplicit.ArtifactId -and
+                $windowsCpuInputExplicit.ExpectedArtifactSha256 -and
+                $windowsCpuInputExplicit.ArchivePath -and
+                -not $windowsCpuInputExplicit.OutputDirectory) `
+            'Download requires the exact producer tuple, independently pinned archive digest, and fresh raw ZIP destination only.'
+        Invoke-WindowsCpuWorkerInputDownload `
+            -SourceRevision $windowsCpuInputEntryArguments.SourceRevision `
+            -WorkerSourceRevision $windowsCpuInputEntryArguments.WorkerSourceRevision `
+            -ProducerRunId $windowsCpuInputEntryArguments.ProducerRunId `
+            -ProducerRunAttempt $windowsCpuInputEntryArguments.ProducerRunAttempt `
+            -ArtifactId $windowsCpuInputEntryArguments.ArtifactId `
+            -ExpectedArtifactSha256 $windowsCpuInputEntryArguments.ExpectedArtifactSha256 `
+            -ArchivePath $windowsCpuInputEntryArguments.ArchivePath
+    }
     elseif ($windowsCpuInputEntryArguments.Mode -ceq 'Resolve') {
         Assert-WindowsCpuWorkerInputCondition `
             ($windowsCpuInputExplicit.ExpectedArtifactSha256 -and $windowsCpuInputExplicit.ArchivePath -and $windowsCpuInputExplicit.OutputDirectory) `
@@ -618,6 +905,6 @@ if (-not $windowsCpuInputFunctionsOnly) {
             -OutputDirectory $windowsCpuInputEntryArguments.OutputDirectory
     }
     else {
-        throw 'Mode must be Preflight or Resolve.'
+        throw 'Mode must be Preflight, Download, or Resolve.'
     }
 }

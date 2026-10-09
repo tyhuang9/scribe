@@ -19,23 +19,25 @@ function Get-CpuWorkflowStep([string]$Name) {
 $exportStep = Get-CpuWorkflowStep 'Export verified CPU worker for immutable reuse'
 $uploadStep = Get-CpuWorkflowStep 'Upload immutable verified CPU worker'
 $null = Get-CpuWorkflowStep 'Verify portable and installer payload parity'
-$expectedGuard = "github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"
+$expectedGuard = "github.repository == 'tyhuang9/scribe' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && steps.cpu-input-policy.outputs.requested != 'true'"
 foreach ($step in @($exportStep, $uploadStep)) {
     $guard = [regex]::Match($step, '(?m)^        if: ([^\r\n]+)').Groups[1].Value
     Assert-CpuWorkflow ($guard -ceq $expectedGuard) 'Artifact emission must remain fixed-repository/manual/main only.'
     # Exercise the actual restricted expression, not a separately maintained policy.
-    $expression = $guard.Replace('github.repository', '$repository').Replace('github.event_name', '$eventName').Replace('github.ref', '$refName').Replace(' == ', ' -ceq ').Replace(' && ', ' -and ')
+    $expression = $guard.Replace('github.repository', '$repository').Replace('github.event_name', '$eventName').Replace('github.ref', '$refName').Replace('steps.cpu-input-policy.outputs.requested', '$cpuRequested').Replace(' == ', ' -ceq ').Replace(' != ', ' -cne ').Replace(' && ', ' -and ')
     $matrixCases = 0
     foreach ($repository in @('tyhuang9/scribe', 'fork/scribe')) {
         foreach ($eventName in @('workflow_dispatch', 'pull_request', 'push')) {
             foreach ($refName in @('refs/heads/main', 'refs/heads/feature', 'refs/tags/v1.0.0')) {
-                $expected = $repository -ceq 'tyhuang9/scribe' -and $eventName -ceq 'workflow_dispatch' -and $refName -ceq 'refs/heads/main'
-                Assert-CpuWorkflow ((Invoke-Expression $expression) -eq $expected) 'Actual emission guard accepted an unexpected context.'
-                $matrixCases++
+                foreach ($cpuRequested in @('false', 'true')) {
+                    $expected = $repository -ceq 'tyhuang9/scribe' -and $eventName -ceq 'workflow_dispatch' -and $refName -ceq 'refs/heads/main' -and $cpuRequested -cne 'true'
+                    Assert-CpuWorkflow ((Invoke-Expression $expression) -eq $expected) 'Actual emission guard accepted an unexpected context.'
+                    $matrixCases++
+                }
             }
         }
     }
-    Assert-CpuWorkflow ($matrixCases -eq 18) 'The complete emission-context matrix was not discovered.'
+    Assert-CpuWorkflow ($matrixCases -eq 36) 'The complete emission-context matrix was not discovered.'
 }
 Assert-CpuWorkflow ($workflow.IndexOf('      - name: Verify portable and installer payload parity', [StringComparison]::Ordinal) -lt $workflow.IndexOf('      - name: Export verified CPU worker for immutable reuse', [StringComparison]::Ordinal)) 'CPU export must follow real installer parity verification.'
 Assert-CpuWorkflow ($workflow.IndexOf('      - name: Export verified CPU worker for immutable reuse', [StringComparison]::Ordinal) -lt $workflow.IndexOf('      - name: Upload immutable verified CPU worker', [StringComparison]::Ordinal)) 'The artifact must not upload before export validation.'
@@ -81,7 +83,7 @@ if ($global:CpuArtifactWorkflowReject) { throw 'Expected exporter refusal.' }
     $rejected = $false
     try { Invoke-Expression $body } catch { if ($_.Exception.Message -notlike '*Expected exporter refusal*') { throw }; $rejected = $true }
     Assert-CpuWorkflow $rejected 'Workflow swallowed an exporter failure.'
-    Assert-CpuWorkflow ($checks -ge 52) 'Expected CPU workflow checks were not discovered.'
+    Assert-CpuWorkflow ($checks -ge 88) 'Expected CPU workflow checks were not discovered.'
     Write-Output "Windows CPU artifact workflow tests passed ($checks checks; actual guarded run block, offline stubs)."
 }
 finally {

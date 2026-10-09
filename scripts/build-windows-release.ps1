@@ -6,8 +6,31 @@ param(
     [string]$InstallerPackAllowlistPath,
     [string]$FrozenCpuWorkerRecordPath,
     [string]$FrozenCpuWorkerSourceRoot,
+    [string]$CiCpuWorkerSourceRevision,
+    [string]$CiCpuWorkerProducerRunId,
+    [string]$CiCpuWorkerProducerRunAttempt,
+    [string]$CiCpuWorkerArtifactId,
+    [string]$CiCpuWorkerExpectedArtifactSha256,
+    [string]$CiCpuWorkerArchivePath,
+    [string]$CiCpuWorkerOutputDirectory,
     [switch]$LocalFrozenGpuObservation
 )
+
+# Helper scripts have their own parameter blocks. Preserve parameter-presence
+# semantics before loading them so a caller cannot blur omitted, empty, and
+# explicitly provided CI acquisition inputs.
+$windowsReleaseEntryExplicit = [ordered]@{
+    FrozenCpuWorkerRecordPath = $PSBoundParameters.ContainsKey('FrozenCpuWorkerRecordPath')
+    FrozenCpuWorkerSourceRoot = $PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot')
+    InstallerPackAllowlistPath = $PSBoundParameters.ContainsKey('InstallerPackAllowlistPath')
+    CiCpuWorkerSourceRevision = $PSBoundParameters.ContainsKey('CiCpuWorkerSourceRevision')
+    CiCpuWorkerProducerRunId = $PSBoundParameters.ContainsKey('CiCpuWorkerProducerRunId')
+    CiCpuWorkerProducerRunAttempt = $PSBoundParameters.ContainsKey('CiCpuWorkerProducerRunAttempt')
+    CiCpuWorkerArtifactId = $PSBoundParameters.ContainsKey('CiCpuWorkerArtifactId')
+    CiCpuWorkerExpectedArtifactSha256 = $PSBoundParameters.ContainsKey('CiCpuWorkerExpectedArtifactSha256')
+    CiCpuWorkerArchivePath = $PSBoundParameters.ContainsKey('CiCpuWorkerArchivePath')
+    CiCpuWorkerOutputDirectory = $PSBoundParameters.ContainsKey('CiCpuWorkerOutputDirectory')
+}
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -379,11 +402,123 @@ function Test-PathIsWithin([string]$CandidatePath, [string]$RootPath) {
         $candidate.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-$frozenCpuWorkerRequested = $PSBoundParameters.ContainsKey('FrozenCpuWorkerRecordPath')
-$frozenCpuWorkerSourceRootWasExplicit = $PSBoundParameters.ContainsKey('FrozenCpuWorkerSourceRoot')
+function Assert-CiCpuWorkerInputDoesNotOverlap(
+    [string]$RawArchivePath,
+    [string]$ResolvedInputDirectory,
+    [string]$ProtectedPath,
+    [string]$ProtectedLabel
+) {
+    foreach ($input in @(
+        [pscustomobject]@{ Path = $RawArchivePath; Label = 'raw CPU worker ZIP' },
+        [pscustomobject]@{ Path = $ResolvedInputDirectory; Label = 'resolved CPU worker input' }
+    )) {
+        if ((Test-PathIsWithin $input.Path $ProtectedPath) -or
+            (Test-PathIsWithin $ProtectedPath $input.Path)) {
+            throw "CI $($input.Label) cannot overlap $ProtectedLabel."
+        }
+    }
+}
+
+function Assert-CiCpuWorkerResolvedInputUnchanged([psobject]$Resolved) {
+    if ($null -eq $Resolved -or $null -eq $Resolved.Record -or $null -eq $Resolved.Context -or
+        $null -eq $Resolved.WorkerStream -or $Resolved.WorkerStream -isnot [System.IO.FileStream] -or
+        $Resolved.RecordBytes -isnot [byte[]] -or
+        [string]$Resolved.RecordSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'CI CPU worker resolver did not return the required retained record, context, and worker stream.'
+    }
+    if ([string]$Resolved.Context.RepositoryRoot -ne '') {
+        throw 'CI CPU worker context must not confer a local repository authority.'
+    }
+    $recordSha256 = ConvertTo-WindowsFrozenCpuWorkerSha256 $Resolved.RecordBytes
+    if ($recordSha256 -cne [string]$Resolved.RecordSha256) {
+        throw 'CI CPU worker retained record bytes changed after resolution.'
+    }
+    try {
+        $retainedRecord = ([Text.UTF8Encoding]::new($false, $true).GetString($Resolved.RecordBytes) |
+            ConvertFrom-Json -AsHashtable -Depth 32)
+    }
+    catch {
+        throw 'CI CPU worker retained record bytes are no longer valid canonical JSON.'
+    }
+    $recordKeys = @($Resolved.Record.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)
+    $retainedKeys = @($retainedRecord.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)
+    if ($recordKeys.Count -ne $retainedKeys.Count -or (Compare-Object $recordKeys $retainedKeys -CaseSensitive)) {
+        throw 'CI CPU worker retained record object no longer matches its original bytes.'
+    }
+    foreach ($name in $recordKeys) {
+        if ([string]$Resolved.Record[$name] -cne [string]$retainedRecord[$name]) {
+            throw "CI CPU worker retained record object changed after resolution: $name."
+        }
+    }
+    foreach ($pair in @(
+        @('source_revision', 'SourceRevision'),
+        @('app_version', 'AppVersion'),
+        @('target_triple', 'TargetTriple'),
+        @('protocol_version', 'ProtocolVersion'),
+        @('worker_abi_version', 'WorkerAbiVersion'),
+        @('desktop_build_id', 'DesktopBuildId'),
+        @('worker_build_id', 'WorkerBuildId'),
+        @('cargo_lock_sha256', 'CargoLockSha256'),
+        @('rust_toolchain_sha256', 'RustToolchainSha256'),
+        @('cargo_manifest_sha256', 'CargoManifestSha256'),
+        @('worker_identity_sha256', 'WorkerIdentitySha256'),
+        @('build_rs_sha256', 'BuildRsSha256'),
+        @('build_contract_sha256', 'BuildContractSha256')
+    )) {
+        if ([string]$Resolved.Record[$pair[0]] -cne [string]$Resolved.Context.($pair[1])) {
+            throw "CI CPU worker record and context disagree on $($pair[0])."
+        }
+    }
+    if ($Resolved.WorkerStream.Length -ne [int64]$Resolved.Record.worker_size_bytes -or
+        (Get-WindowsFrozenCpuWorkerOpenStreamSha256 $Resolved.WorkerStream) -cne [string]$Resolved.Record.worker_sha256) {
+        throw 'CI CPU worker held stream changed after authenticated resolution.'
+    }
+}
+
+function Assert-CiCpuWorkerPreflightMatchesResolved([psobject]$Preflight, [psobject]$Resolved) {
+    if ($null -eq $Preflight) {
+        throw 'CI CPU worker late provenance preflight returned no result.'
+    }
+    foreach ($name in @('SourceRevision', 'WorkerSourceRevision', 'ProducerRunId', 'ProducerRunAttempt', 'ArtifactId', 'ArtifactSha256')) {
+        if ([string]$Preflight.$name -cne [string]$Resolved.$name) {
+            throw "CI CPU worker producer provenance changed after resolution: $name."
+        }
+    }
+    if ([int64]$Preflight.ArtifactSizeBytes -ne [int64]$Resolved.ArtifactSizeBytes) {
+        throw 'CI CPU worker artifact size changed after resolution.'
+    }
+}
+
+$frozenCpuWorkerRequested = $windowsReleaseEntryExplicit.FrozenCpuWorkerRecordPath
+$frozenCpuWorkerSourceRootWasExplicit = $windowsReleaseEntryExplicit.FrozenCpuWorkerSourceRoot
+$ciCpuWorkerInputNames = @(
+    'CiCpuWorkerSourceRevision',
+    'CiCpuWorkerProducerRunId',
+    'CiCpuWorkerProducerRunAttempt',
+    'CiCpuWorkerArtifactId',
+    'CiCpuWorkerExpectedArtifactSha256',
+    'CiCpuWorkerArchivePath',
+    'CiCpuWorkerOutputDirectory'
+)
+$ciCpuWorkerProvided = @($ciCpuWorkerInputNames | Where-Object { $windowsReleaseEntryExplicit[$_] })
+if ($ciCpuWorkerProvided.Count -ne 0 -and $ciCpuWorkerProvided.Count -ne $ciCpuWorkerInputNames.Count) {
+    throw 'CI CPU worker reuse requires all seven explicit acquisition inputs or none.'
+}
+$ciCpuWorkerRequested = $ciCpuWorkerProvided.Count -eq $ciCpuWorkerInputNames.Count
+if ($ciCpuWorkerRequested) {
+    foreach ($name in $ciCpuWorkerInputNames) {
+        if ([string]::IsNullOrWhiteSpace([string](Get-Variable -Name $name -ValueOnly))) {
+            throw "CI CPU worker reuse input $name must be nonblank."
+        }
+    }
+}
 $resolvedFrozenWorkerSourceRoot = $null
-$installerPackAllowlistWasExplicit = $PSBoundParameters.ContainsKey('InstallerPackAllowlistPath') -and
+$installerPackAllowlistWasExplicit = $windowsReleaseEntryExplicit.InstallerPackAllowlistPath -and
     -not [string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)
+if ($ciCpuWorkerRequested -and
+    ($frozenCpuWorkerRequested -or $frozenCpuWorkerSourceRootWasExplicit -or $LocalFrozenGpuObservation)) {
+    throw 'CI CPU worker reuse cannot be combined with local frozen CPU worker inputs or local GPU observation.'
+}
 if ($frozenCpuWorkerRequested -and [string]::IsNullOrWhiteSpace($FrozenCpuWorkerRecordPath)) {
     throw 'FrozenCpuWorkerRecordPath was explicitly supplied but is empty or whitespace.'
 }
@@ -464,6 +599,38 @@ foreach ($protectedCargoTargetRoot in @($defaultCargoTargetRoot, $cargoTargetRoo
         throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
     }
 }
+$ciCpuWorkerArchiveFull = $null
+$ciCpuWorkerOutputFull = $null
+$ciInstallerSourceRevision = $null
+if ($ciCpuWorkerRequested) {
+    $ciInstallerSourceRevision = [string]$env:GITHUB_SHA
+    if ($ciInstallerSourceRevision -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'CI CPU worker reuse requires a canonical GITHUB_SHA for the installer checkout.'
+    }
+    $ciCpuWorkerArchiveFull = Get-NormalizedFullPath $CiCpuWorkerArchivePath
+    $ciCpuWorkerOutputFull = Get-NormalizedFullPath $CiCpuWorkerOutputDirectory
+    Assert-NoReparseAncestors $ciCpuWorkerArchiveFull
+    Assert-NoReparseAncestors $ciCpuWorkerOutputFull
+    foreach ($protectedInput in @(
+        [pscustomobject]@{ Path = $repositoryRoot; Label = 'the physical installer checkout' },
+        [pscustomobject]@{ Path = $finalBundle; Label = 'the release bundle output' },
+        [pscustomobject]@{ Path = $defaultCargoTargetRoot; Label = 'the default Cargo target directory' },
+        [pscustomobject]@{ Path = $cargoTargetRoot; Label = 'the selected Cargo target directory' }
+    )) {
+        Assert-CiCpuWorkerInputDoesNotOverlap `
+            -RawArchivePath $ciCpuWorkerArchiveFull `
+            -ResolvedInputDirectory $ciCpuWorkerOutputFull `
+            -ProtectedPath $protectedInput.Path `
+            -ProtectedLabel $protectedInput.Label
+    }
+    if (-not [string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)) {
+        Assert-CiCpuWorkerInputDoesNotOverlap `
+            -RawArchivePath $ciCpuWorkerArchiveFull `
+            -ResolvedInputDirectory $ciCpuWorkerOutputFull `
+            -ProtectedPath (Get-NormalizedFullPath $InstallerPackAllowlistPath) `
+            -ProtectedLabel 'the installer pack allowlist output'
+    }
+}
 if ($frozenCpuWorkerRequested -and
     -not [string]::Equals($resolvedFrozenWorkerSourceRoot, $repositoryRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
     ((Test-PathIsWithin $cargoTargetRoot $resolvedFrozenWorkerSourceRoot) -or
@@ -514,16 +681,24 @@ $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 $sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
 $frozenCpuWorker = $null
+$ciCpuWorker = $null
 $desktopSourceContext = $null
 $cpuWorkerBaseline = $null
 try {
+    if ($frozenCpuWorkerRequested -or $ciCpuWorkerRequested) {
+        # M is the physical clean installer checkout. CI CPU metadata supplies
+        # only R and provenance; it can never replace this local source identity.
+        $desktopSourceContext = Get-WindowsFrozenCpuWorkerSourceContext $repositoryRoot
+        if ($ciCpuWorkerRequested -and $desktopSourceContext.SourceRevision -cne $ciInstallerSourceRevision) {
+            throw 'Physical installer source revision does not match GITHUB_SHA.'
+        }
+    }
     if ($frozenCpuWorkerRequested) {
         if (Test-PathIsWithin $stagingBundle $frozenInputRoot) {
             throw 'Frozen CPU worker inputs cannot contain bundle, staging, or installer-allowlist outputs.'
         }
         # M and R are independently clean source contexts. R is read only as
         # frozen-worker data; no helper or build command is loaded from it.
-        $desktopSourceContext = Get-WindowsFrozenCpuWorkerSourceContext $repositoryRoot
         # Validate every R source/build-contract field and retain the exact worker
         # read handle before any Cargo invocation. This is local byte integrity,
         # never a substitute for production provenance or signing.
@@ -531,6 +706,36 @@ try {
         Assert-WindowsFrozenCpuWorkerCompatibleSourceContexts $desktopSourceContext $frozenCpuWorker.Context
         $null = Get-WindowsFrozenCpuWorkerSafeTemporaryRoot $desktopSourceContext $frozenCpuWorker
         $sourceInferenceWorker = $frozenCpuWorker.WorkerPath
+    }
+    elseif ($ciCpuWorkerRequested) {
+        $resolverScript = Join-Path $PSScriptRoot 'resolve-windows-cpu-worker-inputs.ps1'
+        $resolved = @(& $resolverScript `
+            -Mode Resolve `
+            -SourceRevision $ciInstallerSourceRevision `
+            -WorkerSourceRevision $CiCpuWorkerSourceRevision `
+            -ProducerRunId $CiCpuWorkerProducerRunId `
+            -ProducerRunAttempt $CiCpuWorkerProducerRunAttempt `
+            -ArtifactId $CiCpuWorkerArtifactId `
+            -ExpectedArtifactSha256 $CiCpuWorkerExpectedArtifactSha256 `
+            -ArchivePath $ciCpuWorkerArchiveFull `
+            -OutputDirectory $ciCpuWorkerOutputFull)
+        if ($resolved.Count -ne 1 -or $resolved[0] -isnot [psobject]) {
+            throw 'CI CPU worker resolver did not return exactly one bounded result.'
+        }
+        $ciCpuWorker = $resolved[0]
+        foreach ($pair in @(
+            @('SourceRevision', $ciInstallerSourceRevision),
+            @('WorkerSourceRevision', $CiCpuWorkerSourceRevision),
+            @('ProducerRunId', $CiCpuWorkerProducerRunId),
+            @('ProducerRunAttempt', $CiCpuWorkerProducerRunAttempt),
+            @('ArtifactId', $CiCpuWorkerArtifactId),
+            @('ArtifactSha256', $CiCpuWorkerExpectedArtifactSha256)
+        )) {
+            if ([string]$ciCpuWorker.($pair[0]) -cne [string]$pair[1]) {
+                throw "CI CPU worker resolver changed the requested $($pair[0])."
+            }
+        }
+        Assert-CiCpuWorkerResolvedInputUnchanged $ciCpuWorker
     }
     $previousWorkerSha256 = $env:SCRIBE_BUNDLED_WORKER_SHA256
     $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
@@ -541,6 +746,13 @@ try {
             $env:SCRIBE_BUILDING_WORKER = $null
             $env:SCRIBE_BUNDLED_WORKER_SHA256 = [string]$frozenCpuWorker.Record.worker_sha256
             # Always overwrite a hostile caller value with desktop M, never R.
+            $env:SCRIBE_BUILD_REVISION = [string]$desktopSourceContext.SourceRevision
+        }
+        elseif ($ciCpuWorkerRequested) {
+            $env:SCRIBE_BUILDING_WORKER = $null
+            $env:SCRIBE_BUNDLED_WORKER_SHA256 = [string]$ciCpuWorker.Record.worker_sha256
+            # The desktop always binds to physical M; R belongs only to the
+            # independently authenticated worker provenance.
             $env:SCRIBE_BUILD_REVISION = [string]$desktopSourceContext.SourceRevision
         }
         else {
@@ -590,20 +802,39 @@ try {
         Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
         Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
     }
+    elseif ($ciCpuWorkerRequested) {
+        Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
+        Assert-CiCpuWorkerResolvedInputUnchanged $ciCpuWorker
+        $resolverScript = Join-Path $PSScriptRoot 'resolve-windows-cpu-worker-inputs.ps1'
+        $postCargoPreflight = @(& $resolverScript `
+            -Mode Preflight `
+            -SourceRevision $ciInstallerSourceRevision `
+            -WorkerSourceRevision $CiCpuWorkerSourceRevision `
+            -ProducerRunId $CiCpuWorkerProducerRunId `
+            -ProducerRunAttempt $CiCpuWorkerProducerRunAttempt `
+            -ArtifactId $CiCpuWorkerArtifactId)
+        if ($postCargoPreflight.Count -ne 1 -or $postCargoPreflight[0] -isnot [psobject]) {
+            throw 'CI CPU worker post-Cargo provenance preflight did not return exactly one result.'
+        }
+        Assert-CiCpuWorkerPreflightMatchesResolved $postCargoPreflight[0] $ciCpuWorker
+    }
 
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
 $null = Assert-ReviewedWindowsPe $sourceExecutable
-Assert-Amd64Pe $sourceInferenceWorker
-$null = Assert-ReviewedWindowsPe $sourceInferenceWorker 3
-if ($frozenCpuWorkerRequested) {
+if (-not $ciCpuWorkerRequested) {
+    Assert-Amd64Pe $sourceInferenceWorker
+    $null = Assert-ReviewedWindowsPe $sourceInferenceWorker 3
+}
+if ($frozenCpuWorkerRequested -or $ciCpuWorkerRequested) {
     $sourceExecutableItem = Assert-RegularFile $sourceExecutable
+    $compiledAdmissionWorker = if ($ciCpuWorkerRequested) { $ciCpuWorker } else { $frozenCpuWorker }
     Assert-WindowsFrozenCpuWorkerCompiledAdmission `
         -Executable $sourceExecutable `
         -ExpectedSize ([int64]$sourceExecutableItem.Length) `
         -ExpectedSha256 (Get-WindowsFrozenCpuWorkerFileSha256 $sourceExecutable) `
         -DesktopContext $desktopSourceContext `
-        -FrozenCpuWorker $frozenCpuWorker | Out-Null
+        -FrozenCpuWorker $compiledAdmissionWorker | Out-Null
 }
 
 try {
@@ -615,6 +846,9 @@ try {
     if ($frozenCpuWorkerRequested) {
         Copy-WindowsFrozenCpuWorkerOpenHandle $frozenCpuWorker.WorkerStream $stagedInferenceWorker
     }
+    elseif ($ciCpuWorkerRequested) {
+        Copy-WindowsFrozenCpuWorkerOpenHandle $ciCpuWorker.WorkerStream $stagedInferenceWorker
+    }
     else {
         Copy-Item -LiteralPath $sourceInferenceWorker -Destination $stagedInferenceWorker
     }
@@ -622,8 +856,8 @@ try {
     $removeFrozenInstallerAllowlist = $false
     if ($frozenCpuWorkerRequested -and -not $installerPackAllowlistWasExplicit) {
         # The pack-stage helper requires an allowlist output even for the empty
-        # CPU-only catalog.  Keep this transient sidecar inside our transaction
-        # rather than dirtying the checkout's normal dist path.
+        # CPU-only catalog. Keep the local frozen-mode sidecar inside the
+        # transaction rather than dirtying the checkout's normal dist path.
         $InstallerPackAllowlistPath = Join-Path $stagingBundle 'worker-pack-allowlist.iss'
         $removeFrozenInstallerAllowlist = $true
     }
@@ -710,7 +944,16 @@ try {
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
     Assert-CopyMatchesSource $sourceExecutable $stagedExecutable
-    Assert-CopyMatchesSource $sourceInferenceWorker $stagedInferenceWorker
+    if ($ciCpuWorkerRequested) {
+        Assert-CiCpuWorkerResolvedInputUnchanged $ciCpuWorker
+        Assert-ExactFile `
+            -Path $stagedInferenceWorker `
+            -ExpectedSize ([int64]$ciCpuWorker.Record.worker_size_bytes) `
+            -ExpectedHash ([string]$ciCpuWorker.Record.worker_sha256)
+    }
+    else {
+        Assert-CopyMatchesSource $sourceInferenceWorker $stagedInferenceWorker
+    }
     Assert-CopyMatchesSource $modelManifestPath $stagedModelManifest
     foreach ($legalFile in $legalFiles) {
         $sourcePath = Join-Path $repositoryRoot ($legalFile.Source -replace '/', '\')
@@ -811,10 +1054,33 @@ try {
         Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
         Assert-WindowsFrozenCpuWorkerContextUnchanged $frozenCpuWorker.Context
     }
+    elseif ($ciCpuWorkerRequested) {
+        # Keep the original resolved record/context/handle authoritative. A
+        # second metadata read may prove the producer remains valid, but does
+        # not replace the bytes selected before Cargo.
+        $resolverScript = Join-Path $PSScriptRoot 'resolve-windows-cpu-worker-inputs.ps1'
+        $activationPreflight = @(& $resolverScript `
+            -Mode Preflight `
+            -SourceRevision $ciInstallerSourceRevision `
+            -WorkerSourceRevision $CiCpuWorkerSourceRevision `
+            -ProducerRunId $CiCpuWorkerProducerRunId `
+            -ProducerRunAttempt $CiCpuWorkerProducerRunAttempt `
+            -ArtifactId $CiCpuWorkerArtifactId)
+        if ($activationPreflight.Count -ne 1 -or $activationPreflight[0] -isnot [psobject]) {
+            throw 'CI CPU worker activation provenance preflight did not return exactly one result.'
+        }
+        Assert-CiCpuWorkerPreflightMatchesResolved $activationPreflight[0] $ciCpuWorker
+        Assert-WindowsFrozenCpuWorkerContextUnchanged $desktopSourceContext
+        Assert-CiCpuWorkerResolvedInputUnchanged $ciCpuWorker
+        Assert-ExactFile `
+            -Path $stagedInferenceWorker `
+            -ExpectedSize ([int64]$ciCpuWorker.Record.worker_size_bytes) `
+            -ExpectedHash ([string]$ciCpuWorker.Record.worker_sha256)
+    }
     if (Test-Path -LiteralPath $finalBundle) {
         throw "Final release bundle appeared during staging; refusing to replace it: $finalBundle"
     }
-    if ($frozenCpuWorkerRequested) {
+    if ($frozenCpuWorkerRequested -or $ciCpuWorkerRequested) {
         [System.IO.Directory]::Move($stagingBundle, $finalBundle)
     }
     else {
@@ -837,5 +1103,8 @@ catch {
 finally {
     if ($null -ne $frozenCpuWorker -and $null -ne $frozenCpuWorker.WorkerStream) {
         $frozenCpuWorker.WorkerStream.Dispose()
+    }
+    if ($null -ne $ciCpuWorker -and $null -ne $ciCpuWorker.WorkerStream) {
+        $ciCpuWorker.WorkerStream.Dispose()
     }
 }

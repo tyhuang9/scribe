@@ -9,6 +9,25 @@ $gpuReleasePolicyScript = Join-Path $PSScriptRoot "resolve-windows-gpu-release-p
 $InstallerPackAllowlistPath = $null
 $FrozenCpuWorkerRecordPath = $null
 $LocalFrozenGpuObservation = $false
+$CiCpuWorkerSourceRevision = $null
+$CiCpuWorkerProducerRunId = $null
+$CiCpuWorkerProducerRunAttempt = $null
+$CiCpuWorkerArtifactId = $null
+$CiCpuWorkerExpectedArtifactSha256 = $null
+$CiCpuWorkerArchivePath = $null
+$CiCpuWorkerOutputDirectory = $null
+$windowsReleaseEntryExplicit = [ordered]@{
+    FrozenCpuWorkerRecordPath = $false
+    FrozenCpuWorkerSourceRoot = $false
+    InstallerPackAllowlistPath = $false
+    CiCpuWorkerSourceRevision = $false
+    CiCpuWorkerProducerRunId = $false
+    CiCpuWorkerProducerRunAttempt = $false
+    CiCpuWorkerArtifactId = $false
+    CiCpuWorkerExpectedArtifactSha256 = $false
+    CiCpuWorkerArchivePath = $false
+    CiCpuWorkerOutputDirectory = $false
+}
 $modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
@@ -1914,6 +1933,9 @@ Set-StrictMode -Version Latest
     & (Join-Path $PSScriptRoot 'test-windows-signed-gpu-workflow.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-cpu-worker-inputs.ps1')
     & (Join-Path $PSScriptRoot 'test-windows-cpu-worker-workflow.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-ci-cpu-worker-download.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-ci-cpu-worker-packaging.ps1')
+    & (Join-Path $PSScriptRoot 'test-windows-ci-cpu-worker-workflow.ps1')
     # The nested fixture runs in this process: it must clear its own overrides
     # temporarily without losing a caller's native-toolchain environment.
     $cpuFixtureToolchainSentinels = [ordered]@{
