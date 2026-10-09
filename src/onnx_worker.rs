@@ -4349,14 +4349,9 @@ impl WorkerLauncher for OsWorkerLauncher {
             });
         }
         let mut command = Command::new(&executable.path);
+        configure_worker_current_directory(&mut command, &executable.path)?;
         command
             .arg(worker_flag)
-            .current_dir(
-                executable
-                    .path
-                    .parent()
-                    .ok_or_else(|| anyhow!("worker executable has no trusted parent directory"))?,
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -4433,6 +4428,58 @@ fn bind_worker_process_tree_or_terminate(
             }
         }
     }
+}
+
+fn configure_worker_current_directory(command: &mut Command, _executable: &Path) -> Result<()> {
+    // CreateProcessW rejects a current directory beyond MAX_PATH even when
+    // its absolute executable path is long-path capable. Do not inherit an
+    // arbitrary directory or introduce a writable DLL-search directory.
+    #[cfg(windows)]
+    let directory = windows_worker_current_directory()?;
+    #[cfg(not(windows))]
+    let directory = _executable
+        .parent()
+        .ok_or_else(|| anyhow!("worker executable has no trusted parent directory"))?;
+    command.current_dir(directory);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_worker_current_directory() -> Result<PathBuf> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetSystemDirectoryW"]
+        fn get_system_directory(buffer: *mut u16, size: u32) -> u32;
+    }
+    let mut buffer = [0_u16; 260];
+    let length = unsafe { get_system_directory(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not resolve the Windows worker system directory");
+    }
+    let directory = bounded_windows_system_directory(&buffer, length as usize)?;
+    let canonical = directory
+        .canonicalize()
+        .context("could not canonicalize the Windows worker system directory")?;
+    use std::os::windows::ffi::OsStrExt;
+    if !canonical.is_dir() || canonical.as_os_str().encode_wide().count() >= buffer.len() {
+        bail!("Windows worker system directory is unavailable or exceeds the launch bound");
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn bounded_windows_system_directory(buffer: &[u16], length: usize) -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    if length == 0 || length >= buffer.len() || buffer[length] != 0 || buffer[..length].contains(&0)
+    {
+        bail!("Windows worker system directory is empty, truncated, or malformed");
+    }
+    let directory = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+    if !directory.is_absolute() {
+        bail!("Windows worker system directory is not absolute");
+    }
+    Ok(directory)
 }
 
 fn configure_worker_environment(command: &mut Command) {
@@ -17177,6 +17224,167 @@ mod tests {
             );
             assert!(driver.starts_with("windows-display:") || driver.starts_with("vulkan:"));
             assert!(driver.len() <= 128);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_system_directory_rejects_invalid_api_results() {
+        let valid = "C:\\Windows\\System32\0".encode_utf16().collect::<Vec<_>>();
+        let length = valid.len() - 1;
+        assert_eq!(
+            bounded_windows_system_directory(&valid, length).unwrap(),
+            PathBuf::from(r"C:\Windows\System32")
+        );
+        for rejected in [0, valid.len(), usize::MAX] {
+            assert!(bounded_windows_system_directory(&valid, rejected).is_err());
+        }
+        let mut malformed = valid.clone();
+        malformed[1] = 0;
+        assert!(bounded_windows_system_directory(&malformed, length).is_err());
+        malformed = valid.clone();
+        malformed[length] = 1;
+        assert!(bounded_windows_system_directory(&malformed, length).is_err());
+        for relative in ["System32\0", "\\Windows\\System32\0", "C:System32\0"] {
+            let wide = relative.encode_utf16().collect::<Vec<_>>();
+            assert!(bounded_windows_system_directory(&wide, wide.len() - 1).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_current_directory_is_system_owned_not_pack_or_environment() {
+        let expected = windows_worker_current_directory().unwrap();
+        for executable in [
+            PathBuf::from(r"C:\pack\worker.exe"),
+            PathBuf::from(r"C:\pack")
+                .join("x".repeat(120))
+                .join("y".repeat(120))
+                .join("worker.exe"),
+        ] {
+            let mut command = Command::new(&executable);
+            command.env("SystemRoot", r"C:\untrusted");
+            configure_worker_current_directory(&mut command, &executable).unwrap();
+            assert_eq!(command.get_current_dir(), Some(expected.as_path()));
+            assert_ne!(command.get_current_dir(), executable.parent());
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_current_directory_preserves_the_executable_parent_off_windows() {
+        let executable = Path::new("/trusted/pack/bin/worker");
+        let mut command = Command::new(executable);
+        configure_worker_current_directory(&mut command, executable).unwrap();
+        assert_eq!(command.get_current_dir(), executable.parent());
+        assert!(configure_worker_current_directory(&mut command, Path::new("/")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_current_directory_launches_long_executable() {
+        use std::os::windows::ffi::OsStrExt;
+        const CHILD: &str = "SCRIBE_TEST_LONG_WORKER_CWD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(
+                std::env::current_exe()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .count()
+                    > 300
+            );
+            assert_eq!(
+                std::env::current_dir().unwrap().canonicalize().unwrap(),
+                windows_worker_current_directory().unwrap()
+            );
+            println!("SCRIBE_LONG_WORKER_CWD_VERIFIED");
+            return;
+        }
+        struct OwnedFixture {
+            root: PathBuf,
+            child: Option<Child>,
+        }
+        impl Drop for OwnedFixture {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.child {
+                    if !matches!(child.try_wait(), Ok(Some(_))) {
+                        let _ = child.kill();
+                    }
+                    if child.wait().is_err() {
+                        return;
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let root = (0..100)
+            .find_map(|attempt| {
+                let path = std::env::temp_dir().join(format!(
+                    "scribe-worker-cwd-{}-{attempt}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => Some(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => panic!("could not create worker-CWD fixture: {error}"),
+                }
+            })
+            .expect("unique worker-CWD fixture");
+        let mut fixture = OwnedFixture { root, child: None };
+        let directory = fixture.root.join("a".repeat(140)).join("b".repeat(120));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("worker-cwd-test.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let executable = executable.canonicalize().unwrap();
+        assert!(executable.as_os_str().encode_wide().count() > 300);
+        let mut command = Command::new(&executable);
+        configure_worker_current_directory(&mut command, &executable).unwrap();
+        configure_hidden_worker_command(&mut command);
+        let name = concat!(
+            module_path!(),
+            "::windows_worker_current_directory_launches_long_executable"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        command
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        fixture.child = Some(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = fixture.child.as_mut().unwrap().try_wait().unwrap() {
+                let mut output = String::new();
+                fixture
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .stdout
+                    .take()
+                    .unwrap()
+                    .take(8192)
+                    .read_to_string(&mut output)
+                    .unwrap();
+                assert!(
+                    status.success(),
+                    "long-path child did not verify its system CWD: {status}; {output}"
+                );
+                assert!(output.contains("SCRIBE_LONG_WORKER_CWD_VERIFIED"));
+                assert!(
+                    output.contains("1 passed"),
+                    "expected child test was not discovered"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "long-path child exceeded its deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
