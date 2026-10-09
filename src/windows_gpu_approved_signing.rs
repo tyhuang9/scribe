@@ -1985,10 +1985,26 @@ mod tests {
     fn production_wrapper_never_accepts_test_trust() {
         let fixture = fixture("verify-production-trust");
         sign_fixture(&fixture);
+        // A canonical explicit worker pin reaches production trust even when
+        // a non-Windows test lane uses a diagnostic compiled build label.
+        let error = verify_signed_windows_set_for_worker_source(
+            &fixture.output,
+            &fixture.policy,
+            &fixture.toolchain,
+            CANDIDATE_REVISION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("separately reviewed production trust entry"));
+
         let error = verify_signed_windows_set(&fixture.output, &fixture.policy, &fixture.toolchain)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("separately reviewed production trust entry"));
+        if validate_revision(env!("SCRIBE_BUILD_REVISION"), "compiled revision").is_ok() {
+            assert!(error.contains("separately reviewed production trust entry"));
+        } else {
+            assert!(error.contains("expected worker source revision"));
+        }
     }
 
     #[test]
