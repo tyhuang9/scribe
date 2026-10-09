@@ -15,21 +15,17 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_READ, GetFileInformationByHandle,
-};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
-    TH32CS_SNAPMODULE32,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameW,
     GetModuleHandleExW,
 };
+use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModulesEx, LIST_MODULES_ALL};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::gpu_worker_pack::manifest::{
     PackBackend, VerifiedCopyEntry, VerifiedPackLease, hash_exact_length,
@@ -67,18 +63,6 @@ struct VerifiedVulkanLoader {
 }
 
 static VERIFIED_VULKAN_LOADER: OnceLock<VerifiedVulkanLoader> = OnceLock::new();
-
-struct Snapshot(HANDLE);
-
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        if self.0 != INVALID_HANDLE_VALUE {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
 
 /// Bind the desktop's launch decision to the exact policy-loader entry in the
 /// signed inventory. `VerifiedPackLease` keeps the already-verified payload
@@ -258,31 +242,25 @@ pub(crate) fn ash_entry(require_policy_loader: bool) -> Result<ash::Entry> {
 }
 
 fn unique_mapped_policy_loader() -> Result<HMODULE> {
-    let snapshot = module_snapshot()?;
-    let mut entry = unsafe { std::mem::zeroed::<MODULEENTRY32W>() };
-    entry.dwSize =
-        u32::try_from(size_of::<MODULEENTRY32W>()).expect("Windows module entry size fits in u32");
-    if unsafe { Module32FirstW(snapshot.0, &mut entry) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("could not enumerate mapped Windows worker modules");
-    }
+    unique_policy_loader_in(&current_process_modules()?, module_path)
+}
 
-    let mut observed = 0_usize;
+fn unique_policy_loader_in(
+    modules: &[HMODULE],
+    mut path_for: impl FnMut(HMODULE) -> Result<PathBuf>,
+) -> Result<HMODULE> {
     let mut matches = Vec::new();
-    loop {
-        observed += 1;
-        if observed > MAX_MAPPED_MODULES {
-            bail!("Windows worker mapped-module list exceeded its safety bound")
-        }
-        if wide_module_name_matches(&entry.szModule, PINNED_VULKAN_LOADER_FILENAME) {
-            matches.push(entry.hModule);
-        }
-        if unsafe { Module32NextW(snapshot.0, &mut entry) } == 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                break;
-            }
-            return Err(error).context("could not continue mapped Windows module enumeration");
+    for &module in modules {
+        // Do not skip a failed path query: that could hide a second loader.
+        let path = path_for(module)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("mapped Windows module path omitted its filename"))?;
+        if name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(PINNED_VULKAN_LOADER_FILENAME)
+        {
+            matches.push(module);
         }
     }
     if matches.len() != 1 {
@@ -295,28 +273,49 @@ fn unique_mapped_policy_loader() -> Result<HMODULE> {
     Ok(matches[0])
 }
 
-fn module_snapshot() -> Result<Snapshot> {
-    let mut last_error = None;
-    for _ in 0..3 {
-        let handle =
-            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
-        if handle != INVALID_HANDLE_VALUE {
-            return Ok(Snapshot(handle));
+fn current_process_modules() -> Result<Vec<HMODULE>> {
+    enumerate_module_handles(|modules, needed| {
+        // Toolhelp snapshots can reject long executable paths with
+        // ERROR_MORE_DATA. Enumerate handles, then use the bounded wide path
+        // reader instead. These handles and the process pseudo-handle must
+        // never be closed; they do not transfer resource ownership.
+        let capacity =
+            u32::try_from(size_of_val(modules)).expect("bounded Windows module buffer fits in u32");
+        if unsafe {
+            K32EnumProcessModulesEx(
+                GetCurrentProcess(),
+                modules.as_mut_ptr(),
+                capacity,
+                needed,
+                LIST_MODULES_ALL,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("could not enumerate mapped Windows worker modules");
         }
-        last_error = Some(std::io::Error::last_os_error());
-    }
-    Err(last_error.unwrap_or_else(std::io::Error::last_os_error))
-        .context("could not snapshot mapped Windows worker modules")
+        Ok(())
+    })
 }
 
-fn wide_module_name_matches(value: &[u16], expected: &str) -> bool {
-    let end = value
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(value.len());
-    OsString::from_wide(&value[..end])
-        .to_string_lossy()
-        .eq_ignore_ascii_case(expected)
+fn enumerate_module_handles(
+    enumerate: impl FnOnce(&mut [HMODULE], &mut u32) -> Result<()>,
+) -> Result<Vec<HMODULE>> {
+    let mut modules = vec![std::ptr::null_mut(); MAX_MAPPED_MODULES];
+    let mut needed = 0;
+    enumerate(&mut modules, &mut needed)?;
+    let needed = needed as usize;
+    if needed == 0
+        || !needed.is_multiple_of(size_of::<HMODULE>())
+        || needed > size_of_val(modules.as_slice())
+    {
+        bail!("Windows worker mapped-module list is incomplete or exceeded its safety bound")
+    }
+    modules.truncate(needed / size_of::<HMODULE>());
+    if modules.iter().any(|module| module.is_null()) {
+        bail!("Windows worker mapped-module list contains a null handle")
+    }
+    Ok(modules)
 }
 
 fn strict_windows_absolute_path_eq(left: &Path, right: &Path) -> bool {
@@ -692,20 +691,213 @@ mod tests {
     }
 
     #[test]
-    fn module_name_matching_is_ascii_case_insensitive_and_nul_bounded() {
-        let mut exact = [0_u16; 32];
-        for (slot, value) in exact.iter_mut().zip("VULKAN-1.DLL".encode_utf16()) {
-            *slot = value;
+    fn module_enumeration_rejects_failure_and_invalid_byte_counts() {
+        assert!(enumerate_module_handles(|_, _| bail!("injected API failure")).is_err());
+        for bytes in [
+            0,
+            1,
+            size_of::<HMODULE>() - 1,
+            (MAX_MAPPED_MODULES + 1) * size_of::<HMODULE>(),
+        ] {
+            assert!(
+                enumerate_module_handles(|_, needed| {
+                    *needed = bytes as u32;
+                    Ok(())
+                })
+                .is_err()
+            );
         }
-        assert!(wide_module_name_matches(
-            &exact,
-            PINNED_VULKAN_LOADER_FILENAME
+    }
+
+    #[test]
+    fn module_enumeration_accepts_exact_capacity_but_never_null_entries() {
+        let handle = 1_usize as HMODULE;
+        let modules = enumerate_module_handles(|modules, needed| {
+            modules.fill(handle);
+            *needed = size_of_val(modules) as u32;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(modules.len(), MAX_MAPPED_MODULES);
+        assert!(
+            enumerate_module_handles(|_, needed| {
+                *needed = size_of::<HMODULE>() as u32;
+                Ok(())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn module_enumeration_uses_only_the_complete_returned_prefix() {
+        let modules = enumerate_module_handles(|modules, needed| {
+            modules[0] = 1_usize as HMODULE;
+            *needed = size_of::<HMODULE>() as u32;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(modules, vec![1_usize as HMODULE]);
+    }
+
+    #[test]
+    fn loader_matching_supports_long_wide_paths_and_filename_case() {
+        let handle = 1_usize as HMODULE;
+        let path = PathBuf::from(format!(
+            r"\\?\C:\{}VULKAN-1.DLL",
+            "long-component\\".repeat(30)
         ));
-        exact[0] = 'x' as u16;
-        assert!(!wide_module_name_matches(
-            &exact,
-            PINNED_VULKAN_LOADER_FILENAME
-        ));
+        assert!(path.as_os_str().encode_wide().count() > 260);
+        assert_eq!(
+            unique_policy_loader_in(&[handle], |_| Ok(path.clone())).unwrap(),
+            handle
+        );
+    }
+
+    #[test]
+    fn loader_matching_rejects_missing_duplicate_and_unreadable_modules() {
+        let first = 1_usize as HMODULE;
+        let second = 2_usize as HMODULE;
+        assert!(
+            unique_policy_loader_in(&[first], |_| Ok(PathBuf::from(r"C:\pack\other.dll"))).is_err()
+        );
+        assert!(
+            unique_policy_loader_in(&[first, second], |module| {
+                Ok(PathBuf::from(if module == first {
+                    r"C:\pack\vulkan-1.dll"
+                } else {
+                    r"C:\other\VULKAN-1.DLL"
+                }))
+            })
+            .is_err()
+        );
+        assert!(
+            unique_policy_loader_in(&[first, second], |module| {
+                if module == first {
+                    Ok(PathBuf::from(r"C:\pack\vulkan-1.dll"))
+                } else {
+                    bail!("injected path query failure/truncation")
+                }
+            })
+            .is_err()
+        );
+        assert!(unique_policy_loader_in(&[first], |_| Ok(PathBuf::from(r"C:\"))).is_err());
+    }
+
+    #[test]
+    fn live_module_enumeration_contains_the_running_executable() {
+        let expected = std::env::current_exe().unwrap();
+        let modules = current_process_modules().unwrap();
+        assert!(
+            modules
+                .into_iter()
+                .map(|module| module_path(module).unwrap())
+                .any(|path| strict_windows_absolute_path_eq(&path, &expected))
+        );
+    }
+
+    #[test]
+    fn live_module_enumeration_supports_long_executable_paths() {
+        use std::io::Read;
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, WaitForSingleObject};
+
+        const CHILD_MARKER: &str = "SCRIBE_TEST_LONG_MODULE_ENUMERATION_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert!(
+                std::env::current_exe()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .count()
+                    > 300
+            );
+            live_module_enumeration_contains_the_running_executable();
+            return;
+        }
+
+        struct OwnedFixture {
+            root: PathBuf,
+            child: Option<Child>,
+        }
+        impl Drop for OwnedFixture {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.child
+                    && !matches!(child.try_wait(), Ok(Some(_)))
+                {
+                    let _ = child.kill();
+                    if child.wait().is_err() {
+                        // Keep the fixture if its child cannot be reaped.
+                        return;
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        // create_dir, not create_dir_all, establishes exclusive fixture ownership.
+        let root = (0..100)
+            .find_map(|attempt| {
+                let path = std::env::temp_dir().join(format!(
+                    "scribe-module-path-{}-{attempt}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => Some(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => panic!("could not create module-path fixture: {error}"),
+                }
+            })
+            .expect("unique module-path fixture");
+        let mut fixture = OwnedFixture { root, child: None };
+        let directory = fixture.root.join("a".repeat(160)).join("b".repeat(100));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("module-path-test.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        assert!(executable.as_os_str().encode_wide().count() > 300);
+        // libtest names omit the crate prefix returned by module_path!().
+        let test_name = concat!(
+            module_path!(),
+            "::live_module_enumeration_supports_long_executable_paths"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        fixture.child = Some(
+            Command::new(executable)
+                .args(["--exact", test_name, "--test-threads=1"])
+                .env(CHILD_MARKER, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .unwrap(),
+        );
+        let child = fixture.child.as_mut().unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.as_raw_handle() as _, 10_000) },
+            WAIT_OBJECT_0,
+            "long-path child did not complete within its bound"
+        );
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take(4097)
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(status.success(), "long-path enumeration child failed");
+        assert!(
+            output.len() <= 4096 && output.contains("1 passed; 0 failed"),
+            "exact long-path child test was not discovered/passed"
+        );
+        drop(fixture);
     }
 
     #[test]
