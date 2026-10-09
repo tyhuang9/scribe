@@ -185,11 +185,13 @@ future desktop build M to launch an exact immutable inference worker from an
 older source build R. The canonical policy is
 `runtime-manifests/frozen-worker-compatibility-windows-x64.json`. Its checked-in
 table is a bounded LOCAL diagnostic artifact mapping for the frozen R source
-build. The current cohort uses the batch-load-diagnostics workers and replaces
+build. The retained cohort uses the batch-load-diagnostics workers and replaces
 the previous cohort; old or mixed identities remain denied.
-It contains exactly three independently verified entries: the CPU worker
-and the CUDA and Vulkan worker packs. This completes the bounded three-entry
-CPU/CUDA/Vulkan local diagnostic cohort only; it does not make the table a
+It contains exactly four independently verified entries: the retained CPU,
+CUDA and Vulkan workers, and one rebuilt Vulkan worker with long-path loader
+admission. The additional exact tuple lets a future desktop test its launcher
+without rebuilding or relabeling the unchanged signed worker. This is a bounded
+CPU/CUDA/Vulkan local diagnostic mapping only; it does not make the table a
 release or installer candidate. Unknown hashes and pack identities remain
 denied, and replacing or adding any tuple requires actual independently
 verified values in a separately reviewed source change, never placeholders.
@@ -199,6 +201,15 @@ backend/provider and the already signed pack ID, version, digest and security
 epoch. Pack signatures, complete inventory verification, rollback floors,
 device reconciliation and the CPU worker's embedded SHA-256 anchor remain
 independently mandatory.
+
+Windows workers use the canonical OS-reported system directory as their working
+directory. A pack's deeply nested directory can exceed Windows' current-directory
+launch limit even when its absolute executable path is supported. Resolution is
+bounded and fails closed; no environment-derived or inherited working directory
+is used. Unix retains the worker-parent directory. Pack identity and native DLL
+admission remain bound to the absolute executable and verified sibling files, not
+the working directory. Bundled, file-picker and managed-model paths are absolute;
+arbitrary relative model paths are not a supported cross-directory launch contract.
 
 Ordinary sessions retain the unchanged SCIF v5 `Hello` and strict same-source
 build checks. Only an opaque approval produced from the compiled policy may
