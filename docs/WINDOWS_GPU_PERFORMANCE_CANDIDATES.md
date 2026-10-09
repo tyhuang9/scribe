@@ -6,6 +6,10 @@ maintainer-reviewed records for frozen workers. It does **not** approve an
 installer, change runtime policy, enable production Auto, sign packs, or publish
 a release.
 
+The separate [application-path benchmark campaign](APPLICATION_BENCHMARK_CAMPAIGNS.md)
+measures ordinary transcription-service latency for one explicit CPU or GPU
+lane. Its unsigned reports are not this evidence schema or candidate authority.
+
 The independent legacy campaign authority is initially empty. Production
 campaign approval, capture-key custody, nonce consumption and final release
 approval remain unprovisioned. GPU-pack signing authority does not grant these
