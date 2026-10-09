@@ -15,6 +15,8 @@ use crate::transcription::{
     TranscriptionService,
 };
 
+mod app_path_campaign;
+
 #[derive(Serialize)]
 struct LocalBenchmarkReport {
     schema_version: u8,
@@ -64,6 +66,9 @@ struct PhaseTimings {
 /// and configuration paths. `--output` writes the same metadata-only JSON.
 pub fn maybe_run_local_command() -> Option<i32> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--benchmark-campaign") {
+        return Some(app_path_campaign::run_local_command(&args));
+    }
     if !args.iter().any(|arg| arg == "--benchmark") {
         return None;
     }
@@ -901,6 +906,19 @@ mod tests {
         let error = parse_local_command(&["--benchmark".into()]).unwrap_err();
 
         assert!(error.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn legacy_benchmark_parser_does_not_absorb_campaign_arguments() {
+        let error = parse_local_command(&[
+            "--benchmark".into(),
+            "fixture.wav".into(),
+            "--benchmark-campaign".into(),
+            "campaign.wav".into(),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown benchmark argument"));
     }
 
     #[test]
