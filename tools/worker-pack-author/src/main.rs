@@ -43,6 +43,7 @@ use manifest::{Compatibility, PackBackend, PackVerifier, ProductionTrustRoot};
 use store::PackStore;
 use windows_gpu_approved_signing::{
     inspect_approved_windows_set, sign_approved_windows_set, verify_signed_windows_set,
+    verify_signed_windows_set_for_worker_source,
 };
 use worker_pack_authoring::{
     AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, PrepareRequest, SigningMode,
@@ -58,7 +59,7 @@ commands:\n\
   sign-prepared-pack --pack-root <path> --expected-manifest-sha256 <sha256> --expected-pack-digest <sha256> (--fixture-signing | --key-id <id> --private-key <path>)\n\
   inspect-approved-windows-set --handoff-root <path> --approval <path> --policy <path>\n\
   sign-approved-windows-set --handoff-root <path> --approval <path> --policy <path> --output-root <path> (PKCS#8 v2 DER key on stdin)\n\
-  verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path>\n\
+  verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path> [--worker-source-revision <40-lowercase-hex>]\n\
   verify-fixture --pack-root <path>\n\
   verify-production-linux --pack-root <path>\n\
   install-production-linux --pack-root <path> --packs-root <path> --state-root <path>\n\
@@ -124,19 +125,7 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
         }
-        Some("verify-signed-windows-set") => {
-            require_exact_options(
-                &options,
-                &["--policy", "--signed-root", "--toolchain-manifest"],
-            )?;
-            let receipt = verify_signed_windows_set(
-                &PathBuf::from(required(&options, "--signed-root")?),
-                &PathBuf::from(required(&options, "--policy")?),
-                &PathBuf::from(required(&options, "--toolchain-manifest")?),
-            )?;
-            println!("{}", serde_json::to_string(&receipt)?);
-            Ok(())
-        }
+        Some("verify-signed-windows-set") => run_verify_signed_windows_set(&options),
         Some("verify-fixture") => {
             require_exact_options(&options, &["--pack-root"])?;
             let descriptor =
@@ -187,6 +176,38 @@ fn linux_production_verifier() -> PackVerifier<'static> {
             allowed_backends: &ALLOWED_BACKENDS,
         },
     )
+}
+
+fn run_verify_signed_windows_set(options: &BTreeMap<String, OsString>) -> Result<()> {
+    let receipt = if options.contains_key("--worker-source-revision") {
+        require_exact_options(
+            options,
+            &[
+                "--policy",
+                "--signed-root",
+                "--toolchain-manifest",
+                "--worker-source-revision",
+            ],
+        )?;
+        verify_signed_windows_set_for_worker_source(
+            &PathBuf::from(required(options, "--signed-root")?),
+            &PathBuf::from(required(options, "--policy")?),
+            &PathBuf::from(required(options, "--toolchain-manifest")?),
+            required_utf8(options, "--worker-source-revision")?,
+        )?
+    } else {
+        require_exact_options(
+            options,
+            &["--policy", "--signed-root", "--toolchain-manifest"],
+        )?;
+        verify_signed_windows_set(
+            &PathBuf::from(required(options, "--signed-root")?),
+            &PathBuf::from(required(options, "--policy")?),
+            &PathBuf::from(required(options, "--toolchain-manifest")?),
+        )?
+    };
+    println!("{}", serde_json::to_string(&receipt)?);
+    Ok(())
 }
 
 fn run_author(options: &BTreeMap<String, OsString>) -> Result<()> {
@@ -555,8 +576,35 @@ mod tests {
         assert!(HELP_TEXT.contains("verify-production-linux"));
         assert!(HELP_TEXT.contains("install-production-linux"));
         assert!(HELP_TEXT.contains(
-            "verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path>"
+            "verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path> [--worker-source-revision <40-lowercase-hex>]"
         ));
+    }
+
+    #[test]
+    fn verify_signed_windows_set_cli_rejects_malformed_worker_source_revision() {
+        let revisions = vec![String::new(), "A".repeat(40), "a".repeat(39)];
+        for revision in revisions {
+            let options = parse_options(
+                vec![
+                    "--policy",
+                    "missing-policy.json",
+                    "--signed-root",
+                    "missing-signed-root",
+                    "--toolchain-manifest",
+                    "missing-toolchain.json",
+                    "--worker-source-revision",
+                    revision.as_str(),
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            )
+            .unwrap();
+            let error = run_verify_signed_windows_set(&options)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("expected worker source revision"));
+        }
     }
 
     #[test]

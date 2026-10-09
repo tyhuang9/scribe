@@ -13,6 +13,7 @@ param(
     [string]$SigningRunId = '',
     [string]$SigningRunAttempt = '',
     [string]$SignedArtifactId = '',
+    [string]$WorkerSourceRevision = '',
     [switch]$PublishRelease,
     [string]$GitHubOutputPath
 )
@@ -32,6 +33,12 @@ $signedInputValues = @($SigningRunId, $SigningRunAttempt, $SignedArtifactId)
 $suppliedSignedInputs = @($signedInputValues | Where-Object { -not [string]::IsNullOrEmpty($_) })
 $requestSignedPacks = $suppliedSignedInputs.Count -gt 0
 $resolvedPolicy = if ([string]::IsNullOrEmpty($Policy)) { 'unconfigured' } else { $Policy }
+
+if (-not [string]::IsNullOrEmpty($WorkerSourceRevision)) {
+    if (-not $requestSignedPacks -or $WorkerSourceRevision -cnotmatch '\A[0-9a-f]{40}\z') {
+        throw 'A GPU worker source revision requires exact signed GPU inputs and a canonical revision.'
+    }
+}
 
 if ($RequestedGpuPacks.IsPresent) {
     throw 'This candidate-ref workflow never receives GPU pack signing authority. Production GPU packs require a separately protected trusted signing workflow over fixed verified unsigned artifacts.'

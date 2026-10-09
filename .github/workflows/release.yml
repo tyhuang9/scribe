@@ -21,6 +21,10 @@ on:
         description: Immutable signed CUDA and Vulkan pair artifact ID
         required: false
         type: string
+      gpu_worker_source_revision:
+        description: Exact GPU worker source revision (omit to use the installer revision)
+        required: false
+        type: string
   push:
     branches: [main]
     tags: ["v*"]
@@ -41,6 +45,7 @@ env:
   GPU_SIGNING_RUN_ID: ${{ inputs.gpu_signing_run_id }}
   GPU_SIGNING_RUN_ATTEMPT: ${{ inputs.gpu_signing_run_attempt }}
   GPU_SIGNED_ARTIFACT_ID: ${{ inputs.gpu_signed_artifact_id }}
+  GPU_WORKER_SOURCE_REVISION: ${{ inputs.gpu_worker_source_revision }}
 
 jobs:
   build:
@@ -57,6 +62,7 @@ jobs:
       gpu_signed_artifact_sha256: ${{ steps.gpu-input-preflight.outputs.artifact_sha256 }}
       gpu_signing_policy_sha256: ${{ steps.gpu-input-preflight.outputs.policy_sha256 }}
       gpu_signer_pins_sha256: ${{ steps.gpu-input-preflight.outputs.signer_pins_sha256 }}
+      gpu_worker_source_revision: ${{ steps.gpu-input-preflight.outputs.worker_source_revision }}
 
     steps:
       - name: Check out source
@@ -78,6 +84,7 @@ jobs:
             -SigningRunId $env:GPU_SIGNING_RUN_ID `
             -SigningRunAttempt $env:GPU_SIGNING_RUN_ATTEMPT `
             -SignedArtifactId $env:GPU_SIGNED_ARTIFACT_ID `
+            -WorkerSourceRevision $env:GPU_WORKER_SOURCE_REVISION `
             -PublishRelease:$publishRelease `
             -GitHubOutputPath $env:GITHUB_OUTPUT
 
@@ -93,13 +100,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $workerSourceArguments = @{}
+          if (-not [string]::IsNullOrEmpty($env:GPU_WORKER_SOURCE_REVISION)) {
+            $workerSourceArguments.WorkerSourceRevision = $env:GPU_WORKER_SOURCE_REVISION
+          }
           $inputs = & .\scripts\resolve-windows-signed-gpu-inputs.ps1 `
+            @workerSourceArguments `
             -Mode Preflight -SourceRevision $env:GITHUB_SHA `
             -SigningRunId $env:GPU_SIGNING_RUN_ID -SigningRunAttempt $env:GPU_SIGNING_RUN_ATTEMPT `
             -SignedArtifactId $env:GPU_SIGNED_ARTIFACT_ID
           "artifact_sha256=$($inputs.ArtifactSha256)" >> $env:GITHUB_OUTPUT
           "policy_sha256=$($inputs.PolicySha256)" >> $env:GITHUB_OUTPUT
           "signer_pins_sha256=$($inputs.SignerPinsSha256)" >> $env:GITHUB_OUTPUT
+          "worker_source_revision=$($inputs.WorkerSourceRevision)" >> $env:GITHUB_OUTPUT
 
       - name: Download the immutable signed pair as data only
         if: steps.gpu-release-policy.outputs.signed_gpu_inputs_requested == 'true'
@@ -425,6 +438,7 @@ jobs:
           EXPECTED_GPU_ARTIFACT_SHA256: ${{ steps.gpu-input-preflight.outputs.artifact_sha256 }}
           EXPECTED_GPU_POLICY_SHA256: ${{ steps.gpu-input-preflight.outputs.policy_sha256 }}
           EXPECTED_GPU_SIGNER_PINS_SHA256: ${{ steps.gpu-input-preflight.outputs.signer_pins_sha256 }}
+          EXPECTED_GPU_WORKER_SOURCE_REVISION: ${{ steps.gpu-input-preflight.outputs.worker_source_revision }}
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
@@ -440,6 +454,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Could not build the release-bound signed-pair verifier.' }
             $verified = & .\scripts\resolve-windows-signed-gpu-inputs.ps1 `
               -Mode Resolve -SourceRevision $env:GITHUB_SHA `
+              -WorkerSourceRevision $env:EXPECTED_GPU_WORKER_SOURCE_REVISION `
               -SigningRunId $env:GPU_SIGNING_RUN_ID -SigningRunAttempt $env:GPU_SIGNING_RUN_ATTEMPT `
               -SignedArtifactId $env:GPU_SIGNED_ARTIFACT_ID `
               -SignedRoot (Join-Path $env:RUNNER_TEMP 'scribe-signed-gpu-installer-inputs') `
@@ -459,12 +474,14 @@ jobs:
           EXPECTED_GPU_ARTIFACT_SHA256: ${{ steps.gpu-input-preflight.outputs.artifact_sha256 }}
           EXPECTED_GPU_POLICY_SHA256: ${{ steps.gpu-input-preflight.outputs.policy_sha256 }}
           EXPECTED_GPU_SIGNER_PINS_SHA256: ${{ steps.gpu-input-preflight.outputs.signer_pins_sha256 }}
+          EXPECTED_GPU_WORKER_SOURCE_REVISION: ${{ steps.gpu-input-preflight.outputs.worker_source_revision }}
           GH_TOKEN: ${{ github.token }}
         run: |
           $included = $false
           if ($env:GPU_INPUTS_REQUESTED -ceq 'true') {
             $verified = & .\scripts\resolve-windows-signed-gpu-inputs.ps1 `
               -Mode VerifyCatalog -SourceRevision $env:GITHUB_SHA `
+              -WorkerSourceRevision $env:EXPECTED_GPU_WORKER_SOURCE_REVISION `
               -SigningRunId $env:GPU_SIGNING_RUN_ID -SigningRunAttempt $env:GPU_SIGNING_RUN_ATTEMPT `
               -SignedArtifactId $env:GPU_SIGNED_ARTIFACT_ID `
               -SignedRoot (Join-Path $env:RUNNER_TEMP 'scribe-signed-gpu-installer-inputs') `
@@ -623,10 +640,12 @@ jobs:
           EXPECTED_GPU_ARTIFACT_SHA256: ${{ steps.gpu-input-preflight.outputs.artifact_sha256 }}
           EXPECTED_GPU_POLICY_SHA256: ${{ steps.gpu-input-preflight.outputs.policy_sha256 }}
           EXPECTED_GPU_SIGNER_PINS_SHA256: ${{ steps.gpu-input-preflight.outputs.signer_pins_sha256 }}
+          EXPECTED_GPU_WORKER_SOURCE_REVISION: ${{ steps.gpu-input-preflight.outputs.worker_source_revision }}
           GH_TOKEN: ${{ github.token }}
         run: |
           & .\scripts\resolve-windows-signed-gpu-inputs.ps1 `
             -Mode Preflight -SourceRevision $env:GITHUB_SHA `
+            -WorkerSourceRevision $env:EXPECTED_GPU_WORKER_SOURCE_REVISION `
             -SigningRunId $env:GPU_SIGNING_RUN_ID -SigningRunAttempt $env:GPU_SIGNING_RUN_ATTEMPT `
             -SignedArtifactId $env:GPU_SIGNED_ARTIFACT_ID `
             -ExpectedArtifactSha256 $env:EXPECTED_GPU_ARTIFACT_SHA256 `
@@ -774,10 +793,12 @@ jobs:
           EXPECTED_GPU_ARTIFACT_SHA256: ${{ needs.build.outputs.gpu_signed_artifact_sha256 }}
           EXPECTED_GPU_POLICY_SHA256: ${{ needs.build.outputs.gpu_signing_policy_sha256 }}
           EXPECTED_GPU_SIGNER_PINS_SHA256: ${{ needs.build.outputs.gpu_signer_pins_sha256 }}
+          EXPECTED_GPU_WORKER_SOURCE_REVISION: ${{ needs.build.outputs.gpu_worker_source_revision }}
           GH_TOKEN: ${{ github.token }}
         run: |
           & .\scripts\resolve-windows-signed-gpu-inputs.ps1 `
             -Mode Preflight -SourceRevision $env:GITHUB_SHA `
+            -WorkerSourceRevision $env:EXPECTED_GPU_WORKER_SOURCE_REVISION `
             -SigningRunId $env:GPU_SIGNING_RUN_ID -SigningRunAttempt $env:GPU_SIGNING_RUN_ATTEMPT `
             -SignedArtifactId $env:GPU_SIGNED_ARTIFACT_ID `
             -ExpectedArtifactSha256 $env:EXPECTED_GPU_ARTIFACT_SHA256 `

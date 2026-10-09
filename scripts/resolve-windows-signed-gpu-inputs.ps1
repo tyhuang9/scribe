@@ -3,6 +3,7 @@ param(
     [ValidateSet('Preflight', 'Resolve', 'VerifyCatalog')]
     [string]$Mode,
     [string]$SourceRevision,
+    [string]$WorkerSourceRevision,
     [string]$SigningRunId,
     [string]$SigningRunAttempt,
     [string]$SignedArtifactId,
@@ -34,6 +35,9 @@ $signedGpuEntryArguments = @{
     ExpectedArtifactSha256 = $ExpectedArtifactSha256
     ExpectedPolicySha256 = $ExpectedPolicySha256
     ExpectedSignerPinsSha256 = $ExpectedSignerPinsSha256
+}
+if ($PSBoundParameters.ContainsKey('WorkerSourceRevision')) {
+    $signedGpuEntryArguments.WorkerSourceRevision = $WorkerSourceRevision
 }
 $signedGpuFunctionsOnly = $FunctionsOnly.IsPresent
 # The reused script has its own top-level parameter block. Preserve this
@@ -161,6 +165,25 @@ function Assert-WindowsGpuProductionContext([string]$Revision) {
     Assert-WindowsGpuInputCondition ((Get-WindowsGpuInstallerGitHead) -ceq $Revision) 'Actual installer checkout does not match the requested source revision.'
 }
 
+function Resolve-WindowsGpuWorkerSourceRevision(
+    [string]$DesktopRevision,
+    [string]$WorkerRevision,
+    [bool]$WorkerRevisionProvided
+) {
+    if (-not $WorkerRevisionProvided) { return $DesktopRevision }
+    Assert-WindowsGpuInputCondition (-not [string]::IsNullOrWhiteSpace($WorkerRevision)) 'Worker source revision cannot be blank when supplied.'
+    Assert-WindowsGpuInputCondition ($WorkerRevision -cmatch '\A[0-9a-f]{40}\z') 'Worker source revision is not canonical.'
+    return $WorkerRevision
+}
+
+function Assert-WindowsGpuWorkerSourceAncestor([string]$WorkerRevision, [string]$DesktopRevision) {
+    $comparison = Invoke-SigningGitHubGet "/repos/$script:SigningRepository/compare/$WorkerRevision...$DesktopRevision"
+    Assert-WindowsGpuInputCondition (
+        $comparison.merge_base_commit.sha -ceq $WorkerRevision -and
+        $comparison.status -cin @('ahead', 'identical')
+    ) 'Worker source revision is not an ancestor of the installer source revision on the fixed repository.'
+}
+
 function Assert-WindowsGpuExpectedHashSet(
     [string]$ArtifactSha256,
     [string]$PolicySha256,
@@ -250,6 +273,7 @@ function Get-WindowsGpuLocalAndCurrentPolicy([string]$Revision, [string]$Path, [
 
 function Invoke-WindowsGpuSignedInputPreflight(
     [string]$Revision,
+    [string]$WorkerRevision,
     [string]$RunId,
     [string]$Attempt,
     [string]$ArtifactId,
@@ -258,7 +282,8 @@ function Invoke-WindowsGpuSignedInputPreflight(
     [string]$ExpectedPolicySha256 = '',
     [string]$ExpectedSignerPinsSha256 = ''
 ) {
-    $signing = Get-WindowsGpuAuthenticatedSigningArtifact $RunId $Attempt $ArtifactId $Revision
+    $signing = Get-WindowsGpuAuthenticatedSigningArtifact $RunId $Attempt $ArtifactId $WorkerRevision
+    Assert-WindowsGpuWorkerSourceAncestor $WorkerRevision $Revision
     $artifactDigest = ([string]$signing.Artifact.digest).Substring(7)
     if ($ExpectedArtifactSha256) {
         Assert-WindowsGpuInputCondition ($artifactDigest -ceq $ExpectedArtifactSha256) 'Signed artifact digest changed after preflight.'
@@ -271,6 +296,7 @@ function Invoke-WindowsGpuSignedInputPreflight(
         ArtifactSha256 = $artifactDigest
         PolicySha256 = $policy.Digest
         SignerPinsSha256 = $pinsDigest
+        WorkerSourceRevision = $WorkerRevision
         Policy = $policy
         Pins = $pins
     }
@@ -290,7 +316,8 @@ function Invoke-WindowsGpuSignedSetVerifier(
     [string]$Executable,
     [string]$ArtifactRoot,
     [string]$LocalPolicyPath,
-    [string]$LocalToolchainPath
+    [string]$LocalToolchainPath,
+    [string]$ExpectedWorkerSourceRevision = ''
 ) {
     $lock = [IO.FileStream]::new($Executable, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $process = $null
@@ -306,10 +333,14 @@ function Invoke-WindowsGpuSignedSetVerifier(
         $info.Environment.Remove('GH_TOKEN') | Out-Null
         $info.Environment.Remove('GITHUB_TOKEN') | Out-Null
         $info.Environment.Remove('SCRIBE_GPU_PACK_PRIVATE_KEY_BASE64') | Out-Null
-        foreach ($argument in @(
+        $arguments = @(
             'verify-signed-windows-set', '--signed-root', $ArtifactRoot,
             '--policy', $LocalPolicyPath, '--toolchain-manifest', $LocalToolchainPath
-        )) { $info.ArgumentList.Add($argument) }
+        )
+        if (-not [string]::IsNullOrEmpty($ExpectedWorkerSourceRevision)) {
+            $arguments += @('--worker-source-revision', $ExpectedWorkerSourceRevision)
+        }
+        foreach ($argument in $arguments) { $info.ArgumentList.Add($argument) }
         $process = [Diagnostics.Process]::Start($info)
         Assert-WindowsGpuInputCondition ($null -ne $process) 'Could not start the trusted signed-set verifier.'
         $process.StandardInput.Close()
@@ -348,8 +379,10 @@ function Assert-WindowsGpuReceipt(
     [string]$Revision,
     [string]$SigningRunId,
     [string]$SignedArtifactId,
-    [string]$ToolchainSha256
+    [string]$ToolchainSha256,
+    [string]$WorkerRevision = ''
 ) {
+    if ([string]::IsNullOrEmpty($WorkerRevision)) { $WorkerRevision = $Revision }
     Assert-WindowsGpuExactKeys $Receipt $script:SignedGpuReceiptFields 'Verified Windows pack signing receipt'
     Assert-WindowsGpuInputCondition ((Assert-WindowsGpuJsonInteger $Receipt.schema_version 1 1 'Signing receipt schema version') -eq 1) 'Signing receipt schema is unsupported.'
     foreach ($field in @('policy_sha256', 'signer_sha256', 'artifact_digest', 'handoff_sha256', 'release_set_digest', 'toolchain_manifest_sha256')) {
@@ -367,9 +400,9 @@ function Assert-WindowsGpuReceipt(
     Assert-WindowsGpuInputCondition (
         $Receipt.source_repository -ceq $script:SigningRepository -and
         $Receipt.source_ref -ceq $script:SigningRef -and
-        $Receipt.source_revision -ceq $Revision -and
+        $Receipt.source_revision -ceq $WorkerRevision -and
         $Receipt.workflow_ref -ceq "$script:SigningRepository/$script:ProducerWorkflow@$script:SigningRef"
-    ) 'Signing receipt source binding does not match the installer checkout.'
+    ) 'Signing receipt source binding does not match the verified worker source.'
     Assert-WindowsGpuInputCondition ($Receipt.toolchain_manifest_sha256 -ceq $ToolchainSha256) 'Signing receipt toolchain digest does not match the checkout bytes.'
     Assert-WindowsGpuStoreComponent ([string]$Receipt.pack_version) 'Signing receipt pack version'
     Assert-WindowsGpuInputCondition (
@@ -378,7 +411,7 @@ function Assert-WindowsGpuReceipt(
     ) 'Signing receipt must identify the distinct original unsigned producer artifact.'
 
     $producer = Get-SigningProducer ([string]$Receipt.run_id) ([string]$Receipt.run_attempt) ([string]$Receipt.artifact_id) ([string]$Receipt.artifact_digest)
-    Assert-WindowsGpuInputCondition ($producer.Run.head_sha -ceq $Revision) 'Original unsigned producer source differs from the installer checkout.'
+    Assert-WindowsGpuInputCondition ($producer.Run.head_sha -ceq $WorkerRevision) 'Original unsigned producer source differs from the verified worker source.'
 
     $receiptPacks = @($Receipt.packs)
     $policyPacks = @($Policy.Document.packs)
@@ -455,6 +488,7 @@ function Invoke-WindowsGpuSignedInputs {
     param(
         [ValidateSet('Preflight', 'Resolve', 'VerifyCatalog')][string]$Mode,
         [string]$SourceRevision,
+        [string]$WorkerSourceRevision,
         [string]$SigningRunId,
         [string]$SigningRunAttempt,
         [string]$SignedArtifactId,
@@ -469,6 +503,8 @@ function Invoke-WindowsGpuSignedInputs {
     )
     Assert-WindowsGpuInputCondition ($Mode -cin @('Preflight', 'Resolve', 'VerifyCatalog')) 'Signed GPU input mode is missing.'
     Assert-WindowsGpuInputCondition ($SourceRevision -cmatch '\A[0-9a-f]{40}\z') 'Installer source revision is not canonical.'
+    $workerSourceRevisionProvided = $PSBoundParameters.ContainsKey('WorkerSourceRevision')
+    $resolvedWorkerSourceRevision = Resolve-WindowsGpuWorkerSourceRevision $SourceRevision $WorkerSourceRevision $workerSourceRevisionProvided
     Assert-SigningId $SigningRunId 'Signing run ID'
     Assert-SigningId $SigningRunAttempt 'Signing run attempt'
     Assert-SigningId $SignedArtifactId 'Signed artifact ID'
@@ -477,13 +513,14 @@ function Invoke-WindowsGpuSignedInputs {
 
     $resolvedPolicyPath = if ([string]::IsNullOrEmpty($PolicyPath)) { $script:SignedGpuDefaultPolicyPath } else { $PolicyPath }
     $preflight = Invoke-WindowsGpuSignedInputPreflight `
-        $SourceRevision $SigningRunId $SigningRunAttempt $SignedArtifactId `
+        $SourceRevision $resolvedWorkerSourceRevision $SigningRunId $SigningRunAttempt $SignedArtifactId `
         $resolvedPolicyPath $ExpectedArtifactSha256 $ExpectedPolicySha256 $ExpectedSignerPinsSha256
     if ($Mode -ceq 'Preflight') {
         return [pscustomobject]@{
             ArtifactSha256 = $preflight.ArtifactSha256
             PolicySha256 = $preflight.PolicySha256
             SignerPinsSha256 = $preflight.SignerPinsSha256
+            WorkerSourceRevision = $preflight.WorkerSourceRevision
         }
     }
 
@@ -496,10 +533,11 @@ function Invoke-WindowsGpuSignedInputs {
     $toolchainBytes = Read-SigningFile $toolchainPath 16777216
     $toolchainSha256 = Get-SigningHash $toolchainBytes
 
-    $nativeOutput = Invoke-WindowsGpuSignedSetVerifier $trustedVerifier $artifactRoot $preflight.Policy.Path $toolchainPath
+    $nativeWorkerSourceRevision = if ($workerSourceRevisionProvided) { $preflight.WorkerSourceRevision } else { '' }
+    $nativeOutput = Invoke-WindowsGpuSignedSetVerifier $trustedVerifier $artifactRoot $preflight.Policy.Path $toolchainPath $nativeWorkerSourceRevision
     Assert-WindowsGpuInputCondition ($nativeOutput -is [string] -and $nativeOutput.Length -gt 0 -and $nativeOutput.Length -le 262144) 'Trusted signed-set verifier returned an invalid output shape.'
     $receipt = ConvertFrom-SigningJson ($script:Utf8.GetBytes($nativeOutput))
-    Assert-WindowsGpuReceipt $receipt $preflight.Policy $preflight.Pins $SourceRevision $SigningRunId $SignedArtifactId $toolchainSha256
+    Assert-WindowsGpuReceipt $receipt $preflight.Policy $preflight.Pins $SourceRevision $SigningRunId $SignedArtifactId $toolchainSha256 $preflight.WorkerSourceRevision
 
     # Re-read protected main immediately before returning consumable roots. A
     # policy change during native verification invalidates this invocation.
@@ -519,6 +557,7 @@ function Invoke-WindowsGpuSignedInputs {
             ArtifactSha256 = $preflight.ArtifactSha256
             PolicySha256 = $preflight.PolicySha256
             SignerPinsSha256 = $preflight.SignerPinsSha256
+            WorkerSourceRevision = $preflight.WorkerSourceRevision
         }
     }
 
@@ -534,6 +573,7 @@ function Invoke-WindowsGpuSignedInputs {
         ArtifactSha256 = $preflight.ArtifactSha256
         PolicySha256 = $preflight.PolicySha256
         SignerPinsSha256 = $preflight.SignerPinsSha256
+        WorkerSourceRevision = $preflight.WorkerSourceRevision
     }
 }
 
