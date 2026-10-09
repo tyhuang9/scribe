@@ -14,6 +14,7 @@ $fixtureRoot = Join-Path $testRoot 'fixture'
 $fixtureModel = Join-Path $testRoot 'fixture-model.gguf'
 $fixtureTarget = Join-Path $testRoot 'cargo-target'
 $script:Assertions = 0
+$script:ScenarioCount = 0
 $script:Utf8 = [Text.UTF8Encoding]::new($false)
 
 $environmentNames = @(
@@ -353,6 +354,7 @@ function Set-AdmissionResponse([psobject]$DesktopContext, [psobject]$WorkerConte
 }
 
 function Reset-Scenario([string]$WorkerRevision = '') {
+    $script:ScenarioCount++
     $desktop = Get-WindowsFrozenCpuWorkerSourceContext $fixtureRoot
     if ([string]::IsNullOrEmpty($WorkerRevision)) { $WorkerRevision = $desktop.SourceRevision }
     $workerContext = New-WorkerContext $desktop $WorkerRevision
@@ -701,7 +703,8 @@ try {
     Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 0 'Ordinary untracked source bypassed clean-source validation.'
     Remove-Item -LiteralPath $untracked -Force
 
-    Assert-Test ($script:Assertions -ge 150) 'CI CPU worker consumer fixture discovery coverage unexpectedly shrank.'
+    # Count the explicit scenarios, not filesystem-dependent cleanup assertions.
+    Assert-Equal $script:ScenarioCount 44 'Expected CI CPU worker consumer scenarios were not all discovered.'
 }
 catch {
     $primaryFailure = $_
@@ -763,4 +766,4 @@ foreach ($name in $fixtureGlobalVariableNames) {
     }
 }
 
-Write-Output "Windows CI CPU worker consumer tests passed ($script:Assertions assertions)."
+Write-Output "Windows CI CPU worker consumer tests passed ($script:ScenarioCount scenarios; $script:Assertions assertions)."
