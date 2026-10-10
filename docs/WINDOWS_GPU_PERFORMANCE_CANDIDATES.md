@@ -16,6 +16,13 @@ approval remain unprovisioned. GPU-pack signing authority does not grant these
 powers. The maintainer-reviewed audit route below deliberately has no campaign
 authority, but is never a replacement for these production approvals.
 
+Protected GPU CI is now the selected production trust model. Its first
+[secret-free provenance preflight](WINDOWS_GPU_PROTECTED_CI.md) authenticates a
+reviewed producer and campaign against current main policy. The checked-in
+inspection policy is empty. That preflight does not acquire or sign evidence,
+consume a nonce, validate archive contents, or replace the missing qualified
+producer and protected custody described below.
+
 ## Why this phase is separate
 
 The full qualification schemas in
