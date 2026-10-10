@@ -3,8 +3,9 @@
 Protected GPU CI is the selected qualification trust model. The controller,
 GPU acquisition runner, capture signer and durable replay ledger must be separate
 boundaries. GPU-pack signing permission does not grant qualification authority.
-This first implementation is a **secret-free provenance preflight**, not a
-qualified capture producer, signer, nonce ledger or Auto rollout.
+The implemented prerequisites are a **secret-free provenance preflight** and
+**pre-acquisition signed-contract admission**, not a qualified capture producer,
+signer, nonce ledger or Auto rollout.
 
 ## Implemented boundary
 
@@ -88,7 +89,64 @@ Those variables alone cannot approve anything: every pin must also match the
 current reviewed policy. This change creates no environment, variables, runners,
 keys, campaign approval or production state, and does not dispatch the workflow.
 
-## Data-only receipt
+## Pre-acquisition signed-contract admission
+
+The evaluator also has a mutually exclusive `CaptureAdmission` parameter set.
+It checks approval before capture evidence exists, using the exact existing
+`windows_gpu_performance_capture_contract` projection and the same P-256,
+source/identity, rule and checked-in contract validators as evidence evaluation.
+It does not synthesize a plan with placeholder evidence hashes.
+
+The canonical request has exactly schema 1, kind
+`windows_gpu_performance_capture_admission_request`, `contract` and
+`authorization`. `contract` is the existing 14-field signed projection,
+including ordered `required_lane_identities`, not `required_lanes` or final
+evidence digests. `authorization` is the existing campaign authorization
+envelope. Independent contract, authorization and nonce pins are mandatory:
+
+```powershell
+pwsh -NoProfile -NonInteractive -File .\scripts\qualify-windows-gpu-evidence.ps1 `
+  -CaptureAdmissionPath <canonical-request.json> `
+  -ExpectedPerformanceContractSha256 <reviewed-contract-sha256> `
+  -ExpectedAuthorizationSha256 <reviewed-authorization-sha256> `
+  -ExpectedCampaignNonce <reviewed-campaign-nonce>
+```
+
+Admission rejects empty, duplicate or unsorted lane matrices, incompatible
+worker/pack/provider identities and altered source, evaluator, toolchain or base
+Auto-policy bindings. It verifies the separate approval authority, distinct
+capture/approval keys, domain-separated signature, epoch and at-most-seven-day
+validity window, then checks expiry again before output. Production also
+requires a clean checkout at the exact frozen source. This local Git check is
+not independent GitHub protected-main provenance; the future controller must
+combine the separate boundaries, not trust either receipt as a credential.
+
+Signed lane acquisition/control declarations are **requirements for the future
+producer to enforce and compare with actual observations**, not measured facts
+established by admission. This does not establish isolation, no throttling,
+instrumentation accuracy, memory-admission semantics or frozen input custody.
+
+The bounded canonical stdout result has kind
+`windows_gpu_performance_capture_admission`, the exact digests, authority digest,
+nonce, source and lane count. `authorization_valid` describes signature/contract
+validation only. `acquisition_started`, `capture_authenticated`,
+`nonce_consumed`, `signing_authorized`, `auto_eligible` and `release_approved`
+are all false. The result is replayable data, not execution or signing authority;
+an executor must reauthenticate and claim a durable nonce before acquisition.
+No executor or signer consumes it yet.
+
+Evidence/artifact paths, review records and `RequireEligible` cannot be combined
+with this parameter set. No capture-selected artifact is opened and no worker,
+download, signer, ledger or GitHub mutation is invoked. Rejections after request
+binding emit one fixed error, without input contents, private paths or native
+diagnostics. Existing evidence-mode behavior and diagnostics remain separate.
+
+The existing fixture switches remain restricted to explicitly fixture-only
+contracts; fixture results identify their trust as `fixture_only`. Supplying a
+fixture clock for production is rejected, and the empty checked-in campaign
+authority continues to deny all production approvals. No key is provisioned.
+
+## Data-only provenance receipt
 
 After all checks, the script emits one bounded canonical JSON document to
 stdout. It writes no file, downloads or extracts no artifact, executes no
@@ -119,6 +177,8 @@ source-defined admission semantics using frozen workers and authenticated
 inputs. Existing unsigned diagnostic observation/campaign reports must not be
 converted, padded or relabeled as qualification evidence. A separate protected
 controller must authenticate the acquisition origin before any signer is used.
+Pre-acquisition admission removes the future-evidence-hash dependency; it does
+not implement those measurements or authorize skipping their remaining gates.
 
 Later units must add durable atomic one-time campaign claim/consumption with
 crash and retry behavior; an independently pinned, GPU-free capture signer;
@@ -151,6 +211,11 @@ also run the existing full evaluator contract suite:
 ```powershell
 pwsh -NoProfile -File .\scripts\test-windows-gpu-qualification.ps1
 ```
+
+That full suite also executes the pre-capture admission group. Its faster
+inner-loop command is the same script with `-CaptureAdmissionOnly`; it uses
+synthetic signatures and requests without creating capture artifacts or changing
+production authorities. This shortcut is not the full regression gate.
 
 Real protected-environment approval, runner isolation, acquisition and signing
 are not established by these tests. No production dispatch can succeed with the

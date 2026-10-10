@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly)
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -931,6 +931,153 @@ function Invoke-FailingFixture($Documents, [string]$Name, [string]$ExpectedReaso
     return $decision
 }
 
+function Invoke-CaptureAdmission($Request, [string]$Name, [string[]]$ExtraArguments = @(), [bool]$FixtureAllowed = $true, [bool]$FixtureClockProvided = $true, $Pins = $null, [scriptblock]$Rewrite = $null, [Int64]$Clock = $FixtureNow, [string[]]$OmitPins = @()) {
+    $script:CaseCounter++
+    $root = Join-Path $TestRoot ('{0:d2}-admission-{1}' -f $script:CaseCounter, $Name)
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $path = Join-Path $root 'request.json'
+    Write-Canonical $path $Request
+    if ($null -ne $Rewrite) { & $Rewrite $path }
+    if ($null -eq $Pins) {
+        $Pins = @{ Contract = Get-CanonicalDigest $Request.contract; Authorization = Get-CanonicalDigest $Request.authorization; Nonce = $Request.contract.capture_authority.campaign_nonce }
+    }
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = (Get-Command pwsh).Source
+    $start.UseShellExecute = $false; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+    foreach ($argument in @('-NoProfile', '-NonInteractive', '-File', $ToolPath, '-CaptureAdmissionPath', $path)) { $start.ArgumentList.Add($argument) }
+    foreach ($pin in @(@{ Name = 'Contract'; Argument = '-ExpectedPerformanceContractSha256' }, @{ Name = 'Authorization'; Argument = '-ExpectedAuthorizationSha256' }, @{ Name = 'Nonce'; Argument = '-ExpectedCampaignNonce' })) {
+        if ($OmitPins -cnotcontains $pin.Name) { $start.ArgumentList.Add($pin.Argument); $start.ArgumentList.Add($Pins[$pin.Name]) }
+    }
+    if ($FixtureAllowed) { $start.ArgumentList.Add('-AllowFixture') }
+    if ($FixtureClockProvided) { $start.ArgumentList.Add('-FixtureNowUnixSeconds'); $start.ArgumentList.Add([string]$Clock) }
+    foreach ($argument in $ExtraArguments) { $start.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) { $process.Kill($true); $process.WaitForExit(); throw 'Capture admission test exceeded its watchdog.' }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdoutTask.GetAwaiter().GetResult(); Stderr = $stderrTask.GetAwaiter().GetResult(); Root = $root }
+    }
+    finally { $process.Dispose() }
+}
+
+function Sync-CaptureAdmissionAuthorization($Request) {
+    $Request.authorization.record.performance_contract_sha256 = Get-CanonicalDigest $Request.contract
+    $Request.authorization.record.source_revision = $Request.contract.source.revision
+    $Request.authorization.record.campaign_nonce = $Request.contract.capture_authority.campaign_nonce
+    Sign-CaptureAdmissionAuthorization $Request
+}
+
+function Sign-CaptureAdmissionAuthorization($Request, [byte[]]$Domain = $PerformanceAuthorizationDomain) {
+    $Request.authorization.signature_base64 = [Convert]::ToBase64String($PerformanceApprovalKey.SignData((Get-DomainPreimage $Domain (Get-CanonicalBytes $Request.authorization.record)), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation))
+}
+
+function Assert-CaptureAdmissionRejected($Result, [string]$Name, [bool]$BindingFailure = $false) {
+    Assert-True ($Result.ExitCode -ne 0 -and [string]::IsNullOrEmpty($Result.Stdout)) "Capture admission $Name did not fail without stdout."
+    if (-not $BindingFailure) {
+        Assert-True ($Result.ExitCode -eq 1 -and $Result.Stderr.TrimEnd("`r", "`n") -ceq 'Windows GPU capture admission rejected.') "Capture admission $Name leaked noncanonical diagnostics: $($Result.Stderr)"
+    }
+}
+
+function Invoke-CaptureAdmissionContractTests {
+    $positiveCount = 0; $negativeCount = 0
+    foreach ($shape in @(
+        @{ Class = 'discrete_gpu'; Vendor = '' }, @{ Class = 'integrated_gpu'; Vendor = '' },
+        @{ Class = 'unified_gpu'; Vendor = '' }, @{ Class = 'unified_gpu'; Vendor = 'intel' }
+    )) {
+        $documents = New-PerformanceDocuments -DeviceClass $shape.Class -VulkanVendor $shape.Vendor
+        $projection = Get-PerformanceContractProjection $documents.Plan
+        $request = [ordered]@{ schema_version = 1; kind = 'windows_gpu_performance_capture_admission_request'; contract = $projection; authorization = $documents.Plan.authorization }
+        $result = Invoke-CaptureAdmission $request "positive-$positiveCount"
+        Assert-True ($result.ExitCode -eq 0 -and [string]::IsNullOrEmpty($result.Stderr)) "Positive pre-capture admission failed: $($result.Stderr)"
+        $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+        Assert-True ($decision.kind -ceq 'windows_gpu_performance_capture_admission' -and $decision.schema_version -eq 1 -and $decision.authorization_valid -and $decision.fixture_only -and $decision.authorization_trust -ceq 'fixture_only') 'Admission result changed its fixture/authorization boundary.'
+        Assert-True ($decision.performance_contract_sha256 -ceq (Get-CanonicalDigest $projection) -and $decision.authorization_sha256 -ceq (Get-CanonicalDigest $request.authorization) -and $decision.campaign_nonce -ceq $request.contract.capture_authority.campaign_nonce -and $decision.source_revision -ceq $projection.source.revision -and $decision.authority_sha256 -ceq (Get-FileDigest $PerformanceAuthorityPath) -and $decision.required_lane_count -eq 1) 'Pre-capture admission did not bind the exact existing plan projection and independent pins.'
+        foreach ($flag in @('acquisition_started', 'capture_authenticated', 'nonce_consumed', 'signing_authorized', 'auto_eligible', 'release_approved')) { Assert-True ($decision[$flag] -is [bool] -and -not $decision[$flag]) "Admission granted $flag." }
+        Assert-True ($Utf8.GetByteCount($result.Stdout) -le 16KB -and $result.Stdout -ceq $Utf8.GetString((Get-CanonicalBytes $decision))) 'Admission output is not bounded canonical JSON.'
+        Assert-True (@(Get-ChildItem -LiteralPath $result.Root -Force).Count -eq 1 -and -not $result.Stdout.Contains('evidence_sha256') -and -not $result.Stdout.Contains('candidate_policy')) 'Admission required capture evidence or wrote persistent output.'
+        if ($positiveCount -eq 0) { $baseline = Copy-Document $request }
+        $positiveCount++
+    }
+    foreach ($case in @(
+        @{ Name = 'request-extra'; Mutate = { param($r) $r.evidence = @{} } },
+        @{ Name = 'request-missing'; Mutate = { param($r) $r.Remove('authorization') } },
+        @{ Name = 'contract-extra'; Mutate = { param($r) $r.contract.required_lanes = @() } },
+        @{ Name = 'contract-schema'; Mutate = { param($r) $r.contract.schema_version = 2 } },
+        @{ Name = 'contract-kind'; Mutate = { param($r) $r.contract.kind = 'windows_gpu_performance_candidate_plan' } },
+        @{ Name = 'empty-lanes'; Mutate = { param($r) $r.contract.required_lane_identities = @() } },
+        @{ Name = 'duplicate-lanes'; Mutate = { param($r) $r.contract.required_lane_identities = @($r.contract.required_lane_identities[0], $r.contract.required_lane_identities[0]) } },
+        @{ Name = 'unsorted-lanes'; Mutate = { param($r) $second = Copy-Document $r.contract.required_lane_identities[0]; $second.lane_id = 'aaa-lane'; $r.contract.required_lane_identities += $second } },
+        @{ Name = 'wrong-provider'; Mutate = { param($r) $r.contract.required_lane_identities[0].provider_id = 'transcribe-cpp-ggml-vulkan' } },
+        @{ Name = 'wrong-worker-source'; Mutate = { param($r) $r.contract.required_lane_identities[0].gpu_worker.worker_build_id = 'scribe-inference-worker@0.1.0#' + ('f' * 40) } },
+        @{ Name = 'wrong-pack'; Mutate = { param($r) $r.contract.required_lane_identities[0].pack.pack_id = 'scribe-vulkan-windows-x64' } },
+        @{ Name = 'evidence-in-identity'; Mutate = { param($r) $r.contract.required_lane_identities[0].evidence_sha256 = Get-Digest 'forbidden' } },
+        @{ Name = 'wrong-repository'; Mutate = { param($r) $r.contract.source.repository = 'other/scribe' } },
+        @{ Name = 'wrong-ref'; Mutate = { param($r) $r.contract.source.ref = 'refs/heads/untrusted' } },
+        @{ Name = 'wrong-source'; Mutate = { param($r) $r.contract.source.revision = 'f' * 40 } },
+        @{ Name = 'wrong-evaluator'; Mutate = { param($r) $r.contract.contract_bindings.evaluator_sha256 = Get-Digest 'wrong-evaluator' } },
+        @{ Name = 'wrong-toolchain'; Mutate = { param($r) $r.contract.contract_bindings.toolchain_contract_sha256 = Get-Digest 'wrong-toolchain' } },
+        @{ Name = 'wrong-auto-policy'; Mutate = { param($r) $r.contract.contract_bindings.base_auto_manifest_sha256 = Get-Digest 'wrong-auto' } },
+        @{ Name = 'wrong-count'; Mutate = { param($r) $r.contract.warm_runs = 19 } },
+        @{ Name = 'wrong-threshold'; Mutate = { param($r) $r.contract.maximum_gpu_p95_cpu_percent = 111 } },
+        @{ Name = 'wrong-power-policy'; Mutate = { param($r) $r.contract.capture_contract.power_policy = 'ac_only' } },
+        @{ Name = 'wrong-key-id'; Mutate = { param($r) $r.contract.approval_key_id = 'performance-approval-p256:' + (Get-Digest 'other-key') } },
+        @{ Name = 'same-signing-key'; Mutate = { param($r) $r.contract.capture_authority.capture_key_id = 'p256:' + $PerformanceApprovalKeyId.Substring('performance-approval-p256:'.Length); $r.contract.capture_authority.capture_public_key_spki_base64 = $PerformanceApprovalSpkiBase64 } },
+        @{ Name = 'epoch-zero'; Mutate = { param($r) $r.authorization.record.policy_epoch = 0 } },
+        @{ Name = 'expired'; Mutate = { param($r) $r.authorization.record.expires_at_unix_seconds = $FixtureNow } },
+        @{ Name = 'future'; Mutate = { param($r) $r.authorization.record.issued_at_unix_seconds = $FixtureNow + 1 } },
+        @{ Name = 'long-window'; Mutate = { param($r) $r.authorization.record.expires_at_unix_seconds = $FixtureNow + 604801 } },
+        @{ Name = 'wrong-scheme'; Mutate = { param($r) $r.authorization.signature_scheme = 'arbitrary' } }
+    )) {
+        $request = Copy-Document $baseline; & $case.Mutate $request
+        if ($request.Contains('authorization')) { Sync-CaptureAdmissionAuthorization $request }
+        $pins = @{ Contract = Get-CanonicalDigest $request.contract; Authorization = if ($request.Contains('authorization')) { Get-CanonicalDigest $request.authorization } else { Get-CanonicalDigest $baseline.authorization }; Nonce = $request.contract.capture_authority.campaign_nonce }
+        Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $request $case.Name -Pins $pins) $case.Name
+        $negativeCount++
+    }
+    foreach ($field in @('Contract', 'Authorization', 'Nonce')) {
+        $pins = @{ Contract = Get-CanonicalDigest $baseline.contract; Authorization = Get-CanonicalDigest $baseline.authorization; Nonce = $baseline.contract.capture_authority.campaign_nonce }
+        $pins[$field] = Get-Digest "wrong-$field"
+        Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $baseline "pin-$field" -Pins $pins) "pin-$field"
+        $negativeCount++
+        Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $baseline "omitted-pin-$field" -OmitPins @($field)) "omitted-pin-$field" $true
+        $negativeCount++
+    }
+    # These signatures and authorization pins are valid for the *wrong* record.
+    # Do not resynchronize the fields: isolate contract-to-authorization binding.
+    foreach ($field in @('source_revision', 'performance_contract_sha256', 'campaign_nonce')) {
+        $request = Copy-Document $baseline
+        $request.authorization.record[$field] = if ($field -ceq 'source_revision') { 'f' * 40 } else { Get-Digest "wrong-record-$field" }
+        Sign-CaptureAdmissionAuthorization $request
+        Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $request "record-$field") "record-$field"
+        $negativeCount++
+    }
+    $wrongDomain = Copy-Document $baseline; Sign-CaptureAdmissionAuthorization $wrongDomain $AttestationDomain
+    Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $wrongDomain 'signature-domain') 'signature-domain'; $negativeCount++
+    $badSignature = Copy-Document $baseline; $badSignature.authorization.signature_base64 = [Convert]::ToBase64String([byte[]](1..64))
+    Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $badSignature 'signature') 'signature'; $negativeCount++
+    Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $baseline 'fixture-not-admitted' -FixtureAllowed $false) 'fixture-not-admitted'; $negativeCount++
+    Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $baseline 'invalid-clock' -Clock 0) 'invalid-clock'; $negativeCount++
+    $production = Copy-Document $baseline; $production.contract.fixture_only = $false; $production.authorization.Remove('fixture_approval_public_key_spki_base64'); $production.authorization.record.issued_at_unix_seconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 60; $production.authorization.record.expires_at_unix_seconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 60; Sync-CaptureAdmissionAuthorization $production
+    Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $production 'empty-production-authority' -FixtureAllowed $false -FixtureClockProvided $false) 'empty-production-authority'; $negativeCount++
+    Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $production 'production-fixture-clock' -FixtureAllowed $true) 'production-fixture-clock'; $negativeCount++
+    foreach ($forbidden in @('PlanPath', 'EvidencePath', 'ArtifactRoot', 'ReviewRecordPath', 'ExpectedReviewSha256', 'RequireEligible')) {
+        $arguments = @("-$forbidden"); if ($forbidden -cne 'RequireEligible') { $arguments += 'must-not-open-private-capture' }
+        Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $baseline "forbidden-$forbidden" -ExtraArguments $arguments) "forbidden-$forbidden" $true
+        $negativeCount++
+    }
+    foreach ($rewrite in @(
+        @{ Name = 'noncanonical'; Rewrite = { param($p) [IO.File]::AppendAllText($p, ' ', $Utf8) } },
+        @{ Name = 'duplicate'; Rewrite = { param($p) [IO.File]::WriteAllText($p, '{"kind":"private-sensitive-marker","kind":"duplicate"}', $Utf8) } },
+        @{ Name = 'case-collision'; Rewrite = { param($p) [IO.File]::WriteAllText($p, '{"kind":"private-sensitive-marker","Kind":"collision"}', $Utf8) } },
+        @{ Name = 'malformed'; Rewrite = { param($p) [IO.File]::WriteAllText($p, 'private-sensitive-marker', $Utf8) } }
+    )) {
+        Assert-CaptureAdmissionRejected (Invoke-CaptureAdmission $baseline $rewrite.Name -Rewrite $rewrite.Rewrite) $rewrite.Name
+        $negativeCount++
+    }
+    Assert-True ($positiveCount -eq 4 -and $negativeCount -eq 53) "Capture admission tests were not all discovered: $positiveCount positive/$negativeCount negative."
+    return [pscustomobject]@{ Positive = $positiveCount; Negative = $negativeCount }
+}
+
 function Invoke-V4ContractTests {
     # Positive final-installer shapes cover discrete CUDA, shared-memory CUDA,
     # and the Vulkan provider. They remain fixture-only and default deny.
@@ -1237,6 +1384,23 @@ try {
     Assert-True ([IO.File]::ReadAllText($AutoManifestPath, $Utf8) -ceq $ExpectedAuto) 'Windows Auto manifest is not exact default deny.'
     Assert-True ([IO.File]::ReadAllText($AuthorityPath, $Utf8) -ceq $ExpectedAuthority) 'Windows qualification authority is not exact empty schema v2.'
     Assert-True ([IO.File]::ReadAllText($PerformanceAuthorityPath, $Utf8) -ceq $ExpectedPerformanceAuthority) 'Windows performance authority is not exact empty schema v1.'
+    # Check the real default-deny plan before expensive fixture groups so stale
+    # evaluator bindings fail every focused mode at the production authority gate.
+    $checkedPlanRaw = [IO.File]::ReadAllText($CheckedPlanPath, $Utf8)
+    $checkedPlan = $checkedPlanRaw | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True ($checkedPlan.schema_version -eq 3 -and $checkedPlan.capture_contract.power_policy -ceq 'ac_for_discrete_ac_and_battery_for_integrated_or_unified' -and -not $checkedPlan.fixture_only -and $checkedPlan.required_lanes.Count -eq 0 -and -not $checkedPlan.runtime_bucket_complete) 'Checked-in plan is not canonical schema-v3 production default deny.'
+    Assert-True (-not $checkedPlan.capture_authority.ContainsKey('fixture_capture_public_key_spki_base64')) 'Checked-in production plan contains a fixture capture key.'
+    Assert-True ($checkedPlanRaw -ceq $Utf8.GetString((Get-CanonicalBytes $checkedPlan))) 'Checked-in plan is not canonical LF JSON.'
+    $checkedEvidencePath = Join-Path $TestRoot 'checked-empty-evidence.json'; Write-Canonical $checkedEvidencePath ([ordered]@{ fixture_only = $false; kind = 'windows_gpu_release_qualification_evidence'; lanes = @(); plan_sha256 = Get-FileDigest $CheckedPlanPath; schema_version = 3 })
+    $checkedProbe = [pscustomobject]@{ PlanPath = $CheckedPlanPath; EvidencePath = $checkedEvidencePath; ArtifactRoot = $TestRoot }
+    Assert-Rejected (Invoke-Evaluator $checkedProbe $false) 'Checked-in default-deny plan validation' 'not approved by the protected production authority'
+
+    if ($CaptureAdmissionOnly -or (-not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+        $admissionCounts = Invoke-CaptureAdmissionContractTests
+        foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Admission tests modified immutable repository input: $name." }
+        Write-Output "Windows GPU pre-capture admission contract tests passed ($($admissionCounts.Positive) positive, $($admissionCounts.Negative) negative)."
+        if ($CaptureAdmissionOnly) { return }
+    }
     if ($MaintainerReviewOnly) {
         $reviewedPositiveCount = Invoke-MaintainerReviewContractTests
         Assert-True ($reviewedPositiveCount -eq 4) 'Maintainer-reviewed suite did not discover all four positive power/kind shapes.'
@@ -1558,15 +1722,6 @@ try {
     $wrongHeadRejected = $false; try { Assert-ProductionSourceCheckout $sourceFixture ('f' * 40) } catch { $wrongHeadRejected = $_.Exception.Message.Contains('HEAD differs') }
     Assert-True $wrongHeadRejected 'Production source check accepted the wrong authorized HEAD.'
     if ($PerformanceOnly) { Write-Output 'Windows GPU performance candidate focused contract tests passed.'; return }
-    $checkedPlanRaw = [IO.File]::ReadAllText($CheckedPlanPath, $Utf8)
-    $checkedPlan = $checkedPlanRaw | ConvertFrom-Json -AsHashtable -Depth 64
-    Assert-True ($checkedPlan.schema_version -eq 3 -and $checkedPlan.capture_contract.power_policy -ceq 'ac_for_discrete_ac_and_battery_for_integrated_or_unified' -and -not $checkedPlan.fixture_only -and $checkedPlan.required_lanes.Count -eq 0 -and -not $checkedPlan.runtime_bucket_complete) 'Checked-in plan is not canonical schema-v3 production default deny.'
-    Assert-True (-not $checkedPlan.capture_authority.ContainsKey('fixture_capture_public_key_spki_base64')) 'Checked-in production plan contains a fixture capture key.'
-    Assert-True ($checkedPlanRaw -ceq $Utf8.GetString((Get-CanonicalBytes $checkedPlan))) 'Checked-in plan is not canonical LF JSON.'
-    $checkedEvidencePath = Join-Path $TestRoot 'checked-empty-evidence.json'; Write-Canonical $checkedEvidencePath ([ordered]@{ fixture_only = $false; kind = 'windows_gpu_release_qualification_evidence'; lanes = @(); plan_sha256 = Get-FileDigest $CheckedPlanPath; schema_version = 3 })
-    $checkedProbe = [pscustomobject]@{ PlanPath = $CheckedPlanPath; EvidencePath = $checkedEvidencePath; ArtifactRoot = $TestRoot }
-    Assert-Rejected (Invoke-Evaluator $checkedProbe $false) 'Checked-in default-deny plan validation' 'not approved by the protected production authority'
-
     $valid = New-Bundle (New-FixtureDocuments) 'valid'
     $validResult = Invoke-Evaluator $valid
     Assert-True ($validResult.ExitCode -eq 0) "Passing signed raw-SCIF fixture failed: $($validResult.Stderr)"
