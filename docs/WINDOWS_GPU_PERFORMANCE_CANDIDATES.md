@@ -254,6 +254,26 @@ required available segments with invented zero counters to make it admissible.
 Representing such incomplete captures requires a separately defined format;
 they cannot be omitted or replaced with successful runs to qualify a campaign.
 
+### Pre-capture authorization check
+
+The evaluator's separate `-CaptureAdmissionPath` mode accepts a canonical
+`windows_gpu_performance_capture_admission_request` containing the exact signed
+contract projection and campaign authorization. It requires independent
+`-ExpectedPerformanceContractSha256`, `-ExpectedAuthorizationSha256` and
+`-ExpectedCampaignNonce` pins, but no evidence or artifact paths. The shared
+source, identity, rule and signature validators therefore work before final
+lane evidence hashes exist, without placeholders or a change to signed bytes.
+See [protected CI admission](WINDOWS_GPU_PROTECTED_CI.md#pre-acquisition-signed-contract-admission)
+for the input and command contract.
+
+Acquisition/control identities here are expected requirements, not observations.
+The bounded result confirms only authorization validation and explicitly grants
+no acquisition, authenticated capture, nonce, signing, Auto or release authority.
+It cannot replace producer provenance, retained-file verification, actual
+measurement controls or durable nonce consumption. Existing evidence evaluation
+still requires final evidence hashes and attestations; its inputs and candidate
+byte format are unchanged. Empty production authorities remain default-deny.
+
 ### Raw provider observations and admission inputs
 
 Each performance run also has `provider_memory.before` and `after`, using the
