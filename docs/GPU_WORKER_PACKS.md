@@ -234,11 +234,19 @@ older source build R. The canonical policy is
 table is a bounded LOCAL diagnostic artifact mapping for the frozen R source
 build. The retained cohort uses the batch-load-diagnostics workers and replaces
 the previous cohort; old or mixed identities remain denied.
-It contains exactly four independently verified entries: the retained CPU,
-CUDA and Vulkan workers, and one rebuilt Vulkan worker with long-path loader
-admission. The additional exact tuple lets a future desktop test its launcher
-without rebuilding or relabeling the unchanged signed worker. This is a bounded
-CPU/CUDA/Vulkan local diagnostic mapping only; it does not make the table a
+It contains exactly six independently verified entries: the retained CPU,
+CUDA and Vulkan workers, one rebuilt Vulkan worker with long-path loader
+admission, and the manifest-bearing e423 CPU/Vulkan pair. The e423 Vulkan pack
+is `lp-e4238ea-r1`; its complete tuple and the CPU digest are pinned in the
+canonical policy. The additional exact tuples let a future desktop test its
+launcher and exit diagnostics without rebuilding or relabeling the unchanged
+workers. The consumer keeps its actual desktop source identity; the workers
+retain their e423 origin. The observed long-path GPU startup failure remains
+unresolved, so this compatibility mapping is not a claim that the manifest
+fixed it. LOCAL describes intended use and publication status, not a runtime
+enforcement boundary: every Windows x64 consumer compiled from this source
+contains these exact approvals, including ordinary inference-only sessions.
+This bounded CPU/CUDA/Vulkan diagnostic mapping does not make the table a
 release or installer candidate. Unknown hashes and pack identities remain
 denied, and replacing or adding any tuple requires actual independently
 verified values in a separately reviewed source change, never placeholders.
