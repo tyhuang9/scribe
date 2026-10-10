@@ -58,17 +58,28 @@ Explicit GPU retains the supervisor-reconciled launch target, including a
 remapped process index and updated volatile facts, instead of restoring cached
 probe metadata.
 
-The opt-in Windows pack probe may additionally report
-`worker_exit_code_before_parent_termination` on a failed-provider diagnostic.
-This is an unsigned 32-bit status observed through a retained duplicate of the
-actual worker process handle, before parent cleanup begins. The first sample
-is final: a running process, unavailable handle, or failed query omits the
-field, and later cleanup cannot supply it. A signaled process may legitimately
-return status 259. This field is terminal-status evidence, not proof of a
-native crash, worker-main progress, or a particular loader/driver cause. The
-existing stage describes the parent's lifecycle milestone only. No raw stderr,
-paths, model data, or transcript content is added; cleanup confirmation and
-Auto qualification remain independent and unchanged.
+The opt-in Windows pack probe reports a fixed `worker_exit_observation` on a
+failed-provider diagnostic. Its possible values are `not_sampled`,
+`handle_unavailable`, `not_signaled`, `wait_failed`, `exit_query_failed`,
+`observation_unavailable` (an inaccessible observation lock), and `exited`.
+Only `exited` also includes the existing unsigned 32-bit
+`worker_exit_code_before_parent_termination`. The tagged observation makes a
+non-exited outcome with a numeric exit code unrepresentable. Unrelated
+diagnostics omit both keys.
+
+Observation uses a retained duplicate of the actual worker process handle,
+before parent cleanup begins. A single zero-timeout wait distinguishes a
+signaled process from `not_signaled`; only a signaled process has its status
+queried. The first sample is final, including unavailable/failed outcomes;
+later cleanup and passive report projection cannot refresh it. `not_sampled`
+means no sampling boundary was recorded, not that a child was never created.
+Reader EOF can precede process signaling, so `not_signaled` does not prove a
+hang or rule out a crash. A signaled process may legitimately return status
+259. These fields do not prove worker-main progress, a native exception, or a
+particular loader/driver cause. The existing stage describes the parent's
+lifecycle milestone only. No raw errors, stderr, paths, model data, or
+transcript content is added; cleanup confirmation, launch/trust/IPC behavior,
+sampling/termination budgets, and Auto qualification remain unchanged.
 
 ## Windows executable long-path declaration
 
