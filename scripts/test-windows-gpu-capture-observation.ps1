@@ -179,6 +179,7 @@ try {
             'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
             'onnx_worker::tests::capture_observation', 'onnx_worker::tests::vulkan_hello_memory',
             'embedded_runtime::tests::provider_memory_observation',
+            'embedded_runtime::tests::retained_gguf', 'runtime_router::tests::retained_gguf',
             'architecture_guard::windows_gpu_capture', 'architecture_guard::windows_gpu_probe')) {
         Invoke-CaptureTests $feature $filter
     }
@@ -193,7 +194,8 @@ try {
         Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$providerFeature", '--', '-D', 'warnings')
         foreach ($filter in @('onnx_worker::tests::capture_observation',
                 'onnx_worker::tests::vulkan_hello_memory',
-                'embedded_runtime::tests::provider_memory_observation')) {
+                'embedded_runtime::tests::provider_memory_observation',
+                'embedded_runtime::tests::retained_gguf', 'runtime_router::tests::retained_gguf')) {
             Invoke-CaptureTests "ui-harness,$providerFeature" $filter
         }
         Write-Output "$GpuProviderCheck worker compilation and deterministic observation tests passed; hardware qualification not run."

@@ -36,13 +36,17 @@ $expectedCaptureFilters = @(
     'onnx_worker::tests::capture_observation',
     'onnx_worker::tests::vulkan_hello_memory',
     'embedded_runtime::tests::provider_memory_observation',
+    'embedded_runtime::tests::retained_gguf',
+    'runtime_router::tests::retained_gguf',
     'architecture_guard::windows_gpu_capture',
     'architecture_guard::windows_gpu_probe'
 )
 $expectedProviderFilters = @(
     'onnx_worker::tests::capture_observation',
     'onnx_worker::tests::vulkan_hello_memory',
-    'embedded_runtime::tests::provider_memory_observation'
+    'embedded_runtime::tests::provider_memory_observation',
+    'embedded_runtime::tests::retained_gguf',
+    'runtime_router::tests::retained_gguf'
 )
 $actualCaptureFilters = @(Get-LoopFilterLiterals -Loop $captureTestLoops[0])
 $actualProviderFilters = @(Get-LoopFilterLiterals -Loop $providerTestLoops[0])
