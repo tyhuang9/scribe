@@ -377,6 +377,25 @@ unreadable, noncanonical, app-build-mismatched, or device-set-mismatched state i
 explicitly invalid/unprobed for GPU while CPU remains eligible. Two successful
 idle probes atomically replace that state and restore availability.
 
+The diagnostics **Retry GPU** action admits only idle application state and
+retains the exact model/backend/provider/device/driver/pack identity. It reprobes
+the verified catalog, consumes the existing one-shot quarantine grant when
+needed, loads that target once, and, for invalid/unprobed or quarantined health,
+sends two bounded health requests on that same authenticated worker generation.
+Each success must be persisted; ordinary health admission must be `Available`
+before retry reports success. Cancellation, a changed target, failed probe,
+worker replacement, or persistence failure stops recovery without another GPU
+or CPU fallback. New recordings wait for the idle retry to finish. Already
+available targets retain load-only retry behavior. Recovery does not qualify
+a backend for Auto or relax transcript-parity requirements.
+
+Retry captures cancellation state before background model resolution and
+disables urgent hotkey starts before native dispatch. Invalidation cancels
+native work; capture, artifact changes, history retry, and another GPU retry
+remain blocked until the exact cancelled operation acknowledges settlement.
+Local health-cache I/O or rollback-authority errors fail closed but are not
+misreported as provider failures.
+
 ## Packaging and key provisioning
 
 Linux x86_64 uses the same Rust manifest verifier and immutable `PackStore` as
