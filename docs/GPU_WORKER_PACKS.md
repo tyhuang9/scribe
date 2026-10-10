@@ -389,6 +389,16 @@ or CPU fallback. New recordings wait for the idle retry to finish. Already
 available targets retain load-only retry behavior. Recovery does not qualify
 a backend for Auto or relax transcript-parity requirements.
 
+An initial explicit-GPU preload or transcription failure retains request-bound,
+parent-verified device context even when no model has loaded successfully yet.
+Diagnostics show that no backend was selected and can offer the exact-target
+retry for exhausted provider failures or unhealthy/quarantined devices. Missing
+or unverified targets do not grant retry authority. Stale session, request,
+model, preference, or acceleration-generation results cannot replace current
+diagnostics; comparison failures do not replace the default model's state.
+Cancellation, content/model/input errors, cleanup failures, and rollback-authority
+rejections do not acquire this recovery context.
+
 Retry captures cancellation state before background model resolution and
 disables urgent hotkey starts before native dispatch. Invalidation cancels
 native work; capture, artifact changes, history retry, and another GPU retry

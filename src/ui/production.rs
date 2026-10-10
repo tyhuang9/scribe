@@ -1,6 +1,8 @@
 //! Thin mappings between the live application runtime and backend-neutral screens.
 
-use crate::backend_policy::{BackendFailureCategory, BackendSelectionReason, BackendSkipReason};
+use crate::backend_policy::{
+    BackendFailureCategory, BackendFailureContext, BackendSelectionReason, BackendSkipReason,
+};
 use crate::models::TranscriptionStatus;
 use crate::transcription::ResolvedAcceleration;
 
@@ -21,31 +23,48 @@ use crate::backend_policy::{
 /// native error details.
 pub(crate) fn acceleration_diagnostics(
     resolved: Option<&ResolvedAcceleration>,
+    failure: Option<&BackendFailureContext>,
     retry_gpu_available: bool,
 ) -> Option<AccelerationDiagnosticsView> {
+    if let Some(failure) = failure {
+        let retry_target = failure.retry_target();
+        let pack = retry_target.and_then(|target| target.pack.as_ref());
+        let skipped_reasons = skipped_reason_labels(&failure.skipped_targets);
+        let quarantine_status = quarantine_status(&failure.skipped_targets);
+        let fallback_details = failure
+            .fallback_history
+            .iter()
+            .map(|fallback| {
+                format!(
+                    "{} ({}) failed: {}",
+                    fallback.target.kind_label(),
+                    fallback.target.display_name,
+                    fallback_category_label(fallback.category),
+                )
+            })
+            .collect::<Vec<_>>();
+        return Some(AccelerationDiagnosticsView {
+            selected_backend: "No backend selected".to_owned(),
+            selected_device: "GPU unavailable".to_owned(),
+            selection_reason: "No GPU backend completed successfully".to_owned(),
+            skipped_reasons,
+            pack_id: pack.map(|pack| pack.pack_id.clone()),
+            pack_version: pack.map(|pack| pack.pack_version.clone()),
+            driver: retry_target.and_then(|target| target.driver_version.clone()),
+            power_source: power_source_label(failure.power_source).to_owned(),
+            power_policy: failure.power_policy.label().to_owned(),
+            quarantine_status,
+            fallback_status: "No backend completed successfully".to_owned(),
+            fallback_details,
+            retry_gpu_available,
+            retry_gpu_in_flight: false,
+            retry_gpu_status: None,
+        });
+    }
     let selection = resolved?.selection.as_ref()?;
     let target = &selection.target;
-    let skipped_reasons = selection
-        .skipped_targets
-        .iter()
-        .map(|skipped| {
-            format!(
-                "{} ({}) — {}",
-                skipped.target.kind_label(),
-                skipped.target.display_name,
-                skipped.reason.label()
-            )
-        })
-        .collect::<Vec<_>>();
-    let quarantine_status = if selection
-        .skipped_targets
-        .iter()
-        .any(|skipped| skipped.reason == BackendSkipReason::Quarantined)
-    {
-        "A GPU is temporarily quarantined".to_owned()
-    } else {
-        "No quarantine reported".to_owned()
-    };
+    let skipped_reasons = skipped_reason_labels(&selection.skipped_targets);
+    let quarantine_status = quarantine_status(&selection.skipped_targets);
     let fallback_status = if !selection.fallback_history.is_empty() {
         "A bounded fallback was used".to_owned()
     } else if selection.reason == BackendSelectionReason::AutoCpuFallback {
@@ -93,6 +112,31 @@ pub(crate) fn acceleration_diagnostics(
         retry_gpu_in_flight: false,
         retry_gpu_status: None,
     })
+}
+
+fn skipped_reason_labels(skipped_targets: &[crate::backend_policy::SkippedBackend]) -> Vec<String> {
+    skipped_targets
+        .iter()
+        .map(|skipped| {
+            format!(
+                "{} ({}) — {}",
+                skipped.target.kind_label(),
+                skipped.target.display_name,
+                skipped.reason.label()
+            )
+        })
+        .collect()
+}
+
+fn quarantine_status(skipped_targets: &[crate::backend_policy::SkippedBackend]) -> String {
+    if skipped_targets
+        .iter()
+        .any(|skipped| skipped.reason == BackendSkipReason::Quarantined)
+    {
+        "A GPU is temporarily quarantined".to_owned()
+    } else {
+        "No quarantine reported".to_owned()
+    }
 }
 
 fn power_source_label(source: crate::backend_policy::PowerSource) -> &'static str {
@@ -369,7 +413,8 @@ mod tests {
             selection: Some(selection),
         };
 
-        let view = acceleration_diagnostics(Some(&resolved), true).expect("selection projects");
+        let view =
+            acceleration_diagnostics(Some(&resolved), None, true).expect("selection projects");
         assert_eq!(view.selected_backend, "Vulkan");
         assert_eq!(view.selected_device, "Studio GPU");
         assert_eq!(view.pack_id.as_deref(), Some("scribe-gpu"));
@@ -402,8 +447,70 @@ mod tests {
             .unwrap()
             .skipped_targets
             .clear();
-        let view = acceleration_diagnostics(Some(&without_reported_quarantine), false)
+        let view = acceleration_diagnostics(Some(&without_reported_quarantine), None, false)
             .expect("selection without a reported quarantine projects");
         assert_eq!(view.quarantine_status, "No quarantine reported");
+    }
+
+    #[test]
+    fn acceleration_failure_projects_no_selection_without_private_identity_or_cpu_fallback() {
+        let target = BackendTarget {
+            backend: BackendKind::Cuda,
+            provider_id: ProviderIdentity::new("provider-stable-secret"),
+            driver_version: Some("555.42".into()),
+            device_id: DeviceIdentity::new("stable-device-secret"),
+            display_name: "Studio GPU".into(),
+            vendor: GpuVendor::Nvidia,
+            device_class: DeviceClass::DiscreteGpu,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 7 * 1024 * 1024 * 1024,
+            pack: Some(BackendPackIdentity {
+                pack_id: "scribe-cuda".into(),
+                pack_version: "1.2.3".into(),
+                pack_digest: "pack-digest-secret".into(),
+                security_epoch: 7,
+                runtime_abi: 4,
+            }),
+            process_index: Some(3),
+        };
+        let skipped = BackendTarget {
+            display_name: "Backup GPU".into(),
+            ..target.clone()
+        };
+        let failure = BackendFailureContext {
+            requested: crate::transcription::AccelerationPreference::Gpu,
+            power_source: PowerSource::Ac,
+            power_policy: PowerPolicyDecision::Unrestricted,
+            fallback_history: vec![BackendFallback {
+                target,
+                category: BackendFailureCategory::InitializationFailed,
+            }],
+            skipped_targets: vec![SkippedBackend {
+                target: skipped,
+                reason: BackendSkipReason::Quarantined,
+            }],
+        };
+
+        let view = acceleration_diagnostics(None, Some(&failure), true)
+            .expect("a typed failure projects without a selection");
+        assert_eq!(view.selected_backend, "No backend selected");
+        assert_eq!(view.selected_device, "GPU unavailable");
+        assert_eq!(view.pack_id.as_deref(), Some("scribe-cuda"));
+        assert_eq!(view.pack_version.as_deref(), Some("1.2.3"));
+        assert_eq!(view.driver.as_deref(), Some("555.42"));
+        assert_eq!(
+            view.fallback_details,
+            ["CUDA (Studio GPU) failed: initialization failed"]
+        );
+        assert!(view.retry_gpu_available);
+        assert!(!view.fallback_status.contains("CPU"));
+        let visible = format!("{view:?}");
+        for private_value in [
+            "provider-stable-secret",
+            "stable-device-secret",
+            "pack-digest-secret",
+        ] {
+            assert!(!visible.contains(private_value), "leaked {private_value}");
+        }
     }
 }

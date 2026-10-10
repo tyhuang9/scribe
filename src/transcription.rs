@@ -39,7 +39,7 @@ use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
 use crate::runtime_contract::{
-    RuntimeError, RuntimeExecution, RuntimeLoadExecution, WARM_MODEL_TTL,
+    RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRequestFailure, WARM_MODEL_TTL,
 };
 #[cfg(test)]
 use crate::runtime_router::IdleTimeoutAction;
@@ -60,6 +60,14 @@ const INSTALL_SMOKE_HELPER_FLAG: &str = "--scribe-install-smoke";
 const INSTALL_SMOKE_PARENT_FLAG: &str = "--scribe-install-smoke-parent";
 const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+fn runtime_request_error(failure: RuntimeRequestFailure) -> anyhow::Error {
+    let error = anyhow!(failure.error);
+    match failure.backend_context {
+        Some(context) => error.context(context),
+        None => error,
+    }
+}
 
 fn preserve_primary_smoke_error<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (primary, cleanup) {
@@ -473,12 +481,12 @@ enum RuntimeCommand {
         audio: Arc<PreparedAudio>,
         options: TranscriptionOptions,
         cancellation_snapshot: u64,
-        reply: SyncSender<Result<RuntimeExecution, RuntimeError>>,
+        reply: SyncSender<Result<RuntimeExecution, RuntimeRequestFailure>>,
     },
     Load {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
-        reply: SyncSender<Result<RuntimeLoadExecution, RuntimeError>>,
+        reply: SyncSender<Result<RuntimeLoadExecution, RuntimeRequestFailure>>,
     },
     RetryGpu {
         artifact: RuntimeArtifact,
@@ -614,11 +622,12 @@ impl RuntimeWorker {
         audio: Arc<PreparedAudio>,
         options: TranscriptionOptions,
         cancellation_snapshot: u64,
-    ) -> Result<RuntimeExecution, RuntimeError> {
+    ) -> Result<RuntimeExecution, RuntimeRequestFailure> {
         if self.cancellation_snapshot() != cancellation_snapshot {
             return Err(RuntimeError::Engine(
                 "transcription request was cancelled before inference dispatch".to_owned(),
-            ));
+            )
+            .into());
         }
         let (reply, response) = sync_channel(1);
         self.inner
@@ -641,7 +650,7 @@ impl RuntimeWorker {
         &self,
         artifact: impl Into<RuntimeArtifact>,
         preference: AccelerationPreference,
-    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+    ) -> Result<RuntimeLoadExecution, RuntimeRequestFailure> {
         let (reply, response) = sync_channel(1);
         self.inner
             .commands
@@ -836,7 +845,7 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                     cancellation_snapshot,
                 );
                 let succeeded = result.is_ok();
-                let _ = reply.send(result);
+                let _ = reply.send(result.map_err(Into::into));
                 (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Load {
@@ -847,7 +856,7 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 let request_activity = activity.acquire_request().ok();
                 let result = router.load(artifact, preference);
                 let succeeded = result.is_ok();
-                let _ = reply.send(result);
+                let _ = reply.send(result.map_err(Into::into));
                 (succeeded, request_activity)
             }
             Ok(RuntimeCommand::RetryGpu {
@@ -943,7 +952,8 @@ fn inference_worker_dispatch_loop(
                 {
                     Err(RuntimeError::Engine(
                         "transcription request was cancelled before inference dispatch".to_owned(),
-                    ))
+                    )
+                    .into())
                 } else {
                     inference.transcribe(
                         artifact,
@@ -1124,7 +1134,9 @@ impl TranscriptionService {
         let artifact = self.onnx_artifact_from_receipt(root)?;
         let preference = self.config.performance.acceleration_preference;
         crate::onnx_worker::resolve_cpu_only_acceleration(preference)?;
-        self.worker.load(artifact, preference).map_err(Into::into)
+        self.worker
+            .load(artifact, preference)
+            .map_err(runtime_request_error)
     }
 
     #[cfg(test)]
@@ -1142,7 +1154,7 @@ impl TranscriptionService {
                 options,
                 self.worker.cancellation_snapshot(),
             )
-            .map_err(Into::into)
+            .map_err(runtime_request_error)
     }
 
     /// Runs the staged bundle through the process-isolated ONNX worker before
@@ -1380,7 +1392,7 @@ impl TranscriptionService {
                 runtime_model,
                 self.config.performance.acceleration_preference,
             )
-            .map_err(|error| anyhow!(error))?;
+            .map_err(runtime_request_error)?;
         Ok(ModelLoadOutcome {
             model_id: model_id.clone(),
             resolved_acceleration: execution.diagnostics.resolved_acceleration,
@@ -1874,7 +1886,7 @@ impl TranscriptionService {
                 request.options.clone(),
                 ticket.native_generation,
             )
-            .map_err(|error| anyhow!(error))?;
+            .map_err(runtime_request_error)?;
         Ok(map_native_execution(request, model, execution))
     }
 
@@ -1930,7 +1942,7 @@ impl TranscriptionService {
                     request.options.clone(),
                     ticket.native_generation,
                 )
-                .map_err(|error| anyhow!(error))?;
+                .map_err(runtime_request_error)?;
             return Ok(map_native_execution(request, model, execution));
         }
         if crate::runtime_contract::handles_model_id(&request.model_id)
@@ -1963,7 +1975,7 @@ impl TranscriptionService {
                 ticket.native_generation,
             )
             .map(|execution| map_native_execution(request, model, execution))
-            .map_err(|error| anyhow!(error))
+            .map_err(runtime_request_error)
     }
 
     fn resolve_runtime_model(&self, model: SttModelInfo) -> Result<RuntimeModel> {
@@ -3355,6 +3367,82 @@ mod tests {
     }
 
     #[test]
+    fn cold_gpu_failure_survives_request_reply_and_preserves_runtime_error_downcast() {
+        use crate::backend_policy::{BackendFailureContext, PowerPolicyDecision, PowerSource};
+        let (root, spec) = service_onnx_spec("cold-failure-envelope");
+        let context = BackendFailureContext {
+            requested: AccelerationPreference::Gpu,
+            power_source: PowerSource::Ac,
+            power_policy: PowerPolicyDecision::NotApplied,
+            fallback_history: Vec::new(),
+            skipped_targets: Vec::new(),
+        };
+        let reply_context = context.clone();
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                let failure = || RuntimeRequestFailure {
+                    error: RuntimeError::OutOfMemory("private raw native diagnostic".to_owned()),
+                    backend_context: Some(reply_context.clone()),
+                };
+                match command {
+                    RuntimeCommand::Load { reply, .. } => reply.send(Err(failure())).unwrap(),
+                    RuntimeCommand::Transcribe { reply, .. } => reply.send(Err(failure())).unwrap(),
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected failure-envelope command"),
+                }
+            }
+        });
+        for transcribe in [false, true] {
+            let failure = if transcribe {
+                worker
+                    .transcribe(
+                        RuntimeArtifact::OnnxBundle(spec.clone()),
+                        AccelerationPreference::Gpu,
+                        Arc::new(
+                            PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap(),
+                        ),
+                        TranscriptionOptions::default(),
+                        0,
+                    )
+                    .unwrap_err()
+            } else {
+                worker
+                    .load(
+                        RuntimeArtifact::OnnxBundle(spec.clone()),
+                        AccelerationPreference::Gpu,
+                    )
+                    .unwrap_err()
+            };
+            let error = runtime_request_error(failure);
+            assert_eq!(
+                error.downcast_ref::<BackendFailureContext>(),
+                Some(&context)
+            );
+            assert!(matches!(
+                error.downcast_ref::<RuntimeError>(),
+                Some(RuntimeError::OutOfMemory(_))
+            ));
+            assert!(!error.to_string().contains("private raw native diagnostic"));
+        }
+        drop(worker);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cold_gpu_failure_context_free_conversion_keeps_original_error() {
+        use crate::backend_policy::BackendFailureContext;
+        let error = runtime_request_error(RuntimeError::Cancelled("cancelled".to_owned()).into());
+        assert!(error.downcast_ref::<BackendFailureContext>().is_none());
+        assert!(matches!(
+            error.downcast_ref::<RuntimeError>(),
+            Some(RuntimeError::Cancelled(_))
+        ));
+    }
+
+    #[test]
     fn gpu_retry_queue_retains_the_cancellation_snapshot() {
         let (root, spec) = service_onnx_spec("gpu-retry-snapshot");
         let worker = simulated_runtime_worker(|receiver| {
@@ -3918,7 +4006,8 @@ mod tests {
                         reply
                             .send(Err(RuntimeError::Engine(
                                 "deterministic service decode failure".to_owned(),
-                            )))
+                            )
+                            .into()))
                             .unwrap()
                     }
                     RuntimeCommand::Unload { reply } => {

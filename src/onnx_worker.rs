@@ -19,9 +19,9 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::backend_policy::{
-    BackendFailureCategory, BackendFallback, BackendKind, BackendSelection, BackendSelectionReason,
-    BackendSkipReason, BackendTarget, DeviceClass, GpuVendor, PowerPolicyDecision, PowerSource,
-    SkippedBackend,
+    BackendFailureCategory, BackendFailureContext, BackendFallback, BackendKind, BackendSelection,
+    BackendSelectionReason, BackendSkipReason, BackendTarget, DeviceClass, GpuVendor,
+    PowerPolicyDecision, PowerSource, SkippedBackend,
 };
 use crate::config;
 use crate::gpu_auto_qualification::{
@@ -42,6 +42,7 @@ use crate::runtime_artifact::{
 };
 use crate::runtime_contract::{
     NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution, RuntimeLoadExecution,
+    RuntimeRequestFailure,
 };
 use crate::runtime_router::RuntimeRouter;
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
@@ -11432,15 +11433,44 @@ impl InferenceWorkerRegistry {
         }
     }
 
+    fn terminal_request_failure(
+        error: RuntimeError,
+        requested: AccelerationPreference,
+        power_source: Option<PowerSource>,
+        fallback_history: Vec<BackendFallback>,
+        skipped_targets: Vec<SkippedBackend>,
+        authority_rejected: bool,
+    ) -> RuntimeRequestFailure {
+        let power_source = power_source.unwrap_or_else(PowerSource::current);
+        RuntimeRequestFailure {
+            error,
+            backend_context: (requested == AccelerationPreference::Gpu && !authority_rejected)
+                .then(|| BackendFailureContext {
+                    requested,
+                    power_source,
+                    power_policy: PowerPolicyDecision::NotApplied,
+                    fallback_history: fallback_history
+                        .into_iter()
+                        .take(MAX_INFERENCE_ROUTE_ATTEMPTS)
+                        .collect(),
+                    skipped_targets: skipped_targets
+                        .into_iter()
+                        .take(MAX_BACKEND_SELECTION_TARGETS)
+                        .collect(),
+                }),
+        }
+    }
+
     pub(crate) fn load(
         &self,
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
-    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+    ) -> Result<RuntimeLoadExecution, RuntimeRequestFailure> {
         let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut fallback_history = Vec::new();
         let mut attempted = false;
+        let mut authority_rejected = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
         let mut execution_skipped_targets = plan.skipped_targets.clone();
         let mut execution_power_source = plan.selection_power_source;
@@ -11478,6 +11508,7 @@ impl InferenceWorkerRegistry {
             match self.prepare_route(route) {
                 Ok(()) => {}
                 Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    authority_rejected = true;
                     self.invalidate_gpu_catalog_after_runtime_failure(route)?;
                     let error = if preference == AccelerationPreference::Gpu {
                         RuntimeError::WorkerUnavailable(format!(
@@ -11490,7 +11521,7 @@ impl InferenceWorkerRegistry {
                     last_retryable = Some(error);
                     continue;
                 }
-                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+                Err(RoutePreparationError::Fatal(error)) => return Err(error.into()),
             }
             match route.supervisor.load(
                 artifact.clone(),
@@ -11582,14 +11613,14 @@ impl InferenceWorkerRegistry {
                         );
                     }
                     self.retire_failed_route(route)?;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
         if !attempted {
             self.retire_active_worker()?;
         }
-        Err(last_retryable.unwrap_or_else(|| {
+        let error = last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
             match plan.diagnostic {
                 Some(diagnostic) if preference == AccelerationPreference::Gpu => {
@@ -11599,7 +11630,15 @@ impl InferenceWorkerRegistry {
                 }
                 _ => Self::no_route_error(preference),
             }
-        }))
+        });
+        Err(Self::terminal_request_failure(
+            error,
+            preference,
+            execution_power_source,
+            fallback_history,
+            execution_skipped_targets,
+            authority_rejected,
+        ))
     }
 
     pub(crate) fn transcribe(
@@ -11610,11 +11649,12 @@ impl InferenceWorkerRegistry {
         options: TranscriptionOptions,
         cancellation_snapshot: u64,
         cancellation_generation: &std::sync::atomic::AtomicU64,
-    ) -> Result<RuntimeExecution, RuntimeError> {
+    ) -> Result<RuntimeExecution, RuntimeRequestFailure> {
         let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut fallback_history = Vec::new();
         let mut attempted = false;
+        let mut authority_rejected = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
         let mut execution_skipped_targets = plan.skipped_targets.clone();
         let mut execution_power_source = plan.selection_power_source;
@@ -11652,6 +11692,7 @@ impl InferenceWorkerRegistry {
             match self.prepare_route(route) {
                 Ok(()) => {}
                 Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    authority_rejected = true;
                     self.invalidate_gpu_catalog_after_runtime_failure(route)?;
                     let error = if preference == AccelerationPreference::Gpu {
                         RuntimeError::WorkerUnavailable(format!(
@@ -11664,7 +11705,7 @@ impl InferenceWorkerRegistry {
                     last_retryable = Some(error);
                     continue;
                 }
-                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+                Err(RoutePreparationError::Fatal(error)) => return Err(error.into()),
             }
             match route.supervisor.transcribe(
                 artifact.clone(),
@@ -11718,7 +11759,8 @@ impl InferenceWorkerRegistry {
                     if cancelled {
                         return Err(RuntimeError::Cancelled(
                             "transcription request was cancelled before output".to_owned(),
-                        ));
+                        )
+                        .into());
                     }
                     record_backend_fallback(&mut fallback_history, route, &error);
                     last_retryable = Some(error);
@@ -11741,7 +11783,8 @@ impl InferenceWorkerRegistry {
                     if cancelled {
                         return Err(RuntimeError::Cancelled(
                             "transcription request was cancelled before output".to_owned(),
-                        ));
+                        )
+                        .into());
                     }
                     record_backend_fallback(&mut fallback_history, route, &error);
                     last_retryable = Some(error);
@@ -11766,7 +11809,8 @@ impl InferenceWorkerRegistry {
                     if cancelled {
                         return Err(RuntimeError::Cancelled(
                             "transcription request was cancelled before output".to_owned(),
-                        ));
+                        )
+                        .into());
                     }
                     record_backend_fallback(&mut fallback_history, route, &error);
                     last_retryable = Some(RuntimeError::RetryableWorkerFailure(error.to_string()));
@@ -11781,14 +11825,14 @@ impl InferenceWorkerRegistry {
                         );
                     }
                     self.retire_failed_route(route)?;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
         if !attempted {
             self.retire_active_worker()?;
         }
-        Err(last_retryable.unwrap_or_else(|| {
+        let error = last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
             match plan.diagnostic {
                 Some(diagnostic) if preference == AccelerationPreference::Gpu => {
@@ -11798,7 +11842,21 @@ impl InferenceWorkerRegistry {
                 }
                 _ => Self::no_route_error(preference),
             }
-        }))
+        });
+        if cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot {
+            return Err(RuntimeError::Cancelled(
+                "transcription request was cancelled before output".to_owned(),
+            )
+            .into());
+        }
+        Err(Self::terminal_request_failure(
+            error,
+            preference,
+            execution_power_source,
+            fallback_history,
+            execution_skipped_targets,
+            authority_rejected,
+        ))
     }
 
     pub(crate) fn health(
@@ -14441,6 +14499,7 @@ mod tests {
             pcm_kind: bool,
         },
         RuntimeFailureOnLoad(RuntimeError),
+        RuntimeFailureOnTranscribe(RuntimeError),
         RuntimeLoad,
         RuntimeDiagnostics(Box<WireRuntimeDiagnostics>),
         RuntimeRetryHealth {
@@ -15125,6 +15184,18 @@ mod tests {
             TestMode::RuntimeFailureOnLoad(error) => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::LoadRuntime { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeFailed {
+                        error: WireRuntimeError::from_runtime(&error),
+                    },
+                );
+            }
+            TestMode::RuntimeFailureOnTranscribe(error) => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::BeginBatch { .. }));
                 respond(
                     &mut output,
                     session_id,
@@ -19730,6 +19801,144 @@ mod tests {
     }
 
     #[test]
+    fn cold_gpu_failure_retains_typed_exhausted_routes_without_cpu() {
+        let failures: [(fn() -> RuntimeError, BackendFailureCategory); 4] = [
+            (
+                || RuntimeError::BackendInitializationFailed("not an OOM".to_owned()),
+                BackendFailureCategory::InitializationFailed,
+            ),
+            (
+                || RuntimeError::BackendUnavailable("not an initialization failure".to_owned()),
+                BackendFailureCategory::DeviceLost,
+            ),
+            (
+                || RuntimeError::OutOfMemory("not a lost device".to_owned()),
+                BackendFailureCategory::OutOfMemory,
+            ),
+            (
+                || RuntimeError::RetryableWorkerFailure("not a provider error".to_owned()),
+                BackendFailureCategory::WorkerFailed,
+            ),
+        ];
+        for (make_error, category) in failures {
+            for transcribe in [false, true] {
+                let mode = || {
+                    if transcribe {
+                        TestMode::RuntimeFailureOnTranscribe(make_error())
+                    } else {
+                        TestMode::RuntimeFailureOnLoad(make_error())
+                    }
+                };
+                let first = Arc::new(TestLauncher::new([mode()]));
+                let second = Arc::new(TestLauncher::new([mode()]));
+                let cpu = Arc::new(TestLauncher::new([]));
+                let (mut registry, first_target) =
+                    explicit_retry_registry(Arc::clone(&first), Arc::clone(&cpu));
+                let mut next_route = verified_gpu_route(
+                    BackendKind::Vulkan,
+                    "native:pci:0000:02:00.0",
+                    "windows-display:32.0.16.1088",
+                    'b',
+                );
+                let next_target = next_route.target.clone().unwrap();
+                next_route.supervisor = inference_supervisor_with_launcher(Arc::clone(&second));
+                let first_route =
+                    registry.gpu_routes_for_testing.as_ref().unwrap().routes[0].clone();
+                registry.gpu_routes_for_testing =
+                    Some(verified_gpu_catalog(vec![first_route, next_route]));
+                let fixture = gguf_artifact_fixture(&format!("cold-gpu-{category:?}-{transcribe}"));
+                let failure = if transcribe {
+                    registry
+                        .transcribe(
+                            fixture.artifact.clone(),
+                            AccelerationPreference::Gpu,
+                            &PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap(),
+                            TranscriptionOptions::default(),
+                            0,
+                            &AtomicU64::new(0),
+                        )
+                        .unwrap_err()
+                } else {
+                    registry
+                        .load(fixture.artifact.clone(), AccelerationPreference::Gpu)
+                        .unwrap_err()
+                };
+                assert_eq!(backend_failure_category(&failure.error), Some(category));
+                let context = failure.backend_context.unwrap();
+                assert_eq!(
+                    context.fallback_history,
+                    vec![
+                        BackendFallback {
+                            target: first_target,
+                            category
+                        },
+                        BackendFallback {
+                            target: next_target.clone(),
+                            category
+                        }
+                    ]
+                );
+                assert_eq!(context.retry_target(), Some(&next_target));
+                assert_eq!(first.launch_attempts.load(Ordering::Acquire), 1);
+                assert_eq!(second.launch_attempts.load(Ordering::Acquire), 1);
+                assert_eq!(cpu.launch_attempts.load(Ordering::Acquire), 0);
+                assert!(registry.active_route.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cold_gpu_failure_does_not_offer_retry_for_missing_routes_or_excluded_errors() {
+        let cpu = Arc::new(TestLauncher::new([]));
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&cpu)),
+        );
+        registry.gpu_routes_for_testing = Some(verified_gpu_catalog(Vec::new()));
+        let failure = registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+            .unwrap_err();
+        assert!(failure.backend_context.unwrap().retry_target().is_none());
+        assert_eq!(cpu.launch_attempts.load(Ordering::Acquire), 0);
+        let cancelled = registry
+            .transcribe(
+                missing_gguf_artifact(),
+                AccelerationPreference::Gpu,
+                &PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap(),
+                TranscriptionOptions::default(),
+                0,
+                &AtomicU64::new(1),
+            )
+            .unwrap_err();
+        assert!(matches!(cancelled.error, RuntimeError::Cancelled(_)));
+        assert!(cancelled.backend_context.is_none());
+
+        for error in [
+            RuntimeError::Cancelled("cancelled".to_owned()),
+            RuntimeError::InvalidAudio {
+                sample_rate_hz: 1,
+                channels: 2,
+            },
+            RuntimeError::ArtifactIntegrity {
+                path: PathBuf::from("private-model"),
+                message: "corrupt".to_owned(),
+            },
+            RuntimeError::Inference("decode content".to_owned()),
+            RuntimeError::Callback("output callback".to_owned()),
+            RuntimeError::Engine("partial/content failure".to_owned()),
+        ] {
+            let gpu = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(error)]));
+            let (registry, _) = explicit_retry_registry(Arc::clone(&gpu), Arc::clone(&cpu));
+            let fixture = gguf_artifact_fixture("cold-gpu-excluded");
+            let failure = registry
+                .load(fixture.artifact.clone(), AccelerationPreference::Gpu)
+                .unwrap_err();
+            assert!(failure.backend_context.is_none());
+            assert_eq!(gpu.launch_attempts.load(Ordering::Acquire), 1);
+            assert_eq!(cpu.launch_attempts.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
     fn explicit_gpu_retry_loads_only_the_exact_target_without_cpu_fallback() {
         let mut runtime_target = verified_gpu_route(
             BackendKind::Vulkan,
@@ -19864,6 +20073,17 @@ mod tests {
                             crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
                         )
                         .unwrap();
+                    if state == "quarantined" {
+                        // The cold-failure case must have no other available
+                        // GPU; exact retry must still leave this route alone.
+                        HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK)
+                            .record_provider_failure(
+                                route_health_key(&catalog.routes[1], &model.expected_sha256)
+                                    .unwrap(),
+                                crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+                            )
+                            .unwrap();
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -19888,8 +20108,44 @@ mod tests {
             );
             assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
 
+            // A first request has no successful selection to seed the UI.
+            // Both entry paths must retain the exact verified recovery target.
+            let cold_load = registry
+                .load(fixture.artifact.clone(), AccelerationPreference::Gpu)
+                .expect_err("unhealthy routes must not load");
+            let cold_transcription = registry
+                .transcribe(
+                    fixture.artifact.clone(),
+                    AccelerationPreference::Gpu,
+                    &PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap(),
+                    TranscriptionOptions::default(),
+                    0,
+                    &AtomicU64::new(0),
+                )
+                .expect_err("unhealthy routes must not transcribe");
+            for failure in [&cold_load, &cold_transcription] {
+                assert!(matches!(failure.error, RuntimeError::WorkerUnavailable(_)));
+                let context = failure.backend_context.as_ref().unwrap();
+                assert_eq!(context.requested, AccelerationPreference::Gpu);
+                assert_eq!(context.power_policy, PowerPolicyDecision::NotApplied);
+                assert!(context.fallback_history.is_empty());
+                assert_eq!(context.retry_target(), Some(&retained));
+            }
+            assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+            assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+            let retry_target = cold_transcription
+                .backend_context
+                .as_ref()
+                .unwrap()
+                .retry_target()
+                .unwrap();
             let result = registry
-                .retry_gpu(fixture.artifact.clone(), &retained, 0, &AtomicU64::new(0))
+                .retry_gpu(
+                    fixture.artifact.clone(),
+                    retry_target,
+                    0,
+                    &AtomicU64::new(0),
+                )
                 .expect("explicit retry must recover the exact health key");
             let selected = result
                 .diagnostics
@@ -21555,14 +21811,124 @@ mod tests {
         explicit_registry.gpu_routes_for_testing =
             Some(verified_gpu_catalog(vec![explicit_gpu_route]));
 
-        let error = explicit_registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
-            .expect_err("explicit GPU must never use CPU after rollback rejection")
-            .to_string();
-        assert!(error.contains("device-local release rollback authority"));
-        assert!(error.contains("CPU fallback is forbidden"));
+        for transcribe in [false, true] {
+            let failure = if transcribe {
+                explicit_registry
+                    .transcribe(
+                        missing_gguf_artifact(),
+                        AccelerationPreference::Gpu,
+                        &PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap(),
+                        TranscriptionOptions::default(),
+                        0,
+                        &AtomicU64::new(0),
+                    )
+                    .map(|_| ())
+            } else {
+                explicit_registry
+                    .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+                    .map(|_| ())
+            }
+            .expect_err("explicit GPU must never use CPU after rollback rejection");
+            assert!(
+                failure.backend_context.is_none(),
+                "authority failure cannot offer Retry GPU"
+            );
+            let error = failure.to_string();
+            assert!(error.contains("device-local release rollback authority"));
+            assert!(error.contains("CPU fallback is forbidden"));
+        }
         assert_eq!(explicit_gpu_launcher.launches.load(Ordering::Acquire), 0);
         assert_eq!(explicit_cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cold_gpu_failure_mixed_rollback_rejection_never_offers_a_retry_target() {
+        struct RejectEpochAfterLaunch(Arc<TestLauncher>);
+        impl WorkerLauncher for RejectEpochAfterLaunch {
+            fn launch(&self) -> Result<SpawnedWorker> {
+                let worker = self.0.launch()?;
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(true);
+                Ok(worker)
+            }
+        }
+        struct ResetEpoch;
+        impl Drop for ResetEpoch {
+            fn drop(&mut self) {
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            }
+        }
+        for transcribe in [false, true] {
+            crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            let _reset = ResetEpoch;
+            let error =
+                RuntimeError::OutOfMemory("provider failure before authority change".to_owned());
+            let first = Arc::new(TestLauncher::new([if transcribe {
+                TestMode::RuntimeFailureOnTranscribe(error)
+            } else {
+                TestMode::RuntimeFailureOnLoad(error)
+            }]));
+            let second = Arc::new(TestLauncher::new([]));
+            let cpu = Arc::new(TestLauncher::new([]));
+            let mut first_route = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "driver",
+                'a',
+            );
+            first_route.supervisor = InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    Arc::new(RejectEpochAfterLaunch(Arc::clone(&first))),
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(AtomicU64::new(0)),
+            };
+            let mut second_route = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:02:00.0",
+                "driver",
+                'b',
+            );
+            second_route.supervisor = inference_supervisor_with_launcher(Arc::clone(&second));
+            let mut catalog = verified_gpu_catalog(vec![first_route, second_route]);
+            catalog.skipped_targets.push(SkippedBackend {
+                target: verified_gpu_route(
+                    BackendKind::Vulkan,
+                    "native:pci:0000:03:00.0",
+                    "driver",
+                    'c',
+                )
+                .target
+                .unwrap(),
+                reason: BackendSkipReason::Unhealthy,
+            });
+            let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+                inference_supervisor_with_launcher(Arc::clone(&cpu)),
+            );
+            registry.gpu_routes_for_testing = Some(catalog);
+            let fixture = gguf_artifact_fixture("cold-mixed-authority-failure");
+            let failure = if transcribe {
+                registry
+                    .transcribe(
+                        fixture.artifact.clone(),
+                        AccelerationPreference::Gpu,
+                        &PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap(),
+                        TranscriptionOptions::default(),
+                        0,
+                        &AtomicU64::new(0),
+                    )
+                    .map(|_| ())
+            } else {
+                registry
+                    .load(fixture.artifact.clone(), AccelerationPreference::Gpu)
+                    .map(|_| ())
+            }
+            .unwrap_err();
+            assert!(failure.to_string().contains("rollback authority"));
+            assert!(failure.backend_context.is_none());
+            assert_eq!(first.launch_attempts.load(Ordering::Acquire), 1);
+            assert_eq!(second.launch_attempts.load(Ordering::Acquire), 0);
+            assert_eq!(cpu.launch_attempts.load(Ordering::Acquire), 0);
+        }
     }
 
     #[test]
