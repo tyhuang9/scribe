@@ -88,6 +88,13 @@ fn map_embedded_runtime_error(error: anyhow::Error) -> RuntimeError {
     }
 }
 
+fn map_embedded_load_error(error: anyhow::Error) -> RuntimeError {
+    match error.downcast::<RuntimeError>() {
+        Ok(error) => error,
+        Err(error) => map_embedded_runtime_error(error),
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct RuntimeActivity {
@@ -308,6 +315,51 @@ impl RuntimeRouter {
         }
     }
 
+    pub(crate) fn transcribe_retained(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancellation_snapshot: u64,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        if audio.sample_rate != PREPARED_SAMPLE_RATE
+            || audio.samples.is_empty()
+            || audio
+                .samples
+                .iter()
+                .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+        {
+            return Err(RuntimeError::InvalidAudio {
+                sample_rate_hz: audio.sample_rate,
+                channels: 1,
+            });
+        }
+        let model_id = artifact.model_id();
+        let kind = runtime_kind_for_artifact(&artifact)
+            .ok_or_else(|| RuntimeError::UnsupportedModel(model_id.clone()))?;
+        let RuntimeArtifact::Gguf(model) = artifact else {
+            return Err(RuntimeError::UnsupportedModel(model_id));
+        };
+        match kind {
+            RuntimeKind::TranscribeCpp => self
+                .inner
+                .lock()
+                .map_err(|_| RuntimeError::Poisoned)?
+                .transcribe_retained_embedded(
+                    model,
+                    preference,
+                    audio,
+                    options,
+                    EmbeddedCancellationContext {
+                        token: Arc::clone(&self.embedded_cancellation),
+                        generation: Arc::clone(&self.cancel_generation),
+                        snapshot: cancellation_snapshot,
+                    },
+                ),
+        }
+    }
+
     pub(crate) fn provider_memory_observation_before(
         &self,
         preference: AccelerationPreference,
@@ -513,41 +565,39 @@ impl RouterState {
         preference: AccelerationPreference,
         cancellation: Arc<Mutex<Option<CancelToken>>>,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
-        let warm_reused = self.embedded_is_warm(&model, preference);
-        verify_embedded_runtime_model(&model, warm_reused)?;
-        let load_started = Instant::now();
         let loaded = {
             let runtime = self.embedded_runtime(&model, preference, Arc::clone(&cancellation))?;
-            SpeechEngine::load(runtime).map(|()| {
-                (
-                    runtime
-                        .resolved_acceleration()
-                        .cloned()
-                        .expect("a successfully loaded embedded runtime resolves acceleration"),
-                    runtime
-                        .detected_architecture()
-                        .expect("a successfully loaded embedded runtime reports its architecture"),
-                    SpeechEngine::capabilities(runtime),
-                )
-            })
+            runtime
+                .load_with_receipt(|| {
+                    verify_embedded_runtime_model(&model, false).map_err(anyhow::Error::new)
+                })
+                .map(|receipt| {
+                    (
+                        receipt,
+                        runtime
+                            .resolved_acceleration()
+                            .cloned()
+                            .expect("a successfully loaded embedded runtime resolves acceleration"),
+                        runtime.detected_architecture().expect(
+                            "a successfully loaded embedded runtime reports its architecture",
+                        ),
+                        SpeechEngine::capabilities(runtime),
+                    )
+                })
         };
-        let (resolved_acceleration, detected_architecture, capabilities) = match loaded {
+        let (receipt, resolved_acceleration, detected_architecture, capabilities) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.discard_embedded_runtime(&cancellation);
-                return Err(map_embedded_runtime_error(error));
+                return Err(map_embedded_load_error(error));
             }
         };
         Ok(RuntimeLoadExecution {
             diagnostics: NativeRuntimeDiagnostics {
                 resolved_acceleration,
                 runtime_location: embedded_runtime_location(),
-                warm_reused,
-                model_load_duration_ms: if warm_reused {
-                    0
-                } else {
-                    load_started.elapsed().as_millis()
-                },
+                warm_reused: receipt.warm_reused,
+                model_load_duration_ms: receipt.model_load_duration_ms,
             },
             detected_architecture,
             capabilities,
@@ -616,6 +666,100 @@ impl RouterState {
             processing_duration_ms,
         })
     }
+
+    fn transcribe_retained_embedded(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancellation: EmbeddedCancellationContext,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        verify_embedded_runtime_model(&model, true)?;
+        let request_validation = validate_retained_request(
+            self.embedded_model.as_ref(),
+            self.embedded
+                .as_ref()
+                .map(|runtime| (runtime.model_path(), runtime.preference())),
+            &model,
+            preference,
+        );
+        let cancellation_token = Arc::clone(&cancellation.token);
+        let (result, resolved_acceleration, processing_duration_ms) =
+            run_validated_retained_request(request_validation, || {
+                let runtime = self
+                    .embedded
+                    .as_mut()
+                    .expect("validated retained GGUF request has an embedded runtime");
+                let processing_started = Instant::now();
+                let result = runtime.transcribe_retained_with_cancellation(
+                    audio,
+                    options,
+                    &cancellation.generation,
+                    cancellation.snapshot,
+                );
+                (
+                    result,
+                    runtime.resolved_acceleration().cloned(),
+                    processing_started.elapsed().as_millis(),
+                )
+            })?;
+        let transcript = match result {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                self.discard_embedded_runtime(&cancellation_token);
+                return Err(map_embedded_runtime_error(error));
+            }
+        };
+        Ok(RuntimeExecution {
+            transcript,
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration: resolved_acceleration
+                    .expect("a successful retained GGUF decode preserves resolved acceleration"),
+                runtime_location: embedded_runtime_location(),
+                warm_reused: true,
+                model_load_duration_ms: 0,
+            },
+            processing_duration_ms,
+        })
+    }
+}
+
+fn validate_retained_request(
+    current_model: Option<&RuntimeModel>,
+    current_runtime: Option<(&Path, AccelerationPreference)>,
+    requested_model: &RuntimeModel,
+    requested_preference: AccelerationPreference,
+) -> Result<(), RuntimeError> {
+    let Some(current_model) = current_model else {
+        return Err(RuntimeError::Engine(
+            "retained GGUF decode requires a model loaded by BeginBatch".to_owned(),
+        ));
+    };
+    if current_model != requested_model {
+        return Err(RuntimeError::Engine(
+            "retained GGUF decode does not match the model loaded by BeginBatch".to_owned(),
+        ));
+    }
+    let Some((current_path, current_preference)) = current_runtime else {
+        return Err(RuntimeError::Engine(
+            "retained GGUF decode requires a live runtime loaded by BeginBatch".to_owned(),
+        ));
+    };
+    if current_path != requested_model.path || current_preference != requested_preference {
+        return Err(RuntimeError::Engine(
+            "retained GGUF decode does not match the runtime loaded by BeginBatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_validated_retained_request<T>(
+    validation: Result<(), RuntimeError>,
+    decode: impl FnOnce() -> T,
+) -> Result<T, RuntimeError> {
+    validation?;
+    Ok(decode())
 }
 
 fn verify_embedded_runtime_model(
@@ -686,6 +830,116 @@ fn static_runtime_capabilities() -> RuntimeCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retained_gguf_model(id: &str, path: &str) -> RuntimeModel {
+        RuntimeModel {
+            id: ModelId::new(id),
+            path: PathBuf::from(path),
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn retained_gguf_absent_or_mismatched_model_fails_before_decoder_invocation() {
+        let requested = retained_gguf_model("requested", "requested.gguf");
+        let different = retained_gguf_model("different", "different.gguf");
+        let different_path = PathBuf::from("different-runtime.gguf");
+        let mut different_size = requested.clone();
+        different_size.expected_size_bytes += 1;
+        let mut different_digest = requested.clone();
+        different_digest.expected_sha256 = "1".repeat(64);
+        for validation in [
+            validate_retained_request(None, None, &requested, AccelerationPreference::Cpu),
+            validate_retained_request(
+                Some(&different),
+                Some((&requested.path, AccelerationPreference::Cpu)),
+                &requested,
+                AccelerationPreference::Cpu,
+            ),
+            validate_retained_request(
+                Some(&requested),
+                None,
+                &requested,
+                AccelerationPreference::Cpu,
+            ),
+            validate_retained_request(
+                Some(&requested),
+                Some((&different_path, AccelerationPreference::Cpu)),
+                &requested,
+                AccelerationPreference::Cpu,
+            ),
+            validate_retained_request(
+                Some(&different_size),
+                Some((&requested.path, AccelerationPreference::Cpu)),
+                &requested,
+                AccelerationPreference::Cpu,
+            ),
+            validate_retained_request(
+                Some(&different_digest),
+                Some((&requested.path, AccelerationPreference::Cpu)),
+                &requested,
+                AccelerationPreference::Cpu,
+            ),
+        ] {
+            let decoder_invoked = std::sync::atomic::AtomicBool::new(false);
+            let error = run_validated_retained_request(validation, || {
+                decoder_invoked.store(true, Ordering::Release);
+            })
+            .unwrap_err();
+
+            assert!(matches!(error, RuntimeError::Engine(_)));
+            assert!(!decoder_invoked.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn retained_gguf_preference_mismatch_fails_before_decoder_invocation() {
+        let requested = retained_gguf_model("requested", "requested.gguf");
+        let validation = validate_retained_request(
+            Some(&requested),
+            Some((&requested.path, AccelerationPreference::Cpu)),
+            &requested,
+            AccelerationPreference::Gpu,
+        );
+        let decoder_invoked = std::sync::atomic::AtomicBool::new(false);
+
+        let error = run_validated_retained_request(validation, || {
+            decoder_invoked.store(true, Ordering::Release);
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, RuntimeError::Engine(_)));
+        assert!(!decoder_invoked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn retained_gguf_missing_cold_model_preserves_artifact_integrity_error() {
+        let temporary = std::env::temp_dir();
+        let root = (0..128)
+            .find_map(|suffix| {
+                let root = temporary.join(format!(
+                    "scribe-router-missing-cold-model-{}-{suffix}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&root) {
+                    Ok(()) => Some(root),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                    Err(error) => panic!("could not create missing-model fixture: {error}"),
+                }
+            })
+            .expect("missing-model fixture path space exhausted");
+        let mut model = retained_gguf_model("missing", "unused.gguf");
+        model.path = root.join("missing.gguf");
+        let result =
+            RuntimeRouter::new().load(RuntimeArtifact::Gguf(model), AccelerationPreference::Cpu);
+        std::fs::remove_dir(root).unwrap();
+        assert!(matches!(
+            result,
+            Err(RuntimeError::ArtifactIntegrity { .. })
+        ));
+    }
 
     #[test]
     fn runtime_selection_requires_a_current_gguf_catalog_manifest() {
