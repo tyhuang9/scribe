@@ -169,6 +169,52 @@ struct DiagnosticProbeState {
     process_started: AtomicBool,
     cleanup_confirmed: AtomicBool,
     cleanup_deadline: MonotonicDeadline,
+    worker_exit: Mutex<DiagnosticProbeExit>,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Default)]
+struct DiagnosticProbeExit {
+    process_handle: Option<OwnedHandle>,
+    sampled: bool,
+    code: Option<u32>,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl DiagnosticProbeExit {
+    fn sample_once(&mut self, query: impl FnOnce(Option<OwnedHandle>) -> Option<u32>) {
+        if !self.sampled {
+            // Living, unavailable and failed queries close the window too:
+            // a later result may have been caused by the parent's cleanup.
+            self.sampled = true;
+            self.code = query(self.process_handle.take());
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn signaled_probe_exit_code(
+    wait_status: u32,
+    query_code: impl FnOnce() -> Option<u32>,
+) -> Option<u32> {
+    (wait_status == windows_sys::Win32::Foundation::WAIT_OBJECT_0)
+        .then(query_code)
+        .flatten()
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn query_probe_process_exit(handle: Option<OwnedHandle>) -> Option<u32> {
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    let handle = handle?;
+    // SAFETY: this is an owned duplicate of the actual Child's process handle,
+    // not a PID lookup. Zero timeout neither blocks nor changes the process.
+    let wait_status = unsafe { WaitForSingleObject(handle.as_raw_handle() as _, 0) };
+    signaled_probe_exit_code(wait_status, || {
+        let mut code = 0;
+        // SAFETY: the retained process handle remains valid and code is writable.
+        (unsafe { GetExitCodeProcess(handle.as_raw_handle() as _, &mut code) } != 0).then_some(code)
+    })
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -180,6 +226,7 @@ impl DiagnosticProbeState {
             process_started: AtomicBool::new(false),
             cleanup_confirmed: AtomicBool::new(true),
             cleanup_deadline,
+            worker_exit: Mutex::new(DiagnosticProbeExit::default()),
         })
     }
 
@@ -212,6 +259,30 @@ impl DiagnosticProbeState {
         !self.launch_pending.load(Ordering::Acquire)
             && (!self.process_started.load(Ordering::Acquire)
                 || self.cleanup_confirmed.load(Ordering::Acquire))
+    }
+
+    fn retain_worker_process_handle(&self, child: &Child) {
+        // Observation failure is metadata loss, never a launch/cleanup failure.
+        let handle = duplicate_windows_process_handle(child).ok();
+        if let Ok(mut exit) = self.worker_exit.lock()
+            && !exit.sampled
+            && exit.process_handle.is_none()
+        {
+            exit.process_handle = handle;
+        }
+    }
+
+    fn observe_exit_before_cleanup(&self) {
+        // Keep the lock through the query: another retirement cannot pass its
+        // observation boundary and terminate the child while this query runs.
+        if let Ok(mut exit) = self.worker_exit.lock() {
+            exit.sample_once(query_probe_process_exit);
+        }
+    }
+
+    fn exit_code_before_parent_termination(&self) -> Option<u32> {
+        // Projection must never perform a fresh query after cleanup.
+        self.worker_exit.lock().ok().and_then(|exit| exit.code)
     }
 }
 
@@ -4376,6 +4447,7 @@ impl WorkerLauncher for OsWorkerLauncher {
             // reported as unconfirmed cleanup unless an explicit reaper path
             // proves otherwise.
             diagnostic_probe.process_started();
+            diagnostic_probe.retain_worker_process_handle(&child);
         }
         parent_liveness.child_spawned();
         let process_guard =
@@ -5096,9 +5168,6 @@ impl WorkerProcess for OsWorkerProcess {
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
-        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
         let mut child = self
             .child
             .lock()
@@ -5106,29 +5175,35 @@ impl WorkerProcess for OsWorkerProcess {
         if child.try_wait()?.is_some() {
             bail!("process worker exited before its observation handle was retained");
         }
-        let mut duplicate: HANDLE = std::ptr::null_mut();
-        // SAFETY: both source and target process pseudo-handles refer to this
-        // process, the Child owns a live process handle, and `duplicate` is
-        // writable for the synchronous call. The returned handle is uniquely
-        // transferred into OwnedHandle below.
-        let duplicated = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                child.as_raw_handle() as HANDLE,
-                GetCurrentProcess(),
-                &mut duplicate,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if duplicated == 0 || duplicate.is_null() {
-            return Err(std::io::Error::last_os_error())
-                .context("could not retain the worker process observation handle");
-        }
-        // SAFETY: DuplicateHandle returned a new owned handle on success.
-        Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+        duplicate_windows_process_handle(&child)
     }
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn duplicate_windows_process_handle(child: &Child) -> Result<OwnedHandle> {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut duplicate: HANDLE = std::ptr::null_mut();
+    // SAFETY: Child owns the process handle, including after exit. Both process
+    // pseudo-handles are ours, output is writable, and inheritance is disabled.
+    let duplicated = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            child.as_raw_handle() as HANDLE,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if duplicated == 0 || duplicate.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .context("could not retain the worker process observation handle");
+    }
+    // SAFETY: DuplicateHandle returned one new owned handle on success.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
 }
 
 struct WriterSlot {
@@ -6731,6 +6806,10 @@ impl ProcessWorkerSupervisor {
         force_kill: bool,
         process: Arc<dyn WorkerProcess>,
     ) -> Result<()> {
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
+            diagnostic_probe.observe_exit_before_cleanup();
+        }
         if force_kill && let Err(error) = process.terminate() {
             if let Ok(mut state) = self.inner.state.lock() {
                 state.retiring_generations.remove(&generation);
@@ -7426,6 +7505,7 @@ fn retire_unpublished_diagnostic_worker(
         process,
         ..
     } = worker;
+    diagnostic_probe.observe_exit_before_cleanup();
     drop(stdin);
     drop(stdout);
     process.terminate()?;
@@ -7473,6 +7553,19 @@ fn reap_process(process: Arc<dyn WorkerProcess>, generation: u64) -> Result<()> 
 
 impl Drop for SupervisorInner {
     fn drop(&mut self) {
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(diagnostic_probe) = &self.diagnostic_probe
+            && self
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .current
+                .is_some()
+        {
+            // No published generation can mean an earlier launch/setup path
+            // already killed the child. Never query it retrospectively.
+            diagnostic_probe.observe_exit_before_cleanup();
+        }
         self.writer
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9242,6 +9335,8 @@ pub(crate) struct GpuPackProbeDiagnostic {
     pack_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_exit_code_before_parent_termination: Option<u32>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -9334,6 +9429,7 @@ fn probe_pack_diagnostic(
             .and_then(crate::gpu_worker_pack::manifest::StoreComponent::new)
             .map(|pack_id| pack_id.as_str().to_owned()),
         backend: diagnostic.backend.map(probe_backend_name),
+        worker_exit_code_before_parent_termination: None,
     }
 }
 
@@ -9370,6 +9466,7 @@ fn project_probe_device(
                 issue: GpuPackProbeIssue::DeviceIdentityRejected,
                 pack_id: None,
                 backend: None,
+                worker_exit_code_before_parent_termination: None,
             });
         }
     };
@@ -9382,6 +9479,7 @@ fn project_probe_device(
         issue,
         pack_id: Some(pack.pack_id.clone()),
         backend: Some(backend),
+        worker_exit_code_before_parent_termination: None,
     };
     if !canonical_probe_device_identity(target.device_id.as_str()) {
         return Err(diagnostic(
@@ -9477,6 +9575,7 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
             issue: GpuPackProbeIssue::PackLimitExceeded,
             pack_id: None,
             backend: None,
+            worker_exit_code_before_parent_termination: None,
         });
     }
 
@@ -9490,13 +9589,14 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                 issue: GpuPackProbeIssue::SharedBudgetExhausted,
                 pack_id: Some(pack_id),
                 backend: Some(probe_backend_name(backend)),
+                worker_exit_code_before_parent_termination: None,
             });
             continue;
         }
         let (supervisor, state) =
             InferenceWorkerSupervisor::for_diagnostic_pack_probe(lease, cleanup_deadline);
         let observed = supervisor.verified_pack_bindings_before(provider_deadline);
-        match observed {
+        let failed_diagnostic_index = match observed {
             Ok(bindings) => {
                 for binding in bindings {
                     match project_probe_device(binding) {
@@ -9504,6 +9604,7 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                         Err(diagnostic) => diagnostics.push(diagnostic),
                     }
                 }
+                None
             }
             Err(_) => {
                 let (stage, issue) = if provider_deadline.remaining().is_err() {
@@ -9520,9 +9621,11 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                     issue,
                     pack_id: Some(pack_id.clone()),
                     backend: Some(probe_backend_name(backend)),
+                    worker_exit_code_before_parent_termination: None,
                 });
+                Some(diagnostics.len() - 1)
             }
-        }
+        };
         if supervisor.retire().is_err() || !state.is_cleanup_confirmed() {
             cleanup_confirmed = false;
             diagnostics.push(GpuPackProbeDiagnostic {
@@ -9530,7 +9633,12 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                 issue: GpuPackProbeIssue::CleanupUnconfirmed,
                 pack_id: Some(pack_id),
                 backend: Some(probe_backend_name(backend)),
+                worker_exit_code_before_parent_termination: None,
             });
+        }
+        if let Some(index) = failed_diagnostic_index {
+            diagnostics[index].worker_exit_code_before_parent_termination =
+                state.exit_code_before_parent_termination();
         }
         probe_states.push(state);
     }
@@ -13716,10 +13824,44 @@ mod tests {
         worker: Mutex<Option<JoinHandle<()>>>,
         kill_started: Option<TestSender<()>>,
         reaped: Option<TestSender<()>>,
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        cleanup_probe: Option<Arc<DiagnosticProbeState>>,
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     struct DiagnosticCleanupFailureProcess;
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    struct DiagnosticCleanupPipe {
+        state: Arc<DiagnosticProbeState>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl Read for DiagnosticCleanupPipe {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl Write for DiagnosticCleanupPipe {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl Drop for DiagnosticCleanupPipe {
+        fn drop(&mut self) {
+            assert!(self.state.worker_exit.lock().unwrap().sampled);
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     impl WorkerProcess for DiagnosticCleanupFailureProcess {
@@ -13742,6 +13884,13 @@ mod tests {
         }
 
         fn terminate(&self) -> Result<()> {
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            if let Some(probe) = &self.cleanup_probe {
+                assert!(
+                    probe.worker_exit.lock().unwrap().sampled,
+                    "diagnostic observation must precede termination"
+                );
+            }
             if let Some(kill_started) = &self.kill_started {
                 let _ = kill_started.send(());
             }
@@ -14004,6 +14153,8 @@ mod tests {
         session_app_build: Option<String>,
         kill_started: Option<TestSender<()>>,
         reaped: Option<TestSender<()>>,
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        cleanup_probe: Option<Arc<DiagnosticProbeState>>,
     }
 
     impl TestLauncher {
@@ -14017,6 +14168,8 @@ mod tests {
                 session_app_build: None,
                 kill_started: None,
                 reaped: None,
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                cleanup_probe: None,
             }
         }
 
@@ -14027,6 +14180,12 @@ mod tests {
         ) -> Self {
             self.kill_started = Some(kill_started);
             self.reaped = Some(reaped);
+            self
+        }
+
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        fn with_cleanup_probe(mut self, probe: Arc<DiagnosticProbeState>) -> Self {
+            self.cleanup_probe = Some(probe);
             self
         }
 
@@ -14082,6 +14241,8 @@ mod tests {
                 worker: Mutex::new(None),
                 kill_started: self.kill_started.clone(),
                 reaped: self.reaped.clone(),
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                cleanup_probe: self.cleanup_probe.clone(),
             });
             let worker_process = Arc::clone(&process);
             let worker_output_for_exit = worker_output.clone();
@@ -16606,6 +16767,251 @@ mod tests {
                 "rejected pack id escaped projection"
             );
         }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_exit_requires_a_signaled_process_and_preserves_all_status_bits() {
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        for code in [0, 1, 259, 0xc000_0106, u32::MAX] {
+            assert_eq!(
+                signaled_probe_exit_code(WAIT_OBJECT_0, || Some(code)),
+                Some(code)
+            );
+        }
+        for wait_status in [WAIT_TIMEOUT, WAIT_FAILED] {
+            assert_eq!(
+                signaled_probe_exit_code(wait_status, || panic!("nonterminal process queried")),
+                None
+            );
+        }
+        assert_eq!(signaled_probe_exit_code(WAIT_OBJECT_0, || None), None);
+        assert_eq!(query_probe_process_exit(None), None);
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_exit_queries_the_retained_real_child_handle() {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        // This is a bounded OS-helper fixture, not an inference-worker launch.
+        // /d disables AutoRun; only fixed numeric exit commands are supplied.
+        let directory = windows_worker_current_directory().unwrap();
+        for code in [0_u32, 259, 0xc000_0106] {
+            let mut command = Command::new(directory.join("cmd.exe"));
+            command
+                .args(["/d", "/c", &format!("exit /b {}", code as i32)])
+                .current_dir(&directory)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_worker_environment(&mut command);
+            configure_hidden_worker_command(&mut command);
+            let mut child = command.spawn().unwrap();
+            let handle = match duplicate_windows_process_handle(&child) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fixed exit helper handle could not be retained: {error}");
+                }
+            };
+            // SAFETY: the retained duplicate remains owned through this bounded wait.
+            let wait_status = unsafe { WaitForSingleObject(handle.as_raw_handle() as _, 2_000) };
+            if wait_status != WAIT_OBJECT_0 {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixed exit helper did not terminate within the bound");
+            }
+            assert_eq!(
+                child.wait().unwrap().code().map(|value| value as u32),
+                Some(code)
+            );
+            assert_eq!(query_probe_process_exit(Some(handle)), Some(code));
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_exit_is_one_shot_even_when_initial_status_is_unavailable() {
+        for initial in [None, Some(0), Some(259), Some(0xc000_0106)] {
+            let mut exit = DiagnosticProbeExit::default();
+            exit.sample_once(|_| initial);
+            exit.sample_once(|_| panic!("post-cleanup status must never be queried"));
+            assert!(exit.sampled);
+            assert_eq!(exit.code, initial);
+            assert!(exit.process_handle.is_none());
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_concurrent_retirement_queries_exit_only_once() {
+        let exit = Arc::new(Mutex::new(DiagnosticProbeExit::default()));
+        let queries = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let exit = Arc::clone(&exit);
+                let queries = Arc::clone(&queries);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    exit.lock().unwrap().sample_once(|_| {
+                        queries.fetch_add(1, Ordering::AcqRel);
+                        None
+                    });
+                });
+            }
+            barrier.wait();
+        });
+        assert_eq!(queries.load(Ordering::Acquire), 1);
+        assert_eq!(exit.lock().unwrap().code, None);
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_observes_exit_before_each_retirement_path() {
+        for retirement in ["published", "unpublished", "drop"] {
+            let state = DiagnosticProbeState::new(
+                MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+            );
+            state.process_started();
+            let launcher = Arc::new(
+                TestLauncher::new([TestMode::Normal]).with_cleanup_probe(Arc::clone(&state)),
+            );
+            if retirement == "unpublished" {
+                retire_unpublished_diagnostic_worker(launcher.launch().unwrap(), &state).unwrap();
+            } else {
+                let transport = ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+                    launcher.clone(),
+                    Arc::clone(&state),
+                );
+                transport.ensure_generation().unwrap();
+                if retirement == "published" {
+                    transport.terminate_current().unwrap();
+                }
+                drop(transport);
+            }
+            assert!(state.worker_exit.lock().unwrap().sampled, "{retirement}");
+            assert!(state.is_cleanup_confirmed(), "{retirement}");
+            assert_eq!(state.exit_code_before_parent_termination(), None);
+            assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_observes_exit_before_unpublished_pipe_teardown() {
+        let state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+        );
+        state.process_started();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pipe = || DiagnosticCleanupPipe {
+            state: Arc::clone(&state),
+            drops: Arc::clone(&drops),
+        };
+        let worker = SpawnedWorker {
+            stdin: Box::new(pipe()),
+            stdout: Box::new(pipe()),
+            process: Arc::new(DiagnosticCleanupFailureProcess),
+            expectation: expected_worker(WorkerRole::Inference),
+            frozen_worker_approval: None,
+            pack_launch: None,
+        };
+        assert!(retire_unpublished_diagnostic_worker(worker, &state).is_err());
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+        assert!(!state.is_cleanup_confirmed());
+        assert_eq!(state.exit_code_before_parent_termination(), None);
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_retirement_preserves_an_already_observed_exit() {
+        let state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+        );
+        state.process_started();
+        let launcher =
+            Arc::new(TestLauncher::new([TestMode::Normal]).with_cleanup_probe(Arc::clone(&state)));
+        let transport =
+            ProcessWorkerSupervisor::unstarted_diagnostic_probe(launcher, Arc::clone(&state));
+        transport.ensure_generation().unwrap();
+        state
+            .worker_exit
+            .lock()
+            .unwrap()
+            .sample_once(|_| Some(0xc000_0106));
+        transport.terminate_current().unwrap();
+        drop(transport);
+        assert!(state.is_cleanup_confirmed());
+        assert_eq!(
+            state.exit_code_before_parent_termination(),
+            Some(0xc000_0106)
+        );
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_unpublished_setup_failure_is_never_sampled_retrospectively() {
+        let state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+        );
+        // Model an early setup failure after process creation but before the
+        // generation was published. Its local cleanup may already have killed it.
+        state.process_started();
+        let transport = ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+            Arc::new(TestLauncher::new([])),
+            Arc::clone(&state),
+        );
+        drop(transport);
+        assert!(!state.worker_exit.lock().unwrap().sampled);
+        assert_eq!(state.exit_code_before_parent_termination(), None);
+        assert!(!state.is_cleanup_confirmed());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_exit_projection_is_optional_numeric_and_passive() {
+        let state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+        );
+        let mut diagnostic = GpuPackProbeDiagnostic {
+            stage: GpuPackProbeStage::HelloAuthentication,
+            issue: GpuPackProbeIssue::ProviderProbeRejected,
+            pack_id: Some("scribe-vulkan-windows-x64".to_owned()),
+            backend: Some("vulkan"),
+            worker_exit_code_before_parent_termination: state.exit_code_before_parent_termination(),
+        };
+        let missing = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(missing.as_object().unwrap().len(), 4);
+        assert!(
+            missing
+                .get("worker_exit_code_before_parent_termination")
+                .is_none()
+        );
+        assert!(!state.worker_exit.lock().unwrap().sampled);
+        state
+            .worker_exit
+            .lock()
+            .unwrap()
+            .sample_once(|_| Some(0xc000_0106));
+        diagnostic.worker_exit_code_before_parent_termination =
+            state.exit_code_before_parent_termination();
+        let present = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(present.as_object().unwrap().len(), 5);
+        assert_eq!(
+            present["worker_exit_code_before_parent_termination"].as_u64(),
+            Some(0xc000_0106)
+        );
+        assert_eq!(present["stage"], "hello_authentication");
+        assert!(
+            state.is_cleanup_confirmed(),
+            "exit observation must not change cleanup state"
+        );
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
