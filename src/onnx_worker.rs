@@ -173,44 +173,69 @@ struct DiagnosticProbeState {
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(tag = "worker_exit_observation", rename_all = "snake_case")]
+enum ProbeExitObservation {
+    #[default]
+    NotSampled,
+    HandleUnavailable,
+    NotSignaled,
+    WaitFailed,
+    ExitQueryFailed,
+    ObservationUnavailable,
+    Exited {
+        #[serde(rename = "worker_exit_code_before_parent_termination")]
+        code: u32,
+    },
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 #[derive(Default)]
 struct DiagnosticProbeExit {
     process_handle: Option<OwnedHandle>,
     sampled: bool,
-    code: Option<u32>,
+    observation: ProbeExitObservation,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 impl DiagnosticProbeExit {
-    fn sample_once(&mut self, query: impl FnOnce(Option<OwnedHandle>) -> Option<u32>) {
+    fn sample_once(&mut self, query: impl FnOnce(Option<OwnedHandle>) -> ProbeExitObservation) {
         if !self.sampled {
             // Living, unavailable and failed queries close the window too:
             // a later result may have been caused by the parent's cleanup.
             self.sampled = true;
-            self.code = query(self.process_handle.take());
+            self.observation = query(self.process_handle.take());
         }
     }
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-fn signaled_probe_exit_code(
+fn probe_exit_observation_for_wait(
     wait_status: u32,
     query_code: impl FnOnce() -> Option<u32>,
-) -> Option<u32> {
-    (wait_status == windows_sys::Win32::Foundation::WAIT_OBJECT_0)
-        .then(query_code)
-        .flatten()
+) -> ProbeExitObservation {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+    match wait_status {
+        WAIT_OBJECT_0 => query_code().map_or(ProbeExitObservation::ExitQueryFailed, |code| {
+            ProbeExitObservation::Exited { code }
+        }),
+        WAIT_TIMEOUT => ProbeExitObservation::NotSignaled,
+        _ => ProbeExitObservation::WaitFailed,
+    }
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-fn query_probe_process_exit(handle: Option<OwnedHandle>) -> Option<u32> {
+fn query_probe_process_exit(handle: Option<OwnedHandle>) -> ProbeExitObservation {
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 
-    let handle = handle?;
+    let Some(handle) = handle else {
+        return ProbeExitObservation::HandleUnavailable;
+    };
     // SAFETY: this is an owned duplicate of the actual Child's process handle,
     // not a PID lookup. Zero timeout neither blocks nor changes the process.
     let wait_status = unsafe { WaitForSingleObject(handle.as_raw_handle() as _, 0) };
-    signaled_probe_exit_code(wait_status, || {
+    probe_exit_observation_for_wait(wait_status, || {
         let mut code = 0;
         // SAFETY: the retained process handle remains valid and code is writable.
         (unsafe { GetExitCodeProcess(handle.as_raw_handle() as _, &mut code) } != 0).then_some(code)
@@ -280,9 +305,13 @@ impl DiagnosticProbeState {
         }
     }
 
-    fn exit_code_before_parent_termination(&self) -> Option<u32> {
+    fn exit_observation_before_parent_termination(&self) -> ProbeExitObservation {
         // Projection must never perform a fresh query after cleanup.
-        self.worker_exit.lock().ok().and_then(|exit| exit.code)
+        self.worker_exit
+            .lock()
+            .map_or(ProbeExitObservation::ObservationUnavailable, |exit| {
+                exit.observation
+            })
     }
 }
 
@@ -9335,8 +9364,8 @@ pub(crate) struct GpuPackProbeDiagnostic {
     pack_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_exit_code_before_parent_termination: Option<u32>,
+    #[serde(flatten)]
+    worker_exit_observation: Option<ProbeExitObservation>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -9429,7 +9458,7 @@ fn probe_pack_diagnostic(
             .and_then(crate::gpu_worker_pack::manifest::StoreComponent::new)
             .map(|pack_id| pack_id.as_str().to_owned()),
         backend: diagnostic.backend.map(probe_backend_name),
-        worker_exit_code_before_parent_termination: None,
+        worker_exit_observation: None,
     }
 }
 
@@ -9466,7 +9495,7 @@ fn project_probe_device(
                 issue: GpuPackProbeIssue::DeviceIdentityRejected,
                 pack_id: None,
                 backend: None,
-                worker_exit_code_before_parent_termination: None,
+                worker_exit_observation: None,
             });
         }
     };
@@ -9479,7 +9508,7 @@ fn project_probe_device(
         issue,
         pack_id: Some(pack.pack_id.clone()),
         backend: Some(backend),
-        worker_exit_code_before_parent_termination: None,
+        worker_exit_observation: None,
     };
     if !canonical_probe_device_identity(target.device_id.as_str()) {
         return Err(diagnostic(
@@ -9575,7 +9604,7 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
             issue: GpuPackProbeIssue::PackLimitExceeded,
             pack_id: None,
             backend: None,
-            worker_exit_code_before_parent_termination: None,
+            worker_exit_observation: None,
         });
     }
 
@@ -9589,7 +9618,7 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                 issue: GpuPackProbeIssue::SharedBudgetExhausted,
                 pack_id: Some(pack_id),
                 backend: Some(probe_backend_name(backend)),
-                worker_exit_code_before_parent_termination: None,
+                worker_exit_observation: None,
             });
             continue;
         }
@@ -9621,7 +9650,7 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                     issue,
                     pack_id: Some(pack_id.clone()),
                     backend: Some(probe_backend_name(backend)),
-                    worker_exit_code_before_parent_termination: None,
+                    worker_exit_observation: None,
                 });
                 Some(diagnostics.len() - 1)
             }
@@ -9633,12 +9662,12 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
                 issue: GpuPackProbeIssue::CleanupUnconfirmed,
                 pack_id: Some(pack_id),
                 backend: Some(probe_backend_name(backend)),
-                worker_exit_code_before_parent_termination: None,
+                worker_exit_observation: None,
             });
         }
         if let Some(index) = failed_diagnostic_index {
-            diagnostics[index].worker_exit_code_before_parent_termination =
-                state.exit_code_before_parent_termination();
+            diagnostics[index].worker_exit_observation =
+                Some(state.exit_observation_before_parent_termination());
         }
         probe_states.push(state);
     }
@@ -16776,18 +16805,28 @@ mod tests {
 
         for code in [0, 1, 259, 0xc000_0106, u32::MAX] {
             assert_eq!(
-                signaled_probe_exit_code(WAIT_OBJECT_0, || Some(code)),
-                Some(code)
+                probe_exit_observation_for_wait(WAIT_OBJECT_0, || Some(code)),
+                ProbeExitObservation::Exited { code }
             );
         }
-        for wait_status in [WAIT_TIMEOUT, WAIT_FAILED] {
+        assert_eq!(
+            probe_exit_observation_for_wait(WAIT_TIMEOUT, || panic!("running process queried")),
+            ProbeExitObservation::NotSignaled
+        );
+        for wait_status in [WAIT_FAILED, 0x80, u32::MAX - 1] {
             assert_eq!(
-                signaled_probe_exit_code(wait_status, || panic!("nonterminal process queried")),
-                None
+                probe_exit_observation_for_wait(wait_status, || panic!("failed wait queried")),
+                ProbeExitObservation::WaitFailed
             );
         }
-        assert_eq!(signaled_probe_exit_code(WAIT_OBJECT_0, || None), None);
-        assert_eq!(query_probe_process_exit(None), None);
+        assert_eq!(
+            probe_exit_observation_for_wait(WAIT_OBJECT_0, || None),
+            ProbeExitObservation::ExitQueryFailed
+        );
+        assert_eq!(
+            query_probe_process_exit(None),
+            ProbeExitObservation::HandleUnavailable
+        );
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -16829,21 +16868,52 @@ mod tests {
                 child.wait().unwrap().code().map(|value| value as u32),
                 Some(code)
             );
-            assert_eq!(query_probe_process_exit(Some(handle)), Some(code));
+            assert_eq!(
+                query_probe_process_exit(Some(handle)),
+                ProbeExitObservation::Exited { code }
+            );
         }
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
     fn gpu_pack_probe_exit_is_one_shot_even_when_initial_status_is_unavailable() {
-        for initial in [None, Some(0), Some(259), Some(0xc000_0106)] {
+        for initial in [
+            ProbeExitObservation::HandleUnavailable,
+            ProbeExitObservation::NotSignaled,
+            ProbeExitObservation::WaitFailed,
+            ProbeExitObservation::ExitQueryFailed,
+            ProbeExitObservation::Exited { code: 0 },
+            ProbeExitObservation::Exited { code: 259 },
+            ProbeExitObservation::Exited { code: 0xc000_0106 },
+            ProbeExitObservation::Exited { code: u32::MAX },
+        ] {
             let mut exit = DiagnosticProbeExit::default();
+            assert_eq!(exit.observation, ProbeExitObservation::NotSampled);
             exit.sample_once(|_| initial);
             exit.sample_once(|_| panic!("post-cleanup status must never be queried"));
             assert!(exit.sampled);
-            assert_eq!(exit.code, initial);
+            assert_eq!(exit.observation, initial);
             assert!(exit.process_handle.is_none());
         }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_exit_does_not_refresh_when_eof_precedes_process_signaling() {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        let mut exit = DiagnosticProbeExit::default();
+        // Reader EOF may precede process signaling. Model that ordering without
+        // sleeps, another native process, or moving the sampling boundary.
+        exit.sample_once(|_| {
+            probe_exit_observation_for_wait(WAIT_TIMEOUT, || panic!("process was not signaled"))
+        });
+        exit.sample_once(|_| {
+            let _ = probe_exit_observation_for_wait(WAIT_OBJECT_0, || Some(0xc000_0106));
+            panic!("later signaling must not refresh the pre-cleanup observation")
+        });
+        assert_eq!(exit.observation, ProbeExitObservation::NotSignaled);
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -16861,14 +16931,17 @@ mod tests {
                     barrier.wait();
                     exit.lock().unwrap().sample_once(|_| {
                         queries.fetch_add(1, Ordering::AcqRel);
-                        None
+                        ProbeExitObservation::NotSignaled
                     });
                 });
             }
             barrier.wait();
         });
         assert_eq!(queries.load(Ordering::Acquire), 1);
-        assert_eq!(exit.lock().unwrap().code, None);
+        assert_eq!(
+            exit.lock().unwrap().observation,
+            ProbeExitObservation::NotSignaled
+        );
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -16897,7 +16970,10 @@ mod tests {
             }
             assert!(state.worker_exit.lock().unwrap().sampled, "{retirement}");
             assert!(state.is_cleanup_confirmed(), "{retirement}");
-            assert_eq!(state.exit_code_before_parent_termination(), None);
+            assert_eq!(
+                state.exit_observation_before_parent_termination(),
+                ProbeExitObservation::HandleUnavailable
+            );
             assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
         }
     }
@@ -16925,7 +17001,10 @@ mod tests {
         assert!(retire_unpublished_diagnostic_worker(worker, &state).is_err());
         assert_eq!(drops.load(Ordering::Acquire), 2);
         assert!(!state.is_cleanup_confirmed());
-        assert_eq!(state.exit_code_before_parent_termination(), None);
+        assert_eq!(
+            state.exit_observation_before_parent_termination(),
+            ProbeExitObservation::HandleUnavailable
+        );
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -16944,13 +17023,13 @@ mod tests {
             .worker_exit
             .lock()
             .unwrap()
-            .sample_once(|_| Some(0xc000_0106));
+            .sample_once(|_| ProbeExitObservation::Exited { code: 0xc000_0106 });
         transport.terminate_current().unwrap();
         drop(transport);
         assert!(state.is_cleanup_confirmed());
         assert_eq!(
-            state.exit_code_before_parent_termination(),
-            Some(0xc000_0106)
+            state.exit_observation_before_parent_termination(),
+            ProbeExitObservation::Exited { code: 0xc000_0106 }
         );
     }
 
@@ -16969,13 +17048,16 @@ mod tests {
         );
         drop(transport);
         assert!(!state.worker_exit.lock().unwrap().sampled);
-        assert_eq!(state.exit_code_before_parent_termination(), None);
+        assert_eq!(
+            state.exit_observation_before_parent_termination(),
+            ProbeExitObservation::NotSampled
+        );
         assert!(!state.is_cleanup_confirmed());
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
-    fn gpu_pack_probe_exit_projection_is_optional_numeric_and_passive() {
+    fn gpu_pack_probe_exit_projection_is_typed_consistent_and_passive() {
         let state = DiagnosticProbeState::new(
             MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
         );
@@ -16984,7 +17066,7 @@ mod tests {
             issue: GpuPackProbeIssue::ProviderProbeRejected,
             pack_id: Some("scribe-vulkan-windows-x64".to_owned()),
             backend: Some("vulkan"),
-            worker_exit_code_before_parent_termination: state.exit_code_before_parent_termination(),
+            worker_exit_observation: None,
         };
         let missing = serde_json::to_value(&diagnostic).unwrap();
         assert_eq!(missing.as_object().unwrap().len(), 4);
@@ -16993,25 +17075,88 @@ mod tests {
                 .get("worker_exit_code_before_parent_termination")
                 .is_none()
         );
-        assert!(!state.worker_exit.lock().unwrap().sampled);
-        state
-            .worker_exit
-            .lock()
-            .unwrap()
-            .sample_once(|_| Some(0xc000_0106));
-        diagnostic.worker_exit_code_before_parent_termination =
-            state.exit_code_before_parent_termination();
-        let present = serde_json::to_value(&diagnostic).unwrap();
-        assert_eq!(present.as_object().unwrap().len(), 5);
-        assert_eq!(
-            present["worker_exit_code_before_parent_termination"].as_u64(),
-            Some(0xc000_0106)
+        assert!(missing.get("worker_exit_observation").is_none());
+        diagnostic.worker_exit_observation =
+            Some(state.exit_observation_before_parent_termination());
+        let unsampled = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(unsampled.as_object().unwrap().len(), 5);
+        assert_eq!(unsampled["worker_exit_observation"], "not_sampled");
+        assert!(
+            unsampled
+                .get("worker_exit_code_before_parent_termination")
+                .is_none()
         );
-        assert_eq!(present["stage"], "hello_authentication");
+        assert!(!state.worker_exit.lock().unwrap().sampled);
+        for (observation, expected_name) in [
+            (
+                ProbeExitObservation::HandleUnavailable,
+                "handle_unavailable",
+            ),
+            (ProbeExitObservation::NotSignaled, "not_signaled"),
+            (ProbeExitObservation::WaitFailed, "wait_failed"),
+            (ProbeExitObservation::ExitQueryFailed, "exit_query_failed"),
+            (
+                ProbeExitObservation::ObservationUnavailable,
+                "observation_unavailable",
+            ),
+        ] {
+            diagnostic.worker_exit_observation = Some(observation);
+            let value = serde_json::to_value(&diagnostic).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 5);
+            assert_eq!(value["worker_exit_observation"], expected_name);
+            assert!(
+                value
+                    .get("worker_exit_code_before_parent_termination")
+                    .is_none()
+            );
+        }
+        for code in [0, 259, 0xc000_0106, u32::MAX] {
+            let state = DiagnosticProbeState::new(
+                MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+            );
+            state
+                .worker_exit
+                .lock()
+                .unwrap()
+                .sample_once(|_| ProbeExitObservation::Exited { code });
+            diagnostic.worker_exit_observation =
+                Some(state.exit_observation_before_parent_termination());
+            let present = serde_json::to_value(&diagnostic).unwrap();
+            assert_eq!(present.as_object().unwrap().len(), 6);
+            assert_eq!(present["worker_exit_observation"], "exited");
+            assert_eq!(
+                present["worker_exit_code_before_parent_termination"].as_u64(),
+                Some(u64::from(code))
+            );
+            assert_eq!(present["stage"], "hello_authentication");
+        }
         assert!(
             state.is_cleanup_confirmed(),
             "exit observation must not change cleanup state"
         );
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_poisoned_exit_projection_is_unavailable_without_recovery() {
+        let state = DiagnosticProbeState::new(
+            MonotonicDeadline::after_for(Duration::from_secs(2), "fixture cleanup").unwrap(),
+        );
+        let poison = std::panic::catch_unwind(|| {
+            let _guard = state.worker_exit.lock().unwrap();
+            panic!("fixture observation lock poison");
+        });
+        assert!(poison.is_err());
+        state.observe_exit_before_cleanup();
+        assert_eq!(
+            state.exit_observation_before_parent_termination(),
+            ProbeExitObservation::ObservationUnavailable
+        );
+        assert!(state.worker_exit.is_poisoned());
+        let exit = state.worker_exit.lock().err().unwrap().into_inner();
+        assert!(!exit.sampled);
+        assert_eq!(exit.observation, ProbeExitObservation::NotSampled);
+        assert!(state.is_cleanup_confirmed());
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
