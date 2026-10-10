@@ -170,6 +170,8 @@ struct DiagnosticProbeState {
     cleanup_confirmed: AtomicBool,
     cleanup_deadline: MonotonicDeadline,
     worker_exit: Mutex<DiagnosticProbeExit>,
+    #[cfg(test)]
+    retirement_waiter_registered: Mutex<Option<SyncSender<()>>>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -252,6 +254,8 @@ impl DiagnosticProbeState {
             cleanup_confirmed: AtomicBool::new(true),
             cleanup_deadline,
             worker_exit: Mutex::new(DiagnosticProbeExit::default()),
+            #[cfg(test)]
+            retirement_waiter_registered: Mutex::new(None),
         })
     }
 
@@ -5827,6 +5831,36 @@ impl ProcessWorkerSupervisor {
                 true,
             )?;
         }
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(probe) = &self.inner.diagnostic_probe {
+            self.await_diagnostic_retirement_settlement(probe)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn await_diagnostic_retirement_settlement(&self, probe: &DiagnosticProbeState) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        while !state.retiring_generations.is_empty() {
+            let remaining = probe.cleanup_deadline.remaining()?;
+            #[cfg(test)]
+            if let Some(registered) = probe.retirement_waiter_registered.lock().unwrap().take() {
+                let _ = registered.try_send(());
+            }
+            let (next_state, _) = self
+                .inner
+                .retirement_changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            state = next_state;
+        }
+        if !probe.is_cleanup_confirmed() {
+            bail!("diagnostic process worker cleanup was not confirmed");
+        }
         Ok(())
     }
 
@@ -6811,16 +6845,22 @@ impl ProcessWorkerSupervisor {
                 if state.retiring_generations.insert(generation) {
                     break process;
                 }
+                let wait_budget = self.inner.deadlines.cancel;
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                let wait_budget = match &self.inner.diagnostic_probe {
+                    Some(probe) => probe.cleanup_deadline.remaining()?,
+                    None => wait_budget,
+                };
                 let (next_state, timeout) = self
                     .inner
                     .retirement_changed
-                    .wait_timeout(state, self.inner.deadlines.cancel)
+                    .wait_timeout(state, wait_budget)
                     .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
                 state = next_state;
                 if timeout.timed_out() && state.retiring_generations.contains(&generation) {
                     bail!(
                         "process worker generation {generation} termination did not complete within {} ms",
-                        self.inner.deadlines.cancel.as_millis()
+                        wait_budget.as_millis()
                     );
                 }
             }
@@ -6868,6 +6908,14 @@ impl ProcessWorkerSupervisor {
             state.active_request = None;
             state.active_stream = None;
             state.active_model = None;
+            // A diagnostic reader may release a failed request before its
+            // bounded process wait finishes. Retain ownership until settlement
+            // so a concurrent explicit retire cannot report cleanup early.
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            if self.inner.diagnostic_probe.is_none() {
+                state.retiring_generations.remove(&generation);
+            }
+            #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
             state.retiring_generations.remove(&generation);
         }
         self.inner.retirement_changed.notify_all();
@@ -6889,8 +6937,18 @@ impl ProcessWorkerSupervisor {
         }
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
-            process.wait_before(diagnostic_probe.cleanup_deadline)?;
-            diagnostic_probe.cleanup_confirmed();
+            let cleanup = process.wait_before(diagnostic_probe.cleanup_deadline);
+            if cleanup.is_ok() {
+                diagnostic_probe.cleanup_confirmed();
+            }
+            self.inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+                .retiring_generations
+                .remove(&generation);
+            self.inner.retirement_changed.notify_all();
+            cleanup?;
         } else {
             reap_process(process, generation)?;
         }
@@ -13861,6 +13919,124 @@ mod tests {
     struct DiagnosticCleanupFailureProcess;
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    struct GatedDiagnosticProcess {
+        entered: SyncSender<MonotonicDeadline>,
+        release: Mutex<Receiver<bool>>,
+        waits: AtomicUsize,
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl WorkerProcess for GatedDiagnosticProcess {
+        fn is_running(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn terminate(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait(&self) -> Result<()> {
+            panic!("diagnostic retirement must use the absolute cleanup deadline")
+        }
+
+        fn wait_before(&self, deadline: MonotonicDeadline) -> Result<()> {
+            self.waits.fetch_add(1, Ordering::AcqRel);
+            self.entered.send(deadline).unwrap();
+            // A watchdog only: the release channel controls the interleaving.
+            if self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))?
+            {
+                Ok(())
+            } else {
+                bail!("fixture cleanup could not settle")
+            }
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    struct GatedDiagnosticRetirement {
+        transport: ProcessWorkerSupervisor,
+        state: Arc<DiagnosticProbeState>,
+        process: Arc<GatedDiagnosticProcess>,
+        entered: Receiver<MonotonicDeadline>,
+        release: SyncSender<bool>,
+        pending: Receiver<PendingResult>,
+        launcher: Arc<TestLauncher>,
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl GatedDiagnosticRetirement {
+        fn new(deadline: MonotonicDeadline) -> Self {
+            let state = DiagnosticProbeState::new(deadline);
+            state.process_started();
+            let launcher = Arc::new(TestLauncher::new([]));
+            let transport = ProcessWorkerSupervisor::unstarted_diagnostic_probe(
+                launcher.clone(),
+                Arc::clone(&state),
+            );
+            let (entered_tx, entered) = sync_channel(1);
+            let (release, release_rx) = sync_channel(1);
+            let process = Arc::new(GatedDiagnosticProcess {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                waits: AtomicUsize::new(0),
+            });
+            transport.inner.state.lock().unwrap().current = Some(CurrentGeneration {
+                generation: 1,
+                process: process.clone(),
+                expectation: expected_worker(WorkerRole::Inference),
+                frozen_worker_approval: None,
+                pack_launch: None,
+                pack_bindings: Vec::new(),
+                validated_handshake: None,
+            });
+            let (pending_tx, pending) = sync_channel(1);
+            transport.inner.pending.lock().unwrap().insert(
+                Correlation {
+                    generation: 1,
+                    session_id: 2,
+                    request_id: 3,
+                },
+                pending_tx,
+            );
+            Self {
+                transport,
+                state,
+                process,
+                entered,
+                release,
+                pending,
+                launcher,
+            }
+        }
+
+        fn assert_cleanup_is_held(&self) {
+            let received = self.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(received.expires_at, self.state.cleanup_deadline.expires_at);
+            assert_eq!(self.transport.current_generation().unwrap(), None);
+            match self.pending.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Err(reason) => assert_eq!(reason, "fixture EOF"),
+                Ok(_) => panic!("fixture failure must precede cleanup settlement"),
+            }
+            assert!(!self.state.is_cleanup_confirmed());
+            assert!(self.state.worker_exit.lock().unwrap().sampled);
+            assert_eq!(self.process.waits.load(Ordering::Acquire), 1);
+            assert_eq!(self.launcher.launches.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    impl Drop for GatedDiagnosticRetirement {
+        fn drop(&mut self) {
+            // Release on assertion failure before the scoped threads are joined.
+            let _ = self.release.try_send(false);
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     struct DiagnosticCleanupPipe {
         state: Arc<DiagnosticProbeState>,
         drops: Arc<AtomicUsize>,
@@ -17157,6 +17333,82 @@ mod tests {
         assert!(!exit.sampled);
         assert_eq!(exit.observation, ProbeExitObservation::NotSampled);
         assert!(state.is_cleanup_confirmed());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_retirement_does_not_overtake_expired_inflight_cleanup() {
+        std::thread::scope(|scope| {
+            let fixture = GatedDiagnosticRetirement::new(MonotonicDeadline {
+                expires_at: Instant::now(),
+                budget: Duration::from_secs(1),
+                label: "fixture expired cleanup",
+            });
+            let retiring = fixture.transport.clone();
+            let reader =
+                scope.spawn(move || retiring.invalidate_generation(1, "fixture EOF", false));
+            fixture.assert_cleanup_is_held();
+            let result = fixture.transport.terminate_current();
+            fixture.release.send(false).unwrap();
+            assert!(reader.join().unwrap().is_err());
+            assert!(
+                result.is_err(),
+                "retire must not return success before settlement"
+            );
+            assert!(!fixture.state.is_cleanup_confirmed());
+            assert_eq!(fixture.process.waits.load(Ordering::Acquire), 1);
+            assert_eq!(fixture.launcher.launches.load(Ordering::Acquire), 0);
+        });
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn gpu_pack_probe_retirement_joins_inflight_cleanup_success_and_failure() {
+        for success in [true, false] {
+            std::thread::scope(|scope| {
+                let fixture = GatedDiagnosticRetirement::new(
+                    MonotonicDeadline::after_for(Duration::from_secs(5), "fixture cleanup")
+                        .unwrap(),
+                );
+                let retiring = fixture.transport.clone();
+                let reader =
+                    scope.spawn(move || retiring.invalidate_generation(1, "fixture EOF", false));
+                fixture.assert_cleanup_is_held();
+                assert!(
+                    fixture
+                        .transport
+                        .inner
+                        .state
+                        .lock()
+                        .unwrap()
+                        .retiring_generations
+                        .contains(&1)
+                );
+                let (registered_tx, registered_rx) = sync_channel(1);
+                *fixture.state.retirement_waiter_registered.lock().unwrap() = Some(registered_tx);
+                let joining = fixture.transport.clone();
+                let joined = scope.spawn(move || joining.terminate_current());
+                // Registration occurs with the state lock held immediately
+                // before the condvar wait. No scheduler-negative assertion.
+                registered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                fixture.release.send(success).unwrap();
+                assert_eq!(reader.join().unwrap().is_ok(), success);
+                assert_eq!(joined.join().unwrap().is_ok(), success);
+                assert_eq!(fixture.state.is_cleanup_confirmed(), success);
+                assert!(
+                    fixture
+                        .transport
+                        .inner
+                        .state
+                        .lock()
+                        .unwrap()
+                        .retiring_generations
+                        .is_empty()
+                );
+                assert_eq!(fixture.process.waits.load(Ordering::Acquire), 1);
+                assert_eq!(fixture.launcher.launches.load(Ordering::Acquire), 0);
+            });
+        }
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]

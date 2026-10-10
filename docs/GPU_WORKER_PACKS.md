@@ -78,8 +78,17 @@ hang or rule out a crash. A signaled process may legitimately return status
 259. These fields do not prove worker-main progress, a native exception, or a
 particular loader/driver cause. The existing stage describes the parent's
 lifecycle milestone only. No raw errors, stderr, paths, model data, or
-transcript content is added; cleanup confirmation, launch/trust/IPC behavior,
-sampling/termination budgets, and Auto qualification remain unchanged.
+transcript content is added; launch/trust/IPC behavior, sampling/termination
+budgets, and Auto qualification remain unchanged.
+
+Diagnostic retirement retains its in-flight ownership until the bounded
+process wait settles. A failed request can still be delivered promptly, but a
+concurrent probe retirement joins that cleanup before reporting confirmation,
+using the original absolute cleanup deadline rather than a new allowance.
+Failed cleanup, an expired deadline, or inaccessible supervisor state remains
+unconfirmed. Ordinary inference retirement/cancellation is unchanged. This
+prevents an early cleanup-reporting race; it does not repair or explain a
+rejected Hello, prove a native crash cause, or qualify a backend for Auto.
 
 ## Windows executable long-path declaration
 
