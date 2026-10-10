@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 & (Join-Path $PSScriptRoot 'test-windows-msvc-payload-profiles.ps1')
+& (Join-Path $PSScriptRoot 'test-windows-application-manifests.ps1')
 
 function Invoke-NativeProcess(
     [string]$Executable,
@@ -1111,6 +1112,7 @@ function Invoke-ExtractedGpuPackFinalization {
 $finalizationFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-finalization-$([guid]::NewGuid().ToString('N'))"
 $finalizationEnvironmentName = 'SCRIBE_GPU_FINALIZATION_FIXTURE'
 $finalizationEnvironmentBefore = Get-ProcessEnvironmentState @($finalizationEnvironmentName)
+$workerManifestStream = $null
 try {
     New-Item -ItemType Directory -Path $finalizationFixtureRoot | Out-Null
 
@@ -1119,6 +1121,9 @@ try {
     New-Item -ItemType Directory -Path $stagingRoot | Out-Null
     $stagingCreated = $true
     $packResult = [pscustomobject]@{ PackRoot = $outputRoot; Case = 'restore-failure' }
+    $heldWorker = Join-Path $stagingRoot 'worker.exe'
+    [IO.File]::WriteAllBytes($heldWorker, [byte[]]@(1))
+    $workerManifestStream = [IO.File]::Open($heldWorker, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     [Environment]::SetEnvironmentVariable($finalizationEnvironmentName, 'mutated', 'Process')
     $previousPinnedMsvcEnvironment = $null
     $buildEnvironmentState = @(
@@ -1139,6 +1144,7 @@ try {
         'Actual builder restoration failure published output or retained its exact staging directory.'
     Assert-True ([Environment]::GetEnvironmentVariable($finalizationEnvironmentName, 'Process') -ceq 'restored-after-failure') `
         'Actual builder restoration failure did not continue to restore later environment entries.'
+    Assert-True (-not $workerManifestStream.CanRead) 'Restoration failure retained the worker manifest lease.'
 
     $outputRoot = Join-Path $finalizationFixtureRoot 'move-output'
     [IO.File]::WriteAllText($outputRoot, 'must survive failed final move', [Text.UTF8Encoding]::new($false))
@@ -1147,6 +1153,9 @@ try {
     New-Item -ItemType Directory -Path $stagingRoot | Out-Null
     $stagingCreated = $true
     $packResult = [pscustomobject]@{ PackRoot = $outputRoot; Case = 'move-failure' }
+    $heldWorker = Join-Path $stagingRoot 'worker.exe'
+    [IO.File]::WriteAllBytes($heldWorker, [byte[]]@(1))
+    $workerManifestStream = [IO.File]::Open($heldWorker, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $buildEnvironmentState = Get-ProcessEnvironmentState @($finalizationEnvironmentName)
     $moveFailureOutput = [System.Collections.Generic.List[object]]::new()
     $moveFailure = $null
@@ -1155,6 +1164,7 @@ try {
     }
     catch { $moveFailure = $_.Exception }
     Assert-True ($null -ne $moveFailure) 'Actual builder final move failure did not surface a move failure.'
+    Assert-True (-not $workerManifestStream.CanRead) 'Move failure retained the worker manifest lease.'
     Assert-True ($moveFailureOutput.Count -eq 0 -and -not (Test-Path -LiteralPath $stagingRoot) -and
         (Test-Path -LiteralPath $outputRoot -PathType Leaf) -and
         [System.Linq.Enumerable]::SequenceEqual([byte[]]$outsideSentinelBytes, [IO.File]::ReadAllBytes($outputRoot))) `
@@ -1165,15 +1175,18 @@ try {
     New-Item -ItemType Directory -Path $stagingRoot | Out-Null
     $stagedMarker = Join-Path $stagingRoot 'marker'
     [IO.File]::WriteAllText($stagedMarker, 'success', [Text.UTF8Encoding]::new($false))
+    $workerManifestStream = [IO.File]::Open($stagedMarker, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $stagingCreated = $true
     $packResult = [pscustomobject]@{ PackRoot = $outputRoot; Case = 'success' }
     $buildEnvironmentState = Get-ProcessEnvironmentState @($finalizationEnvironmentName)
     $successOutput = @(Invoke-ExtractedGpuPackFinalization)
+    Assert-True (-not $workerManifestStream.CanRead) 'Successful finalization retained the worker manifest lease.'
     Assert-True ($successOutput.Count -eq 1 -and $successOutput[0].Case -ceq 'success' -and
         (Test-Path -LiteralPath (Join-Path $outputRoot 'marker')) -and -not (Test-Path -LiteralPath $stagingRoot)) `
         'Actual builder finalization success control did not move exactly one staged result.'
 }
 finally {
+    if ($null -ne $workerManifestStream) { $workerManifestStream.Dispose() }
     Restore-ProcessEnvironment $finalizationEnvironmentBefore
     if (Test-Path -LiteralPath $finalizationFixtureRoot) {
         Microsoft.PowerShell.Management\Remove-Item -LiteralPath $finalizationFixtureRoot -Recurse -Force

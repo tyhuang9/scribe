@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
 . (Join-Path $PSScriptRoot 'windows-vulkan-policy-pack.ps1')
 . (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
+. (Join-Path $PSScriptRoot 'windows-application-manifest.ps1')
 . (Join-Path $PSScriptRoot 'windows-cpu-worker-native-baseline.ps1')
 
 if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
@@ -1403,6 +1404,7 @@ $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
 $stagingCreated = $false
 $packResult = $null
 $builtVulkanLoader = $null
+$workerManifestStream = $null
 $pinnedRuntimeSources = @{}
 
 if ($Backend -eq 'Vulkan') {
@@ -1548,6 +1550,10 @@ try {
     $stagedWorker = Join-Path $stagingRoot 'bin\scribe-inference-worker.exe'
     Copy-Item -LiteralPath $worker -Destination $stagedWorker
     $null = Assert-RegularNonReparseFile $stagedWorker 'Materialized GPU inference worker'
+    # Retain this no-write/no-delete lease through dependency closure and pack
+    # authoring, so the manifest check and signed inventory refer to one file.
+    $workerManifestStream = [IO.File]::Open($stagedWorker, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    Assert-WindowsLongPathAwareApplicationManifest $stagedWorker
     Copy-ReviewedGpuWorkerDependencyClosure `
         $stagedWorker `
         $sdkRoot `
@@ -1617,6 +1623,7 @@ try {
     }
 }
 finally {
+    if ($null -ne $workerManifestStream) { $workerManifestStream.Dispose() }
     $restorationFailures = [System.Collections.Generic.List[System.Exception]]::new()
     if ($null -ne $previousPinnedMsvcEnvironment) {
         try { Restore-ProcessEnvironment $previousPinnedMsvcEnvironment }

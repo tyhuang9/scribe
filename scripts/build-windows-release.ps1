@@ -36,6 +36,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
+. (Join-Path $PSScriptRoot 'windows-application-manifest.ps1')
 . (Join-Path $PSScriptRoot "windows-frozen-cpu-worker-integrity.ps1")
 . (Join-Path $PSScriptRoot "windows-gpu-auto-policy-identity.ps1")
 . (Join-Path $PSScriptRoot "windows-cpu-worker-native-baseline.ps1")
@@ -687,6 +688,7 @@ $desktopSourceContext = $null
 $cpuWorkerBaseline = $null
 $gpuAutoPolicyIdentity = $null
 $gpuAutoPolicyExecutableStream = $null
+$freshCpuWorkerStream = $null
 $gpuAutoPolicyDesktopBuildId = $null
 try {
     $gpuAutoPolicyIdentity = Open-WindowsGpuAutoPolicyIdentity $repositoryRoot
@@ -776,8 +778,10 @@ try {
             Restore-WindowsCpuWorkerBaselineEnvironment $cpuWorkerBaseline
             Write-Output "CPU worker native baseline evidence retained: $($cpuWorkerBaseline.TargetRoot)"
             Assert-Amd64Pe $sourceInferenceWorker
+            $freshCpuWorkerStream = Open-WindowsFrozenCpuWorkerReadHandle $sourceInferenceWorker
+            Assert-WindowsLongPathAwareApplicationManifest $sourceInferenceWorker
             $env:SCRIBE_BUILDING_WORKER = $null
-            $env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker).Hash.ToLowerInvariant()
+            $env:SCRIBE_BUNDLED_WORKER_SHA256 = Get-WindowsFrozenCpuWorkerOpenStreamSha256 $freshCpuWorkerStream
             if ($env:SCRIBE_BUNDLED_WORKER_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
                 throw "The CPU inference worker did not produce a valid SHA-256 trust anchor."
             }
@@ -830,6 +834,7 @@ Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
 $null = Assert-ReviewedWindowsPe $sourceExecutable
 $gpuAutoPolicyExecutableStream = Open-WindowsFrozenCpuWorkerReadHandle $sourceExecutable
+Assert-WindowsLongPathAwareApplicationManifest $sourceExecutable
 $gpuAutoPolicyExecutableSize = [int64]$gpuAutoPolicyExecutableStream.Length
 $gpuAutoPolicyExecutableSha256 = Get-WindowsFrozenCpuWorkerOpenStreamSha256 $gpuAutoPolicyExecutableStream
 Assert-WindowsGpuAutoPolicyCompiledIdentity `
@@ -985,6 +990,7 @@ try {
     Assert-Amd64Pe $stagedExecutable
     Assert-WindowsGuiSubsystem $stagedExecutable
     $null = Assert-ReviewedWindowsPe $stagedExecutable
+    Assert-WindowsLongPathAwareApplicationManifest $stagedExecutable
     Assert-Amd64Pe $stagedInferenceWorker
     $null = Assert-ReviewedWindowsPe $stagedInferenceWorker 3
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
@@ -1134,6 +1140,7 @@ catch {
 }
 }
 finally {
+    if ($null -ne $freshCpuWorkerStream) { $freshCpuWorkerStream.Dispose() }
     if ($null -ne $gpuAutoPolicyExecutableStream) { $gpuAutoPolicyExecutableStream.Dispose() }
     if ($null -ne $gpuAutoPolicyIdentity) { $gpuAutoPolicyIdentity.ManifestStream.Dispose() }
     if ($null -ne $frozenCpuWorker -and $null -ne $frozenCpuWorker.WorkerStream) {

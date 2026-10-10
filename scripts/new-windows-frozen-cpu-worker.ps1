@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-frozen-cpu-worker-integrity.ps1')
 . (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
+. (Join-Path $PSScriptRoot 'windows-application-manifest.ps1')
 . (Join-Path $PSScriptRoot 'windows-cpu-worker-native-baseline.ps1')
 
 function Assert-FrozenCpuWorkerOutputOutside([string]$OutputPath, [string]$ProtectedRoot) {
@@ -114,6 +115,7 @@ try {
         throw 'Frozen CPU worker size is outside the supported byte bounds.'
     }
     $null = Assert-ReviewedWindowsPe $sourceWorker 3
+    Assert-WindowsLongPathAwareApplicationManifest $sourceWorker
     $workerHash = Get-WindowsFrozenCpuWorkerOpenStreamSha256 $workerStream
     Assert-WindowsFrozenCpuWorkerContextUnchanged $context
     Assert-WindowsFrozenCpuWorkerNoReparseAncestors $outputParent

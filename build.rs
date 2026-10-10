@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 #[path = "build_support/build_revision.rs"]
 mod build_revision;
 
+#[path = "build_support/windows_application_manifest.rs"]
+mod windows_application_manifest;
+
 #[cfg(feature = "cuda-acceleration")]
 #[path = "build_support/windows_cuda_link.rs"]
 mod windows_cuda_link;
@@ -22,6 +25,7 @@ const WINDOWS_VULKAN_POLICY_LOADER_MANIFEST: &str =
 
 fn main() {
     reject_multiple_gpu_features();
+    embed_windows_application_manifest();
     embed_windows_vulkan_policy_loader_identity();
     emit_build_revision();
     embed_gpu_pack_release_authority();
@@ -56,6 +60,35 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
+    }
+}
+
+fn embed_windows_application_manifest() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let root = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo must set CARGO_MANIFEST_DIR"),
+    );
+    let manifest = root.join(windows_application_manifest::MANIFEST_PATH);
+    let directives =
+        windows_application_manifest::cargo_directives(&target_os, &target_env, &manifest)
+            .unwrap_or_else(|error| panic!("{error}"));
+    if target_os == "windows" && target_env == "msvc" {
+        let metadata =
+            fs::symlink_metadata(&manifest).expect("Windows application manifest is missing");
+        assert!(
+            metadata.file_type().is_file(),
+            "Windows application manifest must be a regular source file"
+        );
+        let bytes = fs::read(&manifest).expect("could not read Windows application manifest");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            windows_application_manifest::MANIFEST_SHA256,
+            "Windows application manifest differs from the reviewed canonical bytes"
+        );
+    }
+    for directive in directives {
+        println!("{directive}");
     }
 }
 

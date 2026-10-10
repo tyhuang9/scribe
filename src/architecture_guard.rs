@@ -3727,7 +3727,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "$desktopFeatures += 'windows-gpu-capture-observation'",
         "if ($LocalFrozenGpuObservation -and -not $frozenCpuWorkerRequested)",
         "cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple",
-        "Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker",
+        "Open-WindowsFrozenCpuWorkerReadHandle $sourceInferenceWorker",
+        "Assert-WindowsLongPathAwareApplicationManifest $sourceInferenceWorker",
+        "Get-WindowsFrozenCpuWorkerOpenStreamSha256 $freshCpuWorkerStream",
         "SCRIBE_BUNDLED_WORKER_SHA256",
         "SCRIBE_BUILDING_WORKER",
         "scribe-inference-worker.exe",
@@ -3878,18 +3880,26 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         .find("$env:SCRIBE_BUILDING_WORKER = $null")
         .map(|offset| worker_cargo + offset)
         .expect("release build clears the worker marker before desktop compilation");
+    let worker_lease = release
+        .find("Open-WindowsFrozenCpuWorkerReadHandle $sourceInferenceWorker")
+        .expect("release build holds the completed worker image");
+    let worker_manifest = release
+        .find("Assert-WindowsLongPathAwareApplicationManifest $sourceInferenceWorker")
+        .expect("release build checks the held worker manifest");
     let worker_hash = release
-        .find("Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker")
-        .expect("release build hashes the completed worker image");
+        .find("Get-WindowsFrozenCpuWorkerOpenStreamSha256 $freshCpuWorkerStream")
+        .expect("release build hashes the held worker image");
     let desktop_cargo = release
         .find("cargo build --locked --offline --release --bin local-transcriber")
         .expect("release build compiles the anchored desktop second");
     assert!(
         worker_build < worker_cargo
-            && worker_cargo < worker_marker_clear
+            && worker_cargo < worker_lease
+            && worker_lease < worker_manifest
+            && worker_manifest < worker_marker_clear
             && worker_marker_clear < worker_hash
             && worker_hash < desktop_cargo,
-        "release builds must clear the digest, mark/build the worker, clear the marker, hash the image, then build the desktop"
+        "release builds must mark/build the worker, hold/check its manifest, clear the marker, hash the held image, then build the desktop"
     );
 
     let build_script = fs::read_to_string(repository.join("build.rs"))

@@ -11,6 +11,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
+. (Join-Path $PSScriptRoot 'windows-application-manifest.ps1')
 
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
@@ -518,6 +519,9 @@ function Assert-Bundle {
 
     Assert-Amd64GuiPe (Join-Path $root "local-transcriber.exe")
     $null = Assert-ReviewedWindowsPe (Join-Path $root "local-transcriber.exe")
+    # The desktop is newly linked. Retained CPU worker inputs have an explicit
+    # separate provenance/compatibility contract and are not silently relabeled.
+    Assert-WindowsLongPathAwareApplicationManifest (Join-Path $root 'local-transcriber.exe')
     $null = Assert-ReviewedWindowsPe (Join-Path $root "scribe-inference-worker.exe") 3
 }
 
