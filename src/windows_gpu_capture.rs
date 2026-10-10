@@ -13,6 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -25,9 +26,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::backend_policy::PowerSource;
 use crate::model_catalog::ArtifactFormat;
 use crate::onnx_worker::{
-    CaptureObservationWorker, GpuCaptureObservationIdentity, ProviderMemoryNotApplicableReason,
-    ProviderMemoryObservation, WorkerMemoryAvailability, WorkerObservationLease,
-    validate_capture_worker_memory,
+    CaptureFrozenInputs, CaptureObservationWorker, CapturePackPin, CaptureWorkerPin,
+    GpuCaptureObservationIdentity, ProviderMemoryNotApplicableReason, ProviderMemoryObservation,
+    WorkerMemoryAvailability, WorkerObservationLease, validate_capture_worker_memory,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
@@ -52,6 +53,7 @@ struct CommandOptions {
     gpu_device: String,
     output: PathBuf,
     campaign_power: Option<CampaignPower>,
+    frozen_inputs: Option<Arc<CaptureFrozenInputs>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -208,40 +210,59 @@ fn run_single_capture(options: CommandOptions) -> Result<()> {
     // Authenticate and retain both exact worker generations before decoding
     // the WAV or issuing a model command. Empty production pack trust therefore
     // fails before the CPU request or costly model/audio execution.
-    let cpu_worker = CaptureObservationWorker::cpu();
-    let cpu_lease = match cpu_worker.prepare_observation() {
-        Ok(lease) => lease,
-        Err(error) => {
-            let _ = cpu_worker.shutdown();
-            return Err(error.context("could not preflight the bundled CPU worker"));
+    let mut cpu_worker: Option<CaptureObservationWorker> = None;
+    let mut gpu_worker: Option<CaptureObservationWorker> = None;
+    let mut cpu_lease = None;
+    let mut gpu_lease = None;
+    let preflight = single_preflight(options.frozen_inputs.is_some(), |step| {
+        match step {
+            SinglePreflightStep::CpuHello => {
+                let worker =
+                    cpu_worker.insert(CaptureObservationWorker::cpu(options.frozen_inputs.clone()));
+                cpu_lease = Some(
+                    worker
+                        .prepare_observation()
+                        .context("could not preflight the bundled CPU worker")?,
+                );
+            }
+            SinglePreflightStep::GpuAdmission => {
+                // With frozen inputs this admits BOTH identities before any
+                // provider probe. Without them the legacy CPU-first order stays.
+                gpu_worker = Some(
+                    CaptureObservationWorker::gpu(
+                        &options.gpu_pack_id,
+                        &options.gpu_backend,
+                        &options.gpu_device,
+                        options.frozen_inputs.clone(),
+                    )
+                    .context("could not preflight the verified GPU binding")?,
+                );
+            }
+            SinglePreflightStep::GpuHello => {
+                gpu_lease = Some(
+                    gpu_worker
+                        .as_ref()
+                        .expect("GPU admission precedes Hello")
+                        .prepare_observation()
+                        .context("could not preflight the selected GPU worker")?,
+                );
+            }
         }
-    };
-    let gpu_worker = match CaptureObservationWorker::gpu(
-        &options.gpu_pack_id,
-        &options.gpu_backend,
-        &options.gpu_device,
-    ) {
-        Ok(worker) => worker,
-        Err(error) => {
-            let cleanup = cpu_worker.shutdown();
-            return combine_operation_cleanup(
-                Err(error.context("could not preflight the verified GPU binding")),
-                cleanup,
-            );
-        }
-    };
-    let gpu_lease = match gpu_worker.prepare_observation() {
-        Ok(lease) => lease,
-        Err(error) => {
-            let gpu_cleanup = gpu_worker.shutdown();
-            let cpu_cleanup = cpu_worker.shutdown();
-            let cleanup = gpu_cleanup.and(cpu_cleanup);
-            return combine_operation_cleanup(
-                Err(error.context("could not preflight the selected GPU worker")),
-                cleanup,
-            );
-        }
-    };
+        Ok(())
+    });
+    if let Err(error) = preflight {
+        let gpu_cleanup = gpu_worker
+            .as_ref()
+            .map_or(Ok(()), |worker| worker.shutdown());
+        let cpu_cleanup = cpu_worker
+            .as_ref()
+            .map_or(Ok(()), |worker| worker.shutdown());
+        return combine_operation_cleanup(Err(error), gpu_cleanup.and(cpu_cleanup));
+    }
+    let cpu_worker = cpu_worker.expect("successful preflight retains CPU worker");
+    let gpu_worker = gpu_worker.expect("successful preflight retains GPU worker");
+    let cpu_lease = cpu_lease.expect("successful preflight retains CPU lease");
+    let gpu_lease = gpu_lease.expect("successful preflight retains GPU lease");
     if let Err(error) = cpu_worker
         .negotiate_runtime_observation()
         .context("bundled CPU worker does not support runtime memory observation")
@@ -535,6 +556,29 @@ fn normalize_transcript(value: &str) -> String {
         .to_lowercase()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinglePreflightStep {
+    CpuHello,
+    GpuAdmission,
+    GpuHello,
+}
+
+fn single_preflight(
+    frozen: bool,
+    mut execute: impl FnMut(SinglePreflightStep) -> Result<()>,
+) -> Result<()> {
+    use SinglePreflightStep::{CpuHello, GpuAdmission, GpuHello};
+    let steps = if frozen {
+        [GpuAdmission, CpuHello, GpuHello]
+    } else {
+        [CpuHello, GpuAdmission, GpuHello]
+    };
+    for step in steps {
+        execute(step)?;
+    }
+    Ok(())
+}
+
 fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     let mut model = None;
     let mut model_sha256 = None;
@@ -545,6 +589,20 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     let mut gpu_device = None;
     let mut output = None;
     let mut campaign_power = None;
+    let pin_flags = [
+        "--cpu-worker-build-id",
+        "--cpu-worker-sha256",
+        "--cpu-worker-protocol",
+        "--cpu-worker-abi",
+        "--gpu-worker-build-id",
+        "--gpu-worker-sha256",
+        "--gpu-worker-protocol",
+        "--gpu-worker-abi",
+        "--gpu-pack-version",
+        "--gpu-pack-sha256",
+        "--gpu-pack-security-epoch",
+    ];
+    let mut pin_values: [Option<OsString>; 11] = Default::default();
     let mut saw_command = false;
     let mut index = 0;
     while index < args.len() {
@@ -585,7 +643,10 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
             "--gpu-backend" => &mut gpu_backend,
             "--gpu-device" => &mut gpu_device,
             "--output" => &mut output,
-            _ => bail!("unknown Windows GPU capture observation argument: {name}"),
+            _ => match pin_flags.iter().position(|flag| *flag == name) {
+                Some(position) => &mut pin_values[position],
+                None => bail!("unknown Windows GPU capture observation argument: {name}"),
+            },
         };
         if slot.is_some() {
             bail!("{name} may be specified only once")
@@ -624,16 +685,58 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     if !matches!(gpu_backend.as_str(), "cuda" | "vulkan") {
         bail!("--gpu-backend must be cuda or vulkan")
     }
+    let gpu_pack_id = canonical_text(gpu_pack_id, "--gpu-pack-id")?;
+    let frozen_inputs = if pin_values.iter().all(Option::is_none) {
+        None
+    } else {
+        let mut values = Vec::with_capacity(pin_values.len());
+        for (value, flag) in pin_values.into_iter().zip(pin_flags) {
+            values.push(canonical_text(value, flag)?);
+        }
+        let number = |index: usize| -> Result<u64> {
+            let value = &values[index];
+            if value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("capture frozen numeric constraints must be positive canonical decimal");
+            }
+            value
+                .parse()
+                .context("capture frozen numeric constraint is out of range")
+        };
+        let worker = |offset: usize| -> Result<CaptureWorkerPin> {
+            Ok(CaptureWorkerPin {
+                worker_build_id: values[offset].clone(),
+                worker_sha256: values[offset + 1].clone(),
+                protocol_version: u8::try_from(number(offset + 2)?)?,
+                runtime_abi: u16::try_from(number(offset + 3)?)?,
+            })
+        };
+        let cpu_baseline = worker(0)?;
+        let gpu_worker = worker(4)?;
+        let frozen = CaptureFrozenInputs {
+            cpu_baseline,
+            pack: CapturePackPin {
+                pack_id: gpu_pack_id.clone(),
+                pack_version: values[8].clone(),
+                pack_digest: values[9].clone(),
+                security_epoch: number(10)?,
+                runtime_abi: gpu_worker.runtime_abi,
+            },
+            gpu_worker,
+        };
+        frozen.validate()?;
+        Some(Arc::new(frozen))
+    };
     Ok(CommandOptions {
         model: PathBuf::from(required(model, "--model")?),
         model_sha256,
         wav: PathBuf::from(required(wav, "--wav")?),
         wav_sha256,
-        gpu_pack_id: canonical_text(gpu_pack_id, "--gpu-pack-id")?,
+        gpu_pack_id,
         gpu_backend,
         gpu_device: canonical_text(gpu_device, "--gpu-device")?,
         output: PathBuf::from(required(output, "--output")?),
         campaign_power,
+        frozen_inputs,
     })
 }
 
@@ -854,6 +957,126 @@ mod tests {
             + 1;
         uppercase[digest] = "B".repeat(64).into();
         assert!(parse_command(&uppercase).is_err());
+    }
+
+    #[test]
+    fn capture_observation_single_preflight_preserves_unpinned_order_and_stops_at_first_failure() {
+        use SinglePreflightStep::{CpuHello, GpuAdmission, GpuHello};
+        for (frozen, expected) in [
+            (false, [CpuHello, GpuAdmission, GpuHello]),
+            (true, [GpuAdmission, CpuHello, GpuHello]),
+        ] {
+            let mut seen = Vec::new();
+            single_preflight(frozen, |step| {
+                seen.push(step);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, expected);
+            for failed in 0..expected.len() {
+                let mut seen = Vec::new();
+                let error = single_preflight(frozen, |step| {
+                    seen.push(step);
+                    if step == expected[failed] {
+                        bail!("fixture preflight failure")
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+                assert_eq!(error.to_string(), "fixture preflight failure");
+                assert_eq!(seen, expected[..=failed]);
+            }
+        }
+    }
+
+    fn frozen_command_args() -> Vec<OsString> {
+        let mut args = command_args();
+        for (flag, value) in [
+            (
+                "--cpu-worker-build-id",
+                crate::onnx_worker::INFERENCE_WORKER_BUILD_ID.to_owned(),
+            ),
+            ("--cpu-worker-sha256", "c".repeat(64)),
+            ("--cpu-worker-protocol", "5".to_owned()),
+            ("--cpu-worker-abi", "1".to_owned()),
+            (
+                "--gpu-worker-build-id",
+                crate::onnx_worker::INFERENCE_WORKER_BUILD_ID.to_owned(),
+            ),
+            ("--gpu-worker-sha256", "d".repeat(64)),
+            ("--gpu-worker-protocol", "5".to_owned()),
+            ("--gpu-worker-abi", "1".to_owned()),
+            ("--gpu-pack-version", "p1-fixture".to_owned()),
+            ("--gpu-pack-sha256", "e".repeat(64)),
+            ("--gpu-pack-security-epoch", "1".to_owned()),
+        ] {
+            args.extend([flag.into(), value.into()]);
+        }
+        args
+    }
+
+    #[test]
+    fn capture_observation_frozen_cli_is_optional_complete_and_exact() {
+        assert!(
+            parse_command(&command_args())
+                .unwrap()
+                .frozen_inputs
+                .is_none()
+        );
+        let args = frozen_command_args();
+        let pins = parse_command(&args).unwrap().frozen_inputs.unwrap();
+        assert_eq!(pins.cpu_baseline.worker_sha256, "c".repeat(64));
+        assert_eq!(pins.gpu_worker.worker_sha256, "d".repeat(64));
+        assert_eq!(pins.pack.pack_id, "scribe-vulkan-windows-x64");
+        assert_eq!(pins.pack.pack_digest, "e".repeat(64));
+        for index in (command_args().len()..args.len()).step_by(2) {
+            let mut partial = args.clone();
+            partial.drain(index..index + 2);
+            assert!(
+                parse_command(&partial).is_err(),
+                "accepted partial pins at {index}"
+            );
+            let mut duplicate = args.clone();
+            duplicate.extend_from_slice(&args[index..index + 2]);
+            assert!(
+                parse_command(&duplicate).is_err(),
+                "accepted duplicate pins at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_observation_frozen_cli_rejects_noncanonical_or_incompatible_values_before_io() {
+        for (flag, invalid) in [
+            ("--cpu-worker-build-id", "short".to_owned()),
+            ("--gpu-worker-build-id", "has space build".to_owned()),
+            ("--gpu-worker-build-id", "x".repeat(193)),
+            ("--cpu-worker-sha256", "0".repeat(64)),
+            ("--gpu-worker-sha256", "A".repeat(64)),
+            ("--gpu-pack-sha256", "a".repeat(63)),
+            ("--cpu-worker-protocol", "4".to_owned()),
+            ("--gpu-worker-protocol", "05".to_owned()),
+            ("--cpu-worker-abi", "2".to_owned()),
+            ("--gpu-worker-abi", "+1".to_owned()),
+            ("--gpu-pack-version", "../pack".to_owned()),
+            ("--gpu-pack-version", "CON".to_owned()),
+            ("--gpu-pack-version", "con.log".to_owned()),
+            ("--gpu-pack-security-epoch", "0".to_owned()),
+            ("--gpu-pack-security-epoch", "01".to_owned()),
+            (
+                "--gpu-pack-security-epoch",
+                "18446744073709551616".to_owned(),
+            ),
+        ] {
+            let mut args = frozen_command_args();
+            let index = args.iter().position(|value| value == flag).unwrap();
+            args[index + 1] = invalid.into();
+            let error = run_local_command(&args).unwrap_err();
+            assert!(
+                !error.to_string().contains("input does not exist"),
+                "{flag} reached file IO: {error:#}"
+            );
+        }
     }
 
     #[test]

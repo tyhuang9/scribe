@@ -11,11 +11,13 @@ The observer consumes existing verified CPU/GPU workers and hash-pinned GGUF
 model and WAV inputs. It must not build, download, replace, activate or sign
 workers. All ordinary pack verification and the desktop's CPU-worker digest
 anchor remain required. An arbitrary path plus a supplied digest is not launch
-authority. Production worker-pack trust contains the project's public pack key,
-but that grants only verified worker-pack launch authority. The separate
-performance authority still has no approved keys and final qualification has no
-approved plans, so neither performance evidence nor release qualification is
-authorized by pack trust.
+authority. Optional frozen worker/pack identity pins only narrow that existing
+trusted resolution to one exact tuple; they cannot authorize a worker path,
+pack, key or device. Production worker-pack trust contains the project's public
+pack key, but that grants only verified worker-pack launch authority. The
+separate performance authority still has no approved keys and final
+qualification has no approved plans, so neither performance evidence nor
+release qualification is authorized by pack trust.
 
 The default mode is one CPU request and one GPU request, executed serially,
 with actual handshake, request timing and native memory/power observations,
@@ -327,10 +329,35 @@ lowercase SHA-256, and the backend `cuda` or `vulkan`. The worker paths are not
 caller inputs: CPU resolution remains digest-anchored and GPU discovery remains
 signature-verified.
 
+For a controlled diagnostic run, the wrapper and collector also accept one
+complete frozen identity set. The eleven values are
+`--cpu-worker-build-id`, `--cpu-worker-sha256`, `--cpu-worker-protocol`,
+`--cpu-worker-abi`, `--gpu-worker-build-id`, `--gpu-worker-sha256`,
+`--gpu-worker-protocol`, `--gpu-worker-abi`, `--gpu-pack-version`,
+`--gpu-pack-sha256` and `--gpu-pack-security-epoch`. The CPU and GPU worker
+protocol must be `5`, both worker ABIs must be `1`, worker build IDs are bounded
+visible ASCII identities, hashes are nonzero lowercase SHA-256 values, the pack
+version is a canonical lowercase immutable-store component, including the
+reserved Windows-name check used by pack verification, and the security epoch
+is a positive canonical decimal. Supplying only part of the set, a duplicate
+parameter, or a malformed value fails before collector file access.
+When the set is omitted, the existing diagnostic behavior is unchanged.
+These are denial-only constraints over ordinary verified resolution; they do
+not turn an unsigned observation into qualification evidence or enable Auto.
+Before the first provider probe, the collector admits the trusted CPU worker
+and the unique signed GPU lease against the complete tuple, retaining the CPU
+file handle through probing. Every subsequent cold launch rechecks the same
+tuple, and a warm run remains bound to its original authenticated generation.
+No failure replaces the tuple with newly discovered values or authorizes replay.
+
 `scripts/run-windows-gpu-capture-observation.ps1` is a convenience wrapper around
 an independently trusted collector executable. `CollectorPath` and
 `CollectorSha256` identify that build; the remaining named parameters forward
-the inputs above. Keep the executable and its parent directories in a trusted,
+the inputs above. The optional PowerShell frozen identity parameters are
+`CpuWorkerBuildId`, `CpuWorkerSha256`, `CpuWorkerProtocol`, `CpuWorkerAbi`,
+`GpuWorkerBuildId`, `GpuWorkerSha256`, `GpuWorkerProtocol`, `GpuWorkerAbi`,
+`GpuPackVersion`, `GpuPackSha256` and `GpuPackSecurityEpoch`; they must be
+provided together. Keep the executable and its parent directories in a trusted,
 operator-controlled location. The wrapper's supplied digest does not establish
 build provenance or grant pack trust. It performs no build, download or signing.
 It explicitly waits for the GUI collector and checks that process's exit code,
@@ -479,8 +506,10 @@ strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, authenticated Vulkan Hello memory projection,
 provider-memory snapshots, retained GGUF native/runtime boundaries, capture
 architecture guards and probe architecture guards.
-`-ScriptOnly` provides the fast inner-loop check: script parsing, nineteen
-prelaunch argument/file-rejection cases, and four local GUI-process cases.
+`-ScriptOnly` provides the fast inner-loop check: script parsing, forty-seven
+counted prelaunch argument/file-rejection assertions (including frozen identity
+forwarding, partial, duplicate and malformed values), and six local GUI-process
+cases covering both omitted and complete identity sets.
 The latter compile a tiny x64 GUI fixture using the Windows .NET Framework C#
 compiler (also required by the installer fixture tests). Event gates and bounded
 watchdogs exercise waiting, absent/stale exit status, nonzero exits, literal
@@ -492,11 +521,11 @@ Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo
 command and cannot substitute for native verification.
-Six in-memory forwarding cases additionally cover both GPU backends with the
-campaign option omitted, on AC, or on battery, preserving individual argument
-values containing spaces and shell metacharacters. They exercise the actual
-PowerShell bound-parameter dictionary, not just a Hashtable substitute, and
-launch no collector.
+Twelve in-memory forwarding cases additionally cover both GPU backends with the
+campaign option omitted, on AC, or on battery, with and without the complete
+frozen identity set. They preserve individual argument values containing spaces
+and shell metacharacters. They exercise the actual PowerShell bound-parameter
+dictionary, not just a Hashtable substitute, and launch no collector.
 It does not replace the full command above.
 Both strict lint configurations include `ui-harness`, matching the existing
 release checks' shared UI-route coverage. Both lint all targets, with and without
