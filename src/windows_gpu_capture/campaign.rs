@@ -880,11 +880,12 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
         model_sha256: model.sha256.clone(),
         wav_sha256: wav.sha256.clone(),
     };
-    let cpu_factory = CaptureObservationWorkerFactory::cpu();
+    let cpu_factory = CaptureObservationWorkerFactory::cpu(options.frozen_inputs.clone());
     let gpu_factory = match CaptureObservationWorkerFactory::gpu_exact(
         &options.gpu_pack_id,
         &options.gpu_backend,
         &options.gpu_device,
+        options.frozen_inputs.clone(),
     ) {
         Ok(factory) => factory,
         Err(_) => {

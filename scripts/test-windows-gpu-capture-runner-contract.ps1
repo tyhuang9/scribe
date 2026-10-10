@@ -165,7 +165,18 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
             [string]$GpuBackend,
             [string]$GpuDevice,
             [string]$OutputPath,
-            [string]$CampaignPower
+            [string]$CampaignPower,
+            [string]$CpuWorkerBuildId,
+            [string]$CpuWorkerSha256,
+            [string]$CpuWorkerProtocol,
+            [string]$CpuWorkerAbi,
+            [string]$GpuWorkerBuildId,
+            [string]$GpuWorkerSha256,
+            [string]$GpuWorkerProtocol,
+            [string]$GpuWorkerAbi,
+            [string]$GpuPackVersion,
+            [string]$GpuPackSha256,
+            [string]$GpuPackSecurityEpoch
         )
         # Production passes this dictionary, not a Hashtable. In particular,
         # Hashtable.Contains must not appear to work only in these fixtures.
@@ -173,34 +184,68 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
     }
     foreach ($backend in @('cuda', 'vulkan')) {
         foreach ($power in @($null, 'ac', 'battery')) {
-            $options = @{
-                ModelPath = 'C:\fixture dir\model&(one).gguf'
-                ModelSha256 = 'a' * 64
-                WavPath = 'C:\fixture dir\input;audio.wav'
-                WavSha256 = 'b' * 64
-                GpuPackId = 'fixture-pack'
-                GpuBackend = $backend
-                GpuDevice = 'native:luid:0102030405060708'
-                OutputPath = 'C:\fixture dir\new report.json'
-            }
-            if ($null -ne $power) { $options.CampaignPower = $power }
-            $expected = @('--scribe-windows-gpu-capture-observation',
-                '--model', $options.ModelPath, '--model-sha256', $options.ModelSha256,
-                '--wav', $options.WavPath, '--wav-sha256', $options.WavSha256,
-                '--gpu-pack-id', 'fixture-pack', '--gpu-backend', $backend,
-                '--gpu-device', 'native:luid:0102030405060708', '--output', $options.OutputPath)
-            if ($null -ne $power) { $expected += @('--campaign-power', $power) }
-            $actual = @(Invoke-CaptureBoundArgumentFixture @options)
-            if ($actual.Count -ne $expected.Count) { throw 'Capture wrapper changed its argument count.' }
-            for ($index = 0; $index -lt $expected.Count; $index++) {
-                if ($actual[$index] -cne $expected[$index]) {
-                    throw 'Capture wrapper changed an input or the explicit campaign power.'
+            foreach ($includeFrozenIdentity in @($false, $true)) {
+                $options = @{
+                    ModelPath = 'C:\fixture dir\model&(one).gguf'
+                    ModelSha256 = 'a' * 64
+                    WavPath = 'C:\fixture dir\input;audio.wav'
+                    WavSha256 = 'b' * 64
+                    GpuPackId = 'fixture-pack'
+                    GpuBackend = $backend
+                    GpuDevice = 'native:luid:0102030405060708'
+                    OutputPath = 'C:\fixture dir\new report.json'
+                    CpuWorkerBuildId = 'cpu-worker-build-123'
+                    CpuWorkerSha256 = 'd' * 64
+                    CpuWorkerProtocol = '5'
+                    CpuWorkerAbi = '1'
+                    GpuWorkerBuildId = 'gpu-worker-build-456'
+                    GpuWorkerSha256 = 'e' * 64
+                    GpuWorkerProtocol = '5'
+                    GpuWorkerAbi = '1'
+                    GpuPackVersion = 'fixture-pack-1'
+                    GpuPackSha256 = 'f' * 64
+                    GpuPackSecurityEpoch = '1'
+                }
+                if (-not $includeFrozenIdentity) {
+                    foreach ($field in @(
+                        'CpuWorkerBuildId', 'CpuWorkerSha256', 'CpuWorkerProtocol', 'CpuWorkerAbi',
+                        'GpuWorkerBuildId', 'GpuWorkerSha256', 'GpuWorkerProtocol', 'GpuWorkerAbi',
+                        'GpuPackVersion', 'GpuPackSha256', 'GpuPackSecurityEpoch')) {
+                        $options.Remove($field)
+                    }
+                }
+                if ($null -ne $power) { $options.CampaignPower = $power }
+                $expected = @('--scribe-windows-gpu-capture-observation',
+                    '--model', $options.ModelPath, '--model-sha256', $options.ModelSha256,
+                    '--wav', $options.WavPath, '--wav-sha256', $options.WavSha256,
+                    '--gpu-pack-id', 'fixture-pack', '--gpu-backend', $backend,
+                    '--gpu-device', 'native:luid:0102030405060708', '--output', $options.OutputPath)
+                if ($null -ne $power) { $expected += @('--campaign-power', $power) }
+                if ($includeFrozenIdentity) { $expected += @(
+                    '--cpu-worker-build-id', $options.CpuWorkerBuildId,
+                    '--cpu-worker-sha256', $options.CpuWorkerSha256,
+                    '--cpu-worker-protocol', $options.CpuWorkerProtocol,
+                    '--cpu-worker-abi', $options.CpuWorkerAbi,
+                    '--gpu-worker-build-id', $options.GpuWorkerBuildId,
+                    '--gpu-worker-sha256', $options.GpuWorkerSha256,
+                    '--gpu-worker-protocol', $options.GpuWorkerProtocol,
+                    '--gpu-worker-abi', $options.GpuWorkerAbi,
+                    '--gpu-pack-version', $options.GpuPackVersion,
+                    '--gpu-pack-sha256', $options.GpuPackSha256,
+                    '--gpu-pack-security-epoch', $options.GpuPackSecurityEpoch
+                ) }
+                $actual = @(Invoke-CaptureBoundArgumentFixture @options)
+                if ($actual.Count -ne $expected.Count) { throw 'Capture wrapper changed its argument count.' }
+                for ($index = 0; $index -lt $expected.Count; $index++) {
+                    if ($actual[$index] -cne $expected[$index]) {
+                        throw 'Capture wrapper changed an input or the explicit campaign power.'
+                    }
                 }
             }
         }
     }
 } -Definition $argumentBuilder[0].Extent.Text
-Write-Output 'Capture wrapper forwarding contracts passed (6 cases); no collector was launched.'
+Write-Output 'Capture wrapper forwarding contracts passed (12 cases, with and without frozen identity); no collector was launched.'
 
 # Exercise the full wrapper with a GUI executable, not a console mock. Named
 # events control completion, so no sleep or GPU/app/profile access is needed.
@@ -268,90 +313,106 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
         @{ Exit = 0; Previous = 42 },
         @{ Exit = 23; Previous = 0 }
     )) {
-        $id = "$($case.Exit)_$([guid]::NewGuid().ToString('N'))"
-        $output = Join-Path $fixtureRoot "$id.txt"
-        $started = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureStarted-$id")
-        $gate = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureGate-$id")
-        $hostProcess = [Diagnostics.Process]::new()
-        $hostStarted = $false
-        try {
-            $options = @{
-                CollectorPath = $fixtureExe; CollectorSha256 = $fixtureHash
-                ModelPath = (Join-Path $fixtureRoot "model Ω & '(one).gguf"); ModelSha256 = 'a' * 64
-                WavPath = (Join-Path $fixtureRoot 'audio;input.wav'); WavSha256 = 'b' * 64
-                GpuPackId = 'fixture-pack'; GpuBackend = 'vulkan'
-                GpuDevice = 'native:luid:0102030405060708'
-                OutputPath = $output; CampaignPower = 'battery'
-            }
-            $optionsPath = Join-Path $fixtureRoot "$id-options.json"
-            [IO.File]::WriteAllText($optionsPath, ($options | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-            $hostStartInfo = [Diagnostics.ProcessStartInfo]::new()
-            $hostStartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
-            $hostStartInfo.UseShellExecute = $false
-            $hostStartInfo.CreateNoWindow = $true
-            $hostStartInfo.RedirectStandardOutput = $true
-            $hostStartInfo.RedirectStandardError = $true
-            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixtureHost,
-                '-Wrapper', $wrapper, '-OptionsPath', $optionsPath, '-Previous', [string]$case.Previous)) {
-                $hostStartInfo.ArgumentList.Add($argument)
-            }
-            $hostProcess.StartInfo = $hostStartInfo
-            $hostStarted = $hostProcess.Start()
-            if (-not $hostStarted) { throw 'Could not start the isolated capture fixture host.' }
-            $hostStdout = $hostProcess.StandardOutput.ReadToEndAsync()
-            $hostStderr = $hostProcess.StandardError.ReadToEndAsync()
-            if (-not $started.WaitOne(10000)) { throw 'GUI fixture did not signal startup.' }
-            if ($hostProcess.HasExited) { throw 'Capture wrapper returned while its GUI collector was still running.' }
-            $expectedArguments = @(& {
-                param($Definition, $Options)
-                . ([scriptblock]::Create($Definition))
-                Get-CaptureObservationArguments $Options
-            } $argumentBuilder[0].Extent.Text $options)
-            $actualArguments = @([IO.File]::ReadAllLines($output))
-            if ($actualArguments.Count -ne $expectedArguments.Count) { throw 'GUI collector argument count differs.' }
-            for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
-                if ($actualArguments[$index] -cne $expectedArguments[$index]) { throw 'GUI collector literal argument differs.' }
-            }
-            $null = $gate.Set()
-            if (-not $hostProcess.WaitForExit(15000)) { throw 'Capture wrapper did not observe GUI termination.' }
-            $expectedError = if ($case.Exit -eq 0) { '' } else {
-                'Capture observation failed; no qualification or release approval was produced.'
-            }
-            $expectedExit = if ($case.Exit -eq 0) { 0 } else { 1 }
-            if ($hostProcess.ExitCode -ne $expectedExit -or
-                $hostStdout.GetAwaiter().GetResult().Trim() -cne '' -or
-                $hostStderr.GetAwaiter().GetResult().Trim() -cne $expectedError) {
-                throw 'Capture wrapper ignored the GUI process exit status or used stale LASTEXITCODE.'
-            }
-            if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Capture wrapper removed the fixture report.' }
-            $exclusive = [IO.File]::Open($fixtureExe, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-            $exclusive.Dispose()
-        }
-        finally {
-            $null = $gate.Set()
-            if ($hostStarted -and -not $hostProcess.WaitForExit(15000)) {
-                $hostProcess.Kill($true)
-                if (-not $hostProcess.WaitForExit(10000)) { throw 'Owned capture fixture host did not terminate.' }
-            }
-            $hostProcess.Dispose()
-            if (Test-Path -LiteralPath "$output.pid" -PathType Leaf) {
-                $fixturePid = [int]([IO.File]::ReadAllText("$output.pid"))
-                $ownedProcess = Get-Process -Id $fixturePid -ErrorAction SilentlyContinue
-                if ($null -ne $ownedProcess) {
-                    try {
-                        if (-not $ownedProcess.WaitForExit(10000)) {
-                            if (-not [string]::Equals($ownedProcess.MainModule.FileName, $fixtureExe, [StringComparison]::OrdinalIgnoreCase)) {
-                                throw 'Refusing cleanup of a process outside the GUI fixture.'
-                            }
-                            $ownedProcess.Kill()
-                            if (-not $ownedProcess.WaitForExit(10000)) { throw 'Owned GUI fixture did not terminate.' }
-                        }
-                    }
-                    finally { $ownedProcess.Dispose() }
+        foreach ($includeFrozenIdentity in @($false, $true)) {
+            $id = "$($case.Exit)_$([guid]::NewGuid().ToString('N'))"
+            $output = Join-Path $fixtureRoot "$id.txt"
+            $started = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureStarted-$id")
+            $gate = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureGate-$id")
+            $hostProcess = [Diagnostics.Process]::new()
+            $hostStarted = $false
+            try {
+                $options = @{
+                    CollectorPath = $fixtureExe; CollectorSha256 = $fixtureHash
+                    ModelPath = (Join-Path $fixtureRoot "model Ω & '(one).gguf"); ModelSha256 = 'a' * 64
+                    WavPath = (Join-Path $fixtureRoot 'audio;input.wav'); WavSha256 = 'b' * 64
+                    GpuPackId = 'fixture-pack'; GpuBackend = 'vulkan'
+                    GpuDevice = 'native:luid:0102030405060708'
+                    OutputPath = $output; CampaignPower = 'battery'
+                    CpuWorkerBuildId = 'cpu-worker-build-123'; CpuWorkerSha256 = 'd' * 64
+                    CpuWorkerProtocol = '5'; CpuWorkerAbi = '1'
+                    GpuWorkerBuildId = 'gpu-worker-build-456'; GpuWorkerSha256 = 'e' * 64
+                    GpuWorkerProtocol = '5'; GpuWorkerAbi = '1'
+                    GpuPackVersion = 'fixture-pack-1'; GpuPackSha256 = 'f' * 64
+                    GpuPackSecurityEpoch = '1'
                 }
+                if (-not $includeFrozenIdentity) {
+                    foreach ($field in @(
+                        'CpuWorkerBuildId', 'CpuWorkerSha256', 'CpuWorkerProtocol', 'CpuWorkerAbi',
+                        'GpuWorkerBuildId', 'GpuWorkerSha256', 'GpuWorkerProtocol', 'GpuWorkerAbi',
+                        'GpuPackVersion', 'GpuPackSha256', 'GpuPackSecurityEpoch')) {
+                        $options.Remove($field)
+                    }
+                }
+                $optionsPath = Join-Path $fixtureRoot "$id-options.json"
+                [IO.File]::WriteAllText($optionsPath, ($options | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+                $hostStartInfo = [Diagnostics.ProcessStartInfo]::new()
+                $hostStartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+                $hostStartInfo.UseShellExecute = $false
+                $hostStartInfo.CreateNoWindow = $true
+                $hostStartInfo.RedirectStandardOutput = $true
+                $hostStartInfo.RedirectStandardError = $true
+                foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixtureHost,
+                    '-Wrapper', $wrapper, '-OptionsPath', $optionsPath, '-Previous', [string]$case.Previous)) {
+                    $hostStartInfo.ArgumentList.Add($argument)
+                }
+                $hostProcess.StartInfo = $hostStartInfo
+                $hostStarted = $hostProcess.Start()
+                if (-not $hostStarted) { throw 'Could not start the isolated capture fixture host.' }
+                $hostStdout = $hostProcess.StandardOutput.ReadToEndAsync()
+                $hostStderr = $hostProcess.StandardError.ReadToEndAsync()
+                if (-not $started.WaitOne(10000)) { throw 'GUI fixture did not signal startup.' }
+                if ($hostProcess.HasExited) { throw 'Capture wrapper returned while its GUI collector was still running.' }
+                $expectedArguments = @(& {
+                    param($Definition, $Options)
+                    . ([scriptblock]::Create($Definition))
+                    Get-CaptureObservationArguments $Options
+                } $argumentBuilder[0].Extent.Text $options)
+                $actualArguments = @([IO.File]::ReadAllLines($output))
+                if ($actualArguments.Count -ne $expectedArguments.Count) { throw 'GUI collector argument count differs.' }
+                for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
+                    if ($actualArguments[$index] -cne $expectedArguments[$index]) { throw 'GUI collector literal argument differs.' }
+                }
+                $null = $gate.Set()
+                if (-not $hostProcess.WaitForExit(15000)) { throw 'Capture wrapper did not observe GUI termination.' }
+                $expectedError = if ($case.Exit -eq 0) { '' } else {
+                    'Capture observation failed; no qualification or release approval was produced.'
+                }
+                $expectedExit = if ($case.Exit -eq 0) { 0 } else { 1 }
+                if ($hostProcess.ExitCode -ne $expectedExit -or
+                    $hostStdout.GetAwaiter().GetResult().Trim() -cne '' -or
+                    $hostStderr.GetAwaiter().GetResult().Trim() -cne $expectedError) {
+                    throw 'Capture wrapper ignored the GUI process exit status or used stale LASTEXITCODE.'
+                }
+                if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Capture wrapper removed the fixture report.' }
+                $exclusive = [IO.File]::Open($fixtureExe, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                $exclusive.Dispose()
             }
-            $gate.Dispose()
-            $started.Dispose()
+            finally {
+                $null = $gate.Set()
+                if ($hostStarted -and -not $hostProcess.WaitForExit(15000)) {
+                    $hostProcess.Kill($true)
+                    if (-not $hostProcess.WaitForExit(10000)) { throw 'Owned capture fixture host did not terminate.' }
+                }
+                $hostProcess.Dispose()
+                if (Test-Path -LiteralPath "$output.pid" -PathType Leaf) {
+                    $fixturePid = [int]([IO.File]::ReadAllText("$output.pid"))
+                    $ownedProcess = Get-Process -Id $fixturePid -ErrorAction SilentlyContinue
+                    if ($null -ne $ownedProcess) {
+                        try {
+                            if (-not $ownedProcess.WaitForExit(10000)) {
+                                if (-not [string]::Equals($ownedProcess.MainModule.FileName, $fixtureExe, [StringComparison]::OrdinalIgnoreCase)) {
+                                    throw 'Refusing cleanup of a process outside the GUI fixture.'
+                                }
+                                $ownedProcess.Kill()
+                                if (-not $ownedProcess.WaitForExit(10000)) { throw 'Owned GUI fixture did not terminate.' }
+                            }
+                        }
+                        finally { $ownedProcess.Dispose() }
+                    }
+                }
+                $gate.Dispose()
+                $started.Dispose()
+            }
         }
     }
     # A valid digest does not make a malformed executable launchable. Startup
@@ -396,4 +457,4 @@ finally {
         Write-Warning "Failed GUI fixture cleanup; retained generated files at $fixtureRoot"
     }
 }
-Write-Output 'Capture wrapper GUI process contracts passed (4 cases); local synthetic executable only, no GPU or Cargo process.'
+Write-Output 'Capture wrapper GUI process contracts passed (6 cases, with and without frozen identity); local synthetic executable only, no GPU or Cargo process.'

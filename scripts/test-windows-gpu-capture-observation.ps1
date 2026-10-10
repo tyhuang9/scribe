@@ -52,6 +52,7 @@ try {
     }
 
     $wrapper = Join-Path $PSScriptRoot 'run-windows-gpu-capture-observation.ps1'
+    $prelaunchAssertionCount = 0
     $wrapperArguments = @{
         CollectorPath = (Join-Path $repositoryRoot 'not-a-real-collector.exe')
         CollectorSha256 = ('a' * 64)
@@ -63,6 +64,17 @@ try {
         GpuBackend = 'cuda'
         GpuDevice = 'native:0000:01:00.0'
         OutputPath = (Join-Path $repositoryRoot 'not-a-real-report.json')
+        CpuWorkerBuildId = 'cpu-worker-build-123'
+        CpuWorkerSha256 = ('d' * 64)
+        CpuWorkerProtocol = '5'
+        CpuWorkerAbi = '1'
+        GpuWorkerBuildId = 'gpu-worker-build-456'
+        GpuWorkerSha256 = ('e' * 64)
+        GpuWorkerProtocol = '5'
+        GpuWorkerAbi = '1'
+        GpuPackVersion = 'fixture-pack-1'
+        GpuPackSha256 = ('f' * 64)
+        GpuPackSecurityEpoch = '1'
     }
     # Each mutation must fail before file access or native executable launch.
     # These argument-only cases create no executables, models, audio or reports.
@@ -88,6 +100,7 @@ try {
             $rejected = $true
         }
         if (-not $rejected) { throw 'Capture wrapper accepted a malformed input.' }
+        $prelaunchAssertionCount++
     }
 
     foreach ($power in @('AC', 'Battery')) {
@@ -102,7 +115,76 @@ try {
             $rejected = $true
         }
         if (-not $rejected) { throw 'Capture wrapper accepted noncanonical campaign power.' }
+        $prelaunchAssertionCount++
     }
+
+    $frozenIdentityFields = @(
+        'CpuWorkerBuildId', 'CpuWorkerSha256', 'CpuWorkerProtocol', 'CpuWorkerAbi',
+        'GpuWorkerBuildId', 'GpuWorkerSha256', 'GpuWorkerProtocol', 'GpuWorkerAbi',
+        'GpuPackVersion', 'GpuPackSha256', 'GpuPackSecurityEpoch'
+    )
+    foreach ($field in $frozenIdentityFields) {
+        $arguments = $wrapperArguments.Clone()
+        $arguments.Remove($field)
+        $rejected = $false
+        try { & $wrapper @arguments }
+        catch {
+            if ($_.Exception.Message -cne 'Frozen worker and pack identity pins must be supplied as one complete set.') {
+                throw 'Capture wrapper accepted or misclassified a partial frozen identity.'
+            }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Capture wrapper accepted a partial frozen identity.' }
+        $prelaunchAssertionCount++
+    }
+
+    foreach ($invalid in @(
+        @{ Field = 'CpuWorkerBuildId'; Value = 'short'; Error = 'Frozen worker build IDs must be 12-192 ASCII visible characters.' },
+        @{ Field = 'GpuWorkerBuildId'; Value = "gpu`tworker-build-456"; Error = 'Frozen worker build IDs must be 12-192 ASCII visible characters.' },
+        @{ Field = 'CpuWorkerSha256'; Value = ('A' * 64); Error = 'Frozen worker and pack digests must be nonzero lowercase SHA-256.' },
+        @{ Field = 'GpuWorkerSha256'; Value = ('0' * 64); Error = 'Frozen worker and pack digests must be nonzero lowercase SHA-256.' },
+        @{ Field = 'GpuPackSha256'; Value = ('g' * 64); Error = 'Frozen worker and pack digests must be nonzero lowercase SHA-256.' },
+        @{ Field = 'CpuWorkerProtocol'; Value = '05'; Error = 'Frozen worker protocol must be canonical version 5.' },
+        @{ Field = 'GpuWorkerProtocol'; Value = '6'; Error = 'Frozen worker protocol must be canonical version 5.' },
+        @{ Field = 'CpuWorkerAbi'; Value = '01'; Error = 'Frozen worker ABI must be canonical version 1.' },
+        @{ Field = 'GpuWorkerAbi'; Value = '2'; Error = 'Frozen worker ABI must be canonical version 1.' },
+        @{ Field = 'GpuPackVersion'; Value = 'Fixture-Pack'; Error = 'Frozen GPU pack version must be a canonical lowercase immutable store component.' },
+        @{ Field = 'GpuPackVersion'; Value = 'con'; Error = 'Frozen GPU pack version must be a canonical lowercase immutable store component.' },
+        @{ Field = 'GpuPackVersion'; Value = 'prn.log'; Error = 'Frozen GPU pack version must be a canonical lowercase immutable store component.' },
+        @{ Field = 'GpuPackVersion'; Value = 'com1'; Error = 'Frozen GPU pack version must be a canonical lowercase immutable store component.' },
+        @{ Field = 'GpuPackVersion'; Value = 'lpt9.data'; Error = 'Frozen GPU pack version must be a canonical lowercase immutable store component.' },
+        @{ Field = 'GpuPackSecurityEpoch'; Value = '01'; Error = 'Frozen GPU pack security epoch must be a positive canonical decimal.' },
+        @{ Field = 'GpuPackSecurityEpoch'; Value = '0'; Error = 'Frozen GPU pack security epoch must be a positive canonical decimal.' }
+    )) {
+        $arguments = $wrapperArguments.Clone()
+        $arguments[$invalid.Field] = $invalid.Value
+        $rejected = $false
+        try { & $wrapper @arguments }
+        catch {
+            if ($_.Exception.Message -cne $invalid.Error) {
+                throw 'Capture wrapper rejected malformed frozen identity at the wrong boundary.'
+            }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Capture wrapper accepted malformed frozen identity.' }
+        $prelaunchAssertionCount++
+    }
+
+    # PowerShell rejects duplicate bound parameter names before the wrapper body
+    # can inspect paths or launch a collector. Exercise that native contract.
+    $duplicateRejected = $false
+    try {
+        & $wrapper @wrapperArguments -CpuWorkerBuildId 'cpu-worker-build-123' -CpuWorkerBuildId 'cpu-worker-build-789'
+    }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike 'ParameterAlreadyBound*' -and
+            $_.Exception.Message -notmatch '(?i)already.*(specified|bound)') {
+            throw 'Capture wrapper duplicate parameters were rejected at the wrong boundary.'
+        }
+        $duplicateRejected = $true
+    }
+    if (-not $duplicateRejected) { throw 'Capture wrapper accepted duplicate frozen identity parameters.' }
+    $prelaunchAssertionCount++
     foreach ($power in @('', 'unknown', 'auto', ' ac', 'battery ')) {
         $arguments = $wrapperArguments.Clone()
         $arguments.CampaignPower = $power
@@ -115,6 +197,7 @@ try {
             $rejected = $true
         }
         if (-not $rejected) { throw 'Capture wrapper accepted an invalid campaign power.' }
+        $prelaunchAssertionCount++
     }
 
     $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('scribe-capture-wrapper-' + [Guid]::NewGuid().ToString('N'))
@@ -143,6 +226,7 @@ try {
                 $rejected = $true
             }
             if (-not $rejected) { throw 'Capture wrapper accepted an invalid collector file.' }
+            $prelaunchAssertionCount++
         }
         # A rejected digest must release the read lock; none of these fixtures
         # is runnable, and no test is allowed to reach executable launch.
@@ -157,8 +241,11 @@ try {
         }
         Remove-Item -LiteralPath $fixtureRoot -ErrorAction Stop
     }
+    if ($prelaunchAssertionCount -ne 47) {
+        throw "Capture wrapper prelaunch assertion count changed: expected 47, observed $prelaunchAssertionCount."
+    }
     if ($ScriptOnly) {
-        Write-Output 'Windows GPU capture observation script contracts passed (19 prelaunch cases plus GUI process fixtures); GPU/Cargo checks not run.'
+        Write-Output 'Windows GPU capture observation script contracts passed (47 prelaunch assertions plus 6 GUI process fixtures); GPU/Cargo checks not run.'
         return
     }
 

@@ -4325,6 +4325,8 @@ struct OsWorkerLauncher {
     resolver: Arc<dyn WorkerExecutableResolver>,
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     diagnostic_probe: Option<Arc<DiagnosticProbeState>>,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    capture_pins: Option<Arc<CaptureFrozenInputs>>,
 }
 
 impl OsWorkerLauncher {
@@ -4334,6 +4336,8 @@ impl OsWorkerLauncher {
             resolver: Arc::new(InstalledWorkerExecutableResolver),
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             diagnostic_probe: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_pins: None,
         }
     }
 
@@ -4343,6 +4347,8 @@ impl OsWorkerLauncher {
             resolver: Arc::new(InstalledWorkerExecutableResolver),
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             diagnostic_probe: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_pins: None,
         }
     }
 
@@ -4352,6 +4358,8 @@ impl OsWorkerLauncher {
             resolver: Arc::new(VerifiedPackWorkerExecutableResolver { binding }),
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             diagnostic_probe: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_pins: None,
         }
     }
 
@@ -4361,6 +4369,8 @@ impl OsWorkerLauncher {
             resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             diagnostic_probe: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_pins: None,
         }
     }
 
@@ -4373,6 +4383,7 @@ impl OsWorkerLauncher {
             role: WorkerRole::Inference,
             resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
             diagnostic_probe: Some(diagnostic_probe),
+            capture_pins: None,
         }
     }
 
@@ -4383,29 +4394,51 @@ impl OsWorkerLauncher {
             resolver: Arc::new(FixedWorkerExecutableResolver(executable)),
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             diagnostic_probe: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_pins: None,
         }
     }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn with_capture_pins(mut self, pins: Option<Arc<CaptureFrozenInputs>>) -> Self {
+        self.capture_pins = pins;
+        self
+    }
+}
+
+// The trusted expectation comes only from the ordinary resolver and reviewed
+// compatibility approval. Capture constraints must never manufacture it.
+fn resolved_worker_expectation(
+    role: WorkerRole,
+    executable: &VerifiedWorkerExecutable,
+) -> Result<WorkerExpectation> {
+    let mut expectation = expected_worker(role);
+    if let Some(pack) = &executable.pack_launch {
+        expectation.provider = pack.expectation.backend;
+        expectation.pack = Some(pack.expectation.clone());
+        expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
+    }
+    if let Some(approval) = &executable.frozen_worker_approval {
+        if role != WorkerRole::Inference
+            || approval.worker_sha256() != executable.identity.sha256
+            || approval.protocol_version() != PROTOCOL_VERSION
+            || approval.runtime_abi_version() != WORKER_ABI_VERSION
+            || (executable.pack_launch.is_some() == approval.is_cpu())
+        {
+            bail!("frozen worker launch approval does not match the verified executable");
+        }
+        expectation.worker_build = approval.worker_build().to_owned();
+    }
+    Ok(expectation)
 }
 
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
         let executable = self.resolver.resolve(self.role)?;
-        let mut expectation = expected_worker(self.role);
-        if let Some(pack) = &executable.pack_launch {
-            expectation.provider = pack.expectation.backend;
-            expectation.pack = Some(pack.expectation.clone());
-            expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
-        }
-        if let Some(approval) = &executable.frozen_worker_approval {
-            if self.role != WorkerRole::Inference
-                || approval.worker_sha256() != executable.identity.sha256
-                || approval.protocol_version() != PROTOCOL_VERSION
-                || approval.runtime_abi_version() != WORKER_ABI_VERSION
-                || (executable.pack_launch.is_some() == approval.is_cpu())
-            {
-                bail!("frozen worker launch approval does not match the verified executable");
-            }
-            expectation.worker_build = approval.worker_build().to_owned();
+        let expectation = resolved_worker_expectation(self.role, &executable)?;
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(pins) = &self.capture_pins {
+            pins.validate_launch(&expectation, &executable.identity.sha256)?;
         }
         let worker_flag = match self.role {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
@@ -8672,6 +8705,157 @@ pub(crate) struct CaptureObservationWorker {
     pub(crate) gpu_identity: Option<GpuCaptureObservationIdentity>,
 }
 
+/// Caller-supplied denial constraints, not executable or signing authority.
+/// The same immutable value follows discovery, every cold launch and the warm
+/// generation. Existing signature, CPU anchor and authenticated Hello checks
+/// remain mandatory and supply the trusted identity compared here.
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureWorkerPin {
+    pub(crate) worker_build_id: String,
+    pub(crate) worker_sha256: String,
+    pub(crate) protocol_version: u8,
+    pub(crate) runtime_abi: u16,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug)]
+pub(crate) struct CapturePackPin {
+    pub(crate) pack_id: String,
+    pub(crate) pack_version: String,
+    pub(crate) pack_digest: String,
+    pub(crate) security_epoch: u64,
+    pub(crate) runtime_abi: u16,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureFrozenInputs {
+    pub(crate) cpu_baseline: CaptureWorkerPin,
+    pub(crate) gpu_worker: CaptureWorkerPin,
+    pub(crate) pack: CapturePackPin,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl CaptureFrozenInputs {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && value.bytes().any(|byte| byte != b'0')
+        };
+        for worker in [&self.cpu_baseline, &self.gpu_worker] {
+            if !crate::worker_compatibility::is_valid_build_identity(&worker.worker_build_id)
+                || !hash(&worker.worker_sha256)
+                || worker.protocol_version != PROTOCOL_VERSION
+                || worker.runtime_abi != WORKER_ABI_VERSION
+            {
+                bail!("capture frozen worker constraints are invalid or incompatible");
+            }
+        }
+        if crate::gpu_worker_pack::manifest::StoreComponent::new(self.pack.pack_id.clone())
+            .is_none()
+            || crate::gpu_worker_pack::manifest::StoreComponent::new(self.pack.pack_version.clone())
+                .is_none()
+            || !hash(&self.pack.pack_digest)
+            || self.pack.security_epoch == 0
+            || self.pack.runtime_abi != self.gpu_worker.runtime_abi
+        {
+            bail!("capture frozen pack constraints are invalid or incompatible");
+        }
+        Ok(())
+    }
+
+    fn matches_pack(&self, pack: &WorkerPackExpectation) -> bool {
+        pack.pack_id == self.pack.pack_id
+            && pack.pack_version == self.pack.pack_version
+            && pack.pack_digest == self.pack.pack_digest
+            && pack.security_epoch == self.pack.security_epoch
+            && pack.runtime_abi == self.pack.runtime_abi
+    }
+
+    fn matches_lease(&self, lease: &VerifiedPackLease, backend: BackendKind) -> bool {
+        let pack = lease.verified_pack();
+        let pack_expectation = pack_expectation(lease);
+        let worker_build = lease
+            .frozen_worker_approval()
+            .map(|approval| approval.worker_build())
+            .unwrap_or(INFERENCE_WORKER_BUILD_ID);
+        matches!(
+            (backend, pack.backend),
+            (BackendKind::Cuda, PackBackend::Cuda) | (BackendKind::Vulkan, PackBackend::Vulkan)
+        ) && self.matches_pack(&pack_expectation)
+            && self.gpu_worker.worker_build_id == worker_build
+            && lease.copy_entries().iter().any(|entry| {
+                entry.path == pack.worker_relative_path
+                    && entry.sha256 == self.gpu_worker.worker_sha256
+            })
+    }
+
+    fn constrain_discovery(
+        &self,
+        mut discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+        pack_id: &str,
+        backend: BackendKind,
+    ) -> Result<crate::gpu_worker_pack::PackLeaseDiscovery> {
+        self.validate()?;
+        if self.pack.pack_id != pack_id {
+            bail!("capture frozen pack does not match the requested selector");
+        }
+        discovery
+            .leases
+            .retain(|lease| self.matches_lease(lease, backend));
+        if discovery.leases.len() != 1 {
+            bail!("no unique verified pack matches the frozen capture constraints");
+        }
+        Ok(discovery)
+    }
+
+    fn validate_launch(&self, expected: &WorkerExpectation, actual_sha256: &str) -> Result<()> {
+        self.validate()?;
+        let worker = match &expected.pack {
+            Some(pack)
+                if matches!(
+                    expected.provider,
+                    WorkerProvider::Cuda | WorkerProvider::Vulkan
+                ) && pack.backend == expected.provider
+                    && self.matches_pack(pack) =>
+            {
+                &self.gpu_worker
+            }
+            None if expected.provider == WorkerProvider::Cpu => &self.cpu_baseline,
+            _ => bail!("capture frozen pack/provider does not match the trusted launch identity"),
+        };
+        if expected.role != WorkerRole::Inference
+            || expected.worker_build != worker.worker_build_id
+            || expected.abi != worker.runtime_abi
+            || expected.bundled_worker_sha256 != worker.worker_sha256
+            || actual_sha256 != worker.worker_sha256
+        {
+            // In particular, a caller hash cannot replace an absent CPU anchor.
+            bail!("capture frozen worker does not match the trusted launch identity");
+        }
+        Ok(())
+    }
+
+    fn admit_before_probe(
+        &self,
+        expected_cpu: &WorkerExpectation,
+        actual_cpu_sha256: &str,
+        discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+        pack_id: &str,
+        backend: BackendKind,
+    ) -> Result<crate::gpu_worker_pack::PackLeaseDiscovery> {
+        if expected_cpu.pack.is_some() || expected_cpu.provider != WorkerProvider::Cpu {
+            bail!("capture baseline admission requires the trusted CPU worker");
+        }
+        self.validate_launch(expected_cpu, actual_cpu_sha256)?;
+        self.constrain_discovery(discovery, pack_id, backend)
+    }
+}
+
 /// A resolved worker construction authority for the bounded capture campaign.
 ///
 /// GPU discovery happens once when the factory is created. Every `spawn` still
@@ -8682,26 +8866,75 @@ pub(crate) struct CaptureObservationWorker {
 pub(crate) struct CaptureObservationWorkerFactory {
     binding: Option<VerifiedPackLaunchBinding>,
     gpu_identity: Option<GpuCaptureObservationIdentity>,
+    pins: Option<Arc<CaptureFrozenInputs>>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 impl CaptureObservationWorkerFactory {
-    pub(crate) fn cpu() -> Self {
+    pub(crate) fn cpu(pins: Option<Arc<CaptureFrozenInputs>>) -> Self {
         Self {
             binding: None,
             gpu_identity: None,
+            pins,
         }
     }
 
-    pub(crate) fn gpu_exact(pack_id: &str, backend: &str, stable_device: &str) -> Result<Self> {
+    pub(crate) fn gpu_exact(
+        pack_id: &str,
+        backend: &str,
+        stable_device: &str,
+        pins: Option<Arc<CaptureFrozenInputs>>,
+    ) -> Result<Self> {
         let backend = match backend {
             "cuda" => BackendKind::Cuda,
             "vulkan" => BackendKind::Vulkan,
             _ => bail!("GPU observation backend must be cuda or vulkan"),
         };
-        let registry = discover_production_pack_launch_bindings(
-            crate::gpu_worker_pack::discover_production_pack_leases(),
-        );
+        // Admission is two-phase: both identities must pass before the first
+        // provider probe, not merely before each side's eventual model run.
+        // Keep the CPU's deny-write/delete handle live through GPU probing.
+        let cpu_admission = if let Some(pins) = &pins {
+            let executable = InstalledWorkerExecutableResolver.resolve(WorkerRole::Inference)?;
+            let expected = resolved_worker_expectation(WorkerRole::Inference, &executable)?;
+            pins.validate_launch(&expected, &executable.identity.sha256)?;
+            Some((executable, expected))
+        } else {
+            None
+        };
+        let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+        let registry = if let Some(pins) = &pins {
+            // Reject other packs before even a provider-discovery worker starts.
+            let (cpu, expected_cpu) = cpu_admission
+                .as_ref()
+                .expect("pinned CPU admission retained");
+            let discovery = pins.admit_before_probe(
+                expected_cpu,
+                &cpu.identity.sha256,
+                discovery,
+                pack_id,
+                backend,
+            )?;
+            let probes = discovery
+                .leases
+                .into_iter()
+                .map(|lease| PendingPackProbe {
+                    pack_id: lease.verified_pack().pack_id.clone(),
+                    backend: lease.verified_pack().backend,
+                    supervisor: Self::supervisor(
+                        OsWorkerLauncher::for_pack_probe(lease)
+                            .with_capture_pins(Some(pins.clone())),
+                    ),
+                })
+                .collect();
+            discover_pack_launch_bindings_with_budget(
+                probes,
+                discovery.diagnostics,
+                GPU_PROVIDER_DISCOVERY_BUDGET,
+            )
+        } else {
+            discover_production_pack_launch_bindings(discovery)
+        };
+        drop(cpu_admission);
         let (bindings, _) = registry.into_parts();
         let mut matches = bindings.into_iter().filter(|binding| {
             let target = binding.backend_target();
@@ -8768,16 +9001,31 @@ impl CaptureObservationWorkerFactory {
         Ok(Self {
             binding: Some(binding),
             gpu_identity: Some(identity),
+            pins,
         })
     }
 
-    pub(crate) fn spawn(&self) -> CaptureObservationWorker {
-        let supervisor = match &self.binding {
-            Some(binding) => InferenceWorkerSupervisor::for_pack_binding(binding.clone()),
-            None => InferenceWorkerSupervisor::unstarted(),
+    fn supervisor(launcher: OsWorkerLauncher) -> InferenceWorkerSupervisor {
+        InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(launcher),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn launcher(&self) -> OsWorkerLauncher {
+        let launcher = match &self.binding {
+            Some(binding) => OsWorkerLauncher::for_pack_binding(binding.clone()),
+            None => OsWorkerLauncher::inference(),
         };
+        launcher.with_capture_pins(self.pins.clone())
+    }
+
+    pub(crate) fn spawn(&self) -> CaptureObservationWorker {
         CaptureObservationWorker {
-            supervisor,
+            supervisor: Self::supervisor(self.launcher()),
             gpu_identity: self.gpu_identity.clone(),
         }
     }
@@ -8789,12 +9037,20 @@ impl CaptureObservationWorkerFactory {
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 impl CaptureObservationWorker {
-    pub(crate) fn cpu() -> Self {
-        CaptureObservationWorkerFactory::cpu().spawn()
+    pub(crate) fn cpu(pins: Option<Arc<CaptureFrozenInputs>>) -> Self {
+        CaptureObservationWorkerFactory::cpu(pins).spawn()
     }
 
-    pub(crate) fn gpu(pack_id: &str, backend: &str, stable_device: &str) -> Result<Self> {
-        Ok(CaptureObservationWorkerFactory::gpu_exact(pack_id, backend, stable_device)?.spawn())
+    pub(crate) fn gpu(
+        pack_id: &str,
+        backend: &str,
+        stable_device: &str,
+        pins: Option<Arc<CaptureFrozenInputs>>,
+    ) -> Result<Self> {
+        Ok(
+            CaptureObservationWorkerFactory::gpu_exact(pack_id, backend, stable_device, pins)?
+                .spawn(),
+        )
     }
 
     pub(crate) fn prepare_observation(&self) -> Result<WorkerObservationLease> {
@@ -23600,6 +23856,369 @@ mod tests {
         assert!(process.terminated.load(Ordering::Acquire));
         assert_eq!(supervisor.current_generation().unwrap(), None);
         assert!(response.recv().unwrap().is_err());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    mod capture_observation_frozen_launch {
+        use super::*;
+
+        fn pins() -> CaptureFrozenInputs {
+            let worker = |hash| CaptureWorkerPin {
+                worker_build_id: INFERENCE_WORKER_BUILD_ID.to_owned(),
+                worker_sha256: hash,
+                protocol_version: PROTOCOL_VERSION,
+                runtime_abi: WORKER_ABI_VERSION,
+            };
+            CaptureFrozenInputs {
+                cpu_baseline: worker("a".repeat(64)),
+                gpu_worker: worker("b".repeat(64)),
+                pack: CapturePackPin {
+                    pack_id: "fixture-pack".to_owned(),
+                    pack_version: "p1-fixture".to_owned(),
+                    pack_digest: "c".repeat(64),
+                    security_epoch: 1,
+                    runtime_abi: WORKER_ABI_VERSION,
+                },
+            }
+        }
+
+        fn expectation(pins: &CaptureFrozenInputs, provider: WorkerProvider) -> WorkerExpectation {
+            let mut expected = expected_worker_for_provider(WorkerRole::Inference, provider);
+            expected.bundled_worker_sha256 = if provider == WorkerProvider::Cpu {
+                pins.cpu_baseline.worker_sha256.clone()
+            } else {
+                expected.pack = Some(WorkerPackExpectation {
+                    pack_id: pins.pack.pack_id.clone(),
+                    pack_version: pins.pack.pack_version.clone(),
+                    pack_digest: pins.pack.pack_digest.clone(),
+                    security_epoch: pins.pack.security_epoch,
+                    runtime_abi: pins.pack.runtime_abi,
+                    backend: provider,
+                    provider: "fixture-provider".to_owned(),
+                });
+                pins.gpu_worker.worker_sha256.clone()
+            };
+            expected
+        }
+
+        #[test]
+        fn exact_cpu_cuda_and_vulkan_constraints_preserve_trusted_expectation() {
+            let pins = pins();
+            for provider in [
+                WorkerProvider::Cpu,
+                WorkerProvider::Cuda,
+                WorkerProvider::Vulkan,
+            ] {
+                let expected = expectation(&pins, provider);
+                let before = expected.clone();
+                pins.validate_launch(&expected, &expected.bundled_worker_sha256)
+                    .unwrap();
+                assert_eq!(before, expected);
+            }
+        }
+
+        #[test]
+        fn every_frozen_worker_and_pack_field_denies_substitution() {
+            let original = pins();
+            let cpu = expectation(&original, WorkerProvider::Cpu);
+            let gpu = expectation(&original, WorkerProvider::Cuda);
+            let changes: &[fn(&mut CaptureFrozenInputs)] = &[
+                |p| p.cpu_baseline.worker_build_id.push_str("-other"),
+                |p| p.cpu_baseline.worker_sha256 = "d".repeat(64),
+                |p| p.cpu_baseline.protocol_version += 1,
+                |p| p.cpu_baseline.runtime_abi += 1,
+                |p| p.gpu_worker.worker_build_id.push_str("-other"),
+                |p| p.gpu_worker.worker_sha256 = "d".repeat(64),
+                |p| p.gpu_worker.protocol_version += 1,
+                |p| p.gpu_worker.runtime_abi += 1,
+                |p| p.pack.pack_id.push_str("-other"),
+                |p| p.pack.pack_version.push_str("-other"),
+                |p| p.pack.pack_digest = "d".repeat(64),
+                |p| p.pack.security_epoch += 1,
+                |p| p.pack.runtime_abi += 1,
+            ];
+            for (index, change) in changes.iter().enumerate() {
+                let mut changed = original.clone();
+                change(&mut changed);
+                let target = if index < 4 { &cpu } else { &gpu };
+                assert!(
+                    changed
+                        .validate_launch(target, &target.bundled_worker_sha256)
+                        .is_err(),
+                    "accepted changed field {index}"
+                );
+            }
+        }
+
+        #[test]
+        fn caller_hash_cannot_supply_missing_cpu_anchor_or_replace_executable() {
+            let pins = pins();
+            let mut expected = expectation(&pins, WorkerProvider::Cpu);
+            assert!(pins.validate_launch(&expected, &"d".repeat(64)).is_err());
+            expected.bundled_worker_sha256.clear();
+            assert!(
+                pins.validate_launch(&expected, &pins.cpu_baseline.worker_sha256)
+                    .is_err()
+            );
+            expected = expectation(&pins, WorkerProvider::Cpu);
+            expected.role = WorkerRole::Vad;
+            assert!(
+                pins.validate_launch(&expected, &pins.cpu_baseline.worker_sha256)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn constraints_reject_provider_and_pack_substitution() {
+            let pins = pins();
+            let mut expected = expectation(&pins, WorkerProvider::Cuda);
+            expected.provider = WorkerProvider::Cpu;
+            assert!(
+                pins.validate_launch(&expected, &pins.gpu_worker.worker_sha256)
+                    .is_err()
+            );
+            expected = expectation(&pins, WorkerProvider::Cuda);
+            expected.pack.as_mut().unwrap().backend = WorkerProvider::Vulkan;
+            assert!(
+                pins.validate_launch(&expected, &pins.gpu_worker.worker_sha256)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn verified_lease_is_constrained_before_any_provider_probe() {
+            let root = crate::gpu_worker_pack::manifest::test_support::temp_root(
+                "capture-frozen-discovery",
+            );
+            let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+            let lease = Arc::new(lease);
+            let pack = lease.verified_pack();
+            let mut pins = pins();
+            pins.pack = CapturePackPin {
+                pack_id: pack.pack_id.as_str().to_owned(),
+                pack_version: pack.pack_version.as_str().to_owned(),
+                pack_digest: pack.pack_digest.clone(),
+                security_epoch: pack.security_epoch,
+                runtime_abi: pack.runtime_abi_version,
+            };
+            pins.gpu_worker.worker_sha256 = lease
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == pack.worker_relative_path)
+                .unwrap()
+                .sha256
+                .clone();
+            let discovery = |leases| crate::gpu_worker_pack::PackLeaseDiscovery {
+                leases,
+                diagnostics: Vec::new(),
+                catalog_generation: None,
+            };
+            assert!(
+                pins.constrain_discovery(
+                    discovery(vec![lease.clone()]),
+                    &pins.pack.pack_id,
+                    BackendKind::Vulkan
+                )
+                .is_ok()
+            );
+            assert!(
+                pins.constrain_discovery(
+                    discovery(vec![lease.clone()]),
+                    &pins.pack.pack_id,
+                    BackendKind::Cuda
+                )
+                .is_err()
+            );
+            assert!(
+                pins.constrain_discovery(
+                    discovery(vec![lease.clone(), lease.clone()]),
+                    &pins.pack.pack_id,
+                    BackendKind::Vulkan
+                )
+                .is_err()
+            );
+            assert!(
+                pins.constrain_discovery(
+                    discovery(Vec::new()),
+                    &pins.pack.pack_id,
+                    BackendKind::Vulkan
+                )
+                .is_err()
+            );
+            let mutations: &[fn(&mut CaptureFrozenInputs)] = &[
+                |p| p.gpu_worker.worker_build_id.push_str("-other"),
+                |p| p.gpu_worker.worker_sha256 = "f".repeat(64),
+                |p| p.pack.pack_id.push_str("-other"),
+                |p| p.pack.pack_version.push_str("-other"),
+                |p| p.pack.pack_digest = "f".repeat(64),
+                |p| p.pack.security_epoch += 1,
+            ];
+            for change in mutations {
+                let mut changed = pins.clone();
+                change(&mut changed);
+                assert!(
+                    changed
+                        .constrain_discovery(
+                            discovery(vec![lease.clone()]),
+                            &pins.pack.pack_id,
+                            BackendKind::Vulkan
+                        )
+                        .is_err()
+                );
+            }
+            // Both cross-side failures stop at the shared admission boundary,
+            // before a caller can construct the first probe or CPU supervisor.
+            for bad_cpu in [true, false] {
+                let mut changed = pins.clone();
+                if bad_cpu {
+                    changed.cpu_baseline.worker_sha256 = "d".repeat(64);
+                } else {
+                    changed.pack.pack_digest = "d".repeat(64);
+                }
+                let cpu = expectation(&pins, WorkerProvider::Cpu);
+                let admitted = changed.admit_before_probe(
+                    &cpu,
+                    &cpu.bundled_worker_sha256,
+                    discovery(vec![lease.clone()]),
+                    &pins.pack.pack_id,
+                    BackendKind::Vulkan,
+                );
+                assert!(admitted.is_err());
+            }
+            drop(lease);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn actual_launcher_denies_unanchored_cpu_before_process_creation() {
+            let root =
+                crate::gpu_worker_pack::manifest::test_support::temp_root("capture-frozen-launch");
+            let path = root.join("worker.exe");
+            std::fs::write(&path, b"not an executable; no process should be created").unwrap();
+            let executable =
+                verify_worker_executable(&path, &root, std::ffi::OsStr::new("worker.exe"), "")
+                    .unwrap();
+            let trusted = resolved_worker_expectation(WorkerRole::Inference, &executable).unwrap();
+            let mut pins = pins();
+            pins.cpu_baseline.worker_sha256 = executable.identity.sha256.clone();
+            // Fixed fixture resolution does not supply a trusted CPU anchor.
+            assert_ne!(
+                trusted.bundled_worker_sha256,
+                pins.cpu_baseline.worker_sha256
+            );
+            let launcher = OsWorkerLauncher::for_executable(WorkerRole::Inference, path)
+                .with_capture_pins(Some(Arc::new(pins)));
+            let error = launcher
+                .launch()
+                .err()
+                .expect("unanchored fixture cannot launch");
+            assert!(
+                error.to_string().contains("frozen worker"),
+                "reached OS process launch: {error:#}"
+            );
+            drop(executable);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn frozen_launch_and_authenticated_ready_share_exact_unchanged_expectation() {
+            let pins = pins();
+            let expected = expectation(&pins, WorkerProvider::Cpu);
+            pins.validate_launch(&expected, &expected.bundled_worker_sha256)
+                .unwrap();
+            let challenge = "ab".repeat(32);
+            let mut capability = worker_capability_for_provider(
+                WorkerRole::Inference,
+                challenge.clone(),
+                WorkerProvider::Cpu,
+                None,
+            )
+            .unwrap();
+            capability.bundled_worker_sha256 = expected.bundled_worker_sha256.clone();
+            validate_worker_capability(&capability, &challenge, &expected).unwrap();
+            for field in 0..4 {
+                let mut changed = capability.clone();
+                match field {
+                    0 => changed.bundled_worker_sha256 = "d".repeat(64),
+                    1 => changed.worker_build.push_str("-other"),
+                    2 => changed.abi += 1,
+                    _ => changed.challenge = "cd".repeat(32),
+                }
+                assert!(validate_worker_capability(&changed, &challenge, &expected).is_err());
+            }
+        }
+
+        #[test]
+        fn factories_retain_one_immutable_tuple_and_never_rebind_after_cold_spawn() {
+            let pins = Arc::new(pins());
+            let factory = CaptureObservationWorkerFactory::cpu(Some(pins.clone()));
+            let cloned = factory.clone();
+            assert!(Arc::ptr_eq(factory.pins.as_ref().unwrap(), &pins));
+            assert!(Arc::ptr_eq(cloned.pins.as_ref().unwrap(), &pins));
+            assert!(Arc::ptr_eq(
+                factory.launcher().capture_pins.as_ref().unwrap(),
+                &pins
+            ));
+            assert!(Arc::ptr_eq(
+                cloned.launcher().capture_pins.as_ref().unwrap(),
+                &pins
+            ));
+            let first = factory.spawn();
+            let second = cloned.spawn();
+            assert_eq!(
+                first.supervisor.transport.current_generation().unwrap(),
+                None
+            );
+            assert_eq!(
+                second.supervisor.transport.current_generation().unwrap(),
+                None
+            );
+            assert!(Arc::ptr_eq(factory.pins.as_ref().unwrap(), &pins));
+            assert!(
+                CaptureObservationWorkerFactory::cpu(None)
+                    .launcher()
+                    .capture_pins
+                    .is_none()
+            );
+
+            let root = crate::gpu_worker_pack::manifest::test_support::temp_root(
+                "capture-frozen-gpu-launcher",
+            );
+            let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+            let lease = Arc::new(lease);
+            let context = PackLaunchContext::fixture(lease.clone(), None);
+            let capability = WorkerPackCapability {
+                expectation: pack_expectation(&lease),
+                devices: vec![WorkerPackDeviceCapability {
+                    stable_device_identity: "native:luid:0102030405060708".to_owned(),
+                    process_index: 9,
+                    display_name: "fixture GPU".to_owned(),
+                    driver_version: Some("fixture-driver".to_owned()),
+                    device_class: DeviceClass::DiscreteGpu,
+                    vendor: GpuVendor::Nvidia,
+                    memory_total_bytes: 8192,
+                    memory_available_bytes: 4096,
+                }],
+            };
+            let binding = bind_pack_hello(&context, &capability).unwrap().remove(0);
+            let gpu = CaptureObservationWorkerFactory {
+                binding: Some(binding),
+                gpu_identity: None,
+                pins: Some(pins.clone()),
+            };
+            assert!(Arc::ptr_eq(
+                gpu.launcher().capture_pins.as_ref().unwrap(),
+                &pins
+            ));
+            assert!(Arc::ptr_eq(
+                gpu.clone().launcher().capture_pins.as_ref().unwrap(),
+                &pins
+            ));
+            drop(gpu);
+            drop(context);
+            drop(lease);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

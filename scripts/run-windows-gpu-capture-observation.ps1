@@ -10,7 +10,18 @@ param(
     [Parameter(Mandatory)][ValidateSet('cuda', 'vulkan')][string]$GpuBackend,
     [Parameter(Mandatory)][string]$GpuDevice,
     [Parameter(Mandatory)][string]$OutputPath,
-    [ValidateSet('ac', 'battery')][string]$CampaignPower
+    [ValidateSet('ac', 'battery')][string]$CampaignPower,
+    [string]$CpuWorkerBuildId,
+    [string]$CpuWorkerSha256,
+    [string]$CpuWorkerProtocol,
+    [string]$CpuWorkerAbi,
+    [string]$GpuWorkerBuildId,
+    [string]$GpuWorkerSha256,
+    [string]$GpuWorkerProtocol,
+    [string]$GpuWorkerAbi,
+    [string]$GpuPackVersion,
+    [string]$GpuPackSha256,
+    [string]$GpuPackSecurityEpoch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +29,55 @@ Set-StrictMode -Version Latest
 
 if (-not $IsWindows -or -not [Environment]::Is64BitProcess) {
     throw 'Capture observation requires 64-bit PowerShell on Windows.'
+}
+
+$frozenIdentityFields = @(
+    'CpuWorkerBuildId', 'CpuWorkerSha256', 'CpuWorkerProtocol', 'CpuWorkerAbi',
+    'GpuWorkerBuildId', 'GpuWorkerSha256', 'GpuWorkerProtocol', 'GpuWorkerAbi',
+    'GpuPackVersion', 'GpuPackSha256', 'GpuPackSecurityEpoch'
+)
+$frozenIdentityCount = @($frozenIdentityFields | Where-Object { $PSBoundParameters.Keys -contains $_ }).Count
+if ($frozenIdentityCount -ne 0 -and $frozenIdentityCount -ne $frozenIdentityFields.Count) {
+    throw 'Frozen worker and pack identity pins must be supplied as one complete set.'
+}
+
+function Test-CaptureReservedWindowsName([string]$Value) {
+    $stem = ($Value -split '\.', 2)[0]
+    return $stem -cin @('con', 'prn', 'aux', 'nul') -or $stem -cmatch '\A(?:com|lpt)[1-9]\z'
+}
+
+if ($frozenIdentityCount -eq $frozenIdentityFields.Count) {
+    foreach ($buildId in @($CpuWorkerBuildId, $GpuWorkerBuildId)) {
+        if ($buildId -cnotmatch '\A[\x21-\x7e]{12,192}\z') {
+            throw 'Frozen worker build IDs must be 12-192 ASCII visible characters.'
+        }
+    }
+    foreach ($digest in @($CpuWorkerSha256, $GpuWorkerSha256, $GpuPackSha256)) {
+        if ($digest -cnotmatch '\A[0-9a-f]{64}\z' -or $digest -cmatch '\A0{64}\z') {
+            throw 'Frozen worker and pack digests must be nonzero lowercase SHA-256.'
+        }
+    }
+    if ($CpuWorkerProtocol -cne '5' -or $GpuWorkerProtocol -cne '5') {
+        throw 'Frozen worker protocol must be canonical version 5.'
+    }
+    if ($CpuWorkerAbi -cne '1' -or $GpuWorkerAbi -cne '1') {
+        throw 'Frozen worker ABI must be canonical version 1.'
+    }
+    if ($GpuPackVersion -cnotmatch '\A[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?\z' -or
+        (Test-CaptureReservedWindowsName $GpuPackVersion)) {
+        throw 'Frozen GPU pack version must be a canonical lowercase immutable store component.'
+    }
+    if ($GpuPackSecurityEpoch -cnotmatch '\A[1-9][0-9]{0,19}\z') {
+        throw 'Frozen GPU pack security epoch must be a positive canonical decimal.'
+    }
+    $epoch = [uint64]0
+    if (-not [uint64]::TryParse(
+            $GpuPackSecurityEpoch,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$epoch) -or $epoch -eq 0) {
+        throw 'Frozen GPU pack security epoch must be a positive canonical decimal.'
+    }
 }
 foreach ($path in @($CollectorPath, $ModelPath, $WavPath, $OutputPath)) {
     if (-not [IO.Path]::IsPathFullyQualified($path)) {
@@ -46,6 +106,21 @@ function Get-CaptureObservationArguments([Collections.IDictionary]$Options) {
     )
     if ($Options.Keys -contains 'CampaignPower') {
         $arguments += @('--campaign-power', $Options['CampaignPower'])
+    }
+    if ($Options.Keys -contains 'CpuWorkerBuildId') {
+        $arguments += @(
+            '--cpu-worker-build-id', $Options['CpuWorkerBuildId'],
+            '--cpu-worker-sha256', $Options['CpuWorkerSha256'],
+            '--cpu-worker-protocol', $Options['CpuWorkerProtocol'],
+            '--cpu-worker-abi', $Options['CpuWorkerAbi'],
+            '--gpu-worker-build-id', $Options['GpuWorkerBuildId'],
+            '--gpu-worker-sha256', $Options['GpuWorkerSha256'],
+            '--gpu-worker-protocol', $Options['GpuWorkerProtocol'],
+            '--gpu-worker-abi', $Options['GpuWorkerAbi'],
+            '--gpu-pack-version', $Options['GpuPackVersion'],
+            '--gpu-pack-sha256', $Options['GpuPackSha256'],
+            '--gpu-pack-security-epoch', $Options['GpuPackSecurityEpoch']
+        )
     }
     return $arguments
 }
