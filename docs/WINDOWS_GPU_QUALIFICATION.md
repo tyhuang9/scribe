@@ -334,6 +334,13 @@ production qualification is a NO-GO even though the synthetic fixture contract
 passes. The maintainer-reviewed route intentionally does not require those
 services, but is an ineligible audit result rather than a substitute for them.
 
+The selected [protected GPU CI path](WINDOWS_GPU_PROTECTED_CI.md) now has a
+separate secret-free producer/campaign provenance preflight. Its independently
+reviewed inspection policy starts empty and grants no evaluator, signing or
+release authority. It does not implement the missing trusted capture producer,
+signer or durable nonce ledger, and leaves this evaluator and its empty
+production authority unchanged.
+
 ## Maintainer-reviewed audit route
 
 Schema 4 also has a deliberately separate, audit-only maintainer-reviewed

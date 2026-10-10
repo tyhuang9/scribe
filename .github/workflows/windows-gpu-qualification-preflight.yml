@@ -1,0 +1,90 @@
+name: Windows GPU qualification preflight
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-gpu-qualification-preflight.yml'
+      - 'runtime-manifests/windows-gpu-qualification-ci-policy.json'
+      - 'scripts/invoke-windows-gpu-qualification-preflight.ps1'
+      - 'scripts/test-windows-gpu-qualification-preflight.ps1'
+      - 'docs/WINDOWS_GPU_PROTECTED_CI.md'
+      - '.gitattributes'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-gpu-qualification-preflight.yml'
+      - 'runtime-manifests/windows-gpu-qualification-ci-policy.json'
+      - 'scripts/invoke-windows-gpu-qualification-preflight.ps1'
+      - 'scripts/test-windows-gpu-qualification-preflight.ps1'
+      - 'docs/WINDOWS_GPU_PROTECTED_CI.md'
+      - '.gitattributes'
+  workflow_dispatch:
+    inputs:
+      producer_run_id:
+        description: Exact completed, reviewed acquisition run ID.
+        required: true
+        type: string
+      producer_run_attempt:
+        description: Exact latest successful attempt of that run.
+        required: true
+        type: string
+      artifact_id:
+        description: Exact immutable acquisition artifact ID; metadata only.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Test secret-free qualification provenance boundary
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Run canonical offline preflight tests
+        shell: pwsh
+        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-qualification-preflight.ps1
+
+  preflight:
+    name: Inspect approved acquisition metadata without signing or downloads
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'tyhuang9/scribe' && github.ref == 'refs/heads/main'
+    needs: contract
+    runs-on: windows-2022
+    environment: windows-gpu-qualification-preflight
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Authenticate exact campaign and producer against current main
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ inputs.producer_run_attempt }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          REVIEWED_SOURCE_REVISION: ${{ vars.SCRIBE_GPU_CAPTURE_SOURCE_REVISION }}
+          REVIEWED_ARTIFACT_SHA256: ${{ vars.SCRIBE_GPU_CAPTURE_ARTIFACT_SHA256 }}
+          REVIEWED_CONTRACT_SHA256: ${{ vars.SCRIBE_GPU_CAPTURE_CONTRACT_SHA256 }}
+          REVIEWED_CAMPAIGN_NONCE: ${{ vars.SCRIBE_GPU_CAPTURE_CAMPAIGN_NONCE }}
+          REVIEWED_AUTHORIZATION_SHA256: ${{ vars.SCRIBE_GPU_CAPTURE_AUTHORIZATION_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $revision = (git rev-parse --verify HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $revision -cnotmatch '\A[0-9a-f]{40}\z' -or $revision -cne $env:GITHUB_SHA) { throw 'Preflight checkout does not match the workflow source.' }
+          $receipt = & pwsh -NoProfile -File .\scripts\invoke-windows-gpu-qualification-preflight.ps1 `
+            -ProducerSourceRevision $env:REVIEWED_SOURCE_REVISION `
+            -ProducerRunId $env:PRODUCER_RUN_ID -ProducerRunAttempt $env:PRODUCER_RUN_ATTEMPT `
+            -ArtifactId $env:ARTIFACT_ID -ExpectedArtifactSha256 $env:REVIEWED_ARTIFACT_SHA256 `
+            -ExpectedPerformanceContractSha256 $env:REVIEWED_CONTRACT_SHA256 `
+            -ExpectedCampaignNonce $env:REVIEWED_CAMPAIGN_NONCE `
+            -ExpectedAuthorizationSha256 $env:REVIEWED_AUTHORIZATION_SHA256
+          if ($LASTEXITCODE -ne 0) { throw 'Qualification preflight failed; no authority was exercised.' }
+          Write-Output $receipt
