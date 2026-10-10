@@ -173,7 +173,37 @@ no delay imports. Both first builds were rejected by the old artifact digest
 gate before this measured digest was repinned; the gate was not bypassed.
 The older recorded development result above applies only to the older DLL.
 These unit/reproducibility results are not GPU, long-path, layer-isolation or
-worker-pack qualification for this new binary. Those checks must be repeated.
+worker-pack qualification for this new binary. Subsequent checks are recorded
+separately below; results do not transfer between artifacts.
+
+### Exact-DLL mocked policy checks (2026-10-10)
+
+The five existing isolated layer/settings cases passed against the exact
+771,072-byte unsigned diagnostic pack DLL from source `e7e2226`, SHA-256
+`1612250ec2ee7e41589e4e58e5df464735b0b8e06be7624ac0d9ae96cee48586`.
+The framework's generated DLL path was bound to that authenticated artifact,
+not the separate DLL produced by the test build. Registry/device discovery
+remained mocked, with the disposable Windows shim made fail-closed on missing
+hook targets or failed Detours transaction, attachment or commit.
+
+CTest reported five of five passing, exit 0. The surrounding private runner
+then exited 1 because its XML tag check used PowerShell's adapted `.Name`
+attribute rather than the XML element's `get_Name()` method. Read-only
+validation of the original JUnit receipt confirmed all five exact identities,
+one executed case per entry, and no failures or skips; tests were not replayed.
+Do not describe the original surrounding runner as passing.
+
+CMake 4.4.2 launches each discovered case through `GoogleTest/LaunchTest.cmake`
+with a resolved `TEST_FILTER` definition. A verification wrapper must validate
+the complete launcher command and actual case identity rather than assuming a
+direct `--gtest_filter` argument or accepting the unresolved `\2` placeholder.
+Clear inherited GoogleTest repeat, shard and output overrides case-insensitively
+on Windows, and verify their absence before discovery or execution.
+
+This closes only the new DLL's mocked layer/settings regression check. It does
+not establish real-driver isolation, signed-worker startup, long-path support,
+transcription parity, performance or Auto eligibility. Those qualification
+requirements remain open.
 
 ### Qualification boundaries
 
