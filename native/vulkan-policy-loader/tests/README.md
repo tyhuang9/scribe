@@ -148,6 +148,65 @@ than transferring this result to a later binary by assumption.
 
 ## Limits and required qualification
 
+### Module-path regression (2026-10-10)
+
+`scribe_vulkan_module_path_tests.c` is independent of GoogleTest, Detours, Vulkan
+and display drivers. The normal policy-loader builder compiles the exact
+function extracted from the fully authenticated post-patch `loader.c` into this
+harness before building the DLL. Extraction must find exactly one bounded
+function; missing, duplicated, unterminated and oversized inputs are rejected
+by the fast PowerShell tests.
+
+Its 14 cases cover short success with stale error 122, capacity-minus-one and
+capacity-sized results, one and multiple resizes, the 32,768-element ceiling,
+perpetual truncation, query failure before/after resizing, Unicode conversion,
+allocation failure and conversion failure. Expected calls are checked exactly;
+no conversion is allowed on a truncated result. A finite fake-call cap makes
+the original implementation fail assertions instead of hanging or exhausting
+its stack. The original authenticated function failed eight cases; the
+corrected function passed all 14.
+
+Two fresh corrected Release builds reproduced the same 771,072-byte DLL:
+`1612250ec2ee7e41589e4e58e5df464735b0b8e06be7624ac0d9ae96cee48586`.
+Its direct imports remain `advapi32.dll`, `cfgmgr32.dll`, and `kernel32.dll`, with
+no delay imports. Both first builds were rejected by the old artifact digest
+gate before this measured digest was repinned; the gate was not bypassed.
+The older recorded development result above applies only to the older DLL.
+These unit/reproducibility results are not GPU, long-path, layer-isolation or
+worker-pack qualification for this new binary. Subsequent checks are recorded
+separately below; results do not transfer between artifacts.
+
+### Exact-DLL mocked policy checks (2026-10-10)
+
+The five existing isolated layer/settings cases passed against the exact
+771,072-byte unsigned diagnostic pack DLL from source `e7e2226`, SHA-256
+`1612250ec2ee7e41589e4e58e5df464735b0b8e06be7624ac0d9ae96cee48586`.
+The framework's generated DLL path was bound to that authenticated artifact,
+not the separate DLL produced by the test build. Registry/device discovery
+remained mocked, with the disposable Windows shim made fail-closed on missing
+hook targets or failed Detours transaction, attachment or commit.
+
+CTest reported five of five passing, exit 0. The surrounding private runner
+then exited 1 because its XML tag check used PowerShell's adapted `.Name`
+attribute rather than the XML element's `get_Name()` method. Read-only
+validation of the original JUnit receipt confirmed all five exact identities,
+one executed case per entry, and no failures or skips; tests were not replayed.
+Do not describe the original surrounding runner as passing.
+
+CMake 4.4.2 launches each discovered case through `GoogleTest/LaunchTest.cmake`
+with a resolved `TEST_FILTER` definition. A verification wrapper must validate
+the complete launcher command and actual case identity rather than assuming a
+direct `--gtest_filter` argument or accepting the unresolved `\2` placeholder.
+Clear inherited GoogleTest repeat, shard and output overrides case-insensitively
+on Windows, and verify their absence before discovery or execution.
+
+This closes only the new DLL's mocked layer/settings regression check. It does
+not establish real-driver isolation, signed-worker startup, long-path support,
+transcription parity, performance or Auto eligibility. Those qualification
+requirements remain open.
+
+### Qualification boundaries
+
 - The isolated suite proves loader behavior against mocked manifests,
   settings, registry keys, layers, and ICDs. It does not exercise vendor
   display drivers.

@@ -131,6 +131,43 @@ function Invoke-LoaderNative([string]$Executable, [string[]]$Arguments) {
     if ($result.Stderr) { Write-Verbose $result.Stderr }
 }
 
+function Get-LoaderModulePathFunction([string]$Source) {
+    if ($Source.Length -gt 33554432) { throw 'Vulkan module-path test source exceeds its bound.' }
+    $functions = [regex]::Matches($Source,
+        '(?ms)^VkResult get_library_path_of_dl_handle\([^{}]*\{\r?\n.*?^\}')
+    if ($functions.Count -ne 1 -or $functions[0].Length -gt 16384) {
+        throw 'Expected exactly one bounded Vulkan module-path function.'
+    }
+    return $functions[0].Value
+}
+
+function Invoke-LoaderModulePathTests([string]$SourcePath, [string]$SourceSha256, [string]$BuildRoot) {
+    # Compile the actual authenticated implementation, not a parallel copy of
+    # its algorithm. The harness replaces only Win32 query/conversion outcomes.
+    $sourceLease = Open-LoaderInput $SourcePath $SourceSha256
+    try {
+        $reader = [IO.StreamReader]::new($sourceLease, [Text.UTF8Encoding]::new($false, $true), $true, 4096, $true)
+        try { $function = Get-LoaderModulePathFunction $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
+        $testRoot = Join-Path $BuildRoot 'module-path-tests'
+        Assert-ScribeGpuWorkerNoReparse $testRoot
+        if (Test-Path -LiteralPath $testRoot) { throw 'Module-path test output must be fresh.' }
+        [IO.Directory]::CreateDirectory($testRoot) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $testRoot 'module-path-function.h'), $function, [Text.UTF8Encoding]::new($false))
+        $compiler = (Get-Command cl.exe -CommandType Application | Select-Object -First 1).Source
+        $harness = Join-Path $PSScriptRoot '../native/vulkan-policy-loader/tests/scribe_vulkan_module_path_tests.c'
+        $executable = Join-Path $testRoot 'module-path-tests.exe'
+        Invoke-LoaderNative $compiler @('/nologo', '/TC', '/W4', '/WX', '/MT', '/O2',
+            "/I$testRoot", "/Fo$(Join-Path $testRoot 'module-path-tests.obj')", "/Fe$executable", $harness,
+            '/link', '/Brepro', '/INCREMENTAL:NO')
+        $result = Invoke-ScribeGpuWorkerBoundedNativeProcess $executable @() 'Vulkan module-path regression failed.'
+        if ($result.Stdout.Trim() -cne 'SCRIBE_VULKAN_MODULE_PATH_TESTS=PASS cases=14' -or $result.Stderr) {
+            throw 'Vulkan module-path regression did not execute its complete case inventory.'
+        }
+        Write-Verbose $result.Stdout
+    } finally { $sourceLease.Dispose() }
+}
+
 function Assert-NoLoaderBuildOverrides([Collections.IDictionary]$Environment) {
     # The shared preflight rejects compiler/SDK overrides. Also reject CMake's
     # environment initializers (including compiler/linker launchers), before a
@@ -248,6 +285,9 @@ try {
         $verified = Open-LoaderInput (Join-Path $loader $patched.path) $patched.sha256
         $verified.Dispose()
     }
+    $loaderSource = @($manifest.patch.patched_files | Where-Object path -CEQ 'loader/loader.c')
+    if ($loaderSource.Count -ne 1) { throw 'Expected exactly one authenticated loader implementation.' }
+    Invoke-LoaderModulePathTests (Join-Path $loader 'loader/loader.c') $loaderSource[0].sha256 $buildRoot
     if ($manifest.loader.license -cne 'LICENSE.txt') { throw 'Unexpected loader license path.' }
     $license = Open-LoaderInput (Join-Path $loader 'LICENSE.txt') $manifest.loader.license_sha256
     $license.Dispose()

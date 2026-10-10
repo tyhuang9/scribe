@@ -18,7 +18,24 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 diff --git a/loader/loader.c b/loader/loader.c
 --- a/loader/loader.c
 +++ b/loader/loader.c
-@@ -4281,5 +4281,12 @@
+@@ -600,9 +600,15 @@
+-    while (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
++    // Success need not clear last-error. Only a capacity-sized return is truncated.
++    // Bound this optional path query, including its cumulative stack allocations.
++    while (ret == module_file_name_len) {
++        if (module_file_name_len >= 32768) {
++            return VK_SUCCESS;
++        }
+         module_file_name_len *= 2;
++        if (module_file_name_len > 32768) module_file_name_len = 32768;
+         buffer_utf16 = (wchar_t *)loader_stack_alloc(module_file_name_len * sizeof(wchar_t));
+         ret = GetModuleFileNameW(lib_handle, buffer_utf16, (DWORD)module_file_name_len);
+         if (ret == 0) {
+             return VK_SUCCESS;
+         }
+     }
+ 
+@@ -4281,5 +4287,12 @@
  VkResult loader_scan_for_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
                                  const struct loader_envvar_all_filters *filters) {
 +#if defined(SCRIBE_VULKAN_PACK_POLICY)
@@ -31,7 +48,7 @@ diff --git a/loader/loader.c b/loader/loader.c
      VkResult res = VK_SUCCESS;
      struct loader_layer_list settings_layers = {0};
      struct loader_layer_list regular_instance_layers = {0};
-@@ -4360,9 +4367,17 @@
+@@ -4360,9 +4373,17 @@
      free_string_list(inst, &override_paths);
      return res;
 +#endif
@@ -49,7 +66,7 @@ diff --git a/loader/loader.c b/loader/loader.c
      VkResult res = VK_SUCCESS;
      struct loader_layer_list settings_layers = {0};
      struct loader_layer_list regular_instance_layers = {0};
-@@ -4462,6 +4477,7 @@
+@@ -4462,6 +4483,7 @@
  
      free_string_list(inst, &override_paths);
      return res;

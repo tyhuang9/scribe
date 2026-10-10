@@ -13,7 +13,7 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($builderPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw 'Vulkan policy builder did not parse.' }
 # Exercise the actual pure/input helpers without executing the native builder.
-foreach ($name in @('Assert-LoaderProperties', 'Open-LoaderInput', 'Expand-LoaderSource', 'Assert-NoLoaderBuildOverrides')) {
+foreach ($name in @('Assert-LoaderProperties', 'Open-LoaderInput', 'Expand-LoaderSource', 'Assert-NoLoaderBuildOverrides', 'Get-LoaderModulePathFunction')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $false))
@@ -55,6 +55,13 @@ Assert-ScribeGpuWorkerNoReparse $scratch
 if (Test-Path -LiteralPath $scratch) { throw 'Expected fresh test directory.' }
 [IO.Directory]::CreateDirectory($scratch) | Out-Null
 try {
+    $functionFixture = "VkResult get_library_path_of_dl_handle(void) {`n    return 0;`n}"
+    Assert-Policy ((Get-LoaderModulePathFunction $functionFixture) -ceq $functionFixture) 'Module-path extraction changed the implementation.'
+    Assert-PolicyRejected { Get-LoaderModulePathFunction '' } 'Missing module-path implementation was accepted.'
+    Assert-PolicyRejected { Get-LoaderModulePathFunction ($functionFixture + "`n" + $functionFixture) } 'Ambiguous module-path implementations were accepted.'
+    Assert-PolicyRejected { Get-LoaderModulePathFunction $functionFixture.TrimEnd('}') } 'Unterminated module-path implementation was accepted.'
+    Assert-PolicyRejected { Get-LoaderModulePathFunction ('x' * 33554433) } 'Oversized module-path source was accepted.'
+    Assert-PolicyRejected { Get-LoaderModulePathFunction $functionFixture.Replace('return 0;', ('x' * 16384)) } 'Oversized module-path function was accepted.'
     $inputPath = Join-Path $scratch 'input.txt'
     [IO.File]::WriteAllText($inputPath, 'authenticated build input', [Text.UTF8Encoding]::new($false))
     $hash = (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -138,7 +145,7 @@ try {
         Assert-PolicyRejected { Assert-NoLoaderBuildOverrides $hostileEnvironment } "Ambient override $name was accepted."
         Assert-Policy ($hostileEnvironment.Count -eq 2 -and $hostileEnvironment[$name] -ceq 'untrusted value') 'Environment rejection mutated caller input.'
     }
-    Assert-Policy ($script:checks -ge 104) 'Expected policy tests were not executed.'
+    Assert-Policy ($script:checks -ge 110) 'Expected policy tests were not executed.'
     Write-Output "Windows Vulkan policy loader input tests passed ($script:checks checks)."
 } finally {
     # Delete only this invocation's exact physical scratch tree. Do not follow

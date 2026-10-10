@@ -120,7 +120,7 @@
     "provider": "transcribe-cpp-ggml-vulkan",
     "policy_loader": {
       "manifest_path": "native/vulkan-policy-loader/source-manifest.json",
-      "manifest_sha256": "5929d445a3f09c2565bea376c334fb843a99a386fed4d97617acde83167a182a"
+      "manifest_sha256": "790c786a3bec4ded6847d635bf49e1163757e837633ca753e8121b8dd6ec7de3"
     },
     "required_files": [
       {

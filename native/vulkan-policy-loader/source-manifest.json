@@ -26,7 +26,7 @@
   },
   "patch": {
     "file": "no-layers-or-settings.patch",
-    "sha256": "b368552d7a02477728c27bef854f0295e9e713a88bb5f92858062db8696bb40f",
+    "sha256": "a80cba8f7bad8f426821915a95f24d86ff1023d3b686458eba5bc0049732e000",
     "patched_files": [
       {
         "path": "CMakeLists.txt",
@@ -34,7 +34,7 @@
       },
       {
         "path": "loader/loader.c",
-        "sha256": "199a8e8dcf047b17f2921a459867b6771b72404cb84191d73f86c2da3beb87d2"
+        "sha256": "708a46064577ea717fd4b6dbc6631347cafc78d18daca69af0ba143b4409dac1"
       },
       {
         "path": "loader/settings.c",
@@ -45,7 +45,7 @@
   "artifact": {
     "filename": "vulkan-1.dll",
     "size_bytes": 771072,
-    "sha256": "4e8aa4fcdb4299183809fefe89efe12fd68c3a337a604a565ed91fe8da95a14d"
+    "sha256": "1612250ec2ee7e41589e4e58e5df464735b0b8e06be7624ac0d9ae96cee48586"
   },
   "build": {
     "generator": "NMake Makefiles",

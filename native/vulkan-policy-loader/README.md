@@ -30,6 +30,20 @@ fresh directories with the reviewed MSVC 19.44.35227 toolchain. Other compiler
 payload profiles must reproduce that digest or undergo a separately reviewed
 repin; an unexpected output must never be admitted merely because it compiled.
 
+The Windows module-path helper retries only when `GetModuleFileNameW` returns
+the supplied capacity. A successful shorter result is complete even if the
+thread still carries `ERROR_INSUFFICIENT_BUFFER` from an earlier call. This
+optional query stops at 32,768 UTF-16 elements rather than growing its cumulative
+stack allocations without a bound; it never converts a truncated result.
+
+Before compiling the DLL, the builder authenticates the complete patched
+`loader.c`, extracts its unique module-path function without rewriting it, and
+compiles it into the 14-case native regression harness. Only query/conversion
+outcomes and allocation failure are controlled; it does not load a GPU driver.
+The fast input checks and `-VerifyInputsOnly` remain non-native. See the test
+README for the negative control and reproducibility results. This correctness
+fix does not establish the cause or resolution of an installed worker crash.
+
 The compile-time policy returns empty explicit/implicit layer inventories and
 inactive loader settings before any corresponding manifest or registry lookup.
 This prevents settings-forced layers and settings-added drivers from bypassing
