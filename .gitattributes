@@ -21,6 +21,7 @@ runtime-manifests/windows-gpu-performance-authority.json text eol=lf
 scripts/qualify-windows-gpu-evidence.ps1 text eol=lf
 scripts/test-windows-gpu-qualification.ps1 text eol=lf
 *.sh text eol=lf
+resources/windows/application.manifest text eol=lf
 scripts/inspect-linux-deb.py text eol=lf
 scripts/qualify-linux-gpu-evidence.py text eol=lf
 scripts/test-linux-gpu-qualification.py text eol=lf

@@ -58,6 +58,41 @@ Explicit GPU retains the supervisor-reconciled launch target, including a
 remapped process index and updated volatile facts, instead of restoring cached
 probe metadata.
 
+## Windows executable long-path declaration
+
+New Windows MSVC desktop and inference-worker builds embed the reviewed
+`resources/windows/application.manifest` as executable `RT_MANIFEST` ID 1.
+The declaration enables `longPathAware` while retaining `asInvoker` and
+`uiAccess=false`; it adds no elevation, dependency, DPI or registry changes.
+The source bytes are SHA-256 pinned in the build helper and checked out as LF.
+The linker input must be a Unicode absolute path shorter than 260 UTF-16 code
+units (including room for its terminator). An overlong source checkout fails
+with a clear error; the build does not create path aliases.
+
+Fresh CPU workers are checked before their desktop trust-anchor hash or frozen
+record is created. Fresh GPU workers are checked before dependency closure and
+pack authoring; their read lease remains held through authoring. Newly linked
+source/staged desktops and packaged desktops are also checked. The check reads
+one embedded ID-1 manifest in one language from the PE itself, without loading
+imports or executing code, and rejects unsafe or unexpected XML settings.
+Existing frozen/reused CI CPU inputs keep their separate authenticated
+provenance contract. They are not patched, rehashed under a new identity, or
+assumed to have this declaration. Existing signed GPU packs are unchanged.
+
+Run the offline resource/XML fixtures with:
+
+```powershell
+pwsh -NoProfile -File scripts/test-windows-application-manifests.ps1
+```
+
+The script also accepts `-ExecutablePath` with freshly built desktop/worker
+paths to inspect their actual embedded resources without launching them.
+Rust directive/path tests run with `cargo test --locked --test
+windows_application_manifest`. Windows long-path behavior still requires the
+OS `LongPathsEnabled` policy, which Scribe does not change. This declaration
+does not prove third-party driver/library compatibility, GPU startup success,
+or Auto qualification; those remain separate installed/hardware checks.
+
 ## Stage 5 Windows Auto qualification
 
 `runtime-manifests/gpu-auto-qualification-windows-x64.json` is a compact,

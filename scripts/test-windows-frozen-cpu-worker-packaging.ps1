@@ -15,6 +15,8 @@ $policyFixtureGlobalNames = @(
     'WindowsFrozenCpuWorkerTestPolicyCalls',
     'WindowsFrozenCpuWorkerTestPolicyResponse',
     'WindowsFrozenCpuWorkerTestPolicyResponses'
+    'WindowsFrozenCpuWorkerTestManifestCalls'
+    'WindowsFrozenCpuWorkerTestFailManifestLeaf'
 )
 $savedPolicyFixtureGlobals = @{}
 foreach ($name in $policyFixtureGlobalNames) {
@@ -106,6 +108,8 @@ function New-TestReviewedPe([string]$Path, [uint16]$Subsystem) {
 }
 
 function Reset-TestCalls {
+    $global:WindowsFrozenCpuWorkerTestManifestCalls = [Collections.Generic.List[string]]::new()
+    $global:WindowsFrozenCpuWorkerTestFailManifestLeaf = $null
     $global:WindowsFrozenCpuWorkerTestCargoCalls = [System.Collections.Generic.List[object]]::new()
     $global:WindowsFrozenCpuWorkerTestNativeCalls = [System.Collections.Generic.List[object]]::new()
     if (Test-Path -LiteralPath 'Variable:global:WindowsFrozenCpuWorkerTestAdmissionCalls') {
@@ -484,6 +488,7 @@ try {
         'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-gpu-auto-policy-identity.ps1',
         'scripts/report-windows-gpu-auto-qualification.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1',
         'scripts/windows-pe-imports.ps1',
+        'scripts/windows-application-manifest.ps1', 'resources/windows/application.manifest',
         'scripts/stage-verified-worker-packs.ps1',
         'resources/licenses/Apache-2.0.txt', 'resources/licenses/OpenAI-Whisper-MIT.txt',
         'resources/licenses/Whisper-Base-En-NOTICE.txt', 'resources/licenses/THIRD-PARTY-NOTICES.txt',
@@ -495,6 +500,20 @@ try {
     )) {
         Copy-FixtureSourceFile $relativePath
     }
+    # Cargo is fake in this fixture and writes import-only PEs. Keep the real
+    # manifest XML gate and replace only its physical resource reader.
+    $manifestHelper = Join-Path $fixtureRoot 'scripts/windows-application-manifest.ps1'
+    $manifestSeam = @'
+
+function Get-WindowsApplicationManifestBytes([string]$Path) {
+    $global:WindowsFrozenCpuWorkerTestManifestCalls.Add($Path)
+    if ([IO.Path]::GetFileName($Path) -ceq $global:WindowsFrozenCpuWorkerTestFailManifestLeaf) {
+        throw 'Synthetic application-manifest failure.'
+    }
+    return ,([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot '../resources/windows/application.manifest')))
+}
+'@
+    [IO.File]::AppendAllText($manifestHelper, $manifestSeam, [Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllBytes($modelSource, [byte[]](0x01, 0x02, 0x03, 0x04))
     $modelHash = (Get-FileHash -LiteralPath $modelSource -Algorithm SHA256).Hash.ToLowerInvariant()
     $fixtureManifest = [ordered]@{
@@ -954,12 +973,42 @@ try {
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 0 'Non-frozen GPU observation invoked Cargo'
     Assert-True (-not (Test-Path -LiteralPath $nonFrozenObservationBundle)) 'Non-frozen GPU observation rejection left an output.'
 
+    foreach ($rejectedLeaf in @('scribe-inference-worker.exe', 'local-transcriber.exe')) {
+        Reset-TestCalls
+        $global:WindowsFrozenCpuWorkerTestFailManifestLeaf = $rejectedLeaf
+        $rejectedBundle = Join-Path $testRoot "manifest-rejected-$rejectedLeaf"
+        Invoke-ExpectedFailure {
+            & $fixtureBuilder -ModelSource $modelSource -BundlePath $rejectedBundle `
+                -InstallerPackAllowlistPath $installerAllowlist
+        } 'Synthetic application-manifest failure.'
+        $expectedBuilds = if ($rejectedLeaf -ceq 'scribe-inference-worker.exe') { 1 } else { 2 }
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count $expectedBuilds 'Manifest rejection stopped at the expected build boundary'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestNativeCalls.Count 0 'Manifest rejection ran a smoke process'
+        Assert-True (-not (Test-Path -LiteralPath $rejectedBundle)) 'Manifest rejection published a bundle.'
+        Assert-Equal @(Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name.StartsWith("manifest-rejected-$rejectedLeaf.staging-", [StringComparison]::Ordinal) }).Count 0 'Manifest rejection retained a staging directory'
+        Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Manifest rejection restored build revision'
+        Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64) 'Manifest rejection restored worker anchor'
+        Assert-Equal $env:SCRIBE_BUILDING_WORKER 'inherited-worker-flag' 'Manifest rejection restored worker marker'
+        Assert-Equal $env:CARGO_TARGET_DIR $fixtureTarget 'Manifest rejection restored Cargo target'
+        $releasedPaths = @((Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'x86_64-pc-windows-msvc/release/scribe-inference-worker.exe'))
+        if ($rejectedLeaf -ceq 'local-transcriber.exe') {
+            $releasedPaths += Join-Path $fixtureTarget 'x86_64-pc-windows-msvc/release/local-transcriber.exe'
+        }
+        foreach ($releasedPath in $releasedPaths) {
+            $releasedStream = [IO.File]::Open($releasedPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            try { Assert-True $true 'Manifest rejection released the executable lease.' }
+            finally { $releasedStream.Dispose() }
+        }
+    }
+    Reset-TestCalls
     $normalBundle = Join-Path $testRoot 'normal-bundle'
     & $fixtureBuilder `
         -ModelSource $modelSource `
         -BundlePath $normalBundle `
         -InstallerPackAllowlistPath $installerAllowlist
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 2 'Normal packaging Cargo call count'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestManifestCalls.Count 3 'Fresh worker and source/staged desktop manifest gates'
+    Assert-Equal @($global:WindowsFrozenCpuWorkerTestManifestCalls | Where-Object { [IO.Path]::GetFileName($_) -ceq 'scribe-inference-worker.exe' }).Count 1 'Fresh worker manifest checked once before hashing'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Normal packaging worker-first order'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].Binary 'local-transcriber' 'Normal packaging desktop-second order'
     Assert-WorkerCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'Normal CPU worker exact Cargo argv'
@@ -983,6 +1032,7 @@ try {
     Reset-TestCalls
     & $fixtureProducer -OutputDirectory $producerOutput
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Freeze producer Cargo call count'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestManifestCalls.Count 1 'Freeze producer manifest checked before worker hashing'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Freeze producer worker-only build'
     Assert-WorkerCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'Freeze producer exact CPU worker Cargo argv'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Freeze producer exact build revision'
@@ -1213,6 +1263,8 @@ try {
     $frozenBundle = Join-Path $testRoot 'frozen-bundle'
     Invoke-FrozenConsumer $producerRecordPath $frozenBundle
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Frozen consumer Cargo call count'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestManifestCalls.Count 2 'Frozen consumer checks only source/staged desktop manifests'
+    Assert-Equal @($global:WindowsFrozenCpuWorkerTestManifestCalls | Where-Object { [IO.Path]::GetFileName($_) -ceq 'scribe-inference-worker.exe' }).Count 0 'Historical worker is not relabeled as manifest-capable'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'local-transcriber' 'Frozen consumer desktop-only build'
     Assert-DesktopCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'ui-harness' 'Frozen default desktop exact feature argv'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Revision $fixtureContext.SourceRevision 'Frozen consumer exact build revision'

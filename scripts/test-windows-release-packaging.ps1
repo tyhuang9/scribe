@@ -1,5 +1,12 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+& (Join-Path $PSScriptRoot 'test-windows-application-manifests.ps1')
+. (Join-Path $PSScriptRoot 'windows-application-manifest.ps1')
+# Existing payload fixtures test imports/inventory, not the Windows loader.
+# Only their physical resource-read boundary is synthetic; XML stays real.
+function Get-WindowsApplicationManifestBytes([string]$Path) {
+    return ,([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot '../resources/windows/application.manifest')))
+}
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
@@ -186,8 +193,10 @@ function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
         '$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null',
         '$env:SCRIBE_BUILDING_WORKER = ''1''',
         $expectedWorkerBuild,
+        '$freshCpuWorkerStream = Open-WindowsFrozenCpuWorkerReadHandle $sourceInferenceWorker',
+        'Assert-WindowsLongPathAwareApplicationManifest $sourceInferenceWorker',
         '$env:SCRIBE_BUILDING_WORKER = $null',
-        '$env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker)',
+        '$env:SCRIBE_BUNDLED_WORKER_SHA256 = Get-WindowsFrozenCpuWorkerOpenStreamSha256 $freshCpuWorkerStream',
         '$desktopFeatures = @(''ui-harness'')',
         'if ($LocalFrozenGpuObservation) {',
         '$desktopFeatures += ''windows-gpu-capture-observation''',

@@ -7,7 +7,8 @@ Set-StrictMode -Version Latest
 # This keeps the CI consumer boundary executable without building native code.
 # The copied builder and resolver run as scripts, with real ZIP/PE/hash/handle
 # and staging behavior.  Cargo, the smoke executable, compiled admission, and
-# GitHub metadata are the only deterministic seams.
+# GitHub metadata and physical application-manifest resource IO are the
+# deterministic seams; actual manifest resources have separate native fixtures.
 $repositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-windows-ci-cpu-worker-packaging-$([guid]::NewGuid().ToString('N'))"
 $fixtureRoot = Join-Path $testRoot 'fixture'
@@ -36,6 +37,7 @@ $fixtureGlobalVariableNames = @(
     'CiCpuWorkerBuilderCargoCalls', 'CiCpuWorkerBuilderNativeCalls', 'CiCpuWorkerBuilderAdmissionCalls',
     'CiCpuWorkerBuilderPolicyCalls', 'CiCpuWorkerBuilderPolicyResponse', 'CiCpuWorkerBuilderPolicyResponses',
     'CiCpuWorkerBuilderGitHubCalls', 'CiCpuWorkerBuilderFailDesktop', 'CiCpuWorkerBuilderFailSmoke',
+    'CiCpuWorkerBuilderFailManifest',
     'CiCpuWorkerBuilderRaceBundle', 'CiCpuWorkerBuilderMutateWorkerPath',
     'CiCpuWorkerBuilderMutationWasBlocked', 'CiCpuWorkerBuilderMutateStagedWorker',
     'CiCpuWorkerBuilderStagedWorkerMutationAttempted', 'CiCpuWorkerBuilderStagedWorkerMutationSucceeded',
@@ -71,7 +73,7 @@ function Assert-True([bool]$Value, [string]$Message) {
     if (-not $Value) { throw "TEST FAILED: $Message" }
 }
 
-function Assert-Rejected([string]$Name, [scriptblock]$Action) {
+function Assert-Rejected([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
     $script:Assertions++
     try {
         $result = @(& $Action)
@@ -83,6 +85,9 @@ function Assert-Rejected([string]$Name, [scriptblock]$Action) {
     }
     catch {
         if ($_.Exception.Message.StartsWith('TEST FAILED:', [StringComparison]::Ordinal)) { throw }
+        if ($Expected -and -not $_.Exception.Message.Contains($Expected)) {
+            throw "TEST FAILED: $Name failed for the wrong reason: $($_.Exception.Message)"
+        }
         return
     }
     throw "TEST FAILED: $Name was accepted."
@@ -457,6 +462,7 @@ function Reset-Scenario([string]$WorkerRevision = '') {
     $env:SCRIBE_CI_CPU_FIXTURE_POST_CARGO_MUTATION = $null
     $global:CiCpuWorkerBuilderCargoCalls.Clear(); $global:CiCpuWorkerBuilderNativeCalls.Clear(); $global:CiCpuWorkerBuilderAdmissionCalls.Clear(); $global:CiCpuWorkerBuilderPolicyCalls.Clear(); $global:CiCpuWorkerBuilderPolicyResponses.Clear(); $global:CiCpuWorkerBuilderGitHubCalls.Clear()
     $global:CiCpuWorkerBuilderFailDesktop = $false; $global:CiCpuWorkerBuilderFailSmoke = $false
+    $global:CiCpuWorkerBuilderFailManifest = $false
     $global:CiCpuWorkerBuilderRaceBundle = $null; $global:CiCpuWorkerBuilderMutateWorkerPath = $null
     $global:CiCpuWorkerBuilderMutationWasBlocked = $false; $global:CiCpuWorkerBuilderSourceDriftPath = $null
     $global:CiCpuWorkerBuilderMutateStagedWorker = $false
@@ -525,6 +531,7 @@ try {
         '.github/workflows/release.yml', 'scripts/build-windows-release.ps1', 'scripts/resolve-windows-cpu-worker-inputs.ps1',
         'scripts/windows-frozen-cpu-worker-integrity.ps1', 'scripts/windows-gpu-auto-policy-identity.ps1',
         'scripts/report-windows-gpu-auto-qualification.ps1', 'scripts/windows-cpu-worker-native-baseline.ps1', 'scripts/windows-pe-imports.ps1',
+        'scripts/windows-application-manifest.ps1', 'resources/windows/application.manifest',
         'scripts/new-windows-frozen-cpu-worker.ps1', 'scripts/invoke-windows-gpu-approved-signing.ps1', 'scripts/stage-verified-worker-packs.ps1',
         'resources/licenses/Apache-2.0.txt', 'resources/licenses/OpenAI-Whisper-MIT.txt', 'resources/licenses/Whisper-Base-En-NOTICE.txt',
         'resources/licenses/THIRD-PARTY-NOTICES.txt', 'native/transcribe-cpp-v0.1.3/LICENSE', 'native/transcribe-cpp-v0.1.3/PROVENANCE.md',
@@ -532,6 +539,19 @@ try {
         'resources/silero-vad/LICENSE', 'resources/silero-vad/PROVENANCE.md',
         'runtime-manifests/gpu-auto-qualification-windows-x64.json'
     )) { Copy-FixtureSourceFile $relativePath }
+    # The fake Cargo fixture emits import-only PEs. Replace resource IO only;
+    # retain the production XML checks and all provenance/admission behavior.
+    $manifestHelper = Join-Path $fixtureRoot 'scripts/windows-application-manifest.ps1'
+    $manifestSeam = @'
+
+function Get-WindowsApplicationManifestBytes([string]$Path) {
+    if ($global:CiCpuWorkerBuilderFailManifest -and [IO.Path]::GetFileName($Path) -ceq 'local-transcriber.exe') {
+        throw 'Synthetic application-manifest failure.'
+    }
+    return ,([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot '../resources/windows/application.manifest')))
+}
+'@
+    [IO.File]::AppendAllText($manifestHelper, $manifestSeam, [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllBytes($fixtureModel, [byte[]](1, 2, 3, 4))
     $modelHash = Get-TestHash ([IO.File]::ReadAllBytes($fixtureModel))
     $manifestPath = Join-Path $fixtureRoot 'runtime-manifests\whisper-base-en-q8_0-windows-x64.json'
@@ -629,6 +649,23 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $fixtureRoot 'dist\worker-pack-allowlist.iss') -PathType Leaf) 'CI build did not generate the normal dist worker-pack allowlist required by Inno Setup.'
     Assert-True ($global:CiCpuWorkerBuilderGitHubCalls.Count -ge 24) 'CI consumer did not perform initial, post-Cargo, and activation metadata checks.'
     Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Successful CI consumer'
+
+    Reset-Scenario
+    $global:CiCpuWorkerBuilderFailManifest = $true
+    Assert-Rejected 'desktop application manifest failure' { Invoke-CiBuilder } 'Synthetic application-manifest failure.'
+    Assert-Equal $global:CiCpuWorkerBuilderCargoCalls.Count 1 'Manifest rejection did not stop after the desktop build.'
+    Assert-Equal $global:CiCpuWorkerBuilderNativeCalls.Count 0 'Manifest rejection ran a smoke process.'
+    Assert-True (-not (Test-Path -LiteralPath $script:Scenario.BundlePath)) 'Manifest rejection published a CI bundle.'
+    $rejectedBundleName = [IO.Path]::GetFileName($script:Scenario.BundlePath)
+    Assert-Equal @(Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name.StartsWith("$rejectedBundleName.staging-", [StringComparison]::Ordinal) }).Count 0 'Manifest rejection retained CI staging.'
+    Assert-Equal $env:SCRIBE_BUILD_REVISION 'hostile-caller-revision' 'Manifest rejection restored caller revision.'
+    Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64) 'Manifest rejection restored caller worker anchor.'
+    Assert-Equal $env:SCRIBE_BUILDING_WORKER 'hostile-caller-worker-flag' 'Manifest rejection restored caller worker marker.'
+    Assert-Equal $env:CARGO_TARGET_DIR $fixtureTarget 'Manifest rejection restored caller Cargo target.'
+    Assert-WorkerReleased $script:Scenario.ResolvedRoot 'Manifest rejection'
+    $releasedDesktop = [IO.File]::Open((Join-Path $fixtureTarget 'x86_64-pc-windows-msvc/release/local-transcriber.exe'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { Assert-True $true 'Manifest rejection released the desktop lease.' }
+    finally { $releasedDesktop.Dispose() }
 
     Reset-Scenario ('a' * 40)
     Invoke-CiBuilder | Out-Null
@@ -841,7 +878,7 @@ try {
     # built-desktop report failures, two final-preactivation report failures,
     # one additional foreign-R source-drift case, and two staged-desktop drift
     # cases replace the former same-source-only source-drift coverage.
-    Assert-Equal $script:ScenarioCount 55 'Expected CI CPU worker consumer scenarios were not all discovered.'
+    Assert-Equal $script:ScenarioCount 56 'Expected CI CPU worker consumer scenarios were not all discovered.'
 }
 catch {
     $primaryFailure = $_
