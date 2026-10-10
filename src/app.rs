@@ -3153,6 +3153,7 @@ pub struct LocalTranscriberApp {
     acceleration_generation: u64,
     next_gpu_retry_nonce: u64,
     active_gpu_retry: Option<GpuRetryOperation>,
+    settling_gpu_retry: Option<GpuRetryOperation>,
     theme_announcement: Option<String>,
     hotkey_input: String,
     model_search: String,
@@ -3410,6 +3411,7 @@ impl LocalTranscriberApp {
             acceleration_generation: 0,
             next_gpu_retry_nonce: 0,
             active_gpu_retry: None,
+            settling_gpu_retry: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,
@@ -4132,7 +4134,8 @@ impl LocalTranscriberApp {
     }
 
     fn has_active_work(&self) -> bool {
-        self.capture_is_active()
+        self.gpu_retry_is_busy()
+            || self.capture_is_active()
             || self.microphone_test_is_active()
             || self.deferred_recording_start.is_some()
             || self.deferred_history_playback.is_some()
@@ -4183,6 +4186,7 @@ impl LocalTranscriberApp {
             runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready
         });
         let enabled = !self.quit_requested
+            && !self.gpu_retry_is_busy()
             && !self.capturing_hotkey
             && self.armed_history_repaste.is_none()
             && self.deferred_recording_start.is_none()
@@ -5067,6 +5071,12 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
+        if self.gpu_retry_is_busy() {
+            self.transcribe_notice = Some(TranscribeNotice::failure(
+                "Wait for GPU retry to finish before starting a recording.",
+            ));
+            return;
+        }
         // A recording request has priority over retained-audio playback that was waiting
         // for the same monitor teardown. Never allow the two deferred audio owners to coexist.
         self.deferred_history_playback = None;
@@ -7275,21 +7285,40 @@ impl LocalTranscriberApp {
                     target,
                     result,
                 } => {
+                    let matches_operation = |operation: &GpuRetryOperation| {
+                        operation.nonce == nonce
+                            && operation.generation == generation
+                            && operation.model_id == model_id
+                            && operation.preference == preference
+                            && same_backend_target_identity(&operation.target, &target)
+                    };
+                    if self
+                        .settling_gpu_retry
+                        .as_ref()
+                        .is_some_and(matches_operation)
+                    {
+                        self.settling_gpu_retry = None;
+                        self.sync_capture_controller_hotkey();
+                        continue;
+                    }
                     let Some(operation) = self.active_gpu_retry.as_ref() else {
                         continue;
                     };
                     if operation.nonce != nonce {
                         continue;
                     }
-                    let current = operation.generation == generation
+                    let acknowledged = matches_operation(operation);
+                    let current = acknowledged
                         && generation == self.acceleration_generation
-                        && operation.model_id == model_id
-                        && operation.preference == preference
                         && self.config.general.selected_default_model == model_id.as_str()
                         && self.config.performance.acceleration_preference == preference
                         && same_backend_target_identity(&operation.target, &target);
                     if !current {
                         self.cancel_active_gpu_retry_busy_state();
+                        if acknowledged {
+                            self.settling_gpu_retry = None;
+                            self.sync_capture_controller_hotkey();
+                        }
                         continue;
                     }
                     self.active_gpu_retry = None;
@@ -10819,7 +10848,9 @@ impl LocalTranscriberApp {
     }
 
     fn artifact_mutation_block_reason(&self) -> Option<String> {
-        if let Some(error) = self.artifact_recovery_error.as_ref() {
+        if self.gpu_retry_is_busy() {
+            Some("Wait for GPU retry to finish before changing speech artifacts.".to_owned())
+        } else if let Some(error) = self.artifact_recovery_error.as_ref() {
             Some(error.clone())
         } else if self.capture_is_active() || self.pending_recording.is_some() {
             Some("Stop the active recording before changing speech artifacts.".to_owned())
@@ -10840,7 +10871,9 @@ impl LocalTranscriberApp {
     }
 
     fn install_admission_block_reason(&self) -> Option<String> {
-        if let Some(error) = self.artifact_recovery_error.as_ref() {
+        if self.gpu_retry_is_busy() {
+            Some("Wait for GPU retry to finish before installing speech artifacts.".to_owned())
+        } else if let Some(error) = self.artifact_recovery_error.as_ref() {
             Some(error.clone())
         } else if self.capture_is_active() || self.pending_recording.is_some() {
             Some("Stop the active recording before changing speech artifacts.".to_owned())
@@ -11074,7 +11107,14 @@ impl eframe::App for LocalTranscriberApp {
 
 impl LocalTranscriberApp {
     fn cancel_active_gpu_retry_busy_state(&mut self) {
-        let cancelled = self.active_gpu_retry.take().is_some();
+        let cancelled = if let Some(operation) = self.active_gpu_retry.take() {
+            self.settling_gpu_retry = Some(operation);
+            self.transcription_service.cancel_active();
+            self.sync_capture_controller_hotkey();
+            true
+        } else {
+            false
+        };
         if cancelled
             && self.status == TranscriptionStatus::Transcribing
             && self.status_message == "Retrying GPU"
@@ -11129,6 +11169,7 @@ impl LocalTranscriberApp {
                                 && matches!(
                                     skipped.reason,
                                     crate::backend_policy::BackendSkipReason::Quarantined
+                                        | crate::backend_policy::BackendSkipReason::Unhealthy
                                 )
                         })
                         .map(|skipped| skipped.target.clone())
@@ -11149,10 +11190,10 @@ impl LocalTranscriberApp {
             .then(|| {
                 acceleration_diagnostics(
                     Some(&latest.resolved),
-                    latest.retry_target.is_some() && self.active_gpu_retry.is_none(),
+                    latest.retry_target.is_some() && self.gpu_retry_is_idle(),
                 )
                 .map(|mut view| {
-                    view.retry_gpu_in_flight = self.active_gpu_retry.is_some();
+                    view.retry_gpu_in_flight = self.gpu_retry_is_busy();
                     view.retry_gpu_status = self.gpu_retry_status.clone();
                     view
                 })
@@ -11160,8 +11201,27 @@ impl LocalTranscriberApp {
             .flatten()
     }
 
+    fn gpu_retry_is_busy(&self) -> bool {
+        self.active_gpu_retry.is_some() || self.settling_gpu_retry.is_some()
+    }
+
+    fn gpu_retry_is_idle(&self) -> bool {
+        !self.gpu_retry_is_busy()
+            && self.artifact_mutation_block_reason().is_none()
+            && self.session_coordinator.phase() == DictationPhase::Idle
+            && self.deferred_recording_start.is_none()
+            && self.pending_direct_capture.is_none()
+            && self.controller_capture_id().is_none()
+    }
+
     fn retry_gpu(&mut self) {
-        if self.active_gpu_retry.is_some() {
+        if self.gpu_retry_is_busy() {
+            return;
+        }
+        if !self.gpu_retry_is_idle() {
+            self.transcribe_notice = Some(TranscribeNotice::failure(
+                "Wait for recording, transcription, output, and installation work to finish before retrying the GPU.",
+            ));
             return;
         }
         let Some(latest) = self.latest_acceleration.as_ref() else {
@@ -11200,15 +11260,27 @@ impl LocalTranscriberApp {
             preference,
             target: target.clone(),
         });
+        // Disable urgent hotkey starts before dispatch, then check ownership
+        // again for a ticket issued while the initial idle check raced.
+        self.sync_capture_controller_hotkey();
+        if self.pending_direct_capture.is_some() || self.controller_capture_id().is_some() {
+            self.active_gpu_retry = None;
+            self.sync_capture_controller_hotkey();
+            self.transcribe_notice = Some(TranscribeNotice::failure(
+                "Wait for microphone capture cleanup to finish before retrying the GPU.",
+            ));
+            return;
+        }
         self.status = TranscriptionStatus::Transcribing;
         self.status_message = "Retrying GPU".to_owned();
         self.transcribe_notice = Some(TranscribeNotice::information("Retrying GPU…"));
         let service = self.current_transcription_service();
+        let ticket = service.transcription_ticket();
         let tx = self.tx.clone();
         let model_id_for_thread = model_id.clone();
         thread::spawn(move || {
             let result = service
-                .retry_gpu(&model_id_for_thread, &target)
+                .retry_gpu(&model_id_for_thread, &target, ticket)
                 .map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::GpuRetryFinished {
                 nonce,
@@ -21774,6 +21846,322 @@ mod layout_tests {
         }
     }
 
+    fn test_gpu_retry_selection(
+        app: &mut LocalTranscriberApp,
+        reason: crate::backend_policy::BackendSkipReason,
+    ) -> BackendTarget {
+        use crate::backend_policy::*;
+        let mut target = BackendTarget::cpu();
+        target.backend = BackendKind::Vulkan;
+        target.device_class = DeviceClass::IntegratedGpu;
+        target.provider_id = ProviderIdentity::new("fixture:vulkan");
+        target.device_id = DeviceIdentity::new("native:pci:0000:01:00.0");
+        target.display_name = "Fixture GPU".to_owned();
+        app.config.performance.acceleration_preference = AccelerationPreference::Auto;
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+        app.update_latest_acceleration(
+            &model_id,
+            crate::transcription::ResolvedAcceleration {
+                requested: AccelerationPreference::Auto,
+                resolved: crate::transcription::ComputeDevice::Cpu,
+                diagnostic: None,
+                selection: Some(BackendSelection {
+                    requested: AccelerationPreference::Auto,
+                    target: BackendTarget::cpu(),
+                    reason: BackendSelectionReason::AutoCpuFallback,
+                    power_source: PowerSource::Ac,
+                    power_policy: PowerPolicyDecision::Unrestricted,
+                    qualification_policy_version: 1,
+                    fallback_targets: Vec::new(),
+                    fallback_history: Vec::new(),
+                    skipped_targets: vec![SkippedBackend {
+                        target: target.clone(),
+                        reason,
+                    }],
+                }),
+            },
+        );
+        target
+    }
+
+    #[test]
+    fn gpu_retry_selection_offers_only_unhealthy_or_quarantined_gpu_targets() {
+        use crate::backend_policy::BackendSkipReason::*;
+        for reason in [
+            Unhealthy,
+            Quarantined,
+            PlatformUnsupported,
+            StructurallyInvalid,
+            Unaddressable,
+            Incompatible,
+            BatteryPolicy,
+            UnknownPowerSource,
+            NotAutoQualified,
+            FallbackBound,
+        ] {
+            let mut app = test_app();
+            let target = test_gpu_retry_selection(&mut app, reason);
+            assert_eq!(
+                app.latest_acceleration
+                    .as_ref()
+                    .unwrap()
+                    .retry_target
+                    .as_ref(),
+                matches!(reason, Unhealthy | Quarantined).then_some(&target)
+            );
+        }
+        let mut app = test_app();
+        test_gpu_retry_selection(&mut app, Unhealthy);
+        let mut resolved = app.latest_acceleration.as_ref().unwrap().resolved.clone();
+        resolved.selection.as_mut().unwrap().skipped_targets[0].target = BackendTarget::cpu();
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+        app.update_latest_acceleration(&model_id, resolved);
+        assert!(
+            app.latest_acceleration
+                .as_ref()
+                .unwrap()
+                .retry_target
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gpu_retry_selection_preserves_latest_failed_gpu_precedence() {
+        use crate::backend_policy::*;
+        let mut app = test_app();
+        let mut failed = test_gpu_retry_selection(&mut app, BackendSkipReason::Unhealthy);
+        failed.device_id = DeviceIdentity::new("native:pci:0000:02:00.0");
+        let mut resolved = app.latest_acceleration.as_ref().unwrap().resolved.clone();
+        resolved.selection.as_mut().unwrap().fallback_history = vec![
+            BackendFallback {
+                target: failed.clone(),
+                category: BackendFailureCategory::WorkerFailed,
+            },
+            BackendFallback {
+                target: BackendTarget::cpu(),
+                category: BackendFailureCategory::WorkerFailed,
+            },
+        ];
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+        app.update_latest_acceleration(&model_id, resolved);
+        assert_eq!(
+            app.latest_acceleration
+                .as_ref()
+                .unwrap()
+                .retry_target
+                .as_ref(),
+            Some(&failed)
+        );
+    }
+
+    #[test]
+    fn gpu_retry_blocks_new_recordings_without_touching_capture_ownership() {
+        for source in [RecordingSource::Transcribe, RecordingSource::Playground] {
+            let mut app = test_app();
+            let operation = test_gpu_retry_operation(&mut app);
+            let phase = app.session_coordinator.phase();
+            app.start_recording_at(source, Instant::now(), TriggerObservation::AppAction);
+            let retained = app.active_gpu_retry.as_ref().unwrap();
+            assert_eq!(retained.nonce, operation.nonce);
+            assert_eq!(retained.generation, operation.generation);
+            assert_eq!(retained.target, operation.target);
+            assert_eq!(app.session_coordinator.phase(), phase);
+            assert!(app.pending_recording.is_none());
+            assert!(app.active_recording.is_none());
+            assert!(app.deferred_recording_start.is_none());
+        }
+    }
+
+    #[test]
+    fn gpu_retry_blocks_repeated_artifact_actions_even_after_an_error() {
+        for settling in [false, true] {
+            let mut app = test_app();
+            test_gpu_retry_operation(&mut app);
+            if settling {
+                app.invalidate_acceleration_state();
+            }
+            app.status = TranscriptionStatus::Error;
+            for _ in 0..2 {
+                assert!(
+                    app.artifact_mutation_block_reason()
+                        .unwrap()
+                        .contains("GPU retry")
+                );
+                assert!(
+                    app.install_admission_block_reason()
+                        .unwrap()
+                        .contains("GPU retry")
+                );
+                assert!(app.has_active_work());
+                app.apply_model_management_action(ScreenAction::ValidateAndImportLocalGguf);
+                assert!(app.status_message.contains("GPU retry"));
+                assert!(app.local_gguf_import.is_none());
+                assert!(app.artifact_installations.is_empty());
+                assert!(app.gpu_retry_is_busy());
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_retry_invalidation_cancels_native_work_and_waits_for_exact_acknowledgement() {
+        let mut app = test_app();
+        let operation = test_gpu_retry_operation(&mut app);
+        let before = app.transcription_service.transcription_ticket();
+        app.invalidate_acceleration_state();
+        assert_ne!(app.transcription_service.transcription_ticket(), before);
+        assert!(app.active_gpu_retry.is_none());
+        assert!(app.settling_gpu_retry.is_some());
+        assert!(!app.gpu_retry_is_idle());
+        let status = app.status;
+        app.tx
+            .send(test_gpu_retry_event(
+                operation.nonce + 1,
+                operation.generation,
+                operation.model_id.clone(),
+                operation.preference,
+                operation.target.clone(),
+            ))
+            .unwrap();
+        app.poll_events();
+        assert!(app.settling_gpu_retry.is_some());
+        app.tx
+            .send(test_gpu_retry_event(
+                operation.nonce,
+                operation.generation,
+                operation.model_id,
+                operation.preference,
+                operation.target,
+            ))
+            .unwrap();
+        app.poll_events();
+        assert!(!app.gpu_retry_is_busy());
+        assert_eq!(app.status, status);
+        assert!(app.latest_acceleration.is_none());
+    }
+
+    #[test]
+    fn gpu_retry_refuses_unadopted_hotkey_capture_and_disables_new_tickets() {
+        struct ReleaseCapture(Sender<()>);
+        impl Drop for ReleaseCapture {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let mut app = test_app();
+        app.config.recording.hotkey_mode = HotkeyMode::HoldToTalk;
+        test_gpu_retry_selection(
+            &mut app,
+            crate::backend_policy::BackendSkipReason::Unhealthy,
+        );
+        let (_ticket, cancelled, retire, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+        let _release = ReleaseCapture(retire.clone());
+        let nonce = app.next_gpu_retry_nonce;
+        app.retry_gpu();
+        assert_eq!(app.next_gpu_retry_nonce, nonce);
+        assert!(!app.gpu_retry_is_busy());
+        test_gpu_retry_operation(&mut app);
+        app.sync_capture_controller_hotkey();
+        cancelled.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(app.controller_capture_id().is_some());
+        retire_delayed_direct_hotkey_ticket(&mut app, retire);
+        assert!(app.controller_capture_id().is_none());
+        assert!(matches!(
+            app.capture_controller
+                .handle()
+                .dispatch_hotkey(true, Instant::now()),
+            audio::control::HotkeyDispatch::None
+        ));
+        assert!(!accepted_audio.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn gpu_retry_actions_reject_busy_capture_output_installation_and_playground() {
+        for action_route in ["settings", "transcribe"] {
+            for busy in [
+                "phase",
+                "transcription",
+                "output",
+                "playground",
+                "install",
+                "onnx",
+                "import",
+                "deferred",
+                "recovery",
+            ] {
+                let mut app = test_app();
+                test_gpu_retry_selection(
+                    &mut app,
+                    crate::backend_policy::BackendSkipReason::Unhealthy,
+                );
+                assert!(app.gpu_retry_is_idle());
+                match busy {
+                    "phase" => {
+                        app.session_coordinator
+                            .begin(SessionPurpose::Dictation)
+                            .unwrap();
+                        app.status = TranscriptionStatus::Error;
+                    }
+                    "transcription" => app.status = TranscriptionStatus::Transcribing,
+                    "output" => {
+                        app.pending_output = Some(PendingOutput {
+                            session_id: SessionId(1),
+                            history_id: None,
+                            transcript: "fixture output".to_owned(),
+                            completion_message: "Complete".to_owned(),
+                            config: app.config.clone(),
+                            latency: None,
+                        })
+                    }
+                    "playground" => app.playground_pending = 1,
+                    "install" => {
+                        app.artifact_installations
+                            .insert("fixture".to_owned(), (41, InstallCancellation::default()));
+                    }
+                    "onnx" => {
+                        app.onnx_bundle_install = Some(test_onnx_bundle_install_job(
+                            41,
+                            "fixture".to_owned(),
+                            InstallCancellation::default(),
+                        ))
+                    }
+                    "import" => {
+                        app.local_gguf_import = Some(test_local_gguf_import_job(
+                            41,
+                            InstallCancellation::default(),
+                        ))
+                    }
+                    "deferred" => {
+                        app.deferred_recording_start = Some(DeferredRecordingStart {
+                            source: RecordingSource::Transcribe,
+                            activation_at: Instant::now(),
+                            trigger_observation: TriggerObservation::AppAction,
+                        })
+                    }
+                    "recovery" => {
+                        app.artifact_recovery_error = Some("fixture recovery required".to_owned())
+                    }
+                    _ => unreachable!(),
+                }
+                let nonce = app.next_gpu_retry_nonce;
+                let status = app.status;
+                let phase = app.session_coordinator.phase();
+                let selection = app.latest_acceleration.clone();
+                assert!(!app.gpu_retry_is_idle());
+                if action_route == "settings" {
+                    app.apply_settings_screen_action(ScreenAction::RetryGpu);
+                } else {
+                    app.apply_transcribe_screen_action(ScreenAction::RetryGpu);
+                }
+                assert!(app.active_gpu_retry.is_none());
+                assert_eq!(app.next_gpu_retry_nonce, nonce);
+                assert_eq!(app.status, status);
+                assert_eq!(app.session_coordinator.phase(), phase);
+                assert_eq!(app.latest_acceleration, selection);
+            }
+        }
+    }
+
     fn test_gpu_retry_operation(app: &mut LocalTranscriberApp) -> GpuRetryOperation {
         let operation = GpuRetryOperation {
             nonce: 41,
@@ -22245,6 +22633,7 @@ mod layout_tests {
             acceleration_generation: 0,
             next_gpu_retry_nonce: 0,
             active_gpu_retry: None,
+            settling_gpu_retry: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,

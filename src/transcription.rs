@@ -483,6 +483,7 @@ enum RuntimeCommand {
     RetryGpu {
         artifact: RuntimeArtifact,
         target: BackendTarget,
+        cancellation_snapshot: u64,
         reply: SyncSender<Result<RuntimeLoadExecution, RuntimeError>>,
     },
     Health {
@@ -678,13 +679,20 @@ impl RuntimeWorker {
         &self,
         artifact: impl Into<RuntimeArtifact>,
         target: BackendTarget,
+        cancellation_snapshot: u64,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        if self.cancellation_snapshot() != cancellation_snapshot {
+            return Err(RuntimeError::Cancelled(
+                "GPU retry was cancelled before dispatch".to_owned(),
+            ));
+        }
         let (reply, response) = sync_channel(1);
         self.inner
             .commands
             .send(RuntimeCommand::RetryGpu {
                 artifact: artifact.into(),
                 target,
+                cancellation_snapshot,
                 reply,
             })
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
@@ -846,6 +854,7 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 artifact,
                 target: _,
                 reply,
+                ..
             }) => {
                 let request_activity = activity.acquire_request().ok();
                 let _ = artifact;
@@ -962,9 +971,15 @@ fn inference_worker_dispatch_loop(
             Ok(RuntimeCommand::RetryGpu {
                 artifact,
                 target,
+                cancellation_snapshot,
                 reply,
             }) => {
-                let result = inference.retry_gpu(artifact, &target);
+                let result = inference.retry_gpu(
+                    artifact,
+                    &target,
+                    cancellation_snapshot,
+                    &cancellation_generation,
+                );
                 let succeeded = result.is_ok();
                 let _ = reply.send(result);
                 succeeded
@@ -1381,7 +1396,13 @@ impl TranscriptionService {
         &self,
         model_id: &ModelId,
         target: &BackendTarget,
+        ticket: TranscriptionTicket,
     ) -> Result<ModelLoadOutcome> {
+        if self.worker.cancellation_snapshot() != ticket.native_generation {
+            return Err(anyhow!(RuntimeError::Cancelled(
+                "GPU retry was cancelled before model resolution".to_owned()
+            )));
+        }
         if config::installed_onnx_bundle_root(&self.config, model_id).is_some() {
             return Err(anyhow!("GPU retry is unavailable for ONNX models"));
         }
@@ -1392,7 +1413,7 @@ impl TranscriptionService {
         }
         let execution = self
             .worker
-            .retry_gpu(runtime_model, target.clone())
+            .retry_gpu(runtime_model, target.clone(), ticket.native_generation)
             .map_err(|error| anyhow!(error))?;
         Ok(ModelLoadOutcome {
             model_id: model_id.clone(),
@@ -3331,6 +3352,70 @@ mod tests {
             num_threads,
         };
         (root, spec)
+    }
+
+    #[test]
+    fn gpu_retry_queue_retains_the_cancellation_snapshot() {
+        let (root, spec) = service_onnx_spec("gpu-retry-snapshot");
+        let worker = simulated_runtime_worker(|receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::RetryGpu {
+                        cancellation_snapshot,
+                        reply,
+                        ..
+                    } => {
+                        assert_eq!(cancellation_snapshot, 7);
+                        reply
+                            .send(Err(RuntimeError::Cancelled(
+                                "fixture cancellation".to_owned(),
+                            )))
+                            .unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected GPU retry queue command"),
+                }
+            }
+        });
+        worker
+            .inner
+            .cancellation_generation
+            .store(7, Ordering::Release);
+        assert!(matches!(
+            worker.retry_gpu(
+                RuntimeArtifact::OnnxBundle(spec.clone()),
+                BackendTarget::cpu(),
+                7
+            ),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert!(matches!(
+            worker.retry_gpu(RuntimeArtifact::OnnxBundle(spec), BackendTarget::cpu(), 6),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        drop(worker);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_retry_cancelled_before_background_dispatch_skips_model_resolution() {
+        let service = TranscriptionService::new(AppConfig::default());
+        let ticket = service.transcription_ticket();
+        service.cancel_active();
+        let error = service
+            .retry_gpu(
+                &ModelId::new("not-configured"),
+                &BackendTarget::cpu(),
+                ticket,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RuntimeError>(),
+            Some(RuntimeError::Cancelled(_))
+        ));
     }
 
     fn test_load_execution() -> RuntimeLoadExecution {

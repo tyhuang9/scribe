@@ -5588,6 +5588,16 @@ impl ProcessWorkerSupervisor {
 
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.ensure_generation()?;
+        self.health_on_generation(generation, session_id, request_id)
+    }
+
+    fn health_on_generation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+    ) -> Result<()> {
+        self.generation_context_exact(generation)?;
         let frame = control_frame(session_id, request_id, &Control::Health)?;
         self.active_round_trip_with_timeout(
             generation,
@@ -8096,13 +8106,22 @@ impl InferenceWorkerSupervisor {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        self.load_on_generation(artifact, preference, None)
+    }
+
+    fn load_on_generation(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        expected_generation: Option<u64>,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
         if matches!(artifact, RuntimeArtifact::OnnxBundle(_)) {
             resolve_cpu_only_acceleration(preference)
                 .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
         }
         let context = self
             .transport
-            .generation_context()
+            .generation_context_for(expected_generation)
             .map_err(worker_unavailable)?;
         let artifact: WireRuntimeArtifact = artifact.into();
         let artifact_identity =
@@ -11113,6 +11132,8 @@ impl InferenceWorkerRegistry {
         &self,
         artifact: RuntimeArtifact,
         target: &BackendTarget,
+        cancellation_snapshot: u64,
+        cancellation_generation: &std::sync::atomic::AtomicU64,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let RuntimeArtifact::Gguf(_) = &artifact else {
             return Err(RuntimeError::OnnxUnavailable(
@@ -11120,6 +11141,16 @@ impl InferenceWorkerRegistry {
             ));
         };
         let _route_execution = self.lock_route_execution()?;
+        let check_cancelled = || {
+            if cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot {
+                Err(RuntimeError::Cancelled(
+                    "GPU retry was cancelled".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_cancelled()?;
 
         #[cfg(test)]
         let fixture_catalog = self.gpu_routes_for_testing.is_some();
@@ -11154,24 +11185,35 @@ impl InferenceWorkerRegistry {
                 }
             }
             let _ = self.routes_for_preference(AccelerationPreference::Gpu, &artifact)?;
-            let _ = self.grant_explicit_gpu_retry(&artifact, target)?;
         }
+        check_cancelled()?;
+        let _ = self.grant_explicit_gpu_retry(&artifact, target)?;
 
-        let plan = self.routes_for_preference(AccelerationPreference::Gpu, &artifact)?;
+        // Invalid health is admitted only to this explicit, idle recovery
+        // operation, never to ordinary load/transcription or Auto selection.
+        let plan = self.routes_for_preference_with_idle_health(
+            AccelerationPreference::Gpu,
+            &artifact,
+            true,
+        )?;
         let route = plan.routes.iter().find(|route| {
-            route.target.as_ref().is_some_and(|candidate| {
-                candidate.backend == target.backend
-                    && candidate.provider_id == target.provider_id
-                    && candidate.device_id == target.device_id
-                    && candidate.driver_version == target.driver_version
-                    && candidate.pack == target.pack
-            })
+            route
+                .target
+                .as_ref()
+                .is_some_and(|candidate| candidate.has_same_runtime_identity(target))
         });
         let Some(route) = route else {
             return Err(RuntimeError::WorkerUnavailable(
                 "the requested GPU retry target is no longer available".to_owned(),
             ));
         };
+        check_cancelled()?;
+        let needs_recovery = plan.health.as_ref().is_some_and(|health| {
+            route
+                .health_key
+                .as_ref()
+                .is_some_and(|key| health.cache().decision(key) != HealthDecision::Available)
+        });
         if plan
             .health
             .as_ref()
@@ -11181,15 +11223,90 @@ impl InferenceWorkerRegistry {
                 "the requested GPU retry target is not authorized for retry".to_owned(),
             ));
         }
-        self.prepare_route(route).map_err(|error| match error {
+        let preparation_error = |error| match error {
             RoutePreparationError::Fatal(error) => error,
             RoutePreparationError::DeviceRollbackAuthority(error) => {
                 RuntimeError::WorkerUnavailable(format!(
                     "{error}; CPU fallback is forbidden for explicit GPU"
                 ))
             }
-        })?;
-        match route.supervisor.load(artifact, AccelerationPreference::Gpu) {
+        };
+        let mut failure_observation = None;
+        let result = (|| {
+            let mut observe_worker_failure = |error: RuntimeError| {
+                failure_observation =
+                    Some(health_observation_for_runtime_error(&error, false, false));
+                error
+            };
+            self.prepare_route(route).map_err(preparation_error)?;
+            check_cancelled()?;
+            let transport = &route.supervisor.transport;
+            let generation = transport
+                .generation_context()
+                .map_err(worker_unavailable)
+                .map_err(&mut observe_worker_failure)?
+                .generation;
+            check_cancelled()?;
+            self.revalidate_route_activation(route)
+                .map_err(preparation_error)?;
+            let loaded = route.supervisor.load_on_generation(
+                artifact,
+                AccelerationPreference::Gpu,
+                Some(generation),
+            );
+            check_cancelled()?;
+            let execution = loaded.map_err(&mut observe_worker_failure)?;
+            transport
+                .generation_context_exact(generation)
+                .map_err(worker_unavailable)
+                .map_err(&mut observe_worker_failure)?;
+            if needs_recovery {
+                let health = plan
+                    .health
+                    .as_ref()
+                    .expect("recovery requires private health state");
+                let key = route.health_key.as_ref().ok_or_else(|| {
+                    RuntimeError::WorkerUnavailable(
+                        "GPU retry lacks an exact health identity".to_owned(),
+                    )
+                })?;
+                for _ in 0..2 {
+                    check_cancelled()?;
+                    self.revalidate_route_activation(route)
+                        .map_err(preparation_error)?;
+                    let correlation = route.supervisor.next_id();
+                    let probe =
+                        transport.health_on_generation(generation, correlation, correlation);
+                    check_cancelled()?;
+                    probe
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    transport
+                        .generation_context_exact(generation)
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    check_cancelled()?;
+                    health.cache().record_idle_probe_success(key).map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "GPU retry could not persist idle probe health".to_owned(),
+                        )
+                    })?;
+                }
+                check_cancelled()?;
+                if health.cache().decision(key) != HealthDecision::Available {
+                    return Err(RuntimeError::WorkerUnavailable(
+                        "GPU retry health is not available after idle probes".to_owned(),
+                    ));
+                }
+            }
+            transport
+                .generation_context_exact(generation)
+                .map_err(worker_unavailable)
+                .map_err(&mut observe_worker_failure)?;
+            check_cancelled()?;
+            Ok(execution)
+        })();
+        match result {
             Ok(mut execution) => {
                 Self::project_route_diagnostics(
                     &mut execution.diagnostics,
@@ -11202,16 +11319,20 @@ impl InferenceWorkerRegistry {
                 );
                 append_pack_diagnostic(
                     &mut execution.diagnostics.resolved_acceleration,
-                    plan.diagnostic.as_deref(),
+                    if needs_recovery {
+                        Some("GPU health recovered after two successful idle probes")
+                    } else {
+                        plan.diagnostic.as_deref()
+                    },
                 );
                 Ok(execution)
             }
             Err(error) => {
-                if let Some(health) = &plan.health {
-                    health.record_failure(
-                        route,
-                        health_observation_for_runtime_error(&error, false, false),
-                    );
+                let error = check_cancelled().err().unwrap_or(error);
+                if !matches!(error, RuntimeError::Cancelled(_))
+                    && let (Some(health), Some(observation)) = (&plan.health, failure_observation)
+                {
+                    health.record_failure(route, observation);
                 }
                 self.invalidate_gpu_catalog_after_runtime_failure(route)?;
                 self.retire_failed_route(route)?;
@@ -13630,7 +13751,7 @@ mod tests {
     use crate::prepared_audio::PreparedAudio;
     use std::collections::VecDeque;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver as TestReceiver, Sender as TestSender, channel};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -14322,6 +14443,12 @@ mod tests {
         RuntimeFailureOnLoad(RuntimeError),
         RuntimeLoad,
         RuntimeDiagnostics(Box<WireRuntimeDiagnostics>),
+        RuntimeRetryHealth {
+            diagnostics: Box<WireRuntimeDiagnostics>,
+            requests: Arc<Mutex<Vec<&'static str>>>,
+            before_health: Box<dyn Fn(usize) -> bool + Send>,
+            exit_after_health: Option<usize>,
+        },
         RuntimeLoadThenExit,
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         RuntimeObservationWrongBefore {
@@ -15087,6 +15214,60 @@ mod tests {
                     _ => panic!("expected runtime load or batch request"),
                 }
                 run_normal_worker(&mut input, &mut output);
+            }
+            TestMode::RuntimeRetryHealth {
+                diagnostics,
+                requests,
+                before_health,
+                exit_after_health,
+            } => {
+                let mut probes = 0;
+                loop {
+                    let frame = match read_frame(&mut input) {
+                        Ok(frame) => frame,
+                        Err(_) if !running.load(Ordering::Acquire) => return,
+                        Err(error) => panic!("unexpected retry-worker EOF: {error}"),
+                    };
+                    let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
+                    let response = match control {
+                        Control::LoadRuntime { preference, .. } => {
+                            assert_eq!(preference, AccelerationPreference::Gpu);
+                            requests.lock().unwrap().push("load");
+                            Control::RuntimeLoaded {
+                                execution: WireRuntimeLoadExecution {
+                                    diagnostics: (*diagnostics).clone(),
+                                    detected_architecture: "test-runtime".to_owned(),
+                                    capabilities: RuntimeCapabilities::default(),
+                                },
+                            }
+                        }
+                        Control::Health => {
+                            probes += 1;
+                            requests.lock().unwrap().push("health");
+                            if before_health(probes) {
+                                Control::Ok
+                            } else {
+                                Control::Error {
+                                    message: "fixture idle probe failed".to_owned(),
+                                }
+                            }
+                        }
+                        Control::Unload | Control::Cancel { .. } => Control::Ok,
+                        Control::Shutdown => {
+                            respond(&mut output, session_id, request_id, Control::Ok);
+                            return;
+                        }
+                        _ => panic!("retry must not send batch, audio, or unrelated commands"),
+                    };
+                    let exit = exit_after_health == Some(probes);
+                    if exit {
+                        running.store(false, Ordering::Release);
+                    }
+                    respond(&mut output, session_id, request_id, response);
+                    if exit {
+                        return;
+                    }
+                }
             }
             TestMode::RuntimeLoadThenExit => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -19575,7 +19756,7 @@ mod tests {
 
         let artifact = gguf_artifact_fixture("explicit-gpu-retry-success");
         let execution = registry
-            .retry_gpu(artifact.artifact.clone(), &target)
+            .retry_gpu(artifact.artifact.clone(), &target, 0, &AtomicU64::new(0))
             .expect("exact GPU retry should load the retained target");
         let selection = execution
             .diagnostics
@@ -19594,25 +19775,318 @@ mod tests {
     }
 
     #[test]
+    fn explicit_gpu_retry_recovers_invalid_health_only_after_two_persisted_idle_probes() {
+        for state in ["corrupt", "oversized", "stale", "quarantined"] {
+            let fixture = gguf_artifact_fixture(&format!("gpu-retry-recovery-{state}"));
+            let path = Arc::new(fixture.root.join("health.json"));
+            let target = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            )
+            .target
+            .unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let health_check = Arc::new(Mutex::new(None::<(HealthWitnesses, HealthKey)>));
+            let path_for_probe = Arc::clone(&path);
+            let check_for_probe = Arc::clone(&health_check);
+            let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeRetryHealth {
+                diagnostics: Box::new(diagnostics_with_child_gpu_context(target.clone())),
+                requests: Arc::clone(&requests),
+                before_health: Box::new(move |probe| {
+                    let (witnesses, key) = check_for_probe.lock().unwrap().clone().unwrap();
+                    let decision =
+                        HealthCache::open(&*path_for_probe, witnesses, &GPU_HEALTH_CLOCK)
+                            .decision(&key);
+                    assert_ne!(decision, HealthDecision::Available);
+                    assert!(probe <= 2);
+                    if probe == 2 {
+                        let persisted: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&*path_for_probe).unwrap())
+                                .unwrap();
+                        let exact_key = serde_json::to_value(&key).unwrap();
+                        let entries = persisted["records"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .chain(persisted["recovery_probes"].as_array().unwrap())
+                            .filter(|entry| entry["key"] == exact_key)
+                            .collect::<Vec<_>>();
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0]["successful_idle_probes"], 1);
+                    }
+                    true
+                }),
+                exit_after_health: None,
+            }]));
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let unrelated_launcher = Arc::new(TestLauncher::new([]));
+            let (mut registry, retained) =
+                explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+            let mut unrelated = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:02:00.0",
+                "windows-display:32.0.16.1088",
+                'b',
+            );
+            unrelated.supervisor =
+                inference_supervisor_with_launcher(Arc::clone(&unrelated_launcher));
+            let mut routes = registry
+                .gpu_routes_for_testing
+                .as_ref()
+                .unwrap()
+                .routes
+                .as_ref()
+                .clone();
+            routes.push(unrelated);
+            let catalog = verified_gpu_catalog(routes);
+            let RuntimeArtifact::Gguf(model) = &fixture.artifact else {
+                unreachable!()
+            };
+            let key = route_health_key(&catalog.routes[0], &model.expected_sha256).unwrap();
+            let witnesses = HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            };
+            *health_check.lock().unwrap() = Some((witnesses.clone(), key.clone()));
+            match state {
+                "corrupt" => std::fs::write(&*path, b"{broken").unwrap(),
+                "oversized" => std::fs::write(&*path, vec![b'x'; 256 * 1024 + 1]).unwrap(),
+                "stale" | "quarantined" => {
+                    let mut initial = witnesses.clone();
+                    if state == "stale" {
+                        initial.app_build = "old-build".to_owned();
+                    }
+                    HealthCache::open(&*path, initial, &GPU_HEALTH_CLOCK)
+                        .record_provider_failure(
+                            key.clone(),
+                            crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            registry.gpu_health_path = Some(Arc::clone(&path));
+            registry.gpu_routes_for_testing = Some(catalog.clone());
+            registry
+                .gpu_routes
+                .lock()
+                .unwrap()
+                .record_probe(catalog, Instant::now());
+            assert!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+                    .unwrap()
+                    .routes
+                    .iter()
+                    .all(|route| !route
+                        .target
+                        .as_ref()
+                        .unwrap()
+                        .has_same_runtime_identity(&retained))
+            );
+            assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+
+            let result = registry
+                .retry_gpu(fixture.artifact.clone(), &retained, 0, &AtomicU64::new(0))
+                .expect("explicit retry must recover the exact health key");
+            let selected = result
+                .diagnostics
+                .resolved_acceleration
+                .selection
+                .unwrap()
+                .target;
+            assert!(selected.has_same_runtime_identity(&target));
+            assert_eq!(selected.process_index, None);
+            assert_eq!(*requests.lock().unwrap(), ["load", "health", "health"]);
+            assert_eq!(
+                HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::Available
+            );
+            assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+            assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+            assert_eq!(
+                unrelated_launcher.launch_attempts.load(Ordering::Acquire),
+                0
+            );
+            registry.unload().unwrap();
+        }
+    }
+
+    #[test]
     fn explicit_gpu_retry_rejects_a_disappeared_or_changed_target_before_launch() {
-        for change in ["device", "pack"] {
+        for change in [
+            "device",
+            "backend",
+            "provider",
+            "driver",
+            "pack_id",
+            "pack_version",
+            "pack_digest",
+            "epoch",
+            "abi",
+            "disappeared",
+        ] {
             let gpu_launcher = Arc::new(TestLauncher::new([]));
             let cpu_launcher = Arc::new(TestLauncher::new([]));
-            let (registry, mut target) =
+            let (mut registry, mut target) =
                 explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
-            if change == "device" {
-                target.device_id = DeviceIdentity::new("native:pci:0000:02:00.0");
-            } else {
-                target.pack.as_mut().expect("fixture pack").pack_version = "2.0.0".to_owned();
+            match change {
+                "device" => target.device_id = DeviceIdentity::new("native:pci:0000:02:00.0"),
+                "backend" => target.backend = BackendKind::Cuda,
+                "provider" => target.provider_id = ProviderIdentity::new("changed-provider"),
+                "driver" => target.driver_version = Some("changed-driver".to_owned()),
+                "pack_id" => target.pack.as_mut().unwrap().pack_id = "changed-pack".to_owned(),
+                "pack_version" => target.pack.as_mut().unwrap().pack_version = "2.0.0".to_owned(),
+                "pack_digest" => target.pack.as_mut().unwrap().pack_digest = "c".repeat(64),
+                "epoch" => target.pack.as_mut().unwrap().security_epoch += 1,
+                "abi" => target.pack.as_mut().unwrap().runtime_abi += 1,
+                "disappeared" => {
+                    registry.gpu_routes_for_testing = Some(verified_gpu_catalog(Vec::new()))
+                }
+                _ => unreachable!(),
             }
 
             let error = registry
-                .retry_gpu(missing_gguf_artifact(), &target)
+                .retry_gpu(missing_gguf_artifact(), &target, 0, &AtomicU64::new(0))
                 .expect_err("changed exact target must be denied");
             assert!(error.to_string().contains("no longer available"));
-            assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
-            assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+            assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+            assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
         }
+    }
+
+    #[test]
+    fn explicit_gpu_retry_stops_on_probe_persistence_cancellation_or_generation_failure() {
+        for failure in [
+            "probe1", "probe2", "persist1", "persist2", "cancel1", "cancel2", "exit1", "exit2",
+            "reset2",
+        ] {
+            let fixture = gguf_artifact_fixture(&format!("gpu-retry-{failure}"));
+            let path = Arc::new(fixture.root.join("health.json"));
+            std::fs::write(&*path, b"{broken").unwrap();
+            let target = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            )
+            .target
+            .unwrap();
+            let cancellation = Arc::new(AtomicU64::new(0));
+            let cancellation_for_probe = Arc::clone(&cancellation);
+            let path_for_probe = Arc::clone(&path);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let failed_probe = if failure.ends_with('1') { 1 } else { 2 };
+            let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeRetryHealth {
+                diagnostics: Box::new(diagnostics_with_child_gpu_context(target.clone())),
+                requests: Arc::clone(&requests),
+                before_health: Box::new(move |probe| {
+                    if probe != failed_probe {
+                        return true;
+                    }
+                    if failure.starts_with("persist") {
+                        // Only this test's owned, disposable cache is replaced.
+                        std::fs::remove_file(&*path_for_probe).unwrap();
+                        std::fs::create_dir(&*path_for_probe).unwrap();
+                    }
+                    if failure.starts_with("cancel") {
+                        cancellation_for_probe.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if failure == "reset2" {
+                        std::fs::write(&*path_for_probe, b"{broken-again").unwrap();
+                    }
+                    !failure.starts_with("probe")
+                }),
+                exit_after_health: failure.starts_with("exit").then_some(failed_probe),
+            }]));
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let unrelated_launcher = Arc::new(TestLauncher::new([]));
+            let (mut registry, retained) =
+                explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+            let mut unrelated = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:02:00.0",
+                "windows-display:32.0.16.1088",
+                'b',
+            );
+            unrelated.supervisor =
+                inference_supervisor_with_launcher(Arc::clone(&unrelated_launcher));
+            let mut routes = registry
+                .gpu_routes_for_testing
+                .as_ref()
+                .unwrap()
+                .routes
+                .as_ref()
+                .clone();
+            routes.push(unrelated);
+            let catalog = verified_gpu_catalog(routes);
+            let RuntimeArtifact::Gguf(model) = &fixture.artifact else {
+                unreachable!()
+            };
+            let key = route_health_key(&catalog.routes[0], &model.expected_sha256).unwrap();
+            let witnesses = HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            };
+            registry.gpu_routes_for_testing = Some(catalog);
+            registry.gpu_health_path = Some(Arc::clone(&path));
+            let error = registry
+                .retry_gpu(fixture.artifact.clone(), &retained, 0, &cancellation)
+                .expect_err("failed recovery must never report success");
+            if failure.starts_with("cancel") {
+                assert!(matches!(error, RuntimeError::Cancelled(_)));
+            }
+            if failure.starts_with("persist") {
+                assert!(
+                    matches!(&error, RuntimeError::WorkerUnavailable(message) if message == "GPU retry could not persist idle probe health")
+                );
+            }
+            if failure == "reset2" {
+                assert!(
+                    matches!(&error, RuntimeError::WorkerUnavailable(message) if message == "GPU retry health is not available after idle probes")
+                );
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
+                assert!(
+                    persisted["records"].as_array().unwrap().is_empty(),
+                    "local cache invalidation must not create a provider quarantine"
+                );
+                assert_eq!(persisted["recovery_probes"][0]["successful_idle_probes"], 1);
+            }
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                failed_probe + 1,
+                "{failure}"
+            );
+            assert_ne!(
+                HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::Available,
+                "{failure}"
+            );
+            assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+            assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+            assert_eq!(
+                unrelated_launcher.launch_attempts.load(Ordering::Acquire),
+                0
+            );
+            assert!(registry.active_route.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_gpu_retry_rejects_queued_cancellation_before_any_launch() {
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        assert!(matches!(
+            registry.retry_gpu(missing_gguf_artifact(), &target, 0, &AtomicU64::new(1)),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -19627,7 +20101,7 @@ mod tests {
         registry.gpu_health_path = Some(Arc::clone(&health_path));
 
         registry
-            .retry_gpu(artifact.artifact.clone(), &target)
+            .retry_gpu(artifact.artifact.clone(), &target, 0, &AtomicU64::new(0))
             .expect("an available health target does not require a quarantine bypass");
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
         assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
@@ -19655,7 +20129,7 @@ mod tests {
 
         let artifact = gguf_artifact_fixture("explicit-gpu-retry-failure");
         let error = registry
-            .retry_gpu(artifact.artifact.clone(), &target)
+            .retry_gpu(artifact.artifact.clone(), &target, 0, &AtomicU64::new(0))
             .expect_err("fixture runtime failure should be returned");
         assert!(matches!(error, RuntimeError::BackendUnavailable(_)));
         assert!(registry.gpu_routes.lock().unwrap().successful.is_none());
@@ -19684,7 +20158,7 @@ mod tests {
             explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
 
         let error = registry
-            .retry_gpu(artifact, &target)
+            .retry_gpu(artifact, &target, 0, &AtomicU64::new(0))
             .expect_err("ONNX must remain CPU-only");
         assert!(matches!(error, RuntimeError::OnnxUnavailable(_)));
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
