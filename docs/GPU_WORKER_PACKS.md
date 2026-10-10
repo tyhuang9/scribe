@@ -58,6 +58,18 @@ Explicit GPU retains the supervisor-reconciled launch target, including a
 remapped process index and updated volatile facts, instead of restoring cached
 probe metadata.
 
+The opt-in Windows pack probe may additionally report
+`worker_exit_code_before_parent_termination` on a failed-provider diagnostic.
+This is an unsigned 32-bit status observed through a retained duplicate of the
+actual worker process handle, before parent cleanup begins. The first sample
+is final: a running process, unavailable handle, or failed query omits the
+field, and later cleanup cannot supply it. A signaled process may legitimately
+return status 259. This field is terminal-status evidence, not proof of a
+native crash, worker-main progress, or a particular loader/driver cause. The
+existing stage describes the parent's lifecycle milestone only. No raw stderr,
+paths, model data, or transcript content is added; cleanup confirmation and
+Auto qualification remain independent and unchanged.
+
 ## Windows executable long-path declaration
 
 New Windows MSVC desktop and inference-worker builds embed the reviewed
