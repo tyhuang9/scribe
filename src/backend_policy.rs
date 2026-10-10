@@ -565,6 +565,40 @@ pub(crate) struct BackendFallback {
     pub(crate) category: BackendFailureCategory,
 }
 
+/// Parent-verified request context when no backend completed successfully.
+/// This is not a selection, a retry grant, or a worker-provided diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[error("GPU unavailable; CPU fallback is forbidden for explicit GPU")]
+pub(crate) struct BackendFailureContext {
+    pub(crate) requested: AccelerationPreference,
+    pub(crate) power_source: PowerSource,
+    pub(crate) power_policy: PowerPolicyDecision,
+    pub(crate) fallback_history: Vec<BackendFallback>,
+    pub(crate) skipped_targets: Vec<SkippedBackend>,
+}
+
+impl BackendFailureContext {
+    pub(crate) fn retry_target(&self) -> Option<&BackendTarget> {
+        self.fallback_history
+            .iter()
+            .rev()
+            .find(|failure| failure.target.is_gpu())
+            .map(|failure| &failure.target)
+            .or_else(|| {
+                self.skipped_targets
+                    .iter()
+                    .find(|skipped| {
+                        skipped.target.is_gpu()
+                            && matches!(
+                                skipped.reason,
+                                BackendSkipReason::Quarantined | BackendSkipReason::Unhealthy
+                            )
+                    })
+                    .map(|skipped| &skipped.target)
+            })
+    }
+}
+
 /// Deterministic backend resolution for one model load.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackendSelection {

@@ -23,7 +23,7 @@ use crate::audio::{
     CaptureStopReason, LevelSnapshot, RecordingSession,
     SpeechDetectionMode as CaptureSpeechDetectionMode, VadOptions,
 };
-use crate::backend_policy::BackendTarget;
+use crate::backend_policy::{BackendFailureContext, BackendTarget};
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
@@ -729,6 +729,12 @@ struct ModelAccelerationState {
 }
 
 #[derive(Clone, Debug)]
+struct ModelAccelerationFailureState {
+    model_id: ModelId,
+    failure: BackendFailureContext,
+}
+
+#[derive(Clone, Debug)]
 struct GpuRetryOperation {
     nonce: u64,
     generation: u64,
@@ -1413,6 +1419,8 @@ enum AppEvent {
     ModelPreloadFailed {
         session_id: SessionId,
         model_id: ModelId,
+        acceleration_generation: u64,
+        backend_failure: Option<BackendFailureContext>,
         message: String,
     },
     TranscriptionDone {
@@ -1440,6 +1448,8 @@ enum AppEvent {
         session_id: SessionId,
         request_id: RequestId,
         model_id: String,
+        acceleration_generation: u64,
+        backend_failure: Option<BackendFailureContext>,
         message: String,
         latency: Option<LatencyTrace>,
     },
@@ -3150,6 +3160,7 @@ pub struct LocalTranscriberApp {
     transcribe_notice: Option<TranscribeNotice>,
     gpu_retry_status: Option<TranscribeNotice>,
     latest_acceleration: Option<ModelAccelerationState>,
+    latest_acceleration_failure: Option<ModelAccelerationFailureState>,
     acceleration_generation: u64,
     next_gpu_retry_nonce: u64,
     active_gpu_retry: Option<GpuRetryOperation>,
@@ -3408,6 +3419,7 @@ impl LocalTranscriberApp {
             transcribe_notice: None,
             gpu_retry_status: None,
             latest_acceleration: None,
+            latest_acceleration_failure: None,
             acceleration_generation: 0,
             next_gpu_retry_nonce: 0,
             active_gpu_retry: None,
@@ -5355,6 +5367,7 @@ impl LocalTranscriberApp {
             pending.latency.model_load_started_at = Some(Instant::now());
         }
         let service = self.current_transcription_service();
+        let acceleration_generation = self.acceleration_generation;
         let tx = self.tx.clone();
         thread::spawn(
             move || match service.preload_model(&model_id, model.local_path) {
@@ -5367,9 +5380,12 @@ impl LocalTranscriberApp {
                     });
                 }
                 Err(err) => {
+                    let backend_failure = err.downcast_ref::<BackendFailureContext>().cloned();
                     let _ = tx.send(AppEvent::ModelPreloadFailed {
                         session_id,
                         model_id,
+                        acceleration_generation,
+                        backend_failure,
                         message: err.to_string(),
                     });
                 }
@@ -6622,6 +6638,7 @@ impl LocalTranscriberApp {
         self.begin_overlay_session(session_id, NativeOverlayMode::Off, None);
         self.status = TranscriptionStatus::Transcribing;
         self.status_message = "Loading retained audio for history retry".to_owned();
+        let acceleration_generation = self.acceleration_generation;
         let tx = self.tx.clone();
         thread::spawn(move || {
             let retry = match store.retry(history_id) {
@@ -6697,11 +6714,14 @@ impl LocalTranscriberApp {
                     });
                 }
                 Err(error) => {
+                    let backend_failure = error.downcast_ref::<BackendFailureContext>().cloned();
                     let _ = tx.send(AppEvent::TranscriptionFailed {
                         source: RecordingSource::Transcribe,
                         session_id,
                         request_id,
                         model_id: model.id,
+                        acceleration_generation,
+                        backend_failure,
                         message: error.to_string(),
                         latency: Some(latency),
                     });
@@ -7249,6 +7269,8 @@ impl LocalTranscriberApp {
                 AppEvent::ModelPreloadFailed {
                     session_id,
                     model_id,
+                    acceleration_generation,
+                    backend_failure,
                     message,
                 } => {
                     if self
@@ -7258,6 +7280,11 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
+                    self.update_latest_acceleration_failure(
+                        &model_id,
+                        acceleration_generation,
+                        backend_failure,
+                    );
                     if self
                         .active_recording
                         .as_ref()
@@ -7334,12 +7361,10 @@ impl LocalTranscriberApp {
                             {
                                 self.status = TranscriptionStatus::Idle;
                                 self.status_message = "GPU retry could not be completed".to_owned();
-                                self.gpu_retry_status = Some(TranscribeNotice::failure(
-                                    "GPU retry could not be completed. The previous selection remains active.",
-                                ));
-                                self.transcribe_notice = Some(TranscribeNotice::failure(
-                                    "GPU retry could not be completed. The previous selection remains active.",
-                                ));
+                                let notice =
+                                    TranscribeNotice::failure(self.gpu_retry_failure_message());
+                                self.gpu_retry_status = Some(notice.clone());
+                                self.transcribe_notice = Some(notice);
                                 continue;
                             }
                             self.update_latest_acceleration(
@@ -7356,12 +7381,10 @@ impl LocalTranscriberApp {
                         Err(_) => {
                             self.status = TranscriptionStatus::Idle;
                             self.status_message = "GPU retry could not be completed".to_owned();
-                            self.gpu_retry_status = Some(TranscribeNotice::failure(
-                                "GPU retry could not be completed. The previous selection remains active.",
-                            ));
-                            self.transcribe_notice = Some(TranscribeNotice::failure(
-                                "GPU retry could not be completed. The previous selection remains active.",
-                            ));
+                            let notice =
+                                TranscribeNotice::failure(self.gpu_retry_failure_message());
+                            self.gpu_retry_status = Some(notice.clone());
+                            self.transcribe_notice = Some(notice);
                         }
                     }
                 }
@@ -7955,6 +7978,8 @@ impl LocalTranscriberApp {
                     session_id,
                     request_id,
                     model_id,
+                    acceleration_generation,
+                    backend_failure,
                     message,
                     latency,
                 } => {
@@ -8000,6 +8025,13 @@ impl LocalTranscriberApp {
                             continue;
                         }
                     };
+                    if source == RecordingSource::Transcribe {
+                        self.update_latest_acceleration_failure(
+                            &failed_model_id,
+                            acceleration_generation,
+                            backend_failure,
+                        );
+                    }
                     if let Some(mut latency) = latency {
                         latency.ui_result_at = Some(Instant::now());
                         self.record_session_diagnostic(
@@ -8649,6 +8681,7 @@ impl LocalTranscriberApp {
                 return;
             }
         };
+        let acceleration_generation = self.acceleration_generation;
         let tx = self.tx.clone();
 
         if let Some(plan) = history_plan {
@@ -8694,11 +8727,14 @@ impl LocalTranscriberApp {
                     });
                 }
                 Err(err) => {
+                    let backend_failure = err.downcast_ref::<BackendFailureContext>().cloned();
                     let _ = tx.send(AppEvent::TranscriptionFailed {
                         source: RecordingSource::Transcribe,
                         session_id,
                         request_id,
                         model_id: model.id,
+                        acceleration_generation,
+                        backend_failure,
                         message: err.to_string(),
                         latency: Some(latency),
                     });
@@ -8781,6 +8817,7 @@ impl LocalTranscriberApp {
             self.mark_comparison_output_changed(&model_id);
         }
 
+        let acceleration_generation = self.acceleration_generation;
         let tx = self.tx.clone();
         thread::spawn(move || {
             for (request_id, model) in requests {
@@ -8792,11 +8829,14 @@ impl LocalTranscriberApp {
                 let task = match service.begin_transcription_task() {
                     Ok(task) => task,
                     Err(err) => {
+                        let backend_failure = err.downcast_ref::<BackendFailureContext>().cloned();
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
                             session_id,
                             request_id,
                             model_id: model.id,
+                            acceleration_generation,
+                            backend_failure,
                             message: err.to_string(),
                             latency: None,
                         });
@@ -8822,11 +8862,14 @@ impl LocalTranscriberApp {
                         });
                     }
                     Err(err) => {
+                        let backend_failure = err.downcast_ref::<BackendFailureContext>().cloned();
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
                             session_id,
                             request_id,
                             model_id: model.id,
+                            acceleration_generation,
+                            backend_failure,
                             message: err.to_string(),
                             latency: None,
                         });
@@ -11131,6 +11174,7 @@ impl LocalTranscriberApp {
         self.acceleration_generation = self.acceleration_generation.wrapping_add(1);
         self.gpu_retry_status = None;
         self.latest_acceleration = None;
+        self.latest_acceleration_failure = None;
         self.cancel_active_gpu_retry_busy_state();
     }
 
@@ -11148,6 +11192,7 @@ impl LocalTranscriberApp {
         resolved: crate::transcription::ResolvedAcceleration,
     ) {
         self.gpu_retry_status = None;
+        self.latest_acceleration_failure = None;
         let retry_target = resolved
             .selection
             .as_ref()
@@ -11182,23 +11227,79 @@ impl LocalTranscriberApp {
         });
     }
 
+    fn update_latest_acceleration_failure(
+        &mut self,
+        model_id: &ModelId,
+        acceleration_generation: u64,
+        failure: Option<BackendFailureContext>,
+    ) {
+        let Some(failure) = failure else {
+            return;
+        };
+        if acceleration_generation != self.acceleration_generation
+            || failure.requested != self.config.performance.acceleration_preference
+            || self.config.general.selected_default_model != model_id.as_str()
+        {
+            return;
+        }
+        self.gpu_retry_status = None;
+        self.latest_acceleration_failure = Some(ModelAccelerationFailureState {
+            model_id: model_id.clone(),
+            failure,
+        });
+    }
+
     fn acceleration_diagnostics_view(&self) -> Option<crate::ui::AccelerationDiagnosticsView> {
-        let latest = self.latest_acceleration.as_ref()?;
         let selected_model = ModelId::new(&self.config.general.selected_default_model);
-        (latest.model_id == selected_model
-            && latest.resolved.requested == self.config.performance.acceleration_preference)
-            .then(|| {
-                acceleration_diagnostics(
-                    Some(&latest.resolved),
-                    latest.retry_target.is_some() && self.gpu_retry_is_idle(),
-                )
-                .map(|mut view| {
-                    view.retry_gpu_in_flight = self.gpu_retry_is_busy();
-                    view.retry_gpu_status = self.gpu_retry_status.clone();
-                    view
-                })
+        let preference = self.config.performance.acceleration_preference;
+        let current_failure = self.latest_acceleration_failure.as_ref().filter(|latest| {
+            latest.model_id == selected_model && latest.failure.requested == preference
+        });
+        let current_selection = self.latest_acceleration.as_ref().filter(|latest| {
+            latest.model_id == selected_model && latest.resolved.requested == preference
+        });
+        acceleration_diagnostics(
+            current_selection.map(|latest| &latest.resolved),
+            current_failure.map(|latest| &latest.failure),
+            self.current_gpu_retry_target().is_some() && self.gpu_retry_is_idle(),
+        )
+        .map(|mut view| {
+            view.retry_gpu_in_flight = self.gpu_retry_is_busy();
+            view.retry_gpu_status = self.gpu_retry_status.clone();
+            view
+        })
+    }
+
+    fn current_gpu_retry_target(&self) -> Option<BackendTarget> {
+        let model_id = ModelId::new(&self.config.general.selected_default_model);
+        let preference = self.config.performance.acceleration_preference;
+        if let Some(latest) = self
+            .latest_acceleration_failure
+            .as_ref()
+            .filter(|latest| latest.model_id == model_id && latest.failure.requested == preference)
+        {
+            return latest.failure.retry_target().cloned();
+        }
+        self.latest_acceleration
+            .as_ref()
+            .filter(|latest| latest.model_id == model_id && latest.resolved.requested == preference)
+            .and_then(|latest| latest.retry_target.clone())
+    }
+
+    fn gpu_retry_failure_message(&self) -> &'static str {
+        let model_id = ModelId::new(&self.config.general.selected_default_model);
+        let preference = self.config.performance.acceleration_preference;
+        if self
+            .latest_acceleration_failure
+            .as_ref()
+            .is_some_and(|latest| {
+                latest.model_id == model_id && latest.failure.requested == preference
             })
-            .flatten()
+        {
+            "GPU retry could not be completed. The GPU remains unavailable."
+        } else {
+            "GPU retry could not be completed. The previous selection remains active."
+        }
     }
 
     fn gpu_retry_is_busy(&self) -> bool {
@@ -11224,32 +11325,14 @@ impl LocalTranscriberApp {
             ));
             return;
         }
-        let Some(latest) = self.latest_acceleration.as_ref() else {
-            self.transcribe_notice = Some(TranscribeNotice::failure(
-                "GPU retry is unavailable until a model has reported its selection.",
-            ));
-            return;
-        };
-        let Some(target) = latest.retry_target.clone() else {
+        let Some(target) = self.current_gpu_retry_target() else {
             self.transcribe_notice = Some(TranscribeNotice::failure(
                 "GPU retry is unavailable for the current model selection.",
             ));
             return;
         };
         let model_id = ModelId::new(&self.config.general.selected_default_model);
-        if latest.model_id != model_id {
-            self.transcribe_notice = Some(TranscribeNotice::failure(
-                "GPU retry is unavailable for the current model selection.",
-            ));
-            return;
-        }
         let preference = self.config.performance.acceleration_preference;
-        if latest.resolved.requested != preference {
-            self.transcribe_notice = Some(TranscribeNotice::failure(
-                "GPU retry is unavailable for the current acceleration setting.",
-            ));
-            return;
-        }
         let nonce = self.next_gpu_retry_nonce();
         let generation = self.acceleration_generation;
         self.gpu_retry_status = None;
@@ -16275,6 +16358,7 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
 mod layout_tests {
     use super::*;
     use crate::audio::CaptureMetrics;
+    use crate::backend_policy::{BackendKind, BackendPackIdentity, DeviceIdentity};
     use crate::installations::DownloadedArtifact;
     use crate::streaming::StreamIdentity;
     use crate::transcription::StreamUpdate;
@@ -20251,6 +20335,8 @@ mod layout_tests {
                 session_id: SessionId(1),
                 request_id: RequestId(10),
                 model_id: "whisper_cpp_base_en".to_owned(),
+                acceleration_generation: 0,
+                backend_failure: None,
                 message: "runtime stopped".to_owned(),
                 latency: None,
             })
@@ -20347,6 +20433,8 @@ mod layout_tests {
                 session_id,
                 request_id,
                 model_id: model_id.clone(),
+                acceleration_generation: 0,
+                backend_failure: None,
                 message: "expected failure".to_owned(),
                 latency: None,
             })
@@ -20434,6 +20522,8 @@ mod layout_tests {
                 session_id,
                 request_id: first_request,
                 model_id: first_id.clone(),
+                acceleration_generation: 0,
+                backend_failure: None,
                 message: "first failed".to_owned(),
                 latency: None,
             })
@@ -21051,6 +21141,8 @@ mod layout_tests {
                 session_id: SessionId(1),
                 request_id: RequestId(11),
                 model_id: "whisper_cpp_base_en".to_owned(),
+                acceleration_generation: 0,
+                backend_failure: None,
                 message: "obsolete failure".to_owned(),
                 latency: None,
             })
@@ -21156,6 +21248,8 @@ mod layout_tests {
                 session_id: SessionId(1),
                 request_id: RequestId(10),
                 model_id: "whisper_cpp_base_en".to_owned(),
+                acceleration_generation: 0,
+                backend_failure: None,
                 message: "obsolete playground failure".to_owned(),
                 latency: None,
             })
@@ -21229,6 +21323,8 @@ mod layout_tests {
                 session_id: SessionId(1),
                 request_id: RequestId(11),
                 model_id: "whisper_cpp_base_en".to_owned(),
+                acceleration_generation: 0,
+                backend_failure: None,
                 message: "obsolete playground failure".to_owned(),
                 latency: None,
             })
@@ -21882,6 +21978,319 @@ mod layout_tests {
             },
         );
         target
+    }
+
+    fn test_gpu_failure_context(retryable: bool) -> BackendFailureContext {
+        use crate::backend_policy::*;
+        let mut target = BackendTarget::cpu();
+        target.backend = BackendKind::Vulkan;
+        target.device_class = DeviceClass::IntegratedGpu;
+        target.provider_id = ProviderIdentity::new("fixture:vulkan");
+        target.device_id = DeviceIdentity::new("native:pci:0000:01:00.0");
+        target.display_name = "Fixture GPU".to_owned();
+        target.driver_version = Some("fixture-driver-1".to_owned());
+        target.pack = Some(BackendPackIdentity {
+            pack_id: "fixture-vulkan-pack".to_owned(),
+            pack_version: "1.2.3".to_owned(),
+            pack_digest: "fixture-pack-digest".to_owned(),
+            security_epoch: 7,
+            runtime_abi: 1,
+        });
+        BackendFailureContext {
+            requested: AccelerationPreference::Gpu,
+            power_source: PowerSource::Ac,
+            power_policy: PowerPolicyDecision::Unrestricted,
+            fallback_history: if retryable {
+                vec![BackendFallback {
+                    target: target.clone(),
+                    category: BackendFailureCategory::InitializationFailed,
+                }]
+            } else {
+                Vec::new()
+            },
+            skipped_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cold_preload_gpu_failure_is_visible_and_retryable() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        app.session_coordinator
+            .model_load_started(session_id, model_id.clone())
+            .unwrap();
+        app.tx
+            .send(AppEvent::ModelPreloadFailed {
+                session_id,
+                model_id,
+                acceleration_generation: app.acceleration_generation,
+                backend_failure: Some(test_gpu_failure_context(true)),
+                message: "GPU initialization failed".to_owned(),
+            })
+            .unwrap();
+
+        app.poll_events();
+        app.session_coordinator.fail(session_id).unwrap();
+
+        let view = app.acceleration_diagnostics_view().unwrap();
+        assert_eq!(view.selected_backend, "No backend selected");
+        assert_eq!(view.selected_device, "GPU unavailable");
+        assert!(view.retry_gpu_available);
+        assert!(!view.fallback_status.contains("CPU"));
+        let retry_target = app.current_gpu_retry_target().unwrap();
+        assert_eq!(retry_target.backend, BackendKind::Vulkan);
+        assert_eq!(retry_target.provider_id.as_str(), "fixture:vulkan");
+        assert_eq!(retry_target.device_id.as_str(), "native:pci:0000:01:00.0");
+        assert_eq!(
+            retry_target.driver_version.as_deref(),
+            Some("fixture-driver-1")
+        );
+        assert_eq!(
+            retry_target.pack,
+            Some(BackendPackIdentity {
+                pack_id: "fixture-vulkan-pack".to_owned(),
+                pack_version: "1.2.3".to_owned(),
+                pack_digest: "fixture-pack-digest".to_owned(),
+                security_epoch: 7,
+                runtime_abi: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn cold_transcription_gpu_failure_is_visible_and_retryable() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        app.status = TranscriptionStatus::Transcribing;
+        let model_id = app.config.general.selected_default_model.clone();
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(91),
+            RequestId(92),
+            &model_id,
+        );
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(91),
+                request_id: RequestId(92),
+                model_id,
+                acceleration_generation: app.acceleration_generation,
+                backend_failure: Some(test_gpu_failure_context(true)),
+                message: "GPU initialization failed".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        let view = app.acceleration_diagnostics_view().unwrap();
+        assert_eq!(view.selected_backend, "No backend selected");
+        assert!(view.retry_gpu_available);
+        assert_eq!(app.status, TranscriptionStatus::Error);
+    }
+
+    #[test]
+    fn cold_gpu_failure_with_missing_packs_does_not_offer_retry() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+        app.update_latest_acceleration_failure(
+            &model_id,
+            app.acceleration_generation,
+            Some(test_gpu_failure_context(false)),
+        );
+
+        let view = app.acceleration_diagnostics_view().unwrap();
+        assert!(!view.retry_gpu_available);
+        assert_eq!(view.selected_backend, "No backend selected");
+    }
+
+    #[test]
+    fn failed_cold_gpu_retry_does_not_claim_a_previous_selection() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+        let failure = test_gpu_failure_context(true);
+        let target = failure.retry_target().unwrap().clone();
+        app.update_latest_acceleration_failure(
+            &model_id,
+            app.acceleration_generation,
+            Some(failure),
+        );
+        let operation = GpuRetryOperation {
+            nonce: 71,
+            generation: app.acceleration_generation,
+            model_id: model_id.clone(),
+            preference: AccelerationPreference::Gpu,
+            target: target.clone(),
+        };
+        app.active_gpu_retry = Some(operation.clone());
+        app.tx
+            .send(AppEvent::GpuRetryFinished {
+                nonce: operation.nonce,
+                generation: operation.generation,
+                model_id,
+                preference: operation.preference,
+                target,
+                result: Err("retry failed".to_owned()),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        let message = app.transcribe_notice.as_ref().unwrap().message.as_str();
+        assert!(message.contains("GPU remains unavailable"));
+        assert!(!message.contains("previous selection"));
+    }
+
+    #[test]
+    fn stale_gpu_failure_generation_preference_model_and_session_are_ignored() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        let model_id = ModelId::new(&app.config.general.selected_default_model);
+
+        app.update_latest_acceleration_failure(
+            &model_id,
+            app.acceleration_generation.wrapping_add(1),
+            Some(test_gpu_failure_context(true)),
+        );
+        assert!(app.latest_acceleration_failure.is_none());
+
+        let mut wrong_preference = test_gpu_failure_context(true);
+        wrong_preference.requested = AccelerationPreference::Auto;
+        app.update_latest_acceleration_failure(
+            &model_id,
+            app.acceleration_generation,
+            Some(wrong_preference),
+        );
+        assert!(app.latest_acceleration_failure.is_none());
+
+        app.update_latest_acceleration_failure(
+            &ModelId::new("different-model"),
+            app.acceleration_generation,
+            Some(test_gpu_failure_context(true)),
+        );
+        assert!(app.latest_acceleration_failure.is_none());
+
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        app.session_coordinator
+            .model_load_started(session_id, model_id.clone())
+            .unwrap();
+        app.tx
+            .send(AppEvent::ModelPreloadFailed {
+                session_id: SessionId(session_id.0.wrapping_add(1)),
+                model_id,
+                acceleration_generation: app.acceleration_generation,
+                backend_failure: Some(test_gpu_failure_context(true)),
+                message: "stale GPU failure".to_owned(),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.latest_acceleration_failure.is_none());
+    }
+
+    #[test]
+    fn gpu_cpu_gpu_generation_aba_rejects_the_old_final_failure() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        let stale_generation = app.acceleration_generation;
+        app.config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        app.invalidate_acceleration_state();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        app.invalidate_acceleration_state();
+        assert_ne!(app.acceleration_generation, stale_generation);
+
+        let model_id = app.config.general.selected_default_model.clone();
+        let model = ModelId::new(&model_id);
+        app.update_latest_acceleration_failure(
+            &model,
+            app.acceleration_generation,
+            Some(test_gpu_failure_context(true)),
+        );
+        let expected_retry_target = app.current_gpu_retry_target().unwrap();
+        let mut stale_failure = test_gpu_failure_context(true);
+        stale_failure.fallback_history[0].target.device_id =
+            DeviceIdentity::new("native:pci:0000:02:00.0");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(301),
+            RequestId(302),
+            &model_id,
+        );
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(301),
+                request_id: RequestId(302),
+                model_id,
+                acceleration_generation: stale_generation,
+                backend_failure: Some(stale_failure),
+                message: "stale final GPU failure".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.current_gpu_retry_target(), Some(expected_retry_target));
+    }
+
+    #[test]
+    fn wrong_request_and_source_final_failures_preserve_latest_failure_state() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        let model_id = app.config.general.selected_default_model.clone();
+        let model = ModelId::new(&model_id);
+        app.update_latest_acceleration_failure(
+            &model,
+            app.acceleration_generation,
+            Some(test_gpu_failure_context(true)),
+        );
+        let expected_retry_target = app.current_gpu_retry_target().unwrap();
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(401),
+            RequestId(402),
+            &model_id,
+        );
+        let mut unrelated_failure = test_gpu_failure_context(true);
+        unrelated_failure.fallback_history[0].target.device_id =
+            DeviceIdentity::new("native:pci:0000:03:00.0");
+        for (source, request_id) in [
+            (RecordingSource::Transcribe, RequestId(403)),
+            (RecordingSource::Playground, RequestId(402)),
+        ] {
+            app.tx
+                .send(AppEvent::TranscriptionFailed {
+                    source,
+                    session_id: SessionId(401),
+                    request_id,
+                    model_id: model_id.clone(),
+                    acceleration_generation: app.acceleration_generation,
+                    backend_failure: Some(unrelated_failure.clone()),
+                    message: "unrelated final GPU failure".to_owned(),
+                    latency: None,
+                })
+                .unwrap();
+        }
+
+        app.poll_events();
+
+        assert_eq!(app.current_gpu_retry_target(), Some(expected_retry_target));
     }
 
     #[test]
@@ -22630,6 +23039,7 @@ mod layout_tests {
             transcribe_notice: None,
             gpu_retry_status: None,
             latest_acceleration: None,
+            latest_acceleration_failure: None,
             acceleration_generation: 0,
             next_gpu_retry_nonce: 0,
             active_gpu_retry: None,

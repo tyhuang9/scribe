@@ -39,6 +39,25 @@ pub(crate) struct RuntimeLoadExecution {
     pub capabilities: RuntimeCapabilities,
 }
 
+/// A parent-side result envelope. Native error classification and IPC remain
+/// unchanged; only terminal load/transcription failures can retain this context.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub(crate) struct RuntimeRequestFailure {
+    #[source]
+    pub(crate) error: RuntimeError,
+    pub(crate) backend_context: Option<crate::backend_policy::BackendFailureContext>,
+}
+
+impl From<RuntimeError> for RuntimeRequestFailure {
+    fn from(error: RuntimeError) -> Self {
+        Self {
+            error,
+            backend_context: None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RuntimeError {
     #[error(
