@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly, [switch]$ColdAdmissionOnly)
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly, [switch]$ColdAdmissionOnly, [switch]$FileBoundaryOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -898,6 +898,61 @@ function Assert-Rejected($Result, [string]$Label, [string]$Expected = '') {
     if ($Expected) { Assert-True ($Result.Stderr.Contains($Expected)) "$Label did not reach '$Expected': $($Result.Stderr)" }
 }
 
+function Invoke-FileBoundaryContractTests {
+    $positive = 0
+    $negative = 0
+    $bundle = New-Bundle (New-FixtureDocuments) 'file-boundary'
+    # Select a real signed inventory entry, not an unreferenced file or the
+    # plan itself. Neither retained handle writes or modifies this artifact.
+    $artifactPath = Join-Path $bundle.ArtifactRoot ($bundle.Documents.Evidence.lanes[0].artifact_inventory[0].artifact_path.Replace('/', '\'))
+    $boundPaths = [ordered]@{ plan = $bundle.PlanPath; evidence = $bundle.EvidencePath; artifact = $artifactPath }
+    $before = [ordered]@{}
+    foreach ($name in $boundPaths.Keys) { $before[$name] = [IO.File]::ReadAllBytes($boundPaths[$name]) }
+    $missingPlan = Join-Path $bundle.Root 'absent-plan.json'
+    Assert-True (-not (Test-Path -LiteralPath $missingPlan)) 'Missing-plan fixture unexpectedly exists.'
+    # Only the final filename is absent: the physical parent exists, so this
+    # exercises ERROR_FILE_NOT_FOUND (2), not ERROR_PATH_NOT_FOUND (3).
+    $missingResult = Invoke-Evaluator $bundle $true $false $missingPlan
+    Assert-Rejected $missingResult 'Missing qualification plan' 'Win32 error 2'
+    Assert-True ([string]::IsNullOrWhiteSpace($missingResult.Stdout)) 'Missing qualification plan emitted an output decision.'
+    foreach ($path in @($missingPlan, $bundle.Root, $TestRoot)) {
+        Assert-True (-not $missingResult.Stderr.Contains($path) -and -not $missingResult.Stderr.Contains($path.Replace('\', '/'))) 'Missing-plan failure exposed an absolute fixture path.'
+    }
+    $negative++
+
+    $reader = [IO.FileStream]::new($artifactPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $readResult = Invoke-Evaluator $bundle
+        Assert-True ($readResult.ExitCode -eq 0) "Compatible retained artifact reader failed: $($readResult.Stderr)"
+        $readDecision = $readResult.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+        Assert-True ($readDecision.qualification_passed -and $readDecision.fixture_only -and -not $readDecision.auto_eligible -and $readDecision.artifact_count -eq 75) 'Compatible retained artifact reader did not preserve fixture-only/default-deny qualification.'
+        $positive++
+    }
+    finally { $reader.Dispose() }
+
+    $writer = [IO.FileStream]::new($artifactPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $writeResult = Invoke-Evaluator $bundle
+        Assert-Rejected $writeResult 'Retained inventory artifact writer' 'Win32 error 32'
+        Assert-True ([string]::IsNullOrWhiteSpace($writeResult.Stdout)) 'Retained artifact writer emitted an output decision.'
+        foreach ($path in @($artifactPath, $bundle.Root, $TestRoot)) {
+            Assert-True (-not $writeResult.Stderr.Contains($path) -and -not $writeResult.Stderr.Contains($path.Replace('\', '/'))) 'Artifact sharing failure exposed an absolute fixture path.'
+        }
+        $negative++
+    }
+    finally { $writer.Dispose() }
+
+    # Re-evaluate the exact same immutable bundle once after releasing the
+    # writer. No retry loop, rebinding, weaker sharing or artifact regeneration.
+    $releasedResult = Invoke-Evaluator $bundle
+    Assert-True ($releasedResult.ExitCode -eq 0 -and $releasedResult.Stdout -ceq $readResult.Stdout) "Writer release did not restore the unchanged bundle's deterministic success: $($releasedResult.Stderr)"
+    $positive++
+    foreach ($name in $boundPaths.Keys) {
+        Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($before[$name], [IO.File]::ReadAllBytes($boundPaths[$name]))) "File-boundary tests modified the immutable bundle's $name bytes."
+    }
+    return [pscustomobject]@{ Positive = $positive; Negative = $negative }
+}
+
 function Get-Capture($Documents, [string]$Scope, [int]$Ordinal = 0) { return @($Documents.Evidence.lanes[0].captures | Where-Object { $_.launch_scope -ceq $Scope })[$Ordinal] }
 
 function Assert-MutatedCaptureRejected([string]$Name, [string]$Scope, [string]$Which, [scriptblock]$Mutation, [string]$Expected = '') {
@@ -1525,14 +1580,21 @@ try {
     $checkedProbe = [pscustomobject]@{ PlanPath = $CheckedPlanPath; EvidencePath = $checkedEvidencePath; ArtifactRoot = $TestRoot }
     Assert-Rejected (Invoke-Evaluator $checkedProbe $false) 'Checked-in default-deny plan validation' 'not approved by the protected production authority'
 
-    if ($ColdAdmissionOnly -or (-not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+    if ($FileBoundaryOnly -or (-not $ColdAdmissionOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+        $fileBoundaryCounts = Invoke-FileBoundaryContractTests
+        Assert-True ($fileBoundaryCounts.Positive -eq 2 -and $fileBoundaryCounts.Negative -eq 2) 'File-boundary suite did not discover both positive and both negative cases.'
+        foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "File-boundary tests modified immutable repository input: $name." }
+        Write-Output "Windows GPU file-boundary diagnostic contract tests passed ($($fileBoundaryCounts.Positive) positive, $($fileBoundaryCounts.Negative) negative)."
+        if ($FileBoundaryOnly) { return }
+    }
+    if ($ColdAdmissionOnly -or (-not $FileBoundaryOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
         $coldAdmissionCounts = Invoke-ColdAdmissionContractTests
         Assert-True ($coldAdmissionCounts.Positive -eq 12 -and $coldAdmissionCounts.Negative -eq 17) 'Cold-admission suite did not discover all twelve positive and seventeen negative cases.'
         foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Cold-admission tests modified immutable repository input: $name." }
         Write-Output "Windows GPU cold-load admission contract tests passed ($($coldAdmissionCounts.Positive) positive, $($coldAdmissionCounts.Negative) negative)."
         if ($ColdAdmissionOnly) { return }
     }
-    if ($CaptureAdmissionOnly -or (-not $ColdAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+    if ($CaptureAdmissionOnly -or (-not $FileBoundaryOnly -and -not $ColdAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
         $admissionCounts = Invoke-CaptureAdmissionContractTests
         foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Admission tests modified immutable repository input: $name." }
         Write-Output "Windows GPU pre-capture admission contract tests passed ($($admissionCounts.Positive) positive, $($admissionCounts.Negative) negative)."

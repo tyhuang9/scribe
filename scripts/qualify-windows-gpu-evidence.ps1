@@ -360,7 +360,7 @@ namespace ScribeWindowsQualification
 
         private static Win32Exception NativeError(string operation, int error)
         {
-            return new Win32Exception(error, "Could not " + operation + ".");
+            return new Win32Exception(error, "Could not " + operation + " (Win32 error " + error.ToString(System.Globalization.CultureInfo.InvariantCulture) + ").");
         }
     }
 
