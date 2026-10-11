@@ -384,10 +384,18 @@ generation, challenge, device and raw-SCIF bindings remain mandatory.
 Each required power must independently pass success, transcript parity and both
 cold/warm end-to-end p95 limits. Timings are never pooled. The available-memory
 floor is the maximum of the per-power minima actually exercised by successful
-GPU performance starts, and is calculated only when those separate admission
-inputs are complete. Total memory is the authenticated observed total. Later
+**cold** GPU starts (`fresh_process_fresh_model`). Warm-before readings already
+include a resident model and cannot lower the cold-load requirement. Every
+successful cold and warm GPU run must still have a complete separate admission
+pair; missing inputs or no successful cold GPU run suppress the affected floor
+and candidate. Total memory is the authenticated observed total. Later
 scenario observations must not recompute these candidate values: a future final gate must
 instead reject successful Auto GPU starts below the frozen floor.
+
+This aggregation correction changes the pinned evaluator digest, not the wire
+schema. Prior contracts cannot be rebound to reuse historical captures: production
+qualification still requires newly reviewed frozen contracts and authorized
+acquisition. The checked-in authorities and Auto policy remain empty/default-deny.
 
 The displayed warm CPU/GPU p95 pair comes from the worse same-power ratio, with
 AC winning ties. Evidence digests remain power-separated. A candidate cannot

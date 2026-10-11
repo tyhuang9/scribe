@@ -2262,11 +2262,13 @@ function Assert-LaneEvidence($Lane, $Expected, $Plan, [int]$Index, $Context, $Ge
             # V4 deliberately accepts typed raw provider and Windows segment
             # observations without treating either as an admission input. A
             # complete numeric before/after pair from every successful GPU run
-            # is the only source of an exercised available-memory floor.
+            # remains mandatory, but only fresh-model cold starts establish
+            # the floor: warm-before headroom already includes a loaded model.
+            [object[]]$successfulColdGpuRuns = @($parsed.cold.gpu | Where-Object { $_.outcome -ceq 'success' })
             $missingAdmissionInputs = @($successfulGpuRuns | Where-Object { $null -eq $_.available_device_memory_bytes_before -or $null -eq $_.available_device_memory_bytes_after }).Count -gt 0
-            $admissionInputsComplete = $successfulGpuRuns.Count -gt 0 -and -not $missingAdmissionInputs
+            $admissionInputsComplete = $successfulColdGpuRuns.Count -gt 0 -and -not $missingAdmissionInputs
             if ($admissionInputsComplete) {
-                [Int64[]]$runAdmissionBefore = @($successfulGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before })
+                [Int64[]]$runAdmissionBefore = @($successfulColdGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before })
                 $minimumAvailableMemory = [Int64]($runAdmissionBefore | Measure-Object -Minimum).Minimum
             }
         }
@@ -2405,9 +2407,12 @@ function Assert-PerformanceLaneEvidence($Lane, $Expected, $Plan, [int]$Index, $C
         $performance = $allSuccessful
         if ($performance) { foreach ($mode in @('cold', 'warm')) { $gpu = Get-NearestRank @($parsed[$mode].gpu | ForEach-Object { [Int64]$_.end_to_end_ms }) 95; $cpu = Get-NearestRank @($parsed[$mode].cpu | ForEach-Object { [Int64]$_.end_to_end_ms }) 95; if (([Numerics.BigInteger]$gpu * 100) -gt ([Numerics.BigInteger]$cpu * 110)) { $performance = $false } } }
         [object[]]$successfulGpuRuns = @(@($parsed.cold.gpu) + @($parsed.warm.gpu) | Where-Object { $_.outcome -ceq 'success' })
+        # Preserve complete-pair requirements for warm measurements without
+        # using their resident-model headroom as proof of a fresh cold load.
+        [object[]]$successfulColdGpuRuns = @($parsed.cold.gpu | Where-Object { $_.outcome -ceq 'success' })
         $missingAdmissionInputs = @($successfulGpuRuns | Where-Object { $null -eq $_.available_device_memory_bytes_before -or $null -eq $_.available_device_memory_bytes_after }).Count -gt 0
-        $admissionInputsComplete = $successfulGpuRuns.Count -gt 0 -and -not $missingAdmissionInputs
-        $minimum = if (-not $admissionInputsComplete) { $null } else { [Int64](@($successfulGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before }) | Measure-Object -Minimum).Minimum }
+        $admissionInputsComplete = $successfulColdGpuRuns.Count -gt 0 -and -not $missingAdmissionInputs
+        $minimum = if (-not $admissionInputsComplete) { $null } else { [Int64](@($successfulColdGpuRuns | ForEach-Object { [Int64]$_.available_device_memory_bytes_before }) | Measure-Object -Minimum).Minimum }
         $powerEvaluation[$power] = [ordered]@{
             available_memory_admission_inputs_complete = $admissionInputsComplete; correctness = $correctness; performance = $performance; reliability = $allSuccessful; minimum_available_memory_bytes = $minimum
             metrics = [ordered]@{ cold = [ordered]@{ cpu = Get-PerformanceMetricSummary @($parsed.cold.cpu) 'cpu'; gpu = Get-PerformanceMetricSummary @($parsed.cold.gpu) 'gpu' }; warm = [ordered]@{ cpu = Get-PerformanceMetricSummary @($parsed.warm.cpu) 'cpu'; gpu = Get-PerformanceMetricSummary @($parsed.warm.gpu) 'gpu' } }
