@@ -50,6 +50,8 @@ use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
     Transcript, TranscriptSegment, TranscriptionOptions,
 };
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+use crate::windows_gpu_capture::affinity::CaptureWorkerAffinity;
 use crate::worker_compatibility::{
     FrozenCpuWorkerCandidate, FrozenWorkerApproval, FrozenWorkerCompatibilityContext,
     approve_compiled_cpu_worker, is_valid_build_identity,
@@ -1311,6 +1313,16 @@ trait WorkerProcess: Send + Sync {
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn duplicate_observation_handle(&self) -> Result<OwnedHandle> {
         bail!("worker process does not expose a Windows observation handle")
+    }
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn validate_capture_affinity(
+        &self,
+        expected: Option<&Arc<CaptureWorkerAffinity>>,
+    ) -> Result<()> {
+        if expected.is_some() {
+            bail!("worker process does not retain capture affinity enforcement");
+        }
+        Ok(())
     }
 }
 
@@ -4327,6 +4339,8 @@ struct OsWorkerLauncher {
     diagnostic_probe: Option<Arc<DiagnosticProbeState>>,
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     capture_pins: Option<Arc<CaptureFrozenInputs>>,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    capture_affinity: Option<Arc<CaptureWorkerAffinity>>,
 }
 
 impl OsWorkerLauncher {
@@ -4338,6 +4352,8 @@ impl OsWorkerLauncher {
             diagnostic_probe: None,
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             capture_pins: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_affinity: None,
         }
     }
 
@@ -4349,6 +4365,8 @@ impl OsWorkerLauncher {
             diagnostic_probe: None,
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             capture_pins: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_affinity: None,
         }
     }
 
@@ -4360,6 +4378,8 @@ impl OsWorkerLauncher {
             diagnostic_probe: None,
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             capture_pins: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_affinity: None,
         }
     }
 
@@ -4371,6 +4391,8 @@ impl OsWorkerLauncher {
             diagnostic_probe: None,
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             capture_pins: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_affinity: None,
         }
     }
 
@@ -4384,6 +4406,7 @@ impl OsWorkerLauncher {
             resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
             diagnostic_probe: Some(diagnostic_probe),
             capture_pins: None,
+            capture_affinity: None,
         }
     }
 
@@ -4396,12 +4419,20 @@ impl OsWorkerLauncher {
             diagnostic_probe: None,
             #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
             capture_pins: None,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            capture_affinity: None,
         }
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn with_capture_pins(mut self, pins: Option<Arc<CaptureFrozenInputs>>) -> Self {
         self.capture_pins = pins;
+        self
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn with_capture_affinity(mut self, affinity: Option<Arc<CaptureWorkerAffinity>>) -> Self {
+        self.capture_affinity = affinity;
         self
     }
 }
@@ -4434,6 +4465,13 @@ fn resolved_worker_expectation(
 
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(affinity) = &self.capture_affinity {
+            if self.capture_pins.is_none() {
+                bail!("capture affinity requires the complete frozen worker constraints");
+            }
+            affinity.require_current()?;
+        }
         let executable = self.resolver.resolve(self.role)?;
         let expectation = resolved_worker_expectation(self.role, &executable)?;
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -4517,6 +4555,18 @@ impl WorkerLauncher for OsWorkerLauncher {
             diagnostic_probe.retain_worker_process_handle(&child);
         }
         parent_liveness.child_spawned();
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        let process_guard = if let Some(affinity) = &self.capture_affinity {
+            use std::os::windows::io::IntoRawHandle;
+            bind_worker_process_tree_or_terminate(&mut child, |child| {
+                affinity
+                    .bind(child.as_raw_handle() as _)
+                    .map(|job| ProcessTreeGuard(job.into_raw_handle() as isize))
+            })?
+        } else {
+            bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?
+        };
+        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
         let process_guard =
             bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?;
         let stdin = child
@@ -4534,6 +4584,8 @@ impl WorkerLauncher for OsWorkerLauncher {
                 child: Mutex::new(child),
                 _process_guard: process_guard,
                 _parent_liveness: parent_liveness,
+                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                capture_affinity: self.capture_affinity.clone(),
             }),
             expectation,
             frozen_worker_approval: executable.frozen_worker_approval,
@@ -4549,7 +4601,13 @@ fn bind_worker_process_tree_or_terminate(
     match bind(child) {
         Ok(guard) => Ok(guard),
         Err(bind_error) => {
-            let kill_error = child.kill().err();
+            let kill_error = match child.try_wait() {
+                Ok(Some(_)) => None,
+                _ => child
+                    .kill()
+                    .err()
+                    .filter(|_| !matches!(child.try_wait(), Ok(Some(_)))),
+            };
             let wait_error = child.wait().err();
             match (kill_error, wait_error) {
                 (None, None) => Err(bind_error.context(
@@ -5152,9 +5210,31 @@ struct OsWorkerProcess {
     child: Mutex<Child>,
     _process_guard: ProcessTreeGuard,
     _parent_liveness: ParentLivenessChannel,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    capture_affinity: Option<Arc<CaptureWorkerAffinity>>,
 }
 
 impl WorkerProcess for OsWorkerProcess {
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn validate_capture_affinity(
+        &self,
+        expected: Option<&Arc<CaptureWorkerAffinity>>,
+    ) -> Result<()> {
+        match (expected, self.capture_affinity.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(actual)) if Arc::ptr_eq(expected, actual) => {
+                let mut child = self
+                    .child
+                    .lock()
+                    .map_err(|_| anyhow!("process worker process lock was poisoned"))?;
+                if child.try_wait()?.is_some() {
+                    bail!("capture affinity worker exited before enforcement validation");
+                }
+                actual.validate(self._process_guard.0 as _, child.as_raw_handle() as _)
+            }
+            _ => bail!("capture affinity enforcement is absent or rebound"),
+        }
+    }
     fn is_running(&self) -> Result<bool> {
         Ok(self
             .child
@@ -8703,6 +8783,7 @@ pub(crate) fn validate_capture_worker_memory(
 pub(crate) struct CaptureObservationWorker {
     supervisor: InferenceWorkerSupervisor,
     pub(crate) gpu_identity: Option<GpuCaptureObservationIdentity>,
+    affinity: Option<Arc<CaptureWorkerAffinity>>,
 }
 
 /// Caller-supplied denial constraints, not executable or signing authority.
@@ -8867,6 +8948,7 @@ pub(crate) struct CaptureObservationWorkerFactory {
     binding: Option<VerifiedPackLaunchBinding>,
     gpu_identity: Option<GpuCaptureObservationIdentity>,
     pins: Option<Arc<CaptureFrozenInputs>>,
+    affinity: Option<Arc<CaptureWorkerAffinity>>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -8876,15 +8958,43 @@ impl CaptureObservationWorkerFactory {
             binding: None,
             gpu_identity: None,
             pins,
+            affinity: None,
         }
     }
 
-    pub(crate) fn gpu_exact(
+    pub(crate) fn cpu_with_affinity(
+        pins: Option<Arc<CaptureFrozenInputs>>,
+        affinity: Option<Arc<CaptureWorkerAffinity>>,
+    ) -> Result<Self> {
+        Self::validate_affinity_inputs(pins.as_ref(), affinity.as_ref())?;
+        Ok(Self {
+            affinity,
+            ..Self::cpu(pins)
+        })
+    }
+
+    fn validate_affinity_inputs(
+        pins: Option<&Arc<CaptureFrozenInputs>>,
+        affinity: Option<&Arc<CaptureWorkerAffinity>>,
+    ) -> Result<()> {
+        if let Some(affinity) = affinity {
+            pins.ok_or_else(|| {
+                anyhow!("capture affinity requires complete frozen worker constraints")
+            })?
+            .validate()?;
+            affinity.require_current()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn gpu_exact_with_affinity(
         pack_id: &str,
         backend: &str,
         stable_device: &str,
         pins: Option<Arc<CaptureFrozenInputs>>,
+        affinity: Option<Arc<CaptureWorkerAffinity>>,
     ) -> Result<Self> {
+        Self::validate_affinity_inputs(pins.as_ref(), affinity.as_ref())?;
         let backend = match backend {
             "cuda" => BackendKind::Cuda,
             "vulkan" => BackendKind::Vulkan,
@@ -8922,7 +9032,8 @@ impl CaptureObservationWorkerFactory {
                     backend: lease.verified_pack().backend,
                     supervisor: Self::supervisor(
                         OsWorkerLauncher::for_pack_probe(lease)
-                            .with_capture_pins(Some(pins.clone())),
+                            .with_capture_pins(Some(pins.clone()))
+                            .with_capture_affinity(affinity.clone()),
                     ),
                 })
                 .collect();
@@ -9002,6 +9113,7 @@ impl CaptureObservationWorkerFactory {
             binding: Some(binding),
             gpu_identity: Some(identity),
             pins,
+            affinity,
         })
     }
 
@@ -9020,13 +9132,16 @@ impl CaptureObservationWorkerFactory {
             Some(binding) => OsWorkerLauncher::for_pack_binding(binding.clone()),
             None => OsWorkerLauncher::inference(),
         };
-        launcher.with_capture_pins(self.pins.clone())
+        launcher
+            .with_capture_pins(self.pins.clone())
+            .with_capture_affinity(self.affinity.clone())
     }
 
     pub(crate) fn spawn(&self) -> CaptureObservationWorker {
         CaptureObservationWorker {
             supervisor: Self::supervisor(self.launcher()),
             gpu_identity: self.gpu_identity.clone(),
+            affinity: self.affinity.clone(),
         }
     }
 
@@ -9037,30 +9152,55 @@ impl CaptureObservationWorkerFactory {
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 impl CaptureObservationWorker {
-    pub(crate) fn cpu(pins: Option<Arc<CaptureFrozenInputs>>) -> Self {
-        CaptureObservationWorkerFactory::cpu(pins).spawn()
-    }
-
-    pub(crate) fn gpu(
-        pack_id: &str,
-        backend: &str,
-        stable_device: &str,
-        pins: Option<Arc<CaptureFrozenInputs>>,
-    ) -> Result<Self> {
-        Ok(
-            CaptureObservationWorkerFactory::gpu_exact(pack_id, backend, stable_device, pins)?
-                .spawn(),
-        )
-    }
-
     pub(crate) fn prepare_observation(&self) -> Result<WorkerObservationLease> {
-        self.supervisor.transport.observation_lease()
+        let lease = self.supervisor.transport.observation_lease()?;
+        self.validate_affinity_retained(&lease)?;
+        Ok(lease)
+    }
+
+    /// Heavyweight enforcement queries belong only at request/negotiation
+    /// boundaries, not in the telemetry sampler's cheap `require_current`.
+    fn validate_affinity_retained(&self, lease: &WorkerObservationLease) -> Result<()> {
+        let transport = &self.supervisor.transport;
+        let validation = (|| {
+            transport.observation_generation_context(lease)?;
+            lease
+                .process
+                .validate_capture_affinity(self.affinity.as_ref())?;
+            transport.observation_generation_context(lease)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            // The existing lease retirement checks ownership, generation and
+            // retained process identity again, and never kills a replacement.
+            return match transport.retire_observation_lease(lease) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "capture affinity cleanup was not confirmed: {cleanup:#}"
+                ))),
+            };
+        }
+        Ok(())
     }
 
     pub(crate) fn negotiate_runtime_observation(&self) -> Result<()> {
+        if self.affinity.is_some() {
+            bail!("capture affinity negotiation requires its retained preflight lease");
+        }
         self.supervisor
             .negotiate_runtime_observation()
             .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn negotiate_runtime_observation_single(
+        &self,
+        lease: &WorkerObservationLease,
+    ) -> Result<()> {
+        if self.affinity.is_some() {
+            self.negotiate_runtime_observation_retained(lease)
+        } else {
+            self.negotiate_runtime_observation()
+        }
     }
 
     /// Negotiation for a campaign must use its captured generation too. A
@@ -9069,13 +9209,17 @@ impl CaptureObservationWorker {
         &self,
         lease: &WorkerObservationLease,
     ) -> Result<()> {
+        self.validate_affinity_retained(lease)?;
         let context = self
             .supervisor
             .transport
             .observation_generation_context(lease)?;
-        self.supervisor
+        let result = self
+            .supervisor
             .negotiate_runtime_observation_on_generation(Some(context.generation))
-            .map_err(anyhow::Error::new)
+            .map_err(anyhow::Error::new);
+        let validation = self.validate_affinity_retained(lease);
+        Self::finish_affinity_boundary(result, validation)
     }
 
     pub(crate) fn transcribe_observed(
@@ -9084,6 +9228,9 @@ impl CaptureObservationWorker {
         preference: AccelerationPreference,
         audio: &PreparedAudio,
     ) -> Result<ObservedRuntimeExecution> {
+        if self.affinity.is_some() {
+            bail!("capture affinity transcription requires its retained preflight lease");
+        }
         self.supervisor
             .transcribe_with_runtime_observation(
                 artifact,
@@ -9095,6 +9242,20 @@ impl CaptureObservationWorker {
             .map_err(anyhow::Error::new)
     }
 
+    pub(crate) fn transcribe_observed_single(
+        &self,
+        lease: &WorkerObservationLease,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+    ) -> Result<ObservedRuntimeExecution> {
+        if self.affinity.is_some() {
+            self.transcribe_observed_retained(lease, artifact, preference, audio)
+        } else {
+            self.transcribe_observed(artifact, preference, audio)
+        }
+    }
+
     /// Runs an observed request only on the exact live generation retained by
     /// `lease`. This path never starts a replacement worker.
     pub(crate) fn transcribe_observed_retained(
@@ -9104,11 +9265,13 @@ impl CaptureObservationWorker {
         preference: AccelerationPreference,
         audio: &PreparedAudio,
     ) -> Result<ObservedRuntimeExecution> {
+        self.validate_affinity_retained(lease)?;
         let context = self
             .supervisor
             .transport
             .observation_generation_context(lease)?;
-        self.supervisor
+        let result = self
+            .supervisor
             .transcribe_with_runtime_observation(
                 artifact,
                 preference,
@@ -9116,7 +9279,19 @@ impl CaptureObservationWorker {
                 self.gpu_identity.as_ref(),
                 Some(context.generation),
             )
-            .map_err(anyhow::Error::new)
+            .map_err(anyhow::Error::new);
+        let validation = self.validate_affinity_retained(lease);
+        Self::finish_affinity_boundary(result, validation)
+    }
+
+    fn finish_affinity_boundary<T>(result: Result<T>, validation: Result<()>) -> Result<T> {
+        match (result, validation) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(operation), Err(validation)) => Err(operation.context(format!(
+                "capture affinity exit validation/cleanup also failed: {validation:#}"
+            ))),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     pub(crate) fn shutdown(&self) -> Result<()> {
@@ -23540,6 +23715,377 @@ mod tests {
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn capture_affinity_policy() -> Arc<CaptureWorkerAffinity> {
+        use crate::windows_gpu_capture::affinity::RequestedWorkerAffinity;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
+        let mut process = 0_usize;
+        let mut system = 0_usize;
+        // SAFETY: our own process pseudo-handle and two writable mask outputs.
+        assert_ne!(
+            unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) },
+            0
+        );
+        assert_ne!(process, 0);
+        let allowed = process & process.wrapping_neg();
+        Arc::new(
+            RequestedWorkerAffinity::parse(&format!("{allowed:016x}"))
+                .unwrap()
+                .admit()
+                .unwrap(),
+        )
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn capture_affinity_fixture_command() -> Command {
+        let name = concat!(
+            module_path!(),
+            "::capture_observation_affinity_fixture_child"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        configure_hidden_worker_command(&mut command);
+        command
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env("SCRIBE_TEST_CAPTURE_AFFINITY_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        command
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn capture_affinity_fixture_child() -> Child {
+        capture_affinity_fixture_command().spawn().unwrap()
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_fixture_child() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetProcessAffinityMask,
+            SetThreadAffinityMask,
+        };
+        if std::env::var("SCRIBE_TEST_CAPTURE_AFFINITY_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        let mut permit = [0_u8; 1];
+        // Parent sends the permit only after real job binding/readback succeeds.
+        std::io::stdin().read_exact(&mut permit).unwrap();
+        let mut process = 0_usize;
+        let mut system = 0_usize;
+        // SAFETY: own pseudo-handle and two writable outputs.
+        assert_ne!(
+            unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) },
+            0
+        );
+        assert_ne!(process, 0);
+        let outside = system & !process;
+        if outside != 0 {
+            let outside = outside & outside.wrapping_neg();
+            // SAFETY: changes target only this disposable fixture process/thread.
+            let _ = unsafe { SetProcessAffinityMask(GetCurrentProcess(), process | outside) };
+            let mut after_process = 0_usize;
+            let mut after_system = 0_usize;
+            // SAFETY: own pseudo-handle and writable query outputs.
+            let queried = unsafe {
+                GetProcessAffinityMask(GetCurrentProcess(), &mut after_process, &mut after_system)
+            };
+            // Windows can report setter success while ignoring the request
+            // under a job limit. Assert the real allowed-set invariant instead.
+            assert_ne!(queried, 0);
+            assert_eq!(after_process, process);
+            assert_eq!(after_system, system);
+            // SAFETY: same owned fixture thread; an outside-job mask must fail.
+            assert_eq!(
+                unsafe { SetThreadAffinityMask(GetCurrentThread(), outside) },
+                0
+            );
+        }
+        println!("SCRIBE_CAPTURE_AFFINITY_VERIFIED");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_exact(&mut permit).unwrap();
+        panic!("owned capture fixture must be killed by last job handle close");
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_owned_job_enforces_and_kills_on_close() {
+        use std::io::{BufRead, BufReader};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let policy = capture_affinity_policy();
+        let mut child = OwnedChild(capture_affinity_fixture_child());
+        let job = policy.bind(child.0.as_raw_handle() as _).unwrap();
+        policy
+            .validate(job.as_raw_handle() as _, child.0.as_raw_handle() as _)
+            .unwrap();
+        child.0.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+        let output = child.0.stdout.take().unwrap();
+        let (sent, received) = channel();
+        let reader = std::thread::spawn(move || {
+            let mut diagnostic = String::new();
+            for line in BufReader::new(output).lines() {
+                let line = line.unwrap();
+                if line.contains("SCRIBE_CAPTURE_AFFINITY_VERIFIED") {
+                    let _ = sent.send(Ok(()));
+                    return;
+                }
+                if diagnostic.len() < 8192 {
+                    diagnostic.push_str(&line);
+                    diagnostic.push('\n');
+                }
+            }
+            let _ = sent.send(Err(diagnostic));
+        });
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+        reader.join().unwrap();
+        policy
+            .validate(job.as_raw_handle() as _, child.0.as_raw_handle() as _)
+            .unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        drop(job);
+        // SAFETY: Child still owns this exact process handle; wait is bounded.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0.as_raw_handle() as _, 10_000) },
+            WAIT_OBJECT_0
+        );
+        // Kill-on-close promises termination, not a nonzero process exit code.
+        let _ = child.0.wait().unwrap();
+        assert!(child.0.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_native_failures_reap_before_any_hello() {
+        use crate::windows_gpu_capture::affinity::InjectedAffinityFailure::*;
+        use std::os::windows::io::IntoRawHandle;
+        let policy = capture_affinity_policy();
+        for failure in [
+            Create,
+            Configure,
+            Assign,
+            Readback,
+            Membership,
+            Nonmember,
+            WrongMask,
+            Inheritance,
+            ChildAffinity,
+            Topology,
+            PostAssignmentTopologyDrift,
+            PostReadbackTopologyDrift,
+            InvalidChildMask,
+        ] {
+            let mut child = capture_affinity_fixture_child();
+            let mut hello_permitted = false;
+            let result = bind_worker_process_tree_or_terminate(&mut child, |child| {
+                policy
+                    .bind_injected(child.as_raw_handle() as _, failure)
+                    .map(|job| ProcessTreeGuard(job.into_raw_handle() as isize))
+            });
+            if result.is_ok() {
+                hello_permitted = true;
+            }
+            assert!(!hello_permitted, "{failure:?} allowed Hello");
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("terminated and reaped")
+            );
+            assert!(
+                child.try_wait().unwrap().is_some(),
+                "{failure:?} left child alive"
+            );
+            let mut output = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .take(8192)
+                .read_to_string(&mut output)
+                .unwrap();
+            assert!(
+                !output.contains("SCRIBE_CAPTURE_AFFINITY_VERIFIED"),
+                "{failure:?} reached the permitted worker step"
+            );
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_os_process_requires_exact_retained_policy() {
+        use std::os::windows::io::IntoRawHandle;
+        let policy = capture_affinity_policy();
+        let rebound = capture_affinity_policy();
+        assert!(!Arc::ptr_eq(&policy, &rebound));
+        let mut command = capture_affinity_fixture_command();
+        let mut parent_liveness = ParentLivenessChannel::attach(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        parent_liveness.child_spawned();
+        let process_guard = bind_worker_process_tree_or_terminate(&mut child, |child| {
+            policy
+                .bind(child.as_raw_handle() as _)
+                .map(|job| ProcessTreeGuard(job.into_raw_handle() as isize))
+        })
+        .unwrap();
+        let mut process = OsWorkerProcess {
+            child: Mutex::new(child),
+            _process_guard: process_guard,
+            _parent_liveness: parent_liveness,
+            capture_affinity: Some(policy.clone()),
+        };
+        process.validate_capture_affinity(Some(&policy)).unwrap();
+        assert!(process.validate_capture_affinity(Some(&rebound)).is_err());
+        assert!(process.validate_capture_affinity(None).is_err());
+        process.capture_affinity = None;
+        assert!(process.validate_capture_affinity(Some(&policy)).is_err());
+        process.validate_capture_affinity(None).unwrap();
+        process.terminate().unwrap();
+        process
+            .wait_before(MonotonicDeadline::after(Duration::from_secs(10)).unwrap())
+            .unwrap();
+        assert!(!process.is_running().unwrap());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_missing_enforcement_retires_exact_generation_without_replay() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
+        let worker = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(launcher.clone()),
+            gpu_identity: None,
+            affinity: Some(capture_affinity_policy()),
+        };
+        let error = worker.prepare_observation().err().unwrap().to_string();
+        assert!(
+            error.contains("does not retain capture affinity"),
+            "{error}"
+        );
+        assert_eq!(
+            worker.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        let mut no_policy_worker = worker;
+        no_policy_worker.affinity = None;
+        let replacement = no_policy_worker.prepare_observation().unwrap();
+        replacement.require_current().unwrap();
+        no_policy_worker.shutdown().unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_stale_foreign_checks_never_retire_replacement() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
+        let mut worker = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(launcher.clone()),
+            gpu_identity: None,
+            affinity: None,
+        };
+        let stale = worker.prepare_observation().unwrap();
+        worker.retire_observation_generation(&stale).unwrap();
+        let replacement = worker.prepare_observation().unwrap();
+        worker.affinity = Some(capture_affinity_policy());
+        assert!(worker.validate_affinity_retained(&stale).is_err());
+        replacement.require_current().unwrap();
+        let foreign = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(Arc::new(TestLauncher::new([]))),
+            gpu_identity: None,
+            affinity: worker.affinity.clone(),
+        };
+        assert!(foreign.validate_affinity_retained(&replacement).is_err());
+        replacement.require_current().unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        worker.affinity = None;
+        worker.shutdown().unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_single_consumers_never_replace_retained_preflight_generation() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
+        let mut worker = CaptureObservationWorker {
+            supervisor: inference_supervisor_with_launcher(launcher.clone()),
+            gpu_identity: None,
+            affinity: None,
+        };
+        let lease = worker.prepare_observation().unwrap();
+        worker.retire_observation_generation(&lease).unwrap();
+        worker.affinity = Some(capture_affinity_policy());
+        let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+        assert!(worker.negotiate_runtime_observation_single(&lease).is_err());
+        assert!(
+            worker
+                .transcribe_observed_single(
+                    &lease,
+                    missing_gguf_artifact(),
+                    AccelerationPreference::Cpu,
+                    &audio
+                )
+                .is_err()
+        );
+        assert!(worker.negotiate_runtime_observation().is_err());
+        assert!(
+            worker
+                .transcribe_observed(missing_gguf_artifact(), AccelerationPreference::Cpu, &audio)
+                .is_err()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(
+            worker.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_affinity_exit_keeps_operation_and_cleanup_errors() {
+        assert_eq!(
+            CaptureObservationWorker::finish_affinity_boundary(Ok(7), Ok(())).unwrap(),
+            7
+        );
+        assert_eq!(
+            CaptureObservationWorker::finish_affinity_boundary::<()>(
+                Err(anyhow!("request failed")),
+                Ok(())
+            )
+            .unwrap_err()
+            .to_string(),
+            "request failed"
+        );
+        assert_eq!(
+            CaptureObservationWorker::finish_affinity_boundary(
+                Ok(7),
+                Err(anyhow!("enforcement failed"))
+            )
+            .unwrap_err()
+            .to_string(),
+            "enforcement failed"
+        );
+        let error = CaptureObservationWorker::finish_affinity_boundary::<()>(
+            Err(anyhow!("request failed")),
+            Err(anyhow!("retirement unconfirmed")),
+        )
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("request failed"));
+        assert!(diagnostic.contains("retirement unconfirmed"));
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
     fn capture_observation_lease_invalidates_on_cancel_crash_and_replacement() {
         let (received_tx, received_rx) = channel();
@@ -23633,6 +24179,7 @@ mod tests {
             },
         ]));
         let worker = CaptureObservationWorker {
+            affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
             gpu_identity: None,
         };
@@ -23697,11 +24244,13 @@ mod tests {
         };
         let launcher = Arc::new(TestLauncher::new([mode(), mode()]));
         let worker = CaptureObservationWorker {
+            affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
             gpu_identity: None,
         };
         let foreign_launcher = Arc::new(TestLauncher::new([]));
         let foreign = CaptureObservationWorker {
+            affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&foreign_launcher)),
             gpu_identity: None,
         };
@@ -23730,11 +24279,13 @@ mod tests {
     fn capture_observation_retirement_rejects_foreign_and_stale_leases() {
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
         let worker = CaptureObservationWorker {
+            affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
             gpu_identity: None,
         };
         let foreign_launcher = Arc::new(TestLauncher::new([]));
         let foreign = CaptureObservationWorker {
+            affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&foreign_launcher)),
             gpu_identity: None,
         };
@@ -24151,7 +24702,12 @@ mod tests {
         #[test]
         fn factories_retain_one_immutable_tuple_and_never_rebind_after_cold_spawn() {
             let pins = Arc::new(pins());
-            let factory = CaptureObservationWorkerFactory::cpu(Some(pins.clone()));
+            let affinity = capture_affinity_policy();
+            let factory = CaptureObservationWorkerFactory::cpu_with_affinity(
+                Some(pins.clone()),
+                Some(affinity.clone()),
+            )
+            .unwrap();
             let cloned = factory.clone();
             assert!(Arc::ptr_eq(factory.pins.as_ref().unwrap(), &pins));
             assert!(Arc::ptr_eq(cloned.pins.as_ref().unwrap(), &pins));
@@ -24165,6 +24721,16 @@ mod tests {
             ));
             let first = factory.spawn();
             let second = cloned.spawn();
+            for policy in [
+                &factory.affinity,
+                &cloned.affinity,
+                &first.affinity,
+                &second.affinity,
+                &factory.launcher().capture_affinity,
+                &cloned.launcher().capture_affinity,
+            ] {
+                assert!(Arc::ptr_eq(policy.as_ref().unwrap(), &affinity));
+            }
             assert_eq!(
                 first.supervisor.transport.current_generation().unwrap(),
                 None
@@ -24179,6 +24745,16 @@ mod tests {
                     .launcher()
                     .capture_pins
                     .is_none()
+            );
+            assert!(
+                CaptureObservationWorkerFactory::cpu(None)
+                    .launcher()
+                    .capture_affinity
+                    .is_none()
+            );
+            assert!(
+                CaptureObservationWorkerFactory::cpu_with_affinity(None, Some(affinity.clone()))
+                    .is_err()
             );
 
             let root = crate::gpu_worker_pack::manifest::test_support::temp_root(
@@ -24202,6 +24778,7 @@ mod tests {
             };
             let binding = bind_pack_hello(&context, &capability).unwrap().remove(0);
             let gpu = CaptureObservationWorkerFactory {
+                affinity: Some(affinity.clone()),
                 binding: Some(binding),
                 gpu_identity: None,
                 pins: Some(pins.clone()),
@@ -24214,6 +24791,22 @@ mod tests {
                 gpu.clone().launcher().capture_pins.as_ref().unwrap(),
                 &pins
             ));
+            assert!(Arc::ptr_eq(
+                gpu.launcher().capture_affinity.as_ref().unwrap(),
+                &affinity
+            ));
+            assert!(Arc::ptr_eq(
+                gpu.spawn().affinity.as_ref().unwrap(),
+                &affinity
+            ));
+            let probe = OsWorkerLauncher::for_pack_probe(lease.clone())
+                .with_capture_pins(Some(pins.clone()))
+                .with_capture_affinity(Some(affinity.clone()));
+            assert!(Arc::ptr_eq(
+                probe.capture_affinity.as_ref().unwrap(),
+                &affinity
+            ));
+            drop(probe);
             drop(gpu);
             drop(context);
             drop(lease);
@@ -25430,6 +26023,7 @@ mod tests {
             Some(ObservationCompletionMismatch::LegacyResponse),
         ] {
             let worker = CaptureObservationWorker {
+                affinity: None,
                 supervisor: inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
                     TestMode::RuntimeObservationSuccess {
                         completion_mismatch,
@@ -25497,6 +26091,7 @@ mod tests {
                 request_counts: Some(Arc::clone(&request_counts)),
             }]));
             let worker = CaptureObservationWorker {
+                affinity: None,
                 supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
                 gpu_identity: Some(GpuCaptureObservationIdentity {
                     backend: "cuda".to_owned(),
@@ -25783,6 +26378,7 @@ mod tests {
                 },
             ])));
             let worker = CaptureObservationWorker {
+                affinity: None,
                 supervisor,
                 gpu_identity: Some(GpuCaptureObservationIdentity {
                     backend: "cuda".to_owned(),

@@ -851,7 +851,10 @@ fn watchdog_loop(shared: Arc<(Mutex<WarmSharedState>, Condvar)>, origin: Instant
     }
 }
 
-pub(super) fn run(options: CommandOptions) -> Result<()> {
+pub(super) fn run(
+    options: CommandOptions,
+    affinity: Option<Arc<super::affinity::CaptureWorkerAffinity>>,
+) -> Result<()> {
     let expected_power = options
         .campaign_power
         .ok_or_else(|| anyhow!("campaign mode requires an expected power source"))?;
@@ -880,12 +883,16 @@ pub(super) fn run(options: CommandOptions) -> Result<()> {
         model_sha256: model.sha256.clone(),
         wav_sha256: wav.sha256.clone(),
     };
-    let cpu_factory = CaptureObservationWorkerFactory::cpu(options.frozen_inputs.clone());
-    let gpu_factory = match CaptureObservationWorkerFactory::gpu_exact(
+    let cpu_factory = CaptureObservationWorkerFactory::cpu_with_affinity(
+        options.frozen_inputs.clone(),
+        affinity.clone(),
+    )?;
+    let gpu_factory = match CaptureObservationWorkerFactory::gpu_exact_with_affinity(
         &options.gpu_pack_id,
         &options.gpu_backend,
         &options.gpu_device,
         options.frozen_inputs.clone(),
+        affinity,
     ) {
         Ok(factory) => factory,
         Err(_) => {

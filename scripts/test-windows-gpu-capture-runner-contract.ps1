@@ -29,6 +29,7 @@ function Get-LoopFilterLiterals([Management.Automation.Language.ForEachStatement
 }
 $expectedCaptureFilters = @(
     'windows_gpu_capture::tests',
+    'windows_gpu_capture::affinity::tests',
     'windows_gpu_capture::telemetry::tests',
     'windows_gpu_capture::campaign::tests',
     'windows_gpu_probe::tests',
@@ -176,12 +177,14 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
             [string]$GpuWorkerAbi,
             [string]$GpuPackVersion,
             [string]$GpuPackSha256,
-            [string]$GpuPackSecurityEpoch
+            [string]$GpuPackSecurityEpoch,
+            [string]$WorkerAllowedProcessorMask
         )
         # Production passes this dictionary, not a Hashtable. In particular,
         # Hashtable.Contains must not appear to work only in these fixtures.
         Get-CaptureObservationArguments $PSBoundParameters
     }
+    $forwardingCount = 0
     foreach ($backend in @('cuda', 'vulkan')) {
         foreach ($power in @($null, 'ac', 'battery')) {
             foreach ($includeFrozenIdentity in @($false, $true)) {
@@ -234,18 +237,29 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
                     '--gpu-pack-sha256', $options.GpuPackSha256,
                     '--gpu-pack-security-epoch', $options.GpuPackSecurityEpoch
                 ) }
-                $actual = @(Invoke-CaptureBoundArgumentFixture @options)
-                if ($actual.Count -ne $expected.Count) { throw 'Capture wrapper changed its argument count.' }
-                for ($index = 0; $index -lt $expected.Count; $index++) {
-                    if ($actual[$index] -cne $expected[$index]) {
-                        throw 'Capture wrapper changed an input or the explicit campaign power.'
+                $affinityCases = if ($includeFrozenIdentity) { @($false, $true) } else { @($false) }
+                foreach ($includeAffinity in $affinityCases) {
+                    $caseOptions = $options.Clone()
+                    $caseExpected = @($expected)
+                    if ($includeAffinity) {
+                        $caseOptions.WorkerAllowedProcessorMask = '0000000000000001'
+                        $caseExpected += @('--worker-allowed-processor-mask', '0000000000000001')
                     }
+                    $actual = @(Invoke-CaptureBoundArgumentFixture @caseOptions)
+                    if ($actual.Count -ne $caseExpected.Count) { throw 'Capture wrapper changed its argument count.' }
+                    for ($index = 0; $index -lt $caseExpected.Count; $index++) {
+                        if ($actual[$index] -cne $caseExpected[$index]) {
+                            throw 'Capture wrapper changed an input, campaign power or worker affinity constraint.'
+                        }
+                    }
+                    $forwardingCount++
                 }
             }
         }
     }
+    if ($forwardingCount -ne 18) { throw 'Capture wrapper forwarding cases were not all discovered.' }
 } -Definition $argumentBuilder[0].Extent.Text
-Write-Output 'Capture wrapper forwarding contracts passed (12 cases, with and without frozen identity); no collector was launched.'
+Write-Output 'Capture wrapper forwarding contracts passed (18 cases, with and without frozen identity and worker affinity); no collector was launched.'
 
 # Exercise the full wrapper with a GUI executable, not a console mock. Named
 # events control completion, so no sleep or GPU/app/profile access is needed.
@@ -342,6 +356,9 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
                         'GpuPackVersion', 'GpuPackSha256', 'GpuPackSecurityEpoch')) {
                         $options.Remove($field)
                     }
+                }
+                else {
+                    $options.WorkerAllowedProcessorMask = '0000000000000001'
                 }
                 $optionsPath = Join-Path $fixtureRoot "$id-options.json"
                 [IO.File]::WriteAllText($optionsPath, ($options | ConvertTo-Json), [Text.UTF8Encoding]::new($false))

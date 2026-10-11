@@ -4,6 +4,7 @@
 //! and one exact verified-GPU request, retains only validated Hello/Ready
 //! bytes plus bounded native telemetry, and publishes an unqualified report.
 
+pub(crate) mod affinity;
 mod campaign;
 mod telemetry;
 
@@ -34,6 +35,7 @@ use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::runtime_contract::RuntimeExecution;
 use crate::transcription::{AccelerationPreference, ModelId};
+use affinity::{CaptureWorkerAffinity, RequestedWorkerAffinity};
 use telemetry::{SamplingSession, TelemetrySummary, VideoMemorySummary};
 
 const COMMAND_FLAG: &str = "--scribe-windows-gpu-capture-observation";
@@ -54,6 +56,7 @@ struct CommandOptions {
     output: PathBuf,
     campaign_power: Option<CampaignPower>,
     frozen_inputs: Option<Arc<CaptureFrozenInputs>>,
+    worker_allowed_processor_mask: Option<RequestedWorkerAffinity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -181,13 +184,21 @@ pub(crate) fn maybe_run_local_command() -> Option<i32> {
 
 fn run_local_command(args: &[OsString]) -> Result<()> {
     let options = parse_command(args)?;
+    // One immutable admission before input I/O and before any provider probe.
+    let affinity = options
+        .worker_allowed_processor_mask
+        .map(|mask| mask.admit().map(Arc::new))
+        .transpose()?;
     if options.campaign_power.is_some() {
-        return campaign::run(options);
+        return campaign::run(options, affinity);
     }
-    run_single_capture(options)
+    run_single_capture(options, affinity)
 }
 
-fn run_single_capture(options: CommandOptions) -> Result<()> {
+fn run_single_capture(
+    options: CommandOptions,
+    affinity: Option<Arc<CaptureWorkerAffinity>>,
+) -> Result<()> {
     let mut model = verify_input(
         &options.model,
         &options.model_sha256,
@@ -217,8 +228,13 @@ fn run_single_capture(options: CommandOptions) -> Result<()> {
     let preflight = single_preflight(options.frozen_inputs.is_some(), |step| {
         match step {
             SinglePreflightStep::CpuHello => {
-                let worker =
-                    cpu_worker.insert(CaptureObservationWorker::cpu(options.frozen_inputs.clone()));
+                let worker = cpu_worker.insert(
+                    crate::onnx_worker::CaptureObservationWorkerFactory::cpu_with_affinity(
+                        options.frozen_inputs.clone(),
+                        affinity.clone(),
+                    )?
+                    .spawn(),
+                );
                 cpu_lease = Some(
                     worker
                         .prepare_observation()
@@ -229,13 +245,15 @@ fn run_single_capture(options: CommandOptions) -> Result<()> {
                 // With frozen inputs this admits BOTH identities before any
                 // provider probe. Without them the legacy CPU-first order stays.
                 gpu_worker = Some(
-                    CaptureObservationWorker::gpu(
+                    crate::onnx_worker::CaptureObservationWorkerFactory::gpu_exact_with_affinity(
                         &options.gpu_pack_id,
                         &options.gpu_backend,
                         &options.gpu_device,
                         options.frozen_inputs.clone(),
+                        affinity.clone(),
                     )
-                    .context("could not preflight the verified GPU binding")?,
+                    .context("could not preflight the verified GPU binding")?
+                    .spawn(),
                 );
             }
             SinglePreflightStep::GpuHello => {
@@ -264,11 +282,11 @@ fn run_single_capture(options: CommandOptions) -> Result<()> {
     let cpu_lease = cpu_lease.expect("successful preflight retains CPU lease");
     let gpu_lease = gpu_lease.expect("successful preflight retains GPU lease");
     if let Err(error) = cpu_worker
-        .negotiate_runtime_observation()
+        .negotiate_runtime_observation_single(&cpu_lease)
         .context("bundled CPU worker does not support runtime memory observation")
         .and_then(|()| {
             gpu_worker
-                .negotiate_runtime_observation()
+                .negotiate_runtime_observation_single(&gpu_lease)
                 .context("selected GPU worker does not support runtime memory observation")
         })
     {
@@ -401,7 +419,7 @@ fn observe_worker(
     } else {
         SamplingSession::cpu(lease.clone())?
     };
-    let execution = worker.transcribe_observed(artifact, preference, audio);
+    let execution = worker.transcribe_observed_single(&lease, artifact, preference, audio);
     let elapsed = started.elapsed().as_millis();
     let telemetry = sampler.finish();
     let power_source_after = PowerSource::current();
@@ -589,6 +607,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     let mut gpu_device = None;
     let mut output = None;
     let mut campaign_power = None;
+    let mut worker_allowed_processor_mask = None;
     let pin_flags = [
         "--cpu-worker-build-id",
         "--cpu-worker-sha256",
@@ -643,6 +662,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
             "--gpu-backend" => &mut gpu_backend,
             "--gpu-device" => &mut gpu_device,
             "--output" => &mut output,
+            "--worker-allowed-processor-mask" => &mut worker_allowed_processor_mask,
             _ => match pin_flags.iter().position(|flag| *flag == name) {
                 Some(position) => &mut pin_values[position],
                 None => bail!("unknown Windows GPU capture observation argument: {name}"),
@@ -726,6 +746,17 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
         frozen.validate()?;
         Some(Arc::new(frozen))
     };
+    let worker_allowed_processor_mask = worker_allowed_processor_mask
+        .map(|value| {
+            let text = value
+                .to_str()
+                .ok_or_else(|| anyhow!("worker allowed processor mask must be Unicode"))?;
+            RequestedWorkerAffinity::parse(text)
+        })
+        .transpose()?;
+    if worker_allowed_processor_mask.is_some() && frozen_inputs.is_none() {
+        bail!("worker allowed processor mask requires the complete frozen worker constraints");
+    }
     Ok(CommandOptions {
         model: PathBuf::from(required(model, "--model")?),
         model_sha256,
@@ -737,6 +768,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
         output: PathBuf::from(required(output, "--output")?),
         campaign_power,
         frozen_inputs,
+        worker_allowed_processor_mask,
     })
 }
 
@@ -1042,6 +1074,60 @@ mod tests {
                 parse_command(&duplicate).is_err(),
                 "accepted duplicate pins at {index}"
             );
+        }
+    }
+
+    #[test]
+    fn capture_observation_affinity_cli_requires_canonical_mask_and_all_frozen_pins_before_io() {
+        let flag = "--worker-allowed-processor-mask";
+        let mut valid = frozen_command_args();
+        valid.extend([flag.into(), "0000000000000001".into()]);
+        assert!(
+            parse_command(&valid)
+                .unwrap()
+                .worker_allowed_processor_mask
+                .is_some()
+        );
+        assert!(
+            parse_command(&command_args())
+                .unwrap()
+                .worker_allowed_processor_mask
+                .is_none()
+        );
+        let mut missing_pins = command_args();
+        missing_pins.extend([flag.into(), "0000000000000001".into()]);
+        assert!(
+            run_local_command(&missing_pins)
+                .unwrap_err()
+                .to_string()
+                .contains("complete frozen")
+        );
+        for index in (command_args().len()..frozen_command_args().len()).step_by(2) {
+            let mut partial = valid.clone();
+            partial.drain(index..index + 2);
+            assert!(parse_command(&partial).is_err());
+        }
+        let mut duplicate = valid.clone();
+        duplicate.extend([flag.into(), "0000000000000001".into()]);
+        assert!(parse_command(&duplicate).is_err());
+        let mut missing = frozen_command_args();
+        missing.push(flag.into());
+        assert!(parse_command(&missing).is_err());
+        for invalid in [
+            "",
+            "1",
+            "0x00000000000001",
+            "0000000000000000",
+            "FFFFFFFFFFFFFFFF",
+            "00000000000000001",
+            " 000000000000001",
+            "000000000000001\n",
+            "000000000000000g",
+        ] {
+            let mut args = frozen_command_args();
+            args.extend([flag.into(), invalid.into()]);
+            let error = run_local_command(&args).unwrap_err().to_string();
+            assert!(error.contains("processor mask"), "{invalid:?}: {error}");
         }
     }
 
