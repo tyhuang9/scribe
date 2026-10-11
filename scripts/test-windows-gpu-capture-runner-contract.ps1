@@ -30,6 +30,7 @@ function Get-LoopFilterLiterals([Management.Automation.Language.ForEachStatement
 $expectedCaptureFilters = @(
     'windows_gpu_capture::tests',
     'windows_gpu_capture::affinity::tests',
+    'onnx_worker::windows_capture_launch::tests',
     'windows_gpu_capture::telemetry::tests',
     'windows_gpu_capture::campaign::tests',
     'windows_gpu_probe::tests',
