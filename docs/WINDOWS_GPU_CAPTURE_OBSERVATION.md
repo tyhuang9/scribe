@@ -36,6 +36,15 @@ Observation-only raw-frame buffers, retained handshake state, duplicated
 process handles and lease APIs are compiled out of ordinary builds. The
 existing IPC frame format and protocol version are unchanged.
 
+Request telemetry reduces its 5 ms readings into a fixed-size running count
+and integer extrema instead of retaining a growing sample history. CPU/GPU
+segment availability cannot change within a request; incomplete segments,
+query failures and count overflow fail sampling rather than publish a successful
+prefix. Report fields and units are unchanged, including valid zero values.
+This bounds sampler storage independently of request duration, not Windows query
+or thread-join time, and does not establish continuous environmental control or
+qualification authority.
+
 ## Production-trust pack probe
 
 Collector builds also expose a narrower, probe-only command:

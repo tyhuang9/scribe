@@ -203,6 +203,89 @@ struct TelemetrySample {
     non_local: Option<SegmentSample>,
 }
 
+impl From<SegmentSample> for SegmentSummary {
+    fn from(sample: SegmentSample) -> Self {
+        Self {
+            sampled_max_current_usage_bytes: sample.current_usage,
+            sampled_max_current_reservation_bytes: sample.current_reservation,
+            sampled_min_budget_bytes: sample.budget,
+            sampled_min_available_for_reservation_bytes: sample.available_for_reservation,
+        }
+    }
+}
+
+impl SegmentSummary {
+    fn include(&mut self, other: Self) {
+        self.sampled_max_current_usage_bytes = self
+            .sampled_max_current_usage_bytes
+            .max(other.sampled_max_current_usage_bytes);
+        self.sampled_max_current_reservation_bytes = self
+            .sampled_max_current_reservation_bytes
+            .max(other.sampled_max_current_reservation_bytes);
+        self.sampled_min_budget_bytes = self
+            .sampled_min_budget_bytes
+            .min(other.sampled_min_budget_bytes);
+        self.sampled_min_available_for_reservation_bytes = self
+            .sampled_min_available_for_reservation_bytes
+            .min(other.sampled_min_available_for_reservation_bytes);
+    }
+}
+
+/// Fixed-size request-window state: no samples accumulate with request duration.
+/// A rejected update leaves the summary unchanged; its caller must fail the
+/// sampling session rather than publish that prefix as complete telemetry.
+struct TelemetryAccumulator {
+    summary: TelemetrySummary,
+}
+
+impl TelemetryAccumulator {
+    fn new(first: TelemetrySample) -> Result<Self> {
+        let video_memory = match (first.local, first.non_local) {
+            (Some(local), Some(non_local)) => Some(VideoMemorySummary {
+                local: local.into(),
+                non_local: non_local.into(),
+            }),
+            (None, None) => None,
+            _ => bail!("worker telemetry omitted one required memory segment"),
+        };
+        Ok(Self {
+            summary: TelemetrySummary {
+                sample_count: 1,
+                sampled_max_private_usage_bytes: first.private_usage,
+                video_memory,
+            },
+        })
+    }
+
+    fn record(&mut self, sample: TelemetrySample) -> Result<()> {
+        let incoming = Self::new(sample)?.summary;
+        if incoming.video_memory.is_some() != self.summary.video_memory.is_some() {
+            bail!("worker telemetry changed video-memory availability during sampling")
+        }
+        // Validate everything before mutation, including the integer boundary.
+        let count = self
+            .summary
+            .sample_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("worker telemetry sample count overflowed"))?;
+        if let (Some(current), Some(next)) = (&mut self.summary.video_memory, incoming.video_memory)
+        {
+            current.local.include(next.local);
+            current.non_local.include(next.non_local);
+        }
+        self.summary.sampled_max_private_usage_bytes = self
+            .summary
+            .sampled_max_private_usage_bytes
+            .max(incoming.sampled_max_private_usage_bytes);
+        self.summary.sample_count = count;
+        Ok(())
+    }
+
+    fn finish(self) -> TelemetrySummary {
+        self.summary
+    }
+}
+
 trait TelemetryProbe: Send + Sync + 'static {
     fn sample(&self) -> Result<TelemetrySample>;
 }
@@ -276,7 +359,7 @@ impl SamplingSession {
         // Fail before inference if even the first handle-bound sample is not
         // available. The first sample is retained as part of the request
         // window rather than being a capability-only preflight.
-        let first = probe.sample()?;
+        let first = TelemetryAccumulator::new(probe.sample()?)?;
         let stop = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
         let thread_stop = Arc::clone(&stop);
@@ -284,25 +367,21 @@ impl SamplingSession {
         let thread = std::thread::Builder::new()
             .name("scribe-gpu-observation-telemetry".to_owned())
             .spawn(move || {
-                let mut samples = vec![first];
+                let mut samples = first;
                 while !thread_stop.load(Ordering::Acquire) {
                     std::thread::sleep(SAMPLE_INTERVAL);
                     if thread_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    match probe.sample() {
-                        Ok(sample) => samples.push(sample),
-                        Err(error) => {
-                            if let Ok(mut slot) = thread_result.lock() {
-                                *slot = Some(Err(format!("{error:#}")));
-                            }
-                            return;
+                    if let Err(error) = probe.sample().and_then(|sample| samples.record(sample)) {
+                        if let Ok(mut slot) = thread_result.lock() {
+                            *slot = Some(Err(format!("{error:#}")));
                         }
+                        return;
                     }
                 }
-                let aggregated = aggregate_samples(&samples).map_err(|error| format!("{error:#}"));
                 if let Ok(mut slot) = thread_result.lock() {
-                    *slot = Some(aggregated);
+                    *slot = Some(Ok(samples.finish()));
                 }
             })
             .context("could not start bounded worker telemetry sampling")?;
@@ -338,6 +417,9 @@ impl Drop for SamplingSession {
     }
 }
 
+// Retain the previous batch algorithm only as an independent test oracle. The
+// sampler above never retains a vector or allocates per-segment sample buffers.
+#[cfg(test)]
 fn aggregate_samples(samples: &[TelemetrySample]) -> Result<TelemetrySummary> {
     if samples.is_empty() {
         bail!("worker telemetry produced no request-window samples")
@@ -593,10 +675,70 @@ fn query_adapter_info<T>(adapter: u32, query_type: i32, value: &mut T) -> Result
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     use super::*;
+
+    fn streamed_summary(samples: &[TelemetrySample]) -> Result<TelemetrySummary> {
+        let (first, rest) = samples.split_first().context("no fixture samples")?;
+        let mut accumulator = TelemetryAccumulator::new(*first)?;
+        for sample in rest {
+            accumulator.record(*sample)?;
+        }
+        Ok(accumulator.finish())
+    }
+
+    fn cpu_sample(private_usage: u64) -> TelemetrySample {
+        TelemetrySample {
+            private_usage,
+            local: None,
+            non_local: None,
+        }
+    }
+
+    fn gpu_sample(index: u64) -> TelemetrySample {
+        let values = [0, u64::MAX, 17, 300, 1, 900];
+        let value = |offset| values[(index as usize + offset) % values.len()];
+        TelemetrySample {
+            private_usage: value(0),
+            local: Some(SegmentSample {
+                budget: value(1),
+                current_usage: value(2),
+                current_reservation: value(3),
+                available_for_reservation: value(4),
+            }),
+            non_local: Some(SegmentSample {
+                budget: value(5),
+                current_usage: value(0),
+                current_reservation: value(1),
+                available_for_reservation: value(2),
+            }),
+        }
+    }
+
+    struct ScriptedProbe {
+        samples: Vec<std::result::Result<TelemetrySample, &'static str>>,
+        calls: AtomicUsize,
+        observed: mpsc::Sender<usize>,
+    }
+
+    impl TelemetryProbe for ScriptedProbe {
+        fn sample(&self) -> Result<TelemetrySample> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let sample = self
+                .samples
+                .get(call)
+                .or_else(|| self.samples.last())
+                .copied()
+                .unwrap_or(Err("empty fixture probe sequence"))
+                .map_err(anyhow::Error::msg);
+            let _ = self.observed.send(call);
+            sample
+        }
+    }
 
     #[test]
     fn capture_observation_telemetry_aggregates_current_values_with_exact_units() {
@@ -632,7 +774,7 @@ mod tests {
                 }),
             },
         ];
-        let summary = aggregate_samples(&samples).unwrap();
+        let summary = streamed_summary(&samples).unwrap();
         assert_eq!(summary.sample_count, 2);
         assert_eq!(summary.sampled_max_private_usage_bytes, 12);
         let video = summary.video_memory.unwrap();
@@ -647,13 +789,13 @@ mod tests {
 
     #[test]
     fn capture_observation_telemetry_rejects_missing_or_mixed_segments() {
-        assert!(aggregate_samples(&[]).is_err());
+        assert!(streamed_summary(&[]).is_err());
         let cpu = TelemetrySample {
             private_usage: 1,
             local: None,
             non_local: None,
         };
-        assert_eq!(aggregate_samples(&[cpu]).unwrap().video_memory, None);
+        assert_eq!(streamed_summary(&[cpu]).unwrap().video_memory, None);
         let mixed = TelemetrySample {
             private_usage: 2,
             local: Some(SegmentSample {
@@ -664,7 +806,230 @@ mod tests {
             }),
             non_local: None,
         };
-        assert!(aggregate_samples(&[cpu, mixed]).is_err());
+        assert!(streamed_summary(&[cpu, mixed]).is_err());
+    }
+
+    #[test]
+    fn capture_observation_streaming_matches_batch_oracle_for_every_cpu_and_gpu_prefix() {
+        for with_video in [false, true] {
+            let samples = (0..48)
+                .map(|index| {
+                    let sample = gpu_sample(index);
+                    if with_video {
+                        sample
+                    } else {
+                        cpu_sample(sample.private_usage)
+                    }
+                })
+                .collect::<Vec<_>>();
+            for prefix in 1..=samples.len() {
+                let streamed = streamed_summary(&samples[..prefix]).unwrap();
+                let batch = aggregate_samples(&samples[..prefix]).unwrap();
+                assert_eq!(streamed, batch);
+            }
+        }
+    }
+
+    #[test]
+    fn capture_observation_streaming_large_request_keeps_only_fixed_size_state() {
+        assert_eq!(
+            size_of::<TelemetryAccumulator>(),
+            size_of::<TelemetrySummary>()
+        );
+        let mut accumulator = TelemetryAccumulator::new(gpu_sample(0)).unwrap();
+        for index in 1..1_000_000 {
+            accumulator.record(gpu_sample(index)).unwrap();
+        }
+        let mut expected = aggregate_samples(&(0..6).map(gpu_sample).collect::<Vec<_>>()).unwrap();
+        expected.sample_count = 1_000_000;
+        assert_eq!(accumulator.finish(), expected);
+    }
+
+    #[test]
+    fn capture_observation_streaming_rejects_partial_or_changed_segments_without_mutation() {
+        let gpu = gpu_sample(0);
+        for first in [cpu_sample(1), gpu] {
+            for (local, non_local) in [
+                (None, None),
+                (gpu.local, None),
+                (None, gpu.non_local),
+                (gpu.local, gpu.non_local),
+            ] {
+                let next = TelemetrySample {
+                    private_usage: u64::MAX,
+                    local,
+                    non_local,
+                };
+                let mut accumulator = TelemetryAccumulator::new(first).unwrap();
+                let original = accumulator.summary.clone();
+                if local.is_some() != non_local.is_some()
+                    || local.is_some() != first.local.is_some()
+                {
+                    assert!(accumulator.record(next).is_err());
+                    assert_eq!(accumulator.summary, original);
+                } else {
+                    accumulator.record(next).unwrap();
+                    assert_eq!(accumulator.summary.sample_count, 2);
+                }
+            }
+        }
+        for first in [
+            TelemetrySample {
+                non_local: None,
+                ..gpu
+            },
+            TelemetrySample { local: None, ..gpu },
+        ] {
+            assert!(TelemetryAccumulator::new(first).is_err());
+        }
+    }
+
+    #[test]
+    fn capture_observation_streaming_count_overflow_never_wraps_or_mutates_extrema() {
+        let baseline_segment = SegmentSample {
+            budget: 100,
+            current_usage: 10,
+            current_reservation: 20,
+            available_for_reservation: 80,
+        };
+        let rejected_segment = SegmentSample {
+            budget: 0,
+            current_usage: u64::MAX,
+            current_reservation: u64::MAX,
+            available_for_reservation: 0,
+        };
+        for (sample, next) in [
+            (cpu_sample(1), cpu_sample(u64::MAX)),
+            (
+                TelemetrySample {
+                    private_usage: 1,
+                    local: Some(baseline_segment),
+                    non_local: Some(baseline_segment),
+                },
+                TelemetrySample {
+                    private_usage: u64::MAX,
+                    local: Some(rejected_segment),
+                    non_local: Some(rejected_segment),
+                },
+            ),
+        ] {
+            let mut accumulator = TelemetryAccumulator::new(sample).unwrap();
+            accumulator.summary.sample_count = u64::MAX - 1;
+            accumulator.record(sample).unwrap();
+            assert_eq!(accumulator.summary.sample_count, u64::MAX);
+            let original = accumulator.summary.clone();
+            assert!(accumulator.record(next).is_err());
+            assert_eq!(accumulator.summary, original);
+        }
+    }
+
+    #[test]
+    fn capture_observation_sampling_rejects_first_probe_or_shape_failure_before_thread_start() {
+        for first in [
+            Err("fixture query failed"),
+            Ok(TelemetrySample {
+                non_local: None,
+                ..gpu_sample(0)
+            }),
+        ] {
+            let (observed, events) = mpsc::channel();
+            let probe = Arc::new(ScriptedProbe {
+                samples: vec![first],
+                calls: AtomicUsize::new(0),
+                observed,
+            });
+            assert!(SamplingSession::start(probe.clone()).is_err());
+            assert_eq!(events.try_recv().unwrap(), 0);
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn capture_observation_sampling_later_failures_never_publish_successful_prefix() {
+        for second in [
+            Err("fixture query failed"),
+            Ok(TelemetrySample {
+                non_local: None,
+                ..gpu_sample(0)
+            }),
+            Ok(gpu_sample(0)),
+        ] {
+            let (observed, events) = mpsc::channel();
+            let probe = Arc::new(ScriptedProbe {
+                samples: vec![Ok(cpu_sample(1)), second],
+                calls: AtomicUsize::new(0),
+                observed,
+            });
+            let session = SamplingSession::start(probe.clone()).unwrap();
+            assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap(), 0);
+            // An event from the real sampling thread, not a fixed sleep. Finish
+            // joins that thread after it records the rejection.
+            assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+            assert!(session.finish().is_err());
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn capture_observation_sampling_success_includes_later_readings_and_releases_probe() {
+        for samples in [
+            [cpu_sample(0), cpu_sample(u64::MAX)],
+            [gpu_sample(0), gpu_sample(1)],
+        ] {
+            let (observed, events) = mpsc::channel();
+            let probe = Arc::new(ScriptedProbe {
+                samples: samples.into_iter().map(Ok).collect(),
+                calls: AtomicUsize::new(0),
+                observed,
+            });
+            let session = SamplingSession::start(probe.clone()).unwrap();
+            assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap(), 0);
+            assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+            let summary = session.finish().unwrap();
+            assert_eq!(Arc::strong_count(&probe), 1);
+            let mut expected = aggregate_samples(&samples).unwrap();
+            // The probe repeats the last sample if the test thread is delayed.
+            // This does not alter extrema, and every actual read must count.
+            expected.sample_count = probe.calls.load(Ordering::SeqCst) as u64;
+            assert!(expected.sample_count >= 2);
+            assert_eq!(summary, expected);
+            let mut expected_json = serde_json::json!({
+                "sample_count": expected.sample_count,
+                "sampled_max_private_usage_bytes": u64::MAX,
+            });
+            if samples[0].local.is_some() {
+                expected_json["video_memory"] = serde_json::json!({
+                    "local": {
+                        "sampled_max_current_usage_bytes": 300,
+                        "sampled_max_current_reservation_bytes": 300,
+                        "sampled_min_budget_bytes": 17,
+                        "sampled_min_available_for_reservation_bytes": 1,
+                    },
+                    "non_local": {
+                        "sampled_max_current_usage_bytes": u64::MAX,
+                        "sampled_max_current_reservation_bytes": u64::MAX,
+                        "sampled_min_budget_bytes": 0,
+                        "sampled_min_available_for_reservation_bytes": 17,
+                    },
+                });
+            }
+            assert_eq!(serde_json::to_value(&summary).unwrap(), expected_json);
+        }
+    }
+
+    #[test]
+    fn capture_observation_sampling_drop_joins_thread_and_releases_probe() {
+        let (observed, events) = mpsc::channel();
+        let probe = Arc::new(ScriptedProbe {
+            samples: vec![Ok(cpu_sample(0))],
+            calls: AtomicUsize::new(0),
+            observed,
+        });
+        let session = SamplingSession::start(probe.clone()).unwrap();
+        assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap(), 0);
+        assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+        drop(session);
+        assert_eq!(Arc::strong_count(&probe), 1);
     }
 
     #[test]
