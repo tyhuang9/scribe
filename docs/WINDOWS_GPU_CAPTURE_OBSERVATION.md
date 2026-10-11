@@ -375,10 +375,22 @@ topology fails rather than choosing a different mask. Only capture-owned
 workers are constrained. The UI, unrelated applications, Windows settings and
 native-default inference-thread requests are unchanged.
 
-Before returning a launched worker to the supervisor, its fresh unnamed,
-non-inherited Windows job combines affinity with the existing kill-on-close
-limit. The launcher verifies the same owned job's limits, exact child
-membership and a nonzero permitted child-process mask using retained handles,
+For this opt-in policy only, a native Windows launcher creates the worker in
+its fresh unnamed, non-inherited job using `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
+Affinity and kill-on-close limits are configured before process creation, so
+they apply before the initial thread runs. Job-list or nested-job failures do
+not retry through ordinary spawning or post-spawn assignment. An explicit
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricts inheritance to exactly four
+handles: child stdin, stdout, stderr and the parent-liveness reader. The job
+and parent pipe ends are not inherited. The ordinary no-policy `Command`
+launcher is unchanged.
+Diagnostic launches use an owned `NUL` stderr handle. Other capture launches
+duplicate the collector's stderr and fail before process creation if it is
+unavailable, including a GUI host without a stderr handle.
+
+Before returning a launched worker to the supervisor, the launcher verifies
+the same owned job's limits, exact child membership and a nonzero permitted
+child-process mask using retained handles,
 without PID lookup. Nested jobs can narrow the effective set; individual
 threads can use subsets. This enforces an allowed set, not continuous use of
 every requested processor. Request-boundary checks validate the retained
@@ -386,17 +398,42 @@ generation and policy; an enforcement failure retires that generation rather
 than replaying on a replacement. Heavy job queries do not run in the 5 ms
 telemetry sampler.
 
-The boundary is **post-spawn, before Hello/provider discovery and inference**.
-Native startup and any descendants created before job assignment are not
-covered. Cold timing begins earlier, so this is not first-instruction or
-complete cold-window control. `environmental_controls.affinity_control` stays
+The boundary now includes **the worker's first instruction**, not just
+Hello/provider discovery and inference. This constrains the worker and its
+non-breakaway descendants, not the collector or the host. Cold timing begins
+earlier, so this is not complete cold-window control.
+`environmental_controls.affinity_control` stays
 unavailable; reports remain unsigned, unqualified and ineligible for Auto.
-Whole-startup enforcement, isolation, background load, power/thermal controls
+Whole-window control, isolation, background load, power/thermal controls
 and authenticated acquisition custody remain separate qualification gates.
+
+The native route uses the same sanitized environment, trusted system current
+directory, exact executable identity guards and private pipe protocol. It
+retains owned process handles, never reopens a PID, and records diagnostic
+process creation before post-create validation. Setup failures after creation
+terminate the owned worker job and confirm both leader exit and zero active
+job processes under a bounded deadline. An exited leader alone does not prove
+descendant cleanup; failed or timed-out cleanup remains explicitly unconfirmed.
 
 Microsoft documents [job affinity and nested limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information),
 [exact-job membership](https://learn.microsoft.com/en-us/windows/win32/api/jobapi/nf-jobapi-isprocessinjob)
 and [process/system mask semantics](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask).
+The [startup-attribute API](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+supports job lists on Windows 10 and newer; Microsoft's
+[creation-time assignment explanation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812)
+describes the first-thread boundary. No nightly Rust process extension is used.
+
+Native launch tests cover partial startup-attribute failures and exact-once
+release, unavailable stderr, private stdio/liveness inheritance, cancellation
+and liveness EOF, post-create diagnostic ordering, native query failures,
+bounded cleanup and live descendants after leader exit. Owned fixtures also
+exercise drop-only job termination, legal exit code 259, canonical executable
+paths containing spaces and Unicode beyond 260 UTF-16 units, and lossless
+arguments/environment values. Nested-job coverage includes compatible nesting
+and an owned ancestor's active-process limit rejecting child creation; it does
+not establish UI-restricted hierarchy compatibility. The four ignored fixture
+entrypoints are child-only helpers that their parent tests explicitly execute.
+No test assigns the test host to a job.
 
 `scripts/run-windows-gpu-capture-observation.ps1` is a convenience wrapper around
 an independently trusted collector executable. `CollectorPath` and
@@ -551,7 +588,8 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and thirteen test groups: collector, capture-owned job affinity,
+discovery and fourteen test groups: collector, capture-owned job affinity,
+native capture launch,
 native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, authenticated Vulkan Hello memory projection,
@@ -584,6 +622,11 @@ release checks' shared UI-route coverage. Both lint all targets, with and withou
 the observer, so configuration-specific test helpers cannot escape the gate.
 The production checks do not enable `ui-harness`, and no check in
 this command enables a GPU inference provider by default.
+
+Run native process fixtures in a normal Windows environment. A restricted
+process broker can change handle inheritance; a sandbox-only failure must be
+reproduced on unchanged source outside that broker before diagnosing Win32
+behavior. Do not relax inheritance assertions or skip the native checks.
 
 For a provider-enabled worker check, use the same command with
 `-GpuProviderCheck Vulkan` or `-GpuProviderCheck Cuda` after provisioning the

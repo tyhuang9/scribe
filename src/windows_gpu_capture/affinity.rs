@@ -1,13 +1,18 @@
-//! Capture-only, post-spawn/pre-Hello worker job affinity. This is not a
-//! first-instruction, cold-start-window, thread-count or qualification claim.
+//! Capture-only worker job affinity. Production capture launch prepares and
+//! validates the job before `CreateProcessW` supplies it through
+//! `PROC_THREAD_ATTRIBUTE_JOB_LIST`; the post-spawn binder remains test-only
+//! for legacy failure-boundary coverage. This is not a thread-count or
+//! qualification claim.
 
 use std::mem::{size_of, zeroed};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};
+#[cfg(test)]
+use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_AFFINITY,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_AFFINITY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
 };
@@ -22,6 +27,7 @@ const LIMITS: u32 = JOB_OBJECT_LIMIT_AFFINITY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLO
 struct JobApi {
     create: fn() -> Result<OwnedHandle>,
     configure: fn(HANDLE, &JOBOBJECT_EXTENDED_LIMIT_INFORMATION) -> Result<()>,
+    #[cfg(test)]
     assign: fn(HANDLE, HANDLE) -> Result<()>,
     readback: fn(HANDLE) -> Result<(u32, JOBOBJECT_EXTENDED_LIMIT_INFORMATION)>,
     membership: fn(HANDLE, HANDLE) -> Result<bool>,
@@ -40,6 +46,7 @@ enum TopologyBoundary {
 const NATIVE_JOB_API: JobApi = JobApi {
     create: create_job,
     configure: configure_job,
+    #[cfg(test)]
     assign: assign_job,
     readback: readback_job,
     membership: job_membership,
@@ -106,6 +113,26 @@ pub(crate) struct CaptureWorkerAffinity {
     topology: CollectorTopology,
 }
 
+/// A freshly configured capture job whose exact non-inherited limits were
+/// read back before it can be supplied to `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
+pub(crate) struct PreparedCaptureAffinity {
+    job: OwnedHandle,
+}
+
+impl PreparedCaptureAffinity {
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.job.as_raw_handle() as HANDLE
+    }
+
+    pub(crate) fn validate_process(
+        &self,
+        policy: &CaptureWorkerAffinity,
+        process: HANDLE,
+    ) -> Result<()> {
+        policy.validate_process_with(self.handle(), process, &NATIVE_JOB_API)
+    }
+}
+
 impl CaptureWorkerAffinity {
     fn admit_with(
         requested: RequestedWorkerAffinity,
@@ -143,8 +170,13 @@ impl CaptureWorkerAffinity {
         self.require_topology(collector_topology()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn bind(&self, process: HANDLE) -> Result<OwnedHandle> {
         self.bind_with(process, &NATIVE_JOB_API)
+    }
+
+    pub(crate) fn prepare(&self) -> Result<PreparedCaptureAffinity> {
+        self.prepare_with(&NATIVE_JOB_API)
     }
 
     #[cfg(test)]
@@ -213,6 +245,7 @@ impl CaptureWorkerAffinity {
         self.bind_with(process, &api)
     }
 
+    #[cfg(test)]
     fn bind_with(&self, process: HANDLE, api: &JobApi) -> Result<OwnedHandle> {
         self.require_topology((api.topology)(TopologyBoundary::BeforeBind)?)?;
         let job = (api.create)()?;
@@ -224,15 +257,36 @@ impl CaptureWorkerAffinity {
         (api.configure)(raw_job, &limits)?;
         (api.assign)(raw_job, process)?;
         // A failed readback drops our kill-on-close job; caller still reaps child.
-        self.validate_with(raw_job, process, api)?;
+        self.validate_process_with(raw_job, process, api)?;
         Ok(job)
     }
 
     pub(crate) fn validate(&self, job: HANDLE, process: HANDLE) -> Result<()> {
-        self.validate_with(job, process, &NATIVE_JOB_API)
+        self.validate_process_with(job, process, &NATIVE_JOB_API)
     }
 
-    fn validate_with(&self, job: HANDLE, process: HANDLE, api: &JobApi) -> Result<()> {
+    fn prepare_with(&self, api: &JobApi) -> Result<PreparedCaptureAffinity> {
+        self.require_topology((api.topology)(TopologyBoundary::BeforeBind)?)?;
+        let job = (api.create)()?;
+        let raw_job = job.as_raw_handle() as HANDLE;
+        // SAFETY: this Win32 POD consists only of integer fields and pointers.
+        let mut limits = unsafe { zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = LIMITS;
+        limits.BasicLimitInformation.Affinity = self.mask;
+        (api.configure)(raw_job, &limits)?;
+        let handle_flags = (api.inheritance)(raw_job)?;
+        let (returned, readback) = (api.readback)(raw_job)?;
+        self.validate_prepared_readback(
+            handle_flags,
+            returned,
+            readback.BasicLimitInformation.LimitFlags,
+            readback.BasicLimitInformation.Affinity,
+        )?;
+        self.require_topology((api.topology)(TopologyBoundary::BeforeReadback)?)?;
+        Ok(PreparedCaptureAffinity { job })
+    }
+
+    fn validate_process_with(&self, job: HANDLE, process: HANDLE, api: &JobApi) -> Result<()> {
         self.require_topology((api.topology)(TopologyBoundary::BeforeReadback)?)?;
         let handle_flags = (api.inheritance)(job)?;
         let (returned, limits) = (api.readback)(job)?;
@@ -248,6 +302,23 @@ impl CaptureWorkerAffinity {
             system_mask,
         )?;
         self.require_topology((api.topology)(TopologyBoundary::AfterReadback)?)
+    }
+
+    fn validate_prepared_readback(
+        &self,
+        handle_flags: u32,
+        returned: u32,
+        flags: u32,
+        mask: usize,
+    ) -> Result<()> {
+        if handle_flags != 0
+            || returned as usize != size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
+            || flags != LIMITS
+            || mask != self.mask
+        {
+            bail!("capture affinity job configuration readback is invalid");
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -313,6 +384,7 @@ fn configure_job(job: HANDLE, limits: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn assign_job(job: HANDLE, process: HANDLE) -> Result<()> {
     // SAFETY: both retained handles are live; neither is opened by caller PID.
     if unsafe { AssignProcessToJobObject(job, process) } == 0 {

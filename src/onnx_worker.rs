@@ -60,6 +60,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[path = "onnx_worker/windows_capture_launch.rs"]
+mod windows_capture_launch;
+
 pub(crate) use crate::worker_identity::{
     DESKTOP_BUILD_ID, INFERENCE_WORKER_BUILD_ID, PROTOCOL_VERSION, WORKER_ABI_VERSION,
 };
@@ -296,6 +300,16 @@ impl DiagnosticProbeState {
     fn retain_worker_process_handle(&self, child: &Child) {
         // Observation failure is metadata loss, never a launch/cleanup failure.
         let handle = duplicate_windows_process_handle(child).ok();
+        self.retain_worker_process_handle_owned(handle);
+    }
+
+    fn retain_worker_process_handle_raw(&self, process: windows_sys::Win32::Foundation::HANDLE) {
+        // Observation failure is metadata loss, never a launch/cleanup failure.
+        let handle = duplicate_windows_handle(process).ok();
+        self.retain_worker_process_handle_owned(handle);
+    }
+
+    fn retain_worker_process_handle_owned(&self, handle: Option<OwnedHandle>) {
         if let Ok(mut exit) = self.worker_exit.lock()
             && !exit.sampled
             && exit.process_handle.is_none()
@@ -4545,6 +4559,23 @@ impl WorkerLauncher for OsWorkerLauncher {
         let mut parent_liveness = ParentLivenessChannel::attach(&mut command)?;
         configure_hidden_worker_command(&mut command);
         let _immediate_identity_check = executable.revalidate()?;
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(affinity) = &self.capture_affinity {
+            let launched = windows_capture_launch::launch(
+                &command,
+                affinity.clone(),
+                parent_liveness,
+                self.diagnostic_probe.as_ref(),
+            )?;
+            return Ok(SpawnedWorker {
+                stdin: Box::new(launched.stdin),
+                stdout: Box::new(launched.stdout),
+                process: launched.process,
+                expectation,
+                frozen_worker_approval: executable.frozen_worker_approval,
+                pack_launch: executable.pack_launch,
+            });
+        }
         let mut child = command.spawn()?;
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         if let Some(diagnostic_probe) = &self.diagnostic_probe {
@@ -4556,16 +4587,8 @@ impl WorkerLauncher for OsWorkerLauncher {
         }
         parent_liveness.child_spawned();
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-        let process_guard = if let Some(affinity) = &self.capture_affinity {
-            use std::os::windows::io::IntoRawHandle;
-            bind_worker_process_tree_or_terminate(&mut child, |child| {
-                affinity
-                    .bind(child.as_raw_handle() as _)
-                    .map(|job| ProcessTreeGuard(job.into_raw_handle() as isize))
-            })?
-        } else {
-            bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?
-        };
+        let process_guard =
+            bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?;
         #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
         let process_guard =
             bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?;
@@ -4952,6 +4975,11 @@ impl ParentLivenessChannel {
         }
     }
 
+    #[cfg(feature = "windows-gpu-capture-observation")]
+    fn child_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.child_read as _
+    }
+
     fn request_cancel(&self) -> Result<bool> {
         use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
@@ -5328,6 +5356,11 @@ impl WorkerProcess for OsWorkerProcess {
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 fn duplicate_windows_process_handle(child: &Child) -> Result<OwnedHandle> {
+    duplicate_windows_handle(child.as_raw_handle() as _)
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn duplicate_windows_handle(source: windows_sys::Win32::Foundation::HANDLE) -> Result<OwnedHandle> {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -5337,7 +5370,7 @@ fn duplicate_windows_process_handle(child: &Child) -> Result<OwnedHandle> {
     let duplicated = unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
-            child.as_raw_handle() as HANDLE,
+            source,
             GetCurrentProcess(),
             &mut duplicate,
             0,

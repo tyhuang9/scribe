@@ -338,6 +338,7 @@ try {
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::affinity::tests',
+            'onnx_worker::windows_capture_launch::tests',
             'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',
             'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
