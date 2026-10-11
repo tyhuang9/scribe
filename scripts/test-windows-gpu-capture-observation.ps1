@@ -170,6 +170,65 @@ try {
         $prelaunchAssertionCount++
     }
 
+    foreach ($mask in @('', '0', '0000000000000000', '0x00000000000001',
+            '000000000000000A', 'fffffffffffffff', '10000000000000000',
+            ' 000000000000001', '000000000000001 ', '+000000000000001',
+            '000000000000000g', "00000000000000`t1")) {
+        $arguments = $wrapperArguments.Clone()
+        $arguments.WorkerAllowedProcessorMask = $mask
+        $rejected = $false
+        try { & $wrapper @arguments }
+        catch {
+            if ($_.Exception.Message -cne 'Worker allowed processor mask must be exactly 16 lowercase hexadecimal digits and nonzero.') {
+                throw 'Capture wrapper rejected malformed worker affinity at the wrong boundary.'
+            }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Capture wrapper accepted malformed worker affinity.' }
+        $prelaunchAssertionCount++
+    }
+    $arguments = $wrapperArguments.Clone()
+    foreach ($field in $frozenIdentityFields) { $arguments.Remove($field) }
+    $arguments.WorkerAllowedProcessorMask = '0000000000000001'
+    $rejected = $false
+    try { & $wrapper @arguments }
+    catch {
+        if ($_.Exception.Message -cne 'Worker allowed processor mask requires the complete frozen worker and pack identity set.') {
+            throw 'Capture wrapper rejected unpinned worker affinity at the wrong boundary.'
+        }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw 'Capture wrapper accepted unpinned worker affinity.' }
+    $prelaunchAssertionCount++
+
+    $arguments = $wrapperArguments.Clone()
+    $arguments.Remove('GpuPackSha256')
+    $arguments.WorkerAllowedProcessorMask = '0000000000000001'
+    $rejected = $false
+    try { & $wrapper @arguments }
+    catch {
+        if ($_.Exception.Message -cne 'Frozen worker and pack identity pins must be supplied as one complete set.') {
+            throw 'Capture wrapper rejected partially pinned worker affinity at the wrong boundary.'
+        }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw 'Capture wrapper accepted partially pinned worker affinity.' }
+    $prelaunchAssertionCount++
+
+    $duplicateRejected = $false
+    try {
+        & $wrapper @wrapperArguments -WorkerAllowedProcessorMask '0000000000000001' -WorkerAllowedProcessorMask '0000000000000002'
+    }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike 'ParameterAlreadyBound*' -and
+            $_.Exception.Message -notmatch '(?i)already.*(specified|bound)') {
+            throw 'Capture wrapper duplicate worker affinity was rejected at the wrong boundary.'
+        }
+        $duplicateRejected = $true
+    }
+    if (-not $duplicateRejected) { throw 'Capture wrapper accepted duplicate worker affinity.' }
+    $prelaunchAssertionCount++
+
     # PowerShell rejects duplicate bound parameter names before the wrapper body
     # can inspect paths or launch a collector. Exercise that native contract.
     $duplicateRejected = $false
@@ -228,6 +287,23 @@ try {
             if (-not $rejected) { throw 'Capture wrapper accepted an invalid collector file.' }
             $prelaunchAssertionCount++
         }
+        # Syntactically valid masks must reach the existing digest check, not
+        # launch a process. Actual topology admission belongs to the collector.
+        foreach ($mask in @('0000000000000001', '00000000abcdef01', '8000000000000000')) {
+            $arguments = $wrapperArguments.Clone()
+            $arguments.CollectorPath = $wrongDigestExe
+            $arguments.WorkerAllowedProcessorMask = $mask
+            $rejected = $false
+            try { & $wrapper @arguments }
+            catch {
+                if ($_.Exception.Message -cne 'Collector digest does not match the expected build.') {
+                    throw 'Capture wrapper rejected valid worker affinity before the digest boundary.'
+                }
+                $rejected = $true
+            }
+            if (-not $rejected) { throw 'Capture wrapper bypassed the collector digest check.' }
+            $prelaunchAssertionCount++
+        }
         # A rejected digest must release the read lock; none of these fixtures
         # is runnable, and no test is allowed to reach executable launch.
         $exclusive = [IO.File]::Open($wrongDigestExe, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -241,11 +317,11 @@ try {
         }
         Remove-Item -LiteralPath $fixtureRoot -ErrorAction Stop
     }
-    if ($prelaunchAssertionCount -ne 47) {
-        throw "Capture wrapper prelaunch assertion count changed: expected 47, observed $prelaunchAssertionCount."
+    if ($prelaunchAssertionCount -ne 65) {
+        throw "Capture wrapper prelaunch assertion count changed: expected 65, observed $prelaunchAssertionCount."
     }
     if ($ScriptOnly) {
-        Write-Output 'Windows GPU capture observation script contracts passed (47 prelaunch assertions plus 6 GUI process fixtures); GPU/Cargo checks not run.'
+        Write-Output 'Windows GPU capture observation script contracts passed (65 prelaunch assertions plus 6 GUI process fixtures); GPU/Cargo checks not run.'
         return
     }
 
@@ -261,7 +337,8 @@ try {
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', 'ui-harness', '--', '-D', 'warnings')
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
-    foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::telemetry::tests',
+    foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::affinity::tests',
+            'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',
             'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
             'onnx_worker::tests::capture_observation', 'onnx_worker::tests::vulkan_hello_memory',

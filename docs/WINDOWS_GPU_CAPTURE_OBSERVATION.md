@@ -359,6 +359,45 @@ file handle through probing. Every subsequent cold launch rechecks the same
 tuple, and a warm run remains bound to its original authenticated generation.
 No failure replaces the tuple with newly discovered values or authorizes replay.
 
+### Capture-owned worker scheduling constraint
+
+With that complete frozen identity set, an operator may additionally supply
+`--worker-allowed-processor-mask` (PowerShell `-WorkerAllowedProcessorMask`).
+The value is exactly sixteen lowercase hexadecimal digits, nonzero, without a
+`0x` prefix. Omit it to preserve existing scheduling. It is a denial-only
+constraint, not a source of worker trust or qualification authority.
+
+The collector admits a single active processor group, group zero, and freezes
+the collector process/system masks before provider discovery. The requested
+mask must fit both. One immutable policy follows CPU and GPU factories,
+discovery probes and subsequent cold/warm launches; unsupported or changed
+topology fails rather than choosing a different mask. Only capture-owned
+workers are constrained. The UI, unrelated applications, Windows settings and
+native-default inference-thread requests are unchanged.
+
+Before returning a launched worker to the supervisor, its fresh unnamed,
+non-inherited Windows job combines affinity with the existing kill-on-close
+limit. The launcher verifies the same owned job's limits, exact child
+membership and a nonzero permitted child-process mask using retained handles,
+without PID lookup. Nested jobs can narrow the effective set; individual
+threads can use subsets. This enforces an allowed set, not continuous use of
+every requested processor. Request-boundary checks validate the retained
+generation and policy; an enforcement failure retires that generation rather
+than replaying on a replacement. Heavy job queries do not run in the 5 ms
+telemetry sampler.
+
+The boundary is **post-spawn, before Hello/provider discovery and inference**.
+Native startup and any descendants created before job assignment are not
+covered. Cold timing begins earlier, so this is not first-instruction or
+complete cold-window control. `environmental_controls.affinity_control` stays
+unavailable; reports remain unsigned, unqualified and ineligible for Auto.
+Whole-startup enforcement, isolation, background load, power/thermal controls
+and authenticated acquisition custody remain separate qualification gates.
+
+Microsoft documents [job affinity and nested limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information),
+[exact-job membership](https://learn.microsoft.com/en-us/windows/win32/api/jobapi/nf-jobapi-isprocessinjob)
+and [process/system mask semantics](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask).
+
 `scripts/run-windows-gpu-capture-observation.ps1` is a convenience wrapper around
 an independently trusted collector executable. `CollectorPath` and
 `CollectorSha256` identify that build; the remaining named parameters forward
@@ -458,8 +497,10 @@ generation; retain timing, memory, power and transcript digests without raw
 audio, transcript text, user paths or native error messages.
 
 Schema 2 also records the worker **process** affinity at each request endpoint.
-The observer queries the retained generation-bound process handle; it never
-looks up a PID or sets process/thread affinity. Available observations contain
+The endpoint observer remains read-only and queries the retained
+generation-bound process handle; it never looks up a PID or sets process/thread
+affinity. The optional capture launcher job constraint above is separate.
+Available observations contain
 the single processor-group number and canonical fixed-width hexadecimal process
 and system masks. A host with more than one active processor group is reported
 as unsupported because current Windows versions can let processes span groups
@@ -510,12 +551,13 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and twelve test groups: collector, native telemetry, paired campaigns,
+discovery and thirteen test groups: collector, capture-owned job affinity,
+native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, authenticated Vulkan Hello memory projection,
 provider-memory snapshots, retained GGUF native/runtime boundaries, capture
 architecture guards and probe architecture guards.
-`-ScriptOnly` provides the fast inner-loop check: script parsing, forty-seven
+`-ScriptOnly` provides the fast inner-loop check: script parsing, sixty-five
 counted prelaunch argument/file-rejection assertions (including frozen identity
 forwarding, partial, duplicate and malformed values), and six local GUI-process
 cases covering both omitted and complete identity sets.
@@ -530,9 +572,10 @@ Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo
 command and cannot substitute for native verification.
-Twelve in-memory forwarding cases additionally cover both GPU backends with the
+Eighteen in-memory forwarding cases additionally cover both GPU backends with the
 campaign option omitted, on AC, or on battery, with and without the complete
-frozen identity set. They preserve individual argument values containing spaces
+frozen identity set, and optional worker affinity with the complete set.
+They preserve individual argument values containing spaces
 and shell metacharacters. They exercise the actual PowerShell bound-parameter
 dictionary, not just a Hashtable substitute, and launch no collector.
 It does not replace the full command above.

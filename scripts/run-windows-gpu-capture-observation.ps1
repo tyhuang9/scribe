@@ -21,7 +21,8 @@ param(
     [string]$GpuWorkerAbi,
     [string]$GpuPackVersion,
     [string]$GpuPackSha256,
-    [string]$GpuPackSecurityEpoch
+    [string]$GpuPackSecurityEpoch,
+    [string]$WorkerAllowedProcessorMask
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +40,15 @@ $frozenIdentityFields = @(
 $frozenIdentityCount = @($frozenIdentityFields | Where-Object { $PSBoundParameters.Keys -contains $_ }).Count
 if ($frozenIdentityCount -ne 0 -and $frozenIdentityCount -ne $frozenIdentityFields.Count) {
     throw 'Frozen worker and pack identity pins must be supplied as one complete set.'
+}
+if ($PSBoundParameters.ContainsKey('WorkerAllowedProcessorMask')) {
+    if ($WorkerAllowedProcessorMask -cnotmatch '\A[0-9a-f]{16}\z' -or
+        $WorkerAllowedProcessorMask -ceq '0000000000000000') {
+        throw 'Worker allowed processor mask must be exactly 16 lowercase hexadecimal digits and nonzero.'
+    }
+    if ($frozenIdentityCount -ne $frozenIdentityFields.Count) {
+        throw 'Worker allowed processor mask requires the complete frozen worker and pack identity set.'
+    }
 }
 
 function Test-CaptureReservedWindowsName([string]$Value) {
@@ -121,6 +131,9 @@ function Get-CaptureObservationArguments([Collections.IDictionary]$Options) {
             '--gpu-pack-sha256', $Options['GpuPackSha256'],
             '--gpu-pack-security-epoch', $Options['GpuPackSecurityEpoch']
         )
+    }
+    if ($Options.Keys -contains 'WorkerAllowedProcessorMask') {
+        $arguments += @('--worker-allowed-processor-mask', $Options['WorkerAllowedProcessorMask'])
     }
     return $arguments
 }
