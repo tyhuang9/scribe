@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly, [switch]$ColdAdmissionOnly, [switch]$FileBoundaryOnly)
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly, [switch]$ColdAdmissionOnly, [switch]$FileBoundaryOnly, [switch]$NativePathOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -953,6 +953,185 @@ function Invoke-FileBoundaryContractTests {
     return [pscustomobject]@{ Positive = $positive; Negative = $negative }
 }
 
+function New-NativePathTestRoot([string]$Name, [int]$Length) {
+    $path = Join-Path $TestRoot $Name
+    Assert-True ($path.Length -le $Length) 'Native-path fixture base already exceeds its requested synthetic length.'
+    while ($Length - $path.Length -gt 81) { $path += '\' + ('n' * 80) }
+    $remaining = $Length - $path.Length
+    if ($remaining -gt 1) { $path += '\' + ('n' * ($remaining - 1)) }
+    elseif ($remaining -eq 1) { $path += 'n' }
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    Assert-True ($path.Length -eq $Length -and $path.StartsWith($TestRoot + '\', [StringComparison]::OrdinalIgnoreCase)) 'Synthetic native-path root escaped its owned test directory or changed length.'
+    return $path
+}
+
+function Copy-NativePathBundle($Source, [string]$Root) {
+    # Copy the existing signed bytes; never regenerate artifacts, rebind the
+    # plan, or sign a new lane merely because its absolute location changed.
+    foreach ($file in [IO.Directory]::EnumerateFiles($Source.Root, '*', [IO.SearchOption]::AllDirectories)) {
+        $target = Join-Path $Root ([IO.Path]::GetRelativePath($Source.Root, $file))
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+        [IO.File]::Copy($file, $target)
+    }
+    return [pscustomobject]@{ Root = $Root; ArtifactRoot = Join-Path $Root 'artifacts'; PlanPath = Join-Path $Root 'plan.json'; EvidencePath = Join-Path $Root 'evidence.json'; Documents = $Source.Documents }
+}
+
+function Invoke-NativePathContractTests($EvaluatorAst) {
+    $positive = 0; $negative = 0; $nativePositive = 0; $nativeNegative = 0
+    $bundle = New-Bundle (New-FixtureDocuments) 'native-path-original'
+    $before = [ordered]@{}
+    foreach ($file in [IO.Directory]::EnumerateFiles($bundle.Root, '*', [IO.SearchOption]::AllDirectories)) { $before[[IO.Path]::GetRelativePath($bundle.Root, $file)] = [IO.File]::ReadAllBytes($file) }
+    $original = Invoke-Evaluator $bundle
+    Assert-True ($original.ExitCode -eq 0) "Original native-path fixture failed: $($original.Stderr)"
+    $decision = $original.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True ($decision.qualification_passed -and $decision.fixture_only -and -not $decision.auto_eligible -and $decision.artifact_count -eq 75) 'Native-path baseline did not preserve fixture-only/default-deny qualification.'
+    $positive++
+
+    $fileRoot = New-NativePathTestRoot 'native-file' 210
+    $fileBundle = Copy-NativePathBundle $bundle $fileRoot
+    $captureRelative = $bundle.Documents.Evidence.lanes[0].captures[0].artifact_path.Replace('/', '\')
+    $longFile = Join-Path $fileBundle.ArtifactRoot $captureRelative
+    Assert-True ($longFile.Length -gt 260 -and [IO.Path]::GetDirectoryName($longFile).Length -lt 260) 'Long-file fixture does not independently cross MAX_PATH at the final file.'
+    $fileResult = Invoke-Evaluator $fileBundle
+    Assert-True ($fileResult.ExitCode -eq 0 -and $fileResult.Stdout -ceq $original.Stdout) "Byte-identical long-file bundle changed its complete qualification decision: $($fileResult.Stderr)"
+    $positive++
+
+    $ancestorRoot = New-NativePathTestRoot 'native-ancestor' 310
+    $ancestorBundle = Copy-NativePathBundle $bundle $ancestorRoot
+    Assert-True ($ancestorBundle.Root.Length -gt 260 -and $ancestorBundle.PlanPath.Length -lt 1024) 'Long-ancestor fixture does not cross MAX_PATH within the native bound.'
+    $ancestorResult = Invoke-Evaluator $ancestorBundle
+    Assert-True ($ancestorResult.ExitCode -eq 0 -and $ancestorResult.Stdout -ceq $original.Stdout) "Byte-identical long-ancestor bundle changed its complete qualification decision: $($ancestorResult.Stderr)"
+    $positive++
+
+    $artifact = Join-Path $ancestorBundle.ArtifactRoot ($bundle.Documents.Evidence.lanes[0].artifact_inventory[0].artifact_path.Replace('/', '\'))
+    $reader = [IO.FileStream]::new($artifact, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $result = Invoke-Evaluator $ancestorBundle
+        Assert-True ($result.ExitCode -eq 0 -and $result.Stdout -ceq $original.Stdout) "Long-path compatible reader changed qualification: $($result.Stderr)"
+        $positive++
+    }
+    finally { $reader.Dispose() }
+    $writer = [IO.FileStream]::new($artifact, [IO.FileMode]::Open, [IO.FileAccess]::Write, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $result = Invoke-Evaluator $ancestorBundle
+        Assert-Rejected $result 'Long-path retained writer' 'Win32 error 32'
+        Assert-True ([string]::IsNullOrWhiteSpace($result.Stdout) -and -not $result.Stderr.Contains($ancestorRoot)) 'Long-path writer emitted a decision or exposed its absolute path.'
+        $negative++
+    }
+    finally { $writer.Dispose() }
+    $released = Invoke-Evaluator $ancestorBundle
+    Assert-True ($released.ExitCode -eq 0 -and $released.Stdout -ceq $original.Stdout) "Long-path writer release did not restore byte-identical qualification: $($released.Stderr)"
+    $positive++
+
+    $junction = Join-Path $ancestorRoot 'artifact-junction'
+    New-Item -ItemType Junction -Path $junction -Target $ancestorBundle.ArtifactRoot | Out-Null
+    try { Assert-Rejected (Invoke-Evaluator $ancestorBundle $true $false '' '' $junction) 'Long-path junction ancestor' 'physical Windows directory'; $negative++ }
+    finally { [IO.Directory]::Delete($junction) }
+    $hardlink = Join-Path $ancestorRoot 'plan-hardlink.json'
+    # Fixture creation has its own native MAX_PATH boundary; do not let the
+    # PowerShell hardlink utility obscure the qualification reader contract.
+    New-Item -ItemType HardLink -Path ('\\?\' + $hardlink) -Target ('\\?\' + $ancestorBundle.PlanPath) | Out-Null
+    try { Assert-Rejected (Invoke-Evaluator $ancestorBundle $true $false $hardlink) 'Long-path hardlink' 'exactly one hard link'; $negative++ }
+    finally { [IO.File]::Delete($hardlink) }
+    $stream = $ancestorBundle.EvidencePath + ':hidden'
+    [IO.File]::WriteAllText($stream, 'hidden', $Utf8)
+    try { Assert-Rejected (Invoke-Evaluator $ancestorBundle) 'Long-path named stream' 'unnamed data stream'; $negative++ }
+    finally { [IO.File]::Delete($stream) }
+
+    $rawCases = @(
+        @{ Label = 'Raw plan trailing dot'; Plan = $ancestorBundle.PlanPath + '.'; Root = '' },
+        @{ Label = 'Raw plan trailing space'; Plan = $ancestorBundle.PlanPath + ' '; Root = '' },
+        @{ Label = 'Raw artifact root trailing dot'; Plan = ''; Root = $ancestorBundle.ArtifactRoot + '.' },
+        @{ Label = 'Raw artifact root trailing space'; Plan = ''; Root = $ancestorBundle.ArtifactRoot + ' ' },
+        @{ Label = 'Raw extended plan namespace'; Plan = '\\?\' + $ancestorBundle.PlanPath; Root = '' },
+        @{ Label = 'Raw extended artifact namespace'; Plan = ''; Root = '\\?\' + $ancestorBundle.ArtifactRoot },
+        @{ Label = 'Raw UNC plan namespace'; Plan = '\\localhost\' + $ancestorBundle.PlanPath.Replace(':', '$'); Root = '' },
+        @{ Label = 'Raw device artifact namespace'; Plan = ''; Root = '\\.\' + $ancestorBundle.ArtifactRoot },
+        @{ Label = 'Raw plan alternate-stream selector'; Plan = $ancestorBundle.PlanPath + ':hidden'; Root = '' }
+    )
+    Assert-True ($rawCases.Count -eq 9) 'Native-path endpoint negative matrix changed without updating discovery expectations.'
+    foreach ($case in $rawCases) {
+        $result = Invoke-Evaluator $ancestorBundle $true $false $case.Plan '' $case.Root
+        Assert-Rejected $result $case.Label
+        Assert-True ([string]::IsNullOrWhiteSpace($result.Stdout)) "$($case.Label) emitted an output decision."
+        $negative++
+    }
+
+    # Exercise the actual embedded native implementation cheaply, including
+    # every component position; endpoint tests above cover its real wrappers.
+    $nativeAst = $EvaluatorAst.Find({ param($node) $node -is [Management.Automation.Language.StringConstantExpressionAst] -and $node.Value.Contains('namespace ScribeWindowsQualification') }, $true)
+    Assert-True ($null -ne $nativeAst) 'Could not find the actual embedded qualification native helper.'
+    if ($null -eq ('ScribeWindowsQualification.NativeFile' -as [type])) { Add-Type -TypeDefinition $nativeAst.Value }
+    [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetPathRoot($bundle.Root)); $nativePositive++
+    foreach ($path in @(
+        ($bundle.Root + '\.\plan.json'),
+        ($bundle.ArtifactRoot + '\..\plan.json'),
+        [IO.Path]::GetRelativePath([Environment]::CurrentDirectory, $bundle.PlanPath)
+    )) {
+        [byte[]]$bytes = [ScribeWindowsQualification.NativeFile]::ReadBound($path, 16MB)
+        Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($before['plan.json'], $bytes)) 'Ordinary relative or dot-component resolution changed bound bytes.'
+        $nativePositive++
+    }
+    [byte[]]$smallBytes = $Utf8.GetBytes('bounded-native-path')
+    $boundLeaf = 'boundary.evidence'
+    $boundRoot = New-NativePathTestRoot 'native-bound' (1024 - 1 - $boundLeaf.Length)
+    $boundPath = Join-Path $boundRoot $boundLeaf
+    [IO.File]::WriteAllBytes($boundPath, $smallBytes)
+    Assert-True ($boundPath.Length -eq 1024) 'Native maximum-path fixture is not exactly 1024 characters.'
+    Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($smallBytes, [ScribeWindowsQualification.NativeFile]::ReadBound($boundPath, $smallBytes.Length))) 'Native reader rejected or changed a file at the exact 1024-character path bound.'
+    $nativePositive++
+    $nativeFailure = $null
+    try { [ScribeWindowsQualification.NativeFile]::ReadBound($boundPath + 'x', $smallBytes.Length) | Out-Null } catch { $nativeFailure = $_.Exception.GetBaseException() }
+    Assert-True ($null -ne $nativeFailure -and $nativeFailure -is [IO.PathTooLongException]) 'Native reader did not reject 1025 characters at the application bound.'
+    $nativeNegative++
+
+    foreach ($component in @('console.txt', 'COM0.txt', 'COM10.txt', 'LPT0.txt', 'LPT10.txt', '.résumé evidence.txt')) {
+        $path = Join-Path $TestRoot $component
+        [IO.File]::WriteAllBytes($path, $smallBytes)
+        Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($smallBytes, [ScribeWindowsQualification.NativeFile]::ReadBound($path, $smallBytes.Length))) 'Native component validation rejected a non-reserved name.'
+        $nativePositive++
+    }
+    $invalidComponents = @(
+        'trailing.', 'trailing ', 'embedded<name', 'embedded>name', 'embedded|name', 'embedded?name', 'embedded*name', 'embedded"name',
+        ('control' + [char]0 + 'name'), ('control' + [char]1 + 'name'), ('control' + [char]31 + 'name'), 'file:stream',
+        'con', 'CON.txt', 'prn.log', 'AUX', 'NUL.bin', 'COM1', 'COM9.ext', 'LPT1', 'LPT9.csv',
+        'COM¹.bin', 'COM²', 'COM³', 'LPT¹.bin', 'LPT²', 'LPT³', 'CONIN$', 'CONOUT$', 'CLOCK$'
+    )
+    Assert-True ($invalidComponents.Count -eq 30) 'Native invalid-component matrix changed without updating discovery expectations.'
+    foreach ($component in $invalidComponents) {
+        foreach ($path in @(($bundle.Root + '\' + $component), ($bundle.Root + '\' + $component + '\plan.json'))) {
+            $nativeFailure = $null
+            try { [ScribeWindowsQualification.NativeFile]::ReadBound($path, 16MB) | Out-Null } catch { $nativeFailure = $_.Exception.GetBaseException() }
+            Assert-True ($null -ne $nativeFailure -and $nativeFailure -is [InvalidOperationException]) 'Native reader did not reject an ambiguous or reserved leaf/ancestor component before filesystem access.'
+            $nativeNegative++
+        }
+    }
+    foreach ($path in @(('\\?\' + $bundle.PlanPath), ('\\.\' + $bundle.PlanPath), ('\??\' + $bundle.PlanPath), ('\\localhost\' + $bundle.PlanPath.Replace(':', '$')), ('\\?\UNC\localhost\' + $bundle.PlanPath.Replace(':', '$')))) {
+        $nativeFailure = $null
+        try { [ScribeWindowsQualification.NativeFile]::ReadBound($path, 16MB) | Out-Null } catch { $nativeFailure = $_.Exception.GetBaseException() }
+        Assert-True ($null -ne $nativeFailure -and $nativeFailure -is [InvalidOperationException]) 'Native reader accepted a caller-supplied nonlocal/device/extended namespace.'
+        $nativeNegative++
+    }
+    foreach ($leaf in @('literal-dot.', 'literal-space ')) {
+        $path = Join-Path $ancestorRoot $leaf
+        $literalPath = '\\?\' + $path
+        [IO.File]::WriteAllBytes($literalPath, $smallBytes)
+        try {
+            Assert-True ([IO.File]::Exists($literalPath)) 'Literal ambiguous-name fixture was not physically created.'
+            $nativeFailure = $null
+            try { [ScribeWindowsQualification.NativeFile]::ReadBound($path, $smallBytes.Length) | Out-Null } catch { $nativeFailure = $_.Exception.GetBaseException() }
+            Assert-True ($null -ne $nativeFailure -and $nativeFailure -is [InvalidOperationException]) 'Native-prefix handling exposed a literal trailing-dot/space file.'
+            $nativeNegative++
+        }
+        finally { [IO.File]::Delete($literalPath) }
+    }
+    foreach ($copy in @($bundle, $fileBundle, $ancestorBundle)) {
+        Assert-True (@([IO.Directory]::EnumerateFiles($copy.Root, '*', [IO.SearchOption]::AllDirectories)).Count -eq $before.Count) 'Native-path tests changed the copied bundle file inventory.'
+        foreach ($relative in $before.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($before[$relative], [IO.File]::ReadAllBytes((Join-Path $copy.Root $relative)))) 'Native-path tests changed immutable original or copied fixture bytes.' }
+    }
+    return [pscustomobject]@{ Positive = $positive; Negative = $negative; NativePositive = $nativePositive; NativeNegative = $nativeNegative }
+}
+
 function Get-Capture($Documents, [string]$Scope, [int]$Ordinal = 0) { return @($Documents.Evidence.lanes[0].captures | Where-Object { $_.launch_scope -ceq $Scope })[$Ordinal] }
 
 function Assert-MutatedCaptureRejected([string]$Name, [string]$Scope, [string]$Which, [scriptblock]$Mutation, [string]$Expected = '') {
@@ -1580,21 +1759,28 @@ try {
     $checkedProbe = [pscustomobject]@{ PlanPath = $CheckedPlanPath; EvidencePath = $checkedEvidencePath; ArtifactRoot = $TestRoot }
     Assert-Rejected (Invoke-Evaluator $checkedProbe $false) 'Checked-in default-deny plan validation' 'not approved by the protected production authority'
 
-    if ($FileBoundaryOnly -or (-not $ColdAdmissionOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+    if ($NativePathOnly -or (-not $FileBoundaryOnly -and -not $ColdAdmissionOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+        $nativePathCounts = Invoke-NativePathContractTests $evaluatorAst
+        Assert-True ($nativePathCounts.Positive -eq 5 -and $nativePathCounts.Negative -eq 13 -and $nativePathCounts.NativePositive -eq 11 -and $nativePathCounts.NativeNegative -eq 68) 'Native-path suite did not discover all five/thirteen endpoint and eleven/sixty-eight direct helper cases.'
+        foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Native-path tests modified immutable repository input: $name." }
+        Write-Output "Windows GPU native-path contract tests passed ($($nativePathCounts.Positive) positive, $($nativePathCounts.Negative) negative endpoint; $($nativePathCounts.NativePositive) positive, $($nativePathCounts.NativeNegative) negative native)."
+        if ($NativePathOnly) { return }
+    }
+    if ($FileBoundaryOnly -or (-not $NativePathOnly -and -not $ColdAdmissionOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
         $fileBoundaryCounts = Invoke-FileBoundaryContractTests
         Assert-True ($fileBoundaryCounts.Positive -eq 2 -and $fileBoundaryCounts.Negative -eq 2) 'File-boundary suite did not discover both positive and both negative cases.'
         foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "File-boundary tests modified immutable repository input: $name." }
         Write-Output "Windows GPU file-boundary diagnostic contract tests passed ($($fileBoundaryCounts.Positive) positive, $($fileBoundaryCounts.Negative) negative)."
         if ($FileBoundaryOnly) { return }
     }
-    if ($ColdAdmissionOnly -or (-not $FileBoundaryOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+    if ($ColdAdmissionOnly -or (-not $NativePathOnly -and -not $FileBoundaryOnly -and -not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
         $coldAdmissionCounts = Invoke-ColdAdmissionContractTests
         Assert-True ($coldAdmissionCounts.Positive -eq 12 -and $coldAdmissionCounts.Negative -eq 17) 'Cold-admission suite did not discover all twelve positive and seventeen negative cases.'
         foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Cold-admission tests modified immutable repository input: $name." }
         Write-Output "Windows GPU cold-load admission contract tests passed ($($coldAdmissionCounts.Positive) positive, $($coldAdmissionCounts.Negative) negative)."
         if ($ColdAdmissionOnly) { return }
     }
-    if ($CaptureAdmissionOnly -or (-not $FileBoundaryOnly -and -not $ColdAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+    if ($CaptureAdmissionOnly -or (-not $NativePathOnly -and -not $FileBoundaryOnly -and -not $ColdAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
         $admissionCounts = Invoke-CaptureAdmissionContractTests
         foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Admission tests modified immutable repository input: $name." }
         Write-Output "Windows GPU pre-capture admission contract tests passed ($($admissionCounts.Positive) positive, $($admissionCounts.Negative) negative)."
