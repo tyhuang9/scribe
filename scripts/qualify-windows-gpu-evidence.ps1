@@ -156,7 +156,7 @@ namespace ScribeWindowsQualification
             try
             {
                 file = CreateFileW(
-                    path,
+                    @"\\?\" + path,
                     GenericRead | FileReadAttributes,
                     FileShareRead,
                     IntPtr.Zero,
@@ -219,7 +219,7 @@ namespace ScribeWindowsQualification
             string path = CanonicalLocalPath(finalDirectory);
             string root = Path.GetPathRoot(path);
             List<string> paths = new List<string>();
-            string current = path.TrimEnd(Path.DirectorySeparatorChar);
+            string current = path.Length == root.Length ? root : path.TrimEnd(Path.DirectorySeparatorChar);
             while (!string.IsNullOrEmpty(current))
             {
                 paths.Add(current);
@@ -234,7 +234,7 @@ namespace ScribeWindowsQualification
                 foreach (string directory in paths)
                 {
                     SafeFileHandle handle = CreateFileW(
-                        directory,
+                        @"\\?\" + directory,
                         FileReadAttributes,
                         FileShareRead,
                         IntPtr.Zero,
@@ -270,6 +270,10 @@ namespace ScribeWindowsQualification
         {
             if (string.IsNullOrWhiteSpace(suppliedPath))
                 throw new ArgumentException("Qualification path is empty.", nameof(suppliedPath));
+            // Validate spelling before GetFullPath can normalize an alias into
+            // a different object. Native extended paths must not expand the
+            // accepted namespace to verbatim Windows device/ambiguous names.
+            ValidateOrdinaryComponents(suppliedPath);
             string path = Path.GetFullPath(suppliedPath);
             string root = Path.GetPathRoot(path);
             if (string.IsNullOrEmpty(root) || root.Length != 3 || root[1] != ':' || root[2] != Path.DirectorySeparatorChar)
@@ -278,7 +282,35 @@ namespace ScribeWindowsQualification
                 throw new InvalidOperationException("Qualification paths must not select an alternate data stream.");
             if (path.Length > 1024)
                 throw new PathTooLongException("Qualification path exceeds its native bound.");
+            ValidateOrdinaryComponents(path);
             return path;
+        }
+
+        private static void ValidateOrdinaryComponents(string suppliedPath)
+        {
+            string spelling = suppliedPath.Replace('/', '\\');
+            if (spelling.StartsWith(@"\\", StringComparison.Ordinal))
+                throw new InvalidOperationException("Qualification paths must use a local drive-rooted Windows path.");
+            string suffix = spelling.Length >= 2 && spelling[1] == ':' ? spelling.Substring(2) : spelling;
+            if (suffix.IndexOf(':') >= 0)
+                throw new InvalidOperationException("Qualification paths must not select an alternate data stream.");
+            foreach (string component in suffix.Split('\\'))
+            {
+                // Ordinary relative navigation is resolved before adding the
+                // internal native prefix. Never pass it through verbatim.
+                if (component.Length == 0 || component == "." || component == "..") continue;
+                if (component.EndsWith(" ", StringComparison.Ordinal) || component.EndsWith(".", StringComparison.Ordinal))
+                    throw new InvalidOperationException("Qualification path contains an ambiguous Windows component.");
+                foreach (char character in component)
+                    if (character < 0x20 || "\"*<>?|".IndexOf(character) >= 0)
+                        throw new InvalidOperationException("Qualification path contains an invalid Windows component.");
+                string stem = component.Split('.')[0].TrimEnd(' ').ToUpperInvariant();
+                bool numberedDevice = stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal)) &&
+                    "123456789\u00b9\u00b2\u00b3".IndexOf(stem[3]) >= 0;
+                if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" || stem == "CLOCK$" ||
+                    stem == "CONIN$" || stem == "CONOUT$" || numberedDevice)
+                    throw new InvalidOperationException("Qualification path contains a reserved Windows component.");
+            }
         }
 
         private static void VerifyFinalPath(SafeFileHandle handle, string expected, bool directory)
@@ -535,7 +567,7 @@ function Get-PackComponent($Value, [string]$Label) {
 
 function Get-BoundBytes([string]$Path, [string]$Label, [int]$MaximumBytes = $MaxInputBytes) {
     try {
-        return ,([ScribeWindowsQualification.NativeFile]::ReadBound([IO.Path]::GetFullPath($Path), $MaximumBytes))
+        return ,([ScribeWindowsQualification.NativeFile]::ReadBound($Path, $MaximumBytes))
     }
     catch {
         Fail "Could not read $Label through the Windows qualification boundary: $($_.Exception.Message)"
@@ -2497,7 +2529,7 @@ function Get-PerformanceDecision($Plan, [byte[]]$PlanRaw, $Evidence, [string]$Re
     Assert-Condition ((Get-Sha256Value $Evidence.plan_sha256 'performance evidence.plan_sha256') -ceq $planDigest) 'Performance evidence does not bind the exact authorized plan.'
     Assert-Array $Evidence.lanes 'performance evidence.lanes'; [object[]]$lanes = @($Evidence.lanes)
     Assert-Condition ($lanes.Count -le $MaxLanes -and $lanes.Count -eq $validatedPlan.Required.Count) 'Performance evidence does not exactly cover the reviewed lanes.'
-    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty performance evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) } catch { Fail "Performance artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
+    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty performance evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory($ArtifactDirectory) } catch { Fail "Performance artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
     $context = [pscustomobject]@{ Root = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { '' } else { [IO.Path]::GetFullPath($ArtifactDirectory) }; Paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Count = 0; Bytes = [UInt64]0; Inventory = $null; Used = $null }
     $generationCaptures = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $captureGenerations = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $challenges = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $validatedCaptures = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     $summaries = [Collections.Generic.List[object]]::new()
@@ -2547,7 +2579,7 @@ function Get-Decision($Plan, [byte[]]$PlanRaw, $Evidence, [string]$RepositoryRoo
     Assert-Condition ($lanes.Count -eq $validatedPlan.Required.Count) 'Qualification evidence does not cover every representative lane.'
     if ($lanes.Count -gt 0) {
         Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty qualification evidence requires -ArtifactRoot.'
-        try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) }
+        try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory($ArtifactDirectory) }
         catch { Fail "Artifact root is not a physical Windows directory: $($_.Exception.Message)" }
     }
     $context = [pscustomobject]@{
@@ -2619,7 +2651,7 @@ function Get-MaintainerReviewedQualificationDecision($Plan, [byte[]]$PlanRaw, $E
     Assert-Condition ((Get-Sha256Value $Evidence.plan_sha256 'maintainer qualification evidence.plan_sha256') -ceq $planDigest) 'Maintainer qualification evidence does not bind the exact reviewed plan.'
     Assert-Array $Evidence.lanes 'maintainer qualification evidence.lanes'; [object[]]$lanes = @($Evidence.lanes)
     Assert-Condition ($lanes.Count -le $MaxLanes -and $lanes.Count -eq $validatedPlan.Required.Count) 'Maintainer qualification evidence does not exactly cover the reviewed lanes.'
-    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty maintainer qualification evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) } catch { Fail "Maintainer qualification artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
+    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty maintainer qualification evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory($ArtifactDirectory) } catch { Fail "Maintainer qualification artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
     $context = [pscustomobject]@{ Root = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { '' } else { [IO.Path]::GetFullPath($ArtifactDirectory) }; Paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Count = 0; Bytes = [UInt64]0; Inventory = $null; Used = $null }
     $generationCaptures = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $captureGenerations = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $challenges = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $validatedCaptures = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $summaries = [Collections.Generic.List[object]]::new()
     $laneKeys = @('identity', 'acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'scenarios', 'captures', 'battery', 'artifact_inventory')
@@ -2648,7 +2680,7 @@ function Get-MaintainerReviewedPerformanceDecision($Plan, [byte[]]$PlanRaw, $Evi
     Assert-Condition ((Get-Sha256Value $Evidence.plan_sha256 'maintainer performance evidence.plan_sha256') -ceq $planDigest) 'Maintainer performance evidence does not bind the exact reviewed plan.'
     Assert-Array $Evidence.lanes 'maintainer performance evidence.lanes'; [object[]]$lanes = @($Evidence.lanes)
     Assert-Condition ($lanes.Count -le $MaxLanes -and $lanes.Count -eq $validatedPlan.Required.Count) 'Maintainer performance evidence does not exactly cover the reviewed lanes.'
-    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty maintainer performance evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory([IO.Path]::GetFullPath($ArtifactDirectory)) } catch { Fail "Maintainer performance artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
+    if ($lanes.Count -gt 0) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($ArtifactDirectory)) 'Nonempty maintainer performance evidence requires -ArtifactRoot.'; try { [ScribeWindowsQualification.NativeFile]::ValidatePhysicalDirectory($ArtifactDirectory) } catch { Fail "Maintainer performance artifact root is not a physical Windows directory: $($_.Exception.Message)" } }
     $context = [pscustomobject]@{ Root = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { '' } else { [IO.Path]::GetFullPath($ArtifactDirectory) }; Paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Digests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Count = 0; Bytes = [UInt64]0; Inventory = $null; Used = $null }
     $generationCaptures = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $captureGenerations = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal); $challenges = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $validatedCaptures = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $summaries = [Collections.Generic.List[object]]::new()
     $laneKeys = @('identity', 'acquisition_artifact_path', 'acquisition_artifact_sha256', 'run_sets', 'captures', 'battery', 'artifact_inventory')

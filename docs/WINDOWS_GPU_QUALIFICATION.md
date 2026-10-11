@@ -318,6 +318,17 @@ backslashes, colons, parent traversal, case collisions, duplicate paths, and
 duplicate digests are rejected. Nothing from evidence is executed or
 dot-sourced.
 
+Ordinary input paths resolve to local drive-rooted Windows paths bounded to
+1024 characters. The reader adds an extended-length prefix only to its native
+file and ancestor opens; it does not depend on the host's long-path policy or
+require a Windows configuration change. Callers cannot supply UNC, device or
+extended namespace paths. Before normalization, ambiguous components ending in
+a dot or space, reserved DOS device names (including extensions), and invalid
+Windows filename characters are rejected. This deliberately rejects aliases
+that ordinary Windows normalization might previously have redirected. Normal
+relative navigation, Unicode, internal spaces and leading-dot names remain
+supported. The prefix does not weaken retained-handle or identity checks.
+
 Input JSON must be strict UTF-8, printable ASCII, canonical compact JSON with
 one LF, bounded integers only, no comments or trailing commas, and no duplicate
 or case-colliding fields. Every object uses an exact field allowlist. Each
