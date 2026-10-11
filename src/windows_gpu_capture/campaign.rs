@@ -1,7 +1,8 @@
 //! Bounded paired CPU/GPU observation campaign.
 //!
-//! This remains an unsigned observation artifact. It deliberately makes no
-//! qualification, admission, evaluator, signature, memory-floor, thermal, or
+//! This remains an unsigned observation artifact. It may project validated
+//! source-defined memory measurements, but deliberately makes no qualification,
+//! admission-policy, evaluator, signature, memory-floor, thermal, or
 //! background-load claim.
 
 use std::io::Seek;
@@ -25,7 +26,7 @@ use crate::backend_policy::PowerSource;
 use crate::model_catalog::ArtifactFormat;
 use crate::onnx_worker::{
     CaptureObservationWorker, CaptureObservationWorkerFactory, GpuCaptureObservationIdentity,
-    WorkerObservationLease,
+    WorkerMemoryAvailability, WorkerObservationLease, validate_capture_worker_memory,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
@@ -33,7 +34,7 @@ use crate::runtime_contract::WARM_MODEL_TTL;
 use crate::transcription::{AccelerationPreference, ModelId};
 
 const KIND: &str = "windows_gpu_capture_campaign";
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 3;
 const COLD_PAIRS: u8 = 5;
 const WARM_PAIRS: u8 = 20;
 const MAX_CAPTURES: usize = 14;
@@ -244,12 +245,78 @@ struct CampaignRunRecord {
     raw_provider_memory: Option<ProviderMemoryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory_availability: Option<MemoryAvailabilityReport>,
+    available_device_memory_bytes_before: Option<u64>,
+    available_device_memory_bytes_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker_process_affinity: Option<ProcessAffinityPair>,
     #[serde(skip_serializing_if = "Option::is_none")]
     normalized_transcript_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<FailureDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionMemoryPair {
+    before: Option<u64>,
+    after: Option<u64>,
+}
+
+impl AdmissionMemoryPair {
+    const fn unavailable() -> Self {
+        Self {
+            before: None,
+            after: None,
+        }
+    }
+
+    const fn observed(before: u64, after: u64) -> Self {
+        Self {
+            before: Some(before),
+            after: Some(after),
+        }
+    }
+}
+
+fn project_admission_memory(
+    target: Target,
+    expected_gpu: Option<&GpuCaptureObservationIdentity>,
+    availability: &MemoryAvailabilityReport,
+) -> Result<AdmissionMemoryPair> {
+    for endpoint in [&availability.before, &availability.after] {
+        validate_capture_worker_memory(endpoint, target.preference(), expected_gpu)?;
+    }
+
+    if target == Target::Cpu {
+        return Ok(AdmissionMemoryPair::unavailable());
+    }
+
+    let (
+        WorkerMemoryAvailability::Observed {
+            memory_total_bytes: before_total,
+            available_memory_bytes: before,
+            ..
+        },
+        WorkerMemoryAvailability::Observed {
+            memory_total_bytes: after_total,
+            available_memory_bytes: after,
+            ..
+        },
+    ) = (&availability.before, &availability.after)
+    else {
+        return Ok(AdmissionMemoryPair::unavailable());
+    };
+
+    let expected = expected_gpu.ok_or_else(|| {
+        anyhow!("GPU admission-memory projection omitted its authenticated identity")
+    })?;
+    if expected.backend == "vulkan"
+        && (*before_total != expected.memory_total_bytes
+            || *after_total != expected.memory_total_bytes)
+    {
+        return Ok(AdmissionMemoryPair::unavailable());
+    }
+
+    Ok(AdmissionMemoryPair::observed(*before, *after))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -359,6 +426,8 @@ impl CampaignRunRecord {
             video_memory: None,
             raw_provider_memory: None,
             memory_availability: None,
+            available_device_memory_bytes_before: None,
+            available_device_memory_bytes_after: None,
             worker_process_affinity: None,
             normalized_transcript_sha256: None,
             failure: Some(failure),
@@ -1721,6 +1790,19 @@ fn observe_attempt(
             );
         }
     };
+    let admission_memory = match project_admission_memory(
+        spec.target,
+        worker.gpu_identity.as_ref(),
+        &report.memory_availability,
+    ) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return failed(
+                FailureStage::ObservationValidation,
+                FailureCategory::ObservationFailed,
+            );
+        }
+    };
     CampaignRunRecord {
         measured: spec.measured,
         phase: spec.phase,
@@ -1740,6 +1822,8 @@ fn observe_attempt(
         video_memory: Some(report.video_memory),
         raw_provider_memory: Some(report.provider_memory),
         memory_availability: Some(report.memory_availability),
+        available_device_memory_bytes_before: admission_memory.before,
+        available_device_memory_bytes_after: admission_memory.after,
         worker_process_affinity: process_affinity_pair(
             affinity_before.as_ref(),
             affinity_after
@@ -1899,7 +1983,12 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
             bail!("campaign request contains invalid affinity observations")
         }
         if record.status == RecordStatus::Failed {
-            if record.failure.is_none() || !report.incomplete || index + 1 != report.runs.len() {
+            if record.failure.is_none()
+                || !report.incomplete
+                || index + 1 != report.runs.len()
+                || record.available_device_memory_bytes_before.is_some()
+                || record.available_device_memory_bytes_after.is_some()
+            {
                 bail!("campaign failed request is missing its terminal failure")
             }
             continue;
@@ -1927,6 +2016,23 @@ fn validate_report(report: &CampaignReport) -> Result<()> {
                 .is_none_or(|digest| super::canonical_sha256(digest).is_err())
         {
             bail!("campaign successful request omitted verified observations")
+        }
+        let projected_admission_memory = project_admission_memory(
+            record.target,
+            report.gpu_identity.as_ref(),
+            record
+                .memory_availability
+                .as_ref()
+                .expect("successful request checked its memory availability"),
+        )?;
+        if (
+            record.available_device_memory_bytes_before,
+            record.available_device_memory_bytes_after,
+        ) != (
+            projected_admission_memory.before,
+            projected_admission_memory.after,
+        ) {
+            bail!("campaign request contains an invalid admission-memory projection")
         }
     }
     if !report.incomplete
@@ -1984,8 +2090,31 @@ fn mark_collector_constraint_failure(report: &mut CampaignReport) {
 mod tests {
     use super::*;
     use crate::onnx_worker::{
-        ProviderMemoryNotApplicableReason, ProviderMemoryObservation, WorkerMemoryAvailability,
+        ProviderMemoryNotApplicableReason, ProviderMemoryObservation, VulkanMemoryHeapObservation,
+        VulkanMemoryHeapSelection, WorkerMemoryAvailability, WorkerMemoryAvailabilitySource,
+        WorkerMemoryUnavailableReason,
     };
+
+    fn gpu_identity(
+        backend: &str,
+        device_class: &str,
+        memory_total_bytes: u64,
+    ) -> GpuCaptureObservationIdentity {
+        GpuCaptureObservationIdentity {
+            backend: backend.into(),
+            provider: "fixture-provider".into(),
+            stable_device: "native:luid:0102030405060708".into(),
+            driver: "fixture-driver".into(),
+            device_class: device_class.into(),
+            vendor: "intel".into(),
+            memory_total_bytes,
+            pack_id: "fixture-pack".into(),
+            pack_version: "1".into(),
+            pack_sha256: "c".repeat(64),
+            pack_security_epoch: 1,
+            runtime_abi: 1,
+        }
+    }
 
     fn builder() -> ReportBuilder {
         ReportBuilder::new(
@@ -1994,21 +2123,67 @@ mod tests {
                 model_sha256: "a".repeat(64),
                 wav_sha256: "b".repeat(64),
             },
-            Some(GpuCaptureObservationIdentity {
-                backend: "vulkan".into(),
-                provider: "fixture-provider".into(),
-                stable_device: "native:luid:0102030405060708".into(),
-                driver: "fixture-driver".into(),
-                device_class: "integrated_gpu".into(),
-                vendor: "intel".into(),
-                memory_total_bytes: 1024,
-                pack_id: "fixture-pack".into(),
-                pack_version: "1".into(),
-                pack_sha256: "c".repeat(64),
-                pack_security_epoch: 1,
-                runtime_abi: 1,
-            }),
+            Some(gpu_identity("vulkan", "integrated_gpu", 1024)),
         )
+    }
+
+    fn unavailable_memory() -> WorkerMemoryAvailability {
+        WorkerMemoryAvailability::Unavailable {
+            reason: WorkerMemoryUnavailableReason::ProviderQueryFailed,
+        }
+    }
+
+    fn cuda_memory(available_memory_bytes: u64) -> WorkerMemoryAvailability {
+        WorkerMemoryAvailability::Observed {
+            backend: "cuda".into(),
+            provider_id: "fixture-provider".into(),
+            stable_device: "native:luid:0102030405060708".into(),
+            memory_total_bytes: 1024,
+            available_memory_bytes,
+            source: WorkerMemoryAvailabilitySource::CudaMemGetInfo,
+        }
+    }
+
+    fn vulkan_heap(
+        heap_index: u8,
+        size_bytes: u64,
+        flags: u32,
+        budget_bytes: u64,
+        usage_bytes: u64,
+    ) -> VulkanMemoryHeapObservation {
+        VulkanMemoryHeapObservation {
+            heap_index,
+            size_bytes,
+            flags,
+            budget_bytes,
+            usage_bytes,
+        }
+    }
+
+    fn vulkan_memory(
+        heap_selection: VulkanMemoryHeapSelection,
+        memory_total_bytes: u64,
+        available_memory_bytes: u64,
+        heaps: Vec<VulkanMemoryHeapObservation>,
+    ) -> WorkerMemoryAvailability {
+        WorkerMemoryAvailability::Observed {
+            backend: "vulkan".into(),
+            provider_id: "fixture-provider".into(),
+            stable_device: "native:luid:0102030405060708".into(),
+            memory_total_bytes,
+            available_memory_bytes,
+            source: WorkerMemoryAvailabilitySource::VulkanMemoryBudget {
+                heap_selection,
+                heaps,
+            },
+        }
+    }
+
+    fn availability_report(
+        before: WorkerMemoryAvailability,
+        after: WorkerMemoryAvailability,
+    ) -> MemoryAvailabilityReport {
+        MemoryAvailabilityReport { before, after }
     }
 
     fn capture(report: &mut CampaignReport, target: Target, purpose: CapturePurpose) -> String {
@@ -2075,6 +2250,16 @@ mod tests {
                     )
                 }
             };
+            let memory_availability = MemoryAvailabilityReport {
+                before: availability.clone(),
+                after: availability,
+            };
+            let admission_memory = project_admission_memory(
+                spec.target,
+                report.gpu_identity.as_ref(),
+                &memory_availability,
+            )
+            .unwrap();
             report.runs.push(CampaignRunRecord {
                 measured: spec.measured,
                 phase: spec.phase,
@@ -2096,10 +2281,9 @@ mod tests {
                     before: provider.clone(),
                     after: provider,
                 }),
-                memory_availability: Some(MemoryAvailabilityReport {
-                    before: availability.clone(),
-                    after: availability,
-                }),
+                memory_availability: Some(memory_availability),
+                available_device_memory_bytes_before: admission_memory.before,
+                available_device_memory_bytes_after: admission_memory.after,
                 worker_process_affinity: process_affinity_pair(
                     Some(&ProcessAffinityObservation::Available {
                         processor_group: 0,
@@ -2177,6 +2361,293 @@ mod tests {
             }
         }
         assert!(!specs[10].measured && !specs[11].measured);
+    }
+
+    #[test]
+    fn admission_memory_projects_cuda_observed_endpoints() {
+        let expected = gpu_identity("cuda", "discrete_gpu", 1024);
+        let projected = project_admission_memory(
+            Target::Gpu,
+            Some(&expected),
+            &availability_report(cuda_memory(768), cuda_memory(256)),
+        )
+        .unwrap();
+        assert_eq!(projected, AdmissionMemoryPair::observed(768, 256));
+    }
+
+    #[test]
+    fn admission_memory_projects_integrated_and_discrete_vulkan_observed_endpoints() {
+        let integrated = gpu_identity("vulkan", "integrated_gpu", 1024);
+        let integrated_projected = project_admission_memory(
+            Target::Gpu,
+            Some(&integrated),
+            &availability_report(
+                vulkan_memory(
+                    VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                    1024,
+                    600,
+                    vec![
+                        vulkan_heap(0, 256, 0b10, 256, 128),
+                        vulkan_heap(1, 768, 0b1, 768, 296),
+                    ],
+                ),
+                vulkan_memory(
+                    VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                    1024,
+                    200,
+                    vec![
+                        vulkan_heap(0, 256, 0b10, 200, 100),
+                        vulkan_heap(1, 768, 0b1, 600, 500),
+                    ],
+                ),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            integrated_projected,
+            AdmissionMemoryPair::observed(600, 200)
+        );
+
+        let discrete = gpu_identity("vulkan", "discrete_gpu", 768);
+        let discrete_projected = project_admission_memory(
+            Target::Gpu,
+            Some(&discrete),
+            &availability_report(
+                vulkan_memory(
+                    VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                    768,
+                    512,
+                    vec![
+                        vulkan_heap(0, 768, 0b1, 768, 256),
+                        vulkan_heap(1, 256, 0b10, 256, 0),
+                    ],
+                ),
+                vulkan_memory(
+                    VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                    768,
+                    112,
+                    vec![
+                        vulkan_heap(0, 768, 0b1, 512, 400),
+                        vulkan_heap(1, 256, 0b10, 256, 0),
+                    ],
+                ),
+            ),
+        )
+        .unwrap();
+        assert_eq!(discrete_projected, AdmissionMemoryPair::observed(512, 112));
+    }
+
+    #[test]
+    fn admission_memory_returns_null_for_cpu_unavailable_mixed_and_vulkan_capacity_mismatch() {
+        let cpu = availability_report(
+            WorkerMemoryAvailability::NotApplicable {
+                reason: ProviderMemoryNotApplicableReason::CpuProvider,
+            },
+            WorkerMemoryAvailability::NotApplicable {
+                reason: ProviderMemoryNotApplicableReason::CpuProvider,
+            },
+        );
+        assert_eq!(
+            project_admission_memory(Target::Cpu, None, &cpu).unwrap(),
+            AdmissionMemoryPair::unavailable()
+        );
+
+        let expected = gpu_identity("vulkan", "integrated_gpu", 1024);
+        assert_eq!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected),
+                &availability_report(unavailable_memory(), unavailable_memory()),
+            )
+            .unwrap(),
+            AdmissionMemoryPair::unavailable()
+        );
+        assert_eq!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected),
+                &availability_report(
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                        1024,
+                        512,
+                        vec![vulkan_heap(0, 1024, 0b1, 768, 256)],
+                    ),
+                    unavailable_memory(),
+                ),
+            )
+            .unwrap(),
+            AdmissionMemoryPair::unavailable()
+        );
+        assert_eq!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected),
+                &availability_report(
+                    unavailable_memory(),
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                        1024,
+                        512,
+                        vec![vulkan_heap(0, 1024, 0b1, 768, 256)],
+                    ),
+                ),
+            )
+            .unwrap(),
+            AdmissionMemoryPair::unavailable()
+        );
+        assert_eq!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected),
+                &availability_report(
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                        768,
+                        512,
+                        vec![vulkan_heap(0, 768, 0b1, 768, 256)],
+                    ),
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                        1024,
+                        256,
+                        vec![vulkan_heap(0, 1024, 0b1, 512, 256)],
+                    ),
+                ),
+            )
+            .unwrap(),
+            AdmissionMemoryPair::unavailable()
+        );
+        assert_eq!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected),
+                &availability_report(
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                        1024,
+                        512,
+                        vec![vulkan_heap(0, 1024, 0b1, 768, 256)],
+                    ),
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                        768,
+                        256,
+                        vec![vulkan_heap(0, 768, 0b1, 512, 256)],
+                    ),
+                ),
+            )
+            .unwrap(),
+            AdmissionMemoryPair::unavailable()
+        );
+    }
+
+    #[test]
+    fn admission_memory_preserves_zero_and_distinct_endpoint_headroom() {
+        let expected = gpu_identity("cuda", "discrete_gpu", 1024);
+        assert_eq!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected),
+                &availability_report(cuda_memory(0), cuda_memory(513)),
+            )
+            .unwrap(),
+            AdmissionMemoryPair::observed(0, 513)
+        );
+    }
+
+    #[test]
+    fn admission_memory_validates_both_endpoints_before_projection() {
+        let expected_cuda = gpu_identity("cuda", "discrete_gpu", 1024);
+        let mut wrong_backend = cuda_memory(512);
+        let WorkerMemoryAvailability::Observed { backend, .. } = &mut wrong_backend else {
+            unreachable!()
+        };
+        *backend = "vulkan".into();
+
+        let mut wrong_provider = cuda_memory(512);
+        let WorkerMemoryAvailability::Observed { provider_id, .. } = &mut wrong_provider else {
+            unreachable!()
+        };
+        *provider_id = "wrong-provider".into();
+
+        let mut wrong_device = cuda_memory(512);
+        let WorkerMemoryAvailability::Observed { stable_device, .. } = &mut wrong_device else {
+            unreachable!()
+        };
+        *stable_device = "native:luid:1112131415161718".into();
+
+        let mut wrong_total = cuda_memory(512);
+        let WorkerMemoryAvailability::Observed {
+            memory_total_bytes, ..
+        } = &mut wrong_total
+        else {
+            unreachable!()
+        };
+        *memory_total_bytes = 1023;
+
+        let mut wrong_source = vulkan_memory(
+            VulkanMemoryHeapSelection::AllHeapsIntegrated,
+            1024,
+            512,
+            vec![vulkan_heap(0, 1024, 0b1, 768, 256)],
+        );
+        let WorkerMemoryAvailability::Observed { backend, .. } = &mut wrong_source else {
+            unreachable!()
+        };
+        *backend = "cuda".into();
+
+        for (label, before) in [
+            ("wrong backend", wrong_backend),
+            ("wrong provider", wrong_provider),
+            ("wrong stable device", wrong_device),
+            ("wrong CUDA total", wrong_total),
+            ("wrong source", wrong_source),
+        ] {
+            assert!(
+                project_admission_memory(
+                    Target::Gpu,
+                    Some(&expected_cuda),
+                    &availability_report(before, unavailable_memory()),
+                )
+                .is_err(),
+                "{label}"
+            );
+        }
+
+        let expected_vulkan = gpu_identity("vulkan", "integrated_gpu", 1024);
+        assert!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected_vulkan),
+                &availability_report(
+                    vulkan_memory(
+                        VulkanMemoryHeapSelection::DeviceLocalHeaps,
+                        1024,
+                        512,
+                        vec![vulkan_heap(0, 1024, 0b1, 768, 256)],
+                    ),
+                    unavailable_memory(),
+                ),
+            )
+            .is_err(),
+            "wrong Vulkan heap selection"
+        );
+
+        let mut malformed_after = cuda_memory(512);
+        let WorkerMemoryAvailability::Observed { backend, .. } = &mut malformed_after else {
+            unreachable!()
+        };
+        *backend = "CUDA".into();
+        assert!(
+            project_admission_memory(
+                Target::Gpu,
+                Some(&expected_cuda),
+                &availability_report(unavailable_memory(), malformed_after),
+            )
+            .is_err(),
+            "an unavailable first endpoint must not hide a malformed second endpoint"
+        );
     }
 
     #[test]
@@ -2355,12 +2826,12 @@ mod tests {
     }
 
     #[test]
-    fn complete_report_is_bounded_unsigned_and_keeps_environment_unknown() {
+    fn campaign_schema_three_serializes_admission_memory_keys_and_keeps_trust_flags() {
         let report = complete_report();
         let bytes = serialize_report(&report).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["kind"], KIND);
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["unsigned"], true);
         assert_eq!(value["unqualified"], true);
         assert_eq!(value["auto_eligible"], false);
@@ -2372,6 +2843,48 @@ mod tests {
         assert_eq!(
             value["runs"][0]["worker_process_affinity"]["changed"],
             false
+        );
+        for run in value["runs"].as_array().unwrap() {
+            assert!(run.get("available_device_memory_bytes_before").is_some());
+            assert!(run.get("available_device_memory_bytes_after").is_some());
+        }
+        let mut numeric = complete_report();
+        let gpu_index = numeric
+            .runs
+            .iter()
+            .position(|run| run.target == Target::Gpu)
+            .expect("complete fixture has a GPU run");
+        numeric.runs[gpu_index].memory_availability = Some(availability_report(
+            vulkan_memory(
+                VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                1024,
+                600,
+                vec![
+                    vulkan_heap(0, 256, 0b10, 256, 128),
+                    vulkan_heap(1, 768, 0b1, 768, 296),
+                ],
+            ),
+            vulkan_memory(
+                VulkanMemoryHeapSelection::AllHeapsIntegrated,
+                1024,
+                200,
+                vec![
+                    vulkan_heap(0, 256, 0b10, 200, 100),
+                    vulkan_heap(1, 768, 0b1, 600, 500),
+                ],
+            ),
+        ));
+        numeric.runs[gpu_index].available_device_memory_bytes_before = Some(600);
+        numeric.runs[gpu_index].available_device_memory_bytes_after = Some(200);
+        let numeric_value: serde_json::Value =
+            serde_json::from_slice(&serialize_report(&numeric).unwrap()).unwrap();
+        assert_eq!(
+            numeric_value["runs"][gpu_index]["available_device_memory_bytes_before"],
+            600
+        );
+        assert_eq!(
+            numeric_value["runs"][gpu_index]["available_device_memory_bytes_after"],
+            200
         );
         for field in [
             "background_load",
@@ -2389,6 +2902,20 @@ mod tests {
             "not_observed"
         );
         assert!(bytes.len() < MAX_CAMPAIGN_REPORT_BYTES);
+
+        let mut fabricated_cpu = complete_report();
+        fabricated_cpu.runs[0].available_device_memory_bytes_before = Some(0);
+        assert!(validate_report(&fabricated_cpu).is_err());
+
+        let mut fabricated_gpu = complete_report();
+        let gpu_index = fabricated_gpu
+            .runs
+            .iter()
+            .position(|run| run.target == Target::Gpu)
+            .expect("complete fixture has a GPU run");
+        fabricated_gpu.runs[gpu_index].available_device_memory_bytes_before = Some(600);
+        fabricated_gpu.runs[gpu_index].available_device_memory_bytes_after = Some(200);
+        assert!(validate_report(&fabricated_gpu).is_err());
     }
 
     #[test]
@@ -2634,7 +3161,21 @@ mod tests {
                 .get("sampled_max_private_usage_bytes")
                 .is_none()
         );
+        assert!(
+            value["runs"][0]
+                .get("available_device_memory_bytes_before")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert!(
+            value["runs"][0]
+                .get("available_device_memory_bytes_after")
+                .is_some_and(serde_json::Value::is_null)
+        );
         assert!(value["runs"][0].get("native_error").is_none());
+
+        builder.report.runs[0].available_device_memory_bytes_before = Some(600);
+        builder.report.runs[0].available_device_memory_bytes_after = Some(200);
+        assert!(validate_report(&builder.report).is_err());
     }
 
     #[test]

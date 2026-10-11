@@ -420,7 +420,7 @@ paths, sizes and hashes come from the parity-verified installed inventory.
 For a local, fail-closed diagnostic campaign only, append
 `-ObservationCampaignPower ac` or `-ObservationCampaignPower battery` with the
 same six arguments. This keeps the fixed fifteen-minute deadline and requests
-the collector's schema-2 five-cold/twenty-warm campaign; it is not a performance
+the collector's schema-3 five-cold/twenty-warm campaign; it is not a performance
 qualification, power-plan change, Auto decision, authorization, or release gate.
 The verifier accepts only a completed, cleanup-complete local-only report and
 does not publish a final report after any timeout, oversized output, malformed
