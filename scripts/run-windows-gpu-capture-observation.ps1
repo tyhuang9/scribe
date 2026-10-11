@@ -22,7 +22,8 @@ param(
     [string]$GpuPackVersion,
     [string]$GpuPackSha256,
     [string]$GpuPackSecurityEpoch,
-    [string]$WorkerAllowedProcessorMask
+    [string]$WorkerAllowedProcessorMask,
+    [switch]$ConstrainCollector
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,6 +50,9 @@ if ($PSBoundParameters.ContainsKey('WorkerAllowedProcessorMask')) {
     if ($frozenIdentityCount -ne $frozenIdentityFields.Count) {
         throw 'Worker allowed processor mask requires the complete frozen worker and pack identity set.'
     }
+}
+if ($ConstrainCollector -and -not $PSBoundParameters.ContainsKey('WorkerAllowedProcessorMask')) {
+    throw 'Collector constraint requires a worker allowed processor mask and complete frozen identity set.'
 }
 
 function Test-CaptureReservedWindowsName([string]$Value) {
@@ -134,6 +138,9 @@ function Get-CaptureObservationArguments([Collections.IDictionary]$Options) {
     }
     if ($Options.Keys -contains 'WorkerAllowedProcessorMask') {
         $arguments += @('--worker-allowed-processor-mask', $Options['WorkerAllowedProcessorMask'])
+    }
+    if ($Options.Keys -contains 'ConstrainCollector' -and [bool]$Options['ConstrainCollector']) {
+        $arguments += '--constrain-collector'
     }
     return $arguments
 }

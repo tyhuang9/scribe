@@ -179,7 +179,8 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
             [string]$GpuPackVersion,
             [string]$GpuPackSha256,
             [string]$GpuPackSecurityEpoch,
-            [string]$WorkerAllowedProcessorMask
+            [string]$WorkerAllowedProcessorMask,
+            [switch]$ConstrainCollector
         )
         # Production passes this dictionary, not a Hashtable. In particular,
         # Hashtable.Contains must not appear to work only in these fixtures.
@@ -238,19 +239,27 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
                     '--gpu-pack-sha256', $options.GpuPackSha256,
                     '--gpu-pack-security-epoch', $options.GpuPackSecurityEpoch
                 ) }
-                $affinityCases = if ($includeFrozenIdentity) { @($false, $true) } else { @($false) }
-                foreach ($includeAffinity in $affinityCases) {
+                $affinityCases = if ($includeFrozenIdentity) {
+                    @('none', 'disabled', 'worker', 'collector')
+                } else { @('none', 'disabled') }
+                foreach ($affinityCase in $affinityCases) {
                     $caseOptions = $options.Clone()
                     $caseExpected = @($expected)
-                    if ($includeAffinity) {
+                    if ($affinityCase -in @('worker', 'collector')) {
                         $caseOptions.WorkerAllowedProcessorMask = '0000000000000001'
                         $caseExpected += @('--worker-allowed-processor-mask', '0000000000000001')
+                    }
+                    if ($affinityCase -eq 'collector') {
+                        $caseOptions.ConstrainCollector = $true
+                        $caseExpected += '--constrain-collector'
+                    } elseif ($affinityCase -eq 'disabled') {
+                        $caseOptions.ConstrainCollector = $false
                     }
                     $actual = @(Invoke-CaptureBoundArgumentFixture @caseOptions)
                     if ($actual.Count -ne $caseExpected.Count) { throw 'Capture wrapper changed its argument count.' }
                     for ($index = 0; $index -lt $caseExpected.Count; $index++) {
                         if ($actual[$index] -cne $caseExpected[$index]) {
-                            throw 'Capture wrapper changed an input, campaign power or worker affinity constraint.'
+                            throw 'Capture wrapper changed an input, campaign power or affinity constraint.'
                         }
                     }
                     $forwardingCount++
@@ -258,9 +267,9 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
             }
         }
     }
-    if ($forwardingCount -ne 18) { throw 'Capture wrapper forwarding cases were not all discovered.' }
+    if ($forwardingCount -ne 36) { throw 'Capture wrapper forwarding cases were not all discovered.' }
 } -Definition $argumentBuilder[0].Extent.Text
-Write-Output 'Capture wrapper forwarding contracts passed (18 cases, with and without frozen identity and worker affinity); no collector was launched.'
+Write-Output 'Capture wrapper forwarding contracts passed (36 cases, including worker-only, collector and explicitly disabled constraints); no collector was launched.'
 
 # Exercise the full wrapper with a GUI executable, not a console mock. Named
 # events control completion, so no sleep or GPU/app/profile access is needed.
@@ -328,7 +337,7 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
         @{ Exit = 0; Previous = 42 },
         @{ Exit = 23; Previous = 0 }
     )) {
-        foreach ($includeFrozenIdentity in @($false, $true)) {
+        foreach ($affinityCase in @('none', 'worker', 'collector')) {
             $id = "$($case.Exit)_$([guid]::NewGuid().ToString('N'))"
             $output = Join-Path $fixtureRoot "$id.txt"
             $started = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\ScribeCaptureStarted-$id")
@@ -350,7 +359,7 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
                     GpuPackVersion = 'fixture-pack-1'; GpuPackSha256 = 'f' * 64
                     GpuPackSecurityEpoch = '1'
                 }
-                if (-not $includeFrozenIdentity) {
+                if ($affinityCase -eq 'none') {
                     foreach ($field in @(
                         'CpuWorkerBuildId', 'CpuWorkerSha256', 'CpuWorkerProtocol', 'CpuWorkerAbi',
                         'GpuWorkerBuildId', 'GpuWorkerSha256', 'GpuWorkerProtocol', 'GpuWorkerAbi',
@@ -360,6 +369,7 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
                 }
                 else {
                     $options.WorkerAllowedProcessorMask = '0000000000000001'
+                    if ($affinityCase -eq 'collector') { $options.ConstrainCollector = $true }
                 }
                 $optionsPath = Join-Path $fixtureRoot "$id-options.json"
                 [IO.File]::WriteAllText($optionsPath, ($options | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
@@ -475,4 +485,4 @@ finally {
         Write-Warning "Failed GUI fixture cleanup; retained generated files at $fixtureRoot"
     }
 }
-Write-Output 'Capture wrapper GUI process contracts passed (6 cases, with and without frozen identity); local synthetic executable only, no GPU or Cargo process.'
+Write-Output 'Capture wrapper GUI process contracts passed (9 cases, including worker-only and collector constraints); local synthetic executable only, no GPU or Cargo process.'

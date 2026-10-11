@@ -174,19 +174,61 @@ try {
             '000000000000000A', 'fffffffffffffff', '10000000000000000',
             ' 000000000000001', '000000000000001 ', '+000000000000001',
             '000000000000000g', "00000000000000`t1")) {
+        foreach ($constrainCollector in @($false, $true)) {
+            $arguments = $wrapperArguments.Clone()
+            $arguments.WorkerAllowedProcessorMask = $mask
+            if ($constrainCollector) { $arguments.ConstrainCollector = $true }
+            $rejected = $false
+            try { & $wrapper @arguments }
+            catch {
+                if ($_.Exception.Message -cne 'Worker allowed processor mask must be exactly 16 lowercase hexadecimal digits and nonzero.') {
+                    throw 'Capture wrapper rejected malformed worker affinity at the wrong boundary.'
+                }
+                $rejected = $true
+            }
+            if (-not $rejected) { throw 'Capture wrapper accepted malformed worker affinity.' }
+            $prelaunchAssertionCount++
+        }
+    }
+    foreach ($case in @(
+        @{ RemoveWorker = $true; RemovePins = $false; Partial = $false;
+            Error = 'Collector constraint requires a worker allowed processor mask and complete frozen identity set.' },
+        @{ RemoveWorker = $true; RemovePins = $true; Partial = $false;
+            Error = 'Collector constraint requires a worker allowed processor mask and complete frozen identity set.' },
+        @{ RemoveWorker = $false; RemovePins = $true; Partial = $false;
+            Error = 'Worker allowed processor mask requires the complete frozen worker and pack identity set.' },
+        @{ RemoveWorker = $false; RemovePins = $false; Partial = $true;
+            Error = 'Frozen worker and pack identity pins must be supplied as one complete set.' }
+    )) {
         $arguments = $wrapperArguments.Clone()
-        $arguments.WorkerAllowedProcessorMask = $mask
+        $arguments.ConstrainCollector = $true
+        if (-not $case.RemoveWorker) { $arguments.WorkerAllowedProcessorMask = '0000000000000001' }
+        if ($case.RemovePins) { foreach ($field in $frozenIdentityFields) { $arguments.Remove($field) } }
+        if ($case.Partial) { $arguments.Remove('GpuPackSha256') }
         $rejected = $false
         try { & $wrapper @arguments }
         catch {
-            if ($_.Exception.Message -cne 'Worker allowed processor mask must be exactly 16 lowercase hexadecimal digits and nonzero.') {
-                throw 'Capture wrapper rejected malformed worker affinity at the wrong boundary.'
+            if ($_.Exception.Message -cne $case.Error) {
+                throw 'Capture wrapper rejected collector constraint prerequisites at the wrong boundary.'
             }
             $rejected = $true
         }
-        if (-not $rejected) { throw 'Capture wrapper accepted malformed worker affinity.' }
+        if (-not $rejected) { throw 'Capture wrapper accepted an unpinned collector constraint.' }
         $prelaunchAssertionCount++
     }
+
+    $duplicateRejected = $false
+    try { & $wrapper @wrapperArguments -ConstrainCollector -ConstrainCollector }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike 'ParameterAlreadyBound*' -and
+            $_.Exception.Message -notmatch '(?i)already.*(specified|bound)') {
+            throw 'Capture wrapper duplicate collector constraint was rejected at the wrong boundary.'
+        }
+        $duplicateRejected = $true
+    }
+    if (-not $duplicateRejected) { throw 'Capture wrapper accepted a duplicate collector constraint.' }
+    $prelaunchAssertionCount++
+
     $arguments = $wrapperArguments.Clone()
     foreach ($field in $frozenIdentityFields) { $arguments.Remove($field) }
     $arguments.WorkerAllowedProcessorMask = '0000000000000001'
@@ -290,18 +332,37 @@ try {
         # Syntactically valid masks must reach the existing digest check, not
         # launch a process. Actual topology admission belongs to the collector.
         foreach ($mask in @('0000000000000001', '00000000abcdef01', '8000000000000000')) {
+            foreach ($constrainCollector in @($false, $true)) {
+                $arguments = $wrapperArguments.Clone()
+                $arguments.CollectorPath = $wrongDigestExe
+                $arguments.WorkerAllowedProcessorMask = $mask
+                if ($constrainCollector) { $arguments.ConstrainCollector = $true }
+                $rejected = $false
+                try { & $wrapper @arguments }
+                catch {
+                    if ($_.Exception.Message -cne 'Collector digest does not match the expected build.') {
+                        throw 'Capture wrapper rejected valid worker affinity before the digest boundary.'
+                    }
+                    $rejected = $true
+                }
+                if (-not $rejected) { throw 'Capture wrapper bypassed the collector digest check.' }
+                $prelaunchAssertionCount++
+            }
+        }
+        foreach ($includePins in @($false, $true)) {
             $arguments = $wrapperArguments.Clone()
+            if (-not $includePins) { foreach ($field in $frozenIdentityFields) { $arguments.Remove($field) } }
             $arguments.CollectorPath = $wrongDigestExe
-            $arguments.WorkerAllowedProcessorMask = $mask
+            $arguments.ConstrainCollector = $false
             $rejected = $false
             try { & $wrapper @arguments }
             catch {
                 if ($_.Exception.Message -cne 'Collector digest does not match the expected build.') {
-                    throw 'Capture wrapper rejected valid worker affinity before the digest boundary.'
+                    throw 'An explicitly disabled collector constraint changed the prelaunch boundary.'
                 }
                 $rejected = $true
             }
-            if (-not $rejected) { throw 'Capture wrapper bypassed the collector digest check.' }
+            if (-not $rejected) { throw 'Capture wrapper bypassed the digest check with a disabled constraint.' }
             $prelaunchAssertionCount++
         }
         # A rejected digest must release the read lock; none of these fixtures
@@ -317,11 +378,11 @@ try {
         }
         Remove-Item -LiteralPath $fixtureRoot -ErrorAction Stop
     }
-    if ($prelaunchAssertionCount -ne 65) {
-        throw "Capture wrapper prelaunch assertion count changed: expected 65, observed $prelaunchAssertionCount."
+    if ($prelaunchAssertionCount -ne 87) {
+        throw "Capture wrapper prelaunch assertion count changed: expected 87, observed $prelaunchAssertionCount."
     }
     if ($ScriptOnly) {
-        Write-Output 'Windows GPU capture observation script contracts passed (65 prelaunch assertions plus 6 GUI process fixtures); GPU/Cargo checks not run.'
+        Write-Output 'Windows GPU capture observation script contracts passed (87 prelaunch assertions plus 9 GUI process fixtures); GPU/Cargo checks not run.'
         return
     }
 
