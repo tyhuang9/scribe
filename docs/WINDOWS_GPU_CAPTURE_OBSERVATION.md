@@ -371,7 +371,7 @@ The collector admits a single active processor group, group zero, and freezes
 the collector process/system masks before provider discovery. The requested
 mask must fit both. One immutable policy follows CPU and GPU factories,
 discovery probes and subsequent cold/warm launches; unsupported or changed
-topology fails rather than choosing a different mask. Only capture-owned
+topology fails rather than choosing a different mask. By default only capture-owned
 workers are constrained. The UI, unrelated applications, Windows settings and
 native-default inference-thread requests are unchanged.
 
@@ -398,13 +398,41 @@ generation and policy; an enforcement failure retires that generation rather
 than replaying on a replacement. Heavy job queries do not run in the 5 ms
 telemetry sampler.
 
-The boundary now includes **the worker's first instruction**, not just
+The worker-only boundary includes **the worker's first instruction**, not just
 Hello/provider discovery and inference. This constrains the worker and its
 non-breakaway descendants, not the collector or the host. Cold timing begins
-earlier, so this is not complete cold-window control.
+earlier, so the worker-only option is not complete cold-window control.
+
+#### Optional collector scheduling constraint
+
+Add `--constrain-collector` (PowerShell `-ConstrainCollector`) to constrain the
+disposable capture collector to the same allowed processor mask. This boolean
+option requires both the worker mask and the complete frozen identity set;
+duplicate, valued or incomplete CLI forms fail before input file access.
+Omitting the option, or passing PowerShell `-ConstrainCollector:$false`, preserves
+the existing worker-only behavior.
+
+The collector enters a fresh unnamed, non-inherited **affinity-only** job before
+input I/O, provider discovery or any measured window. This job deliberately has
+no kill-on-close limit: closing a self-owned job must not terminate the collector
+before it can report an error. The guard is retained through capture, publication
+and worker cleanup. Worker policy admission freezes the narrowed collector
+topology afterward, and the collector constraint is rechecked before measured
+windows and publication. Unsupported topology, assignment, membership or
+readback failures abort; there is no unconstrained fallback. The existing
+worker-owned kill-on-close jobs remain unchanged.
+
+Job assignment is not undone. Capture dispatch is exit-only, including failures
+after assignment; it cannot continue into the UI. Only this disposable process
+and its owned workers are affected, never the wrapper, parent shell, test host,
+unrelated applications or system settings. This is an allowed-processor
+constraint, not a promise of processor occupancy, inference thread count,
+background-load control or isolation of a personal PC.
+
 `environmental_controls.affinity_control` stays
 unavailable; reports remain unsigned, unqualified and ineligible for Auto.
-Whole-window control, isolation, background load, power/thermal controls
+The report schemas are unchanged. Authenticated whole-window evidence,
+isolation, background load, power/thermal controls
 and authenticated acquisition custody remain separate qualification gates.
 
 The native route uses the same sanitized environment, trusted system current
@@ -595,10 +623,17 @@ strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
 observation controls/leases, authenticated Vulkan Hello memory projection,
 provider-memory snapshots, retained GGUF native/runtime boundaries, capture
 architecture guards and probe architecture guards.
-`-ScriptOnly` provides the fast inner-loop check: script parsing, sixty-five
+Collector-affinity fixtures exercise exact affinity-only job limits, native-call
+failures, topology/effective-mask drift, actual nested worker membership and
+worker kill-on-close. Self-assignment runs only in an explicitly invoked ignored
+child helper, with event/pipe gates and bounded exit/cleanup checks; the test host
+never assigns itself. No-policy and post-assignment-failure child cases cover
+unchanged scheduling and exit-only failure behavior. These are synthetic native
+process tests, not GPU/model or protected-host qualification.
+`-ScriptOnly` provides the fast inner-loop check: script parsing, eighty-seven
 counted prelaunch argument/file-rejection assertions (including frozen identity
-forwarding, partial, duplicate and malformed values), and six local GUI-process
-cases covering both omitted and complete identity sets.
+forwarding, partial, duplicate and malformed values), and nine local GUI-process
+cases covering omitted identities, worker-only and collector constraints.
 The latter compile a tiny x64 GUI fixture using the Windows .NET Framework C#
 compiler (also required by the installer fixture tests). Event gates and bounded
 watchdogs exercise waiting, absent/stale exit status, nonzero exits, literal
@@ -610,9 +645,10 @@ Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo
 command and cannot substitute for native verification.
-Eighteen in-memory forwarding cases additionally cover both GPU backends with the
+Thirty-six in-memory forwarding cases additionally cover both GPU backends with the
 campaign option omitted, on AC, or on battery, with and without the complete
-frozen identity set, and optional worker affinity with the complete set.
+frozen identity set, optional worker-only or collector constraints with the
+complete set, and an explicitly disabled collector switch.
 They preserve individual argument values containing spaces
 and shell metacharacters. They exercise the actual PowerShell bound-parameter
 dictionary, not just a Hashtable substitute, and launch no collector.

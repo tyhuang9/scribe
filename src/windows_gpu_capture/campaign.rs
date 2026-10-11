@@ -854,7 +854,9 @@ fn watchdog_loop(shared: Arc<(Mutex<WarmSharedState>, Condvar)>, origin: Instant
 pub(super) fn run(
     options: CommandOptions,
     affinity: Option<Arc<super::affinity::CaptureWorkerAffinity>>,
+    collector_affinity: Option<super::affinity::CollectorAffinityGuard>,
 ) -> Result<()> {
+    super::require_collector_affinity(collector_affinity.as_ref())?;
     let expected_power = options
         .campaign_power
         .ok_or_else(|| anyhow!("campaign mode requires an expected power source"))?;
@@ -901,7 +903,7 @@ pub(super) fn run(
                 FailureStage::WorkerPreflight,
                 FailureCategory::WorkerUnavailable,
             ));
-            return publish_campaign(builder.report, &options.output);
+            return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
         }
     };
     let mut builder =
@@ -912,14 +914,14 @@ pub(super) fn run(
             FailureStage::PowerPreflight,
             category,
         ));
-        return publish_campaign(builder.report, &options.output);
+        return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
     }
 
     if let Err(failure) =
         preflight_workers(&cpu_factory, &gpu_factory, expected_power, &mut builder)
     {
         builder.fail(failure);
-        return publish_campaign(builder.report, &options.output);
+        return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
     }
 
     // Preflight support has succeeded for both exact workers before the WAV is
@@ -936,7 +938,7 @@ pub(super) fn run(
                 FailureStage::AudioPreparation,
                 FailureCategory::InvariantViolation,
             ));
-            return publish_campaign(builder.report, &options.output);
+            return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
         }
     };
 
@@ -955,6 +957,7 @@ pub(super) fn run(
             &audio,
             expected_power,
             &mut builder,
+            collector_affinity.as_ref(),
         );
         let failed = record.failure;
         builder.report.runs.push(record);
@@ -976,6 +979,7 @@ pub(super) fn run(
                 &audio,
                 expected_power,
                 &mut builder,
+                collector_affinity.as_ref(),
             ),
             Err(_) => builder.fail(FailureDescriptor::global(
                 FailureStage::WarmModelTtl,
@@ -984,7 +988,7 @@ pub(super) fn run(
         }
     }
 
-    publish_campaign(builder.report, &options.output)
+    publish_campaign(builder.report, &options.output, collector_affinity.as_ref())
 }
 
 fn preflight_workers(
@@ -1099,7 +1103,19 @@ fn run_cold(
     audio: &PreparedAudio,
     expected_power: CampaignPower,
     builder: &mut ReportBuilder,
+    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
 ) -> (CampaignRunRecord, bool) {
+    if super::require_collector_affinity(collector_affinity).is_err() {
+        let failure = FailureDescriptor::for_spec(
+            spec,
+            FailureStage::ObservationValidation,
+            FailureCategory::InvariantViolation,
+        );
+        return (
+            CampaignRunRecord::failed(spec, None, Duration::ZERO, None, None, failure),
+            true,
+        );
+    }
     let power_before = PowerSource::current();
     let started = Instant::now();
     if let Err(category) = require_power(expected_power, power_before) {
@@ -1183,12 +1199,17 @@ fn run_cold(
         expected_power,
         started,
         Some(power_before),
+        collector_affinity,
         |_, _| Ok(()),
     );
     let clean = cleanup_worker(&worker, Some(&lease));
     (record, clean)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "retained campaign execution carries the two frozen factories, prepared request inputs, report owner, and optional collector guard"
+)]
 fn run_retained_campaign(
     pool: WarmPool,
     cpu_factory: &CaptureObservationWorkerFactory,
@@ -1197,6 +1218,7 @@ fn run_retained_campaign(
     audio: &PreparedAudio,
     expected_power: CampaignPower,
     builder: &mut ReportBuilder,
+    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
 ) {
     for (order, target) in [Target::Cpu, Target::Gpu].into_iter().enumerate() {
         check_pool(&pool, builder, Phase::Prime);
@@ -1210,6 +1232,23 @@ fn run_retained_campaign(
             order_in_pair: u8::try_from(order + 1).expect("prime order is bounded"),
             target,
         };
+        if super::require_collector_affinity(collector_affinity).is_err() {
+            let failure = FailureDescriptor::for_spec(
+                spec,
+                FailureStage::ObservationValidation,
+                FailureCategory::InvariantViolation,
+            );
+            builder.report.runs.push(CampaignRunRecord::failed(
+                spec,
+                None,
+                Duration::ZERO,
+                None,
+                None,
+                failure,
+            ));
+            builder.fail(failure);
+            break;
+        }
         let factory = match target {
             Target::Cpu => cpu_factory,
             Target::Gpu => gpu_factory,
@@ -1332,6 +1371,7 @@ fn run_retained_campaign(
             expected_power,
             started,
             Some(power_before),
+            collector_affinity,
             |result_at, succeeded| {
                 if succeeded {
                     pool.install(
@@ -1361,6 +1401,23 @@ fn run_retained_campaign(
     if !builder.report.incomplete {
         for spec in measured_specs(Phase::Warm, WARM_PAIRS) {
             if builder.report.incomplete {
+                break;
+            }
+            if super::require_collector_affinity(collector_affinity).is_err() {
+                let failure = FailureDescriptor::for_spec(
+                    spec,
+                    FailureStage::ObservationValidation,
+                    FailureCategory::InvariantViolation,
+                );
+                builder.report.runs.push(CampaignRunRecord::failed(
+                    spec,
+                    None,
+                    Duration::ZERO,
+                    None,
+                    None,
+                    failure,
+                ));
+                builder.fail(failure);
                 break;
             }
             let started = Instant::now();
@@ -1403,6 +1460,7 @@ fn run_retained_campaign(
                 expected_power,
                 started,
                 None,
+                collector_affinity,
                 |result_at, succeeded| pool.finish(spec.target, result_at, succeeded),
             );
             let failure = record.failure;
@@ -1470,13 +1528,21 @@ fn validate_diagnostics(
 fn terminal_attempt_failure(
     request_failure: Option<(FailureStage, FailureCategory)>,
     affinity_lease_stale: bool,
+    collector_constraint_stale: bool,
 ) -> Option<(FailureStage, FailureCategory)> {
-    request_failure.or_else(|| {
-        affinity_lease_stale.then_some((
-            FailureStage::ObservationValidation,
-            FailureCategory::IdentityMismatch,
-        ))
-    })
+    request_failure
+        .or_else(|| {
+            affinity_lease_stale.then_some((
+                FailureStage::ObservationValidation,
+                FailureCategory::IdentityMismatch,
+            ))
+        })
+        .or_else(|| {
+            collector_constraint_stale.then_some((
+                FailureStage::ObservationValidation,
+                FailureCategory::InvariantViolation,
+            ))
+        })
 }
 
 #[allow(
@@ -1493,6 +1559,7 @@ fn observe_attempt(
     expected_power: CampaignPower,
     started: Instant,
     initial_power: Option<PowerSource>,
+    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
     settled: impl FnOnce(Instant, bool) -> Result<()>,
 ) -> CampaignRunRecord {
     let mut power_before = initial_power;
@@ -1568,11 +1635,13 @@ fn observe_attempt(
         record
     };
     let request_failure = execution.as_ref().err().copied();
+    let collector_constraint_stale = super::require_collector_affinity(collector_affinity).is_err();
     if let Some((stage, category)) = terminal_attempt_failure(
         request_failure,
         affinity_after
             .as_ref()
             .is_some_and(|result| result.is_err()),
+        collector_constraint_stale,
     ) {
         return failed(stage, category);
     }
@@ -1881,13 +1950,34 @@ fn serialize_report(report: &CampaignReport) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn publish_campaign(report: CampaignReport, output: &Path) -> Result<()> {
+fn publish_campaign(
+    mut report: CampaignReport,
+    output: &Path,
+    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
+) -> Result<()> {
+    // The final collector check precedes serialization and the no-replace
+    // publication. A failure converts a would-be success into the existing
+    // categorized incomplete shape; there is no fallible post-publication
+    // collector check that could contradict the immutable artifact.
+    if super::require_collector_affinity(collector_affinity).is_err() {
+        mark_collector_constraint_failure(&mut report);
+    }
     let bytes = serialize_report(&report)?;
     publish_atomic_new(output, &bytes)?;
     if report.incomplete {
         bail!("campaign incomplete; categorized diagnostic report published after cleanup")
     }
     Ok(())
+}
+
+fn mark_collector_constraint_failure(report: &mut CampaignReport) {
+    report.incomplete = true;
+    if report.failure.is_none() {
+        report.failure = Some(FailureDescriptor::global(
+            FailureStage::ObservationValidation,
+            FailureCategory::InvariantViolation,
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2220,15 +2310,48 @@ mod tests {
     #[test]
     fn request_failure_precedes_post_query_stale_identity() {
         let primary = (FailureStage::Inference, FailureCategory::ObservationFailed);
-        assert_eq!(terminal_attempt_failure(Some(primary), true), Some(primary));
         assert_eq!(
-            terminal_attempt_failure(None, true),
+            terminal_attempt_failure(Some(primary), true, true),
+            Some(primary)
+        );
+        assert_eq!(
+            terminal_attempt_failure(None, true, true),
             Some((
                 FailureStage::ObservationValidation,
                 FailureCategory::IdentityMismatch
             ))
         );
-        assert_eq!(terminal_attempt_failure(None, false), None);
+        assert_eq!(
+            terminal_attempt_failure(None, false, true),
+            Some((
+                FailureStage::ObservationValidation,
+                FailureCategory::InvariantViolation
+            ))
+        );
+        assert_eq!(terminal_attempt_failure(None, false, false), None);
+    }
+
+    #[test]
+    fn collector_constraint_failure_makes_campaign_incomplete_without_overwriting_primary_error() {
+        let mut success = complete_report();
+        mark_collector_constraint_failure(&mut success);
+        assert!(success.incomplete);
+        assert_eq!(
+            success.failure,
+            Some(FailureDescriptor::global(
+                FailureStage::ObservationValidation,
+                FailureCategory::InvariantViolation,
+            ))
+        );
+        assert!(serialize_report(&success).is_ok());
+
+        let primary =
+            FailureDescriptor::global(FailureStage::Inference, FailureCategory::ObservationFailed);
+        let mut failed = builder().report;
+        failed.incomplete = true;
+        failed.failure = Some(primary);
+        mark_collector_constraint_failure(&mut failed);
+        assert_eq!(failed.failure, Some(primary));
     }
 
     #[test]
@@ -2527,9 +2650,9 @@ mod tests {
             FailureStage::WorkerPreflight,
             FailureCategory::WorkerUnavailable,
         ));
-        assert!(publish_campaign(builder.report, &output).is_err());
+        assert!(publish_campaign(builder.report, &output, None).is_err());
         let original = std::fs::read(&output).unwrap();
-        assert!(publish_campaign(complete_report(), &output).is_err());
+        assert!(publish_campaign(complete_report(), &output, None).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), original);
         let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
         assert_eq!(value["incomplete"], true);

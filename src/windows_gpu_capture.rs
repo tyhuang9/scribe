@@ -35,7 +35,7 @@ use crate::prepared_audio::PreparedAudio;
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::runtime_contract::RuntimeExecution;
 use crate::transcription::{AccelerationPreference, ModelId};
-use affinity::{CaptureWorkerAffinity, RequestedWorkerAffinity};
+use affinity::{CaptureWorkerAffinity, CollectorAffinityGuard, RequestedWorkerAffinity};
 use telemetry::{SamplingSession, TelemetrySummary, VideoMemorySummary};
 
 const COMMAND_FLAG: &str = "--scribe-windows-gpu-capture-observation";
@@ -57,6 +57,7 @@ struct CommandOptions {
     campaign_power: Option<CampaignPower>,
     frozen_inputs: Option<Arc<CaptureFrozenInputs>>,
     worker_allowed_processor_mask: Option<RequestedWorkerAffinity>,
+    constrain_collector: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -184,21 +185,36 @@ pub(crate) fn maybe_run_local_command() -> Option<i32> {
 
 fn run_local_command(args: &[OsString]) -> Result<()> {
     let options = parse_command(args)?;
+    // Current-process assignment is irreversible. Establish and fully verify
+    // the retained collector job before worker admission snapshots the now
+    // constrained process mask.
+    let collector_affinity = options
+        .constrain_collector
+        .then(|| {
+            CollectorAffinityGuard::establish(
+                options
+                    .worker_allowed_processor_mask
+                    .expect("collector constraint parsing requires a worker mask"),
+            )
+        })
+        .transpose()?;
     // One immutable admission before input I/O and before any provider probe.
     let affinity = options
         .worker_allowed_processor_mask
         .map(|mask| mask.admit().map(Arc::new))
         .transpose()?;
     if options.campaign_power.is_some() {
-        return campaign::run(options, affinity);
+        return campaign::run(options, affinity, collector_affinity);
     }
-    run_single_capture(options, affinity)
+    run_single_capture(options, affinity, collector_affinity)
 }
 
 fn run_single_capture(
     options: CommandOptions,
     affinity: Option<Arc<CaptureWorkerAffinity>>,
+    collector_affinity: Option<CollectorAffinityGuard>,
 ) -> Result<()> {
+    require_collector_affinity(collector_affinity.as_ref())?;
     let mut model = verify_input(
         &options.model,
         &options.model_sha256,
@@ -310,6 +326,7 @@ fn run_single_capture(
         AccelerationPreference::Cpu,
         &audio,
         false,
+        collector_affinity.as_ref(),
     ) {
         Ok(observation) => observation,
         Err(error) => {
@@ -327,6 +344,7 @@ fn run_single_capture(
         AccelerationPreference::Gpu,
         &audio,
         true,
+        collector_affinity.as_ref(),
     )?;
     if cpu.report.power_source_before != gpu.report.power_source_before {
         bail!("CPU and GPU observations crossed a power-source boundary")
@@ -365,7 +383,9 @@ fn run_single_capture(
     if bytes.len() > MAX_REPORT_BYTES {
         bail!("capture observation report exceeds the {MAX_REPORT_BYTES}-byte limit")
     }
-    publish_atomic_new(&options.output, &bytes)
+    publish_atomic_new_with(&options.output, &bytes, |_, _| {
+        require_collector_affinity(collector_affinity.as_ref())
+    })
 }
 
 fn observe_and_shutdown(
@@ -375,8 +395,17 @@ fn observe_and_shutdown(
     preference: AccelerationPreference,
     audio: &PreparedAudio,
     gpu: bool,
+    collector_affinity: Option<&CollectorAffinityGuard>,
 ) -> Result<ObservedWorker> {
-    let operation = observe_worker(&worker, lease, artifact, preference, audio, gpu);
+    let operation = observe_worker(
+        &worker,
+        lease,
+        artifact,
+        preference,
+        audio,
+        gpu,
+        collector_affinity,
+    );
     let cleanup = worker.shutdown();
     combine_operation_cleanup(operation, cleanup)
 }
@@ -401,12 +430,15 @@ fn observe_worker(
     preference: AccelerationPreference,
     audio: &PreparedAudio,
     gpu: bool,
+    collector_affinity: Option<&CollectorAffinityGuard>,
 ) -> Result<ObservedWorker> {
     validate_handshake_capture(&lease)?;
     let power_source_before = PowerSource::current();
     if power_source_before == PowerSource::Unknown {
         bail!("power source was unknown before the worker request")
     }
+    // This check is intentionally outside the measured interval.
+    require_collector_affinity(collector_affinity)?;
     let started = Instant::now();
     let sampler = if gpu {
         let stable = worker
@@ -426,6 +458,7 @@ fn observe_worker(
     let execution = execution?;
     let telemetry = telemetry?;
     lease.require_current()?;
+    require_collector_affinity(collector_affinity)?;
     require_stable_power(power_source_before, power_source_after)?;
     build_worker_report(
         &lease,
@@ -447,6 +480,10 @@ fn observe_worker(
         gpu,
         worker.gpu_identity.as_ref(),
     )
+}
+
+fn require_collector_affinity(guard: Option<&CollectorAffinityGuard>) -> Result<()> {
+    guard.map_or(Ok(()), CollectorAffinityGuard::require_current)
 }
 
 fn require_stable_power(before: PowerSource, after: PowerSource) -> Result<()> {
@@ -608,6 +645,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     let mut output = None;
     let mut campaign_power = None;
     let mut worker_allowed_processor_mask = None;
+    let mut constrain_collector = false;
     let pin_flags = [
         "--cpu-worker-build-id",
         "--cpu-worker-sha256",
@@ -642,6 +680,14 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
                 "battery" => CampaignPower::Battery,
                 _ => bail!("--campaign-power must be ac or battery"),
             });
+            index += 1;
+            continue;
+        }
+        if name == "--constrain-collector" {
+            if constrain_collector {
+                bail!("--constrain-collector may be specified only once")
+            }
+            constrain_collector = true;
             index += 1;
             continue;
         }
@@ -754,6 +800,11 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
             RequestedWorkerAffinity::parse(text)
         })
         .transpose()?;
+    if constrain_collector && (worker_allowed_processor_mask.is_none() || frozen_inputs.is_none()) {
+        bail!(
+            "collector constraint requires a worker allowed processor mask and complete frozen identity set"
+        );
+    }
     if worker_allowed_processor_mask.is_some() && frozen_inputs.is_none() {
         bail!("worker allowed processor mask requires the complete frozen worker constraints");
     }
@@ -769,6 +820,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
         campaign_power,
         frozen_inputs,
         worker_allowed_processor_mask,
+        constrain_collector,
     })
 }
 
@@ -1082,12 +1134,9 @@ mod tests {
         let flag = "--worker-allowed-processor-mask";
         let mut valid = frozen_command_args();
         valid.extend([flag.into(), "0000000000000001".into()]);
-        assert!(
-            parse_command(&valid)
-                .unwrap()
-                .worker_allowed_processor_mask
-                .is_some()
-        );
+        let parsed = parse_command(&valid).unwrap();
+        assert!(parsed.worker_allowed_processor_mask.is_some());
+        assert!(!parsed.constrain_collector);
         assert!(
             parse_command(&command_args())
                 .unwrap()
@@ -1128,6 +1177,50 @@ mod tests {
             args.extend([flag.into(), invalid.into()]);
             let error = run_local_command(&args).unwrap_err().to_string();
             assert!(error.contains("processor mask"), "{invalid:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn collector_constraint_cli_is_valueless_exact_and_requires_mask_with_complete_pins() {
+        let flag = "--constrain-collector";
+        assert!(!parse_command(&command_args()).unwrap().constrain_collector);
+
+        let mut valid = frozen_command_args();
+        valid.extend([
+            "--worker-allowed-processor-mask".into(),
+            "0000000000000001".into(),
+            flag.into(),
+        ]);
+        assert!(parse_command(&valid).unwrap().constrain_collector);
+
+        let mut missing_mask = frozen_command_args();
+        missing_mask.push(flag.into());
+        let error = parse_command(&missing_mask).unwrap_err().to_string();
+        assert!(error.contains("worker allowed processor mask"), "{error}");
+
+        let mut missing_pins = command_args();
+        missing_pins.extend([
+            "--worker-allowed-processor-mask".into(),
+            "0000000000000001".into(),
+            flag.into(),
+        ]);
+        let error = parse_command(&missing_pins).unwrap_err().to_string();
+        assert!(error.contains("complete frozen identity set"), "{error}");
+
+        let mut duplicate = valid.clone();
+        duplicate.push(flag.into());
+        assert!(parse_command(&duplicate).is_err());
+
+        for value in ["true", "false", "1", "0000000000000001"] {
+            let mut with_value = valid.clone();
+            with_value.push(value.into());
+            assert!(parse_command(&with_value).is_err(), "accepted {value:?}");
+        }
+
+        for index in (command_args().len()..frozen_command_args().len()).step_by(2) {
+            let mut partial = valid.clone();
+            partial.drain(index..index + 2);
+            assert!(parse_command(&partial).is_err());
         }
     }
 
