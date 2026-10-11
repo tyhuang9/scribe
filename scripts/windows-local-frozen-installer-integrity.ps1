@@ -671,6 +671,41 @@ function Assert-WindowsLocalFrozenCampaignMemoryAvailability(
     Assert-WindowsLocalFrozenCampaignMemoryAvailabilityEndpoint $MemoryAvailability.after $Target $GpuIdentity
 }
 
+function Assert-WindowsLocalFrozenCampaignAdmissionMemory(
+    [psobject]$Run,
+    [string]$Target,
+    [psobject]$GpuIdentity
+) {
+    # Validate BOTH fresh endpoints before considering an unavailable result.
+    # An unavailable endpoint must not conceal an invalid identity or source.
+    Assert-WindowsLocalFrozenCampaignMemoryAvailability $Run.memory_availability $Target $GpuIdentity
+    $before = $Run.available_device_memory_bytes_before
+    $after = $Run.available_device_memory_bytes_after
+    if (($null -eq $before) -ne ($null -eq $after)) {
+        throw 'Installed GPU observation campaign admission memory must be an atomic numeric or null pair.'
+    }
+    $compatible = $Target -ceq 'gpu' -and
+        [string]$Run.memory_availability.before.status -ceq 'observed' -and
+        [string]$Run.memory_availability.after.status -ceq 'observed' -and
+        [int64]$Run.memory_availability.before.memory_total_bytes -eq [int64]$GpuIdentity.memory_total_bytes -and
+        [int64]$Run.memory_availability.after.memory_total_bytes -eq [int64]$GpuIdentity.memory_total_bytes
+    if (-not $compatible) {
+        if ($null -ne $before -or $null -ne $after) {
+            throw 'Installed GPU observation campaign unavailable admission memory must be null at both endpoints.'
+        }
+        return
+    }
+    if ($null -eq $before -or $null -eq $after) {
+        throw 'Installed GPU observation campaign compatible observed admission memory requires both numeric endpoints.'
+    }
+    $beforeValue = Assert-WindowsLocalFrozenCampaignInteger $before 'Installed GPU observation campaign admission memory before'
+    $afterValue = Assert-WindowsLocalFrozenCampaignInteger $after 'Installed GPU observation campaign admission memory after'
+    if ($beforeValue -ne [int64]$Run.memory_availability.before.available_memory_bytes -or
+        $afterValue -ne [int64]$Run.memory_availability.after.available_memory_bytes) {
+        throw 'Installed GPU observation campaign admission memory does not match the fresh observed endpoints.'
+    }
+}
+
 function Assert-WindowsLocalFrozenCampaignAffinityEndpoint(
     [psobject]$Endpoint,
     [string]$Description
@@ -756,7 +791,7 @@ function Read-WindowsLocalFrozenCaptureCampaignReport(
         'unavailable', 'environmental_controls'
     ) 'Installed GPU observation campaign report'
     if (($report.schema_version -isnot [int32] -and $report.schema_version -isnot [int64]) -or
-        [int]$report.schema_version -ne 2 -or
+        [int]$report.schema_version -ne 3 -or
         $report.kind -isnot [string] -or [string]$report.kind -cne 'windows_gpu_capture_campaign' -or
         $report.unsigned -isnot [bool] -or -not $report.unsigned -or
         $report.unqualified -isnot [bool] -or -not $report.unqualified -or
@@ -855,7 +890,8 @@ function Read-WindowsLocalFrozenCaptureCampaignReport(
             'power_source_before', 'power_source_after', 'end_to_end_ms', 'backend_ms',
             'model_load_ms', 'warm_reused', 'sampled_max_private_usage_bytes',
             'telemetry_sample_count', 'video_memory', 'raw_provider_memory',
-            'memory_availability', 'worker_process_affinity', 'normalized_transcript_sha256'
+            'memory_availability', 'available_device_memory_bytes_before',
+            'available_device_memory_bytes_after', 'worker_process_affinity', 'normalized_transcript_sha256'
         )
         if ($null -ne $pairIndex) { $properties += 'pair_index' }
         Assert-WindowsLocalFrozenExactProperties $run $properties 'Installed GPU observation campaign request record'
@@ -885,7 +921,7 @@ function Read-WindowsLocalFrozenCaptureCampaignReport(
         }
         Assert-WindowsLocalFrozenCampaignVideoMemory $run.video_memory $target
         Assert-WindowsLocalFrozenCampaignProviderMemory $run.raw_provider_memory $target $report.gpu_identity
-        Assert-WindowsLocalFrozenCampaignMemoryAvailability $run.memory_availability $target $report.gpu_identity
+        Assert-WindowsLocalFrozenCampaignAdmissionMemory $run $target $report.gpu_identity
         Assert-WindowsLocalFrozenCampaignAffinityPair $run.worker_process_affinity
     }
     return [pscustomobject]@{ Report = $report; Bytes = $serialized.Bytes }

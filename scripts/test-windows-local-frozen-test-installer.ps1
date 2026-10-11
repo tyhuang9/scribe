@@ -285,6 +285,8 @@ function New-FixtureCampaignReport([string]$Power, [string]$Backend = 'cuda') {
             memory_availability = [ordered]@{
                 before = $(if ($gpu) { & $availability } else { & $notApplicable }); after = $(if ($gpu) { & $availability } else { & $notApplicable })
             };
+            available_device_memory_bytes_before = $(if ($gpu -and $Backend -ceq 'cuda') { 32 } else { $null });
+            available_device_memory_bytes_after = $(if ($gpu -and $Backend -ceq 'cuda') { 32 } else { $null });
             worker_process_affinity = [ordered]@{
                 before = [ordered]@{ status = 'available'; processor_group = 0; process_mask_hex = '0000000000000001'; system_mask_hex = '0000000000000003' };
                 after = [ordered]@{ status = 'available'; processor_group = 0; process_mask_hex = '0000000000000002'; system_mask_hex = '0000000000000003' };
@@ -310,7 +312,7 @@ function New-FixtureCampaignReport([string]$Power, [string]$Backend = 'cuda') {
         }
     }
     return [ordered]@{
-        schema_version = 2; kind = 'windows_gpu_capture_campaign'; unsigned = $true; unqualified = $true;
+        schema_version = 3; kind = 'windows_gpu_capture_campaign'; unsigned = $true; unqualified = $true;
         auto_eligible = $false; release_approved = $false; collector_build_revision = $global:WindowsLocalFrozenVerifierRevision;
         expected_power = $Power; incomplete = $false; cleanup_complete = $true;
         inputs = [ordered]@{ model_sha256 = $global:WindowsLocalFrozenVerifierModelSha256; wav_sha256 = $global:WindowsLocalFrozenVerifierWavSha256 };
@@ -1480,7 +1482,8 @@ public static class FakeIscc {
         }
         $syntheticCampaignPath = Join-Path $testRoot 'synthetic-campaign.json'
         foreach ($case in @(
-            @{ Change = { param($r) $r.schema_version = 3 }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.schema_version = 2 }; Expected = 'completion or identity flags' },
+            @{ Change = { param($r) $r.schema_version = 4 }; Expected = 'completion or identity flags' },
             @{ Change = { param($r) $r.unsigned = 'true' }; Expected = 'completion or identity flags' },
             @{ Change = { param($r) $r.auto_eligible = $true }; Expected = 'completion or identity flags' },
             @{ Change = { param($r) $r.release_approved = $true }; Expected = 'completion or identity flags' },
@@ -1516,6 +1519,28 @@ public static class FakeIscc {
             @{ Change = { param($r) $r.runs[1].video_memory.local.sampled_min_budget_bytes = -1 }; Expected = 'nonnegative integer range' },
             @{ Change = { param($r) $r.runs[1].raw_provider_memory.before.provider_reported_memory_free_bytes = 65 }; Expected = 'provider memory is inconsistent' },
             @{ Change = { param($r) $r.runs[1].memory_availability.after.source.method = 'wrong' }; Expected = 'CUDA memory source is invalid' },
+            @{ Change = { param($r) $r.runs[1].Remove('available_device_memory_bytes_before') }; Expected = 'unexpected or missing fields' },
+            @{ Change = { param($r) $r.runs[1].Remove('available_device_memory_bytes_after') }; Expected = 'unexpected or missing fields' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_before = $null }; Expected = 'atomic numeric or null pair' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_after = $null }; Expected = 'atomic numeric or null pair' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_before = $null; $r.runs[1].available_device_memory_bytes_after = $null }; Expected = 'requires both numeric endpoints' },
+            @{ Change = { param($r) $r.runs[0].available_device_memory_bytes_before = 0; $r.runs[0].available_device_memory_bytes_after = 0 }; Expected = 'unavailable admission memory must be null' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_before = '32' }; Expected = 'must be an integer' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_after = 32.5 }; Expected = 'must be an integer' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_before = -1 }; Expected = 'nonnegative integer range' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_before = 31 }; Expected = 'does not match the fresh observed endpoints' },
+            @{ Change = { param($r) $r.runs[1].available_device_memory_bytes_after = 33 }; Expected = 'does not match the fresh observed endpoints' },
+            @{ Change = { param($r) $r.runs[1].memory_availability.before = [ordered]@{ status = 'unavailable'; reason = 'provider_query_failed' } }; Expected = 'unavailable admission memory must be null' },
+            @{ Change = { param($r)
+                $r.runs[1].memory_availability.before = [ordered]@{ status = 'unavailable'; reason = 'provider_query_failed' }
+                $r.runs[1].memory_availability.after.stable_device = 'wrong-device'
+                $r.runs[1].available_device_memory_bytes_before = $null; $r.runs[1].available_device_memory_bytes_after = $null
+            }; Expected = 'observed GPU memory availability is inconsistent' },
+            @{ Change = { param($r)
+                $r.runs[1].memory_availability.after = [ordered]@{ status = 'unavailable'; reason = 'provider_query_failed' }
+                $r.runs[1].memory_availability.before.source.method = 'wrong'
+                $r.runs[1].available_device_memory_bytes_before = $null; $r.runs[1].available_device_memory_bytes_after = $null
+            }; Expected = 'CUDA memory source is invalid' },
             @{ Change = { param($r) $r.runs[0].worker_process_affinity.changed = $false }; Expected = 'change result is inconsistent' },
             @{ Change = { param($r) $r.runs[0].worker_process_affinity.after.process_mask_hex = '0000000000000004' }; Expected = 'masks are inconsistent' },
             @{ Change = { param($r) $r.runs[0].worker_process_affinity.before = $null }; Expected = 'omitted an endpoint' },
@@ -1549,18 +1574,76 @@ public static class FakeIscc {
         $uncertainCampaign = New-FixtureCampaignReport 'ac'
         $uncertainCampaign.runs[1].raw_provider_memory.before = [ordered]@{ status = 'unavailable'; reason = 'provider_query_failed' }
         $uncertainCampaign.runs[1].memory_availability.after = [ordered]@{ status = 'unavailable'; reason = 'stable_device_ambiguous' }
+        $uncertainCampaign.runs[1].available_device_memory_bytes_before = $null
+        $uncertainCampaign.runs[1].available_device_memory_bytes_after = $null
         $uncertainCampaign.runs[0].worker_process_affinity.before = [ordered]@{ status = 'unavailable'; reason = 'unsupported_processor_group_topology' }
         $uncertainCampaign.runs[0].worker_process_affinity.changed = $null
         Write-Utf8 $syntheticCampaignPath ($uncertainCampaign | ConvertTo-Json -Depth 24)
         $acceptedUncertain = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
         Assert-Equal $acceptedUncertain.Report.runs[1].memory_availability.after.reason 'stable_device_ambiguous' 'Campaign diagnostic lost unavailable telemetry'
         Assert-True ($null -eq $acceptedUncertain.Report.runs[0].worker_process_affinity.changed) 'Campaign diagnostic invented affinity certainty'
+        Assert-True ($null -eq $acceptedUncertain.Report.runs[1].available_device_memory_bytes_before -and
+            $null -eq $acceptedUncertain.Report.runs[1].available_device_memory_bytes_after) 'Unavailable endpoint invented an admission memory pair'
+
+        $cudaCampaign = New-FixtureCampaignReport 'ac'
+        $cudaCampaign.runs[1].raw_provider_memory.before = [ordered]@{ status = 'unavailable'; reason = 'provider_query_failed' }
+        $cudaCampaign.runs[1].memory_availability.before.available_memory_bytes = 0
+        $cudaCampaign.runs[1].available_device_memory_bytes_before = 0
+        $cudaCampaign.runs[1].memory_availability.after.available_memory_bytes = 17
+        $cudaCampaign.runs[1].available_device_memory_bytes_after = 17
+        Write-Utf8 $syntheticCampaignPath ($cudaCampaign | ConvertTo-Json -Depth 24)
+        $acceptedCuda = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+        Assert-Equal $acceptedCuda.Report.schema_version 3 'Admission memory campaign schema'
+        Assert-Equal $acceptedCuda.Report.runs[1].available_device_memory_bytes_before 0 'Observed zero headroom was discarded or clamped'
+        Assert-Equal $acceptedCuda.Report.runs[1].available_device_memory_bytes_after 17 'Distinct endpoint headroom was replaced with the before value'
+        Assert-True ($null -eq $acceptedCuda.Report.runs[0].available_device_memory_bytes_before -and
+            $null -eq $acceptedCuda.Report.runs[0].available_device_memory_bytes_after) 'CPU admission memory was fabricated'
+        Assert-True ($acceptedCuda.Report.unsigned -and $acceptedCuda.Report.unqualified -and
+            -not $acceptedCuda.Report.auto_eligible -and -not $acceptedCuda.Report.release_approved) 'Admission memory changed the campaign trust boundary'
 
         $campaignExpected.Backend = 'vulkan'; $campaignExpected.Provider = 'vulkan'
         $vulkanCampaign = New-FixtureCampaignReport 'ac' 'vulkan'
         Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
         $acceptedVulkan = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
         Assert-True ($acceptedVulkan.Report.runs[1].memory_availability.before.memory_total_bytes -ne $acceptedVulkan.Report.gpu_identity.memory_total_bytes) 'Vulkan derived heap total was incorrectly forced to match provider identity total'
+        Assert-True ($null -eq $acceptedVulkan.Report.runs[1].available_device_memory_bytes_before -and
+            $null -eq $acceptedVulkan.Report.runs[1].available_device_memory_bytes_after) 'Vulkan capacity mismatch fabricated admission memory'
+        $vulkanCampaign.runs[1].available_device_memory_bytes_before = 384
+        $vulkanCampaign.runs[1].available_device_memory_bytes_after = 384
+        Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
+        Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } 'unavailable admission memory must be null'
+
+        $compatibleVulkan = New-FixtureCampaignReport 'ac' 'vulkan'
+        $compatibleVulkan.gpu_identity.memory_total_bytes = 1024
+        foreach ($run in $compatibleVulkan.runs | Where-Object { $_.target -ceq 'gpu' }) {
+            $run.raw_provider_memory.before.memory_total_bytes = 1024
+            $run.raw_provider_memory.after.memory_total_bytes = 1024
+            $run.available_device_memory_bytes_before = 384
+            $run.available_device_memory_bytes_after = 384
+        }
+        # Usage at or above budget is an observed zero, not unavailable.
+        $compatibleVulkan.runs[1].memory_availability.before.source.heaps[0].usage_bytes = 513
+        $compatibleVulkan.runs[1].memory_availability.before.available_memory_bytes = 0
+        $compatibleVulkan.runs[1].available_device_memory_bytes_before = 0
+        Write-Utf8 $syntheticCampaignPath ($compatibleVulkan | ConvertTo-Json -Depth 24)
+        $acceptedCompatible = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+        Assert-Equal $acceptedCompatible.Report.runs[1].available_device_memory_bytes_before 0 'Vulkan over-budget zero was lost'
+        Assert-Equal $acceptedCompatible.Report.runs[1].available_device_memory_bytes_after 384 'Compatible discrete Vulkan headroom'
+        foreach ($endpointName in @('before', 'after')) {
+            $mismatch = ($compatibleVulkan | ConvertTo-Json -Depth 24) | ConvertFrom-Json -Depth 24
+            $mismatch.runs[1].memory_availability.$endpointName.source.heaps[0].size_bytes = 2048
+            $mismatch.runs[1].memory_availability.$endpointName.memory_total_bytes = 2048
+            Write-Utf8 $syntheticCampaignPath ($mismatch | ConvertTo-Json -Depth 24)
+            Invoke-ExpectedFailure { Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected } 'unavailable admission memory must be null'
+            $mismatch.runs[1].available_device_memory_bytes_before = $null
+            $mismatch.runs[1].available_device_memory_bytes_after = $null
+            Write-Utf8 $syntheticCampaignPath ($mismatch | ConvertTo-Json -Depth 24)
+            $acceptedMismatch = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+            Assert-True ($null -eq $acceptedMismatch.Report.runs[1].available_device_memory_bytes_before -and
+                $null -eq $acceptedMismatch.Report.runs[1].available_device_memory_bytes_after) "Vulkan $endpointName capacity mismatch was not atomic"
+        }
+
+        $vulkanCampaign = New-FixtureCampaignReport 'ac' 'vulkan'
         foreach ($run in $vulkanCampaign.runs | Where-Object { $_.target -ceq 'gpu' }) {
             foreach ($endpoint in @($run.memory_availability.before, $run.memory_availability.after)) {
                 $endpoint.source.heaps[0].flags = 3
@@ -1580,6 +1663,17 @@ public static class FakeIscc {
         $vulkanCampaign.gpu_identity.device_class = 'integrated_gpu'
         Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
         Assert-Equal (Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected).Report.runs[1].memory_availability.before.available_memory_bytes 640 'Vulkan integrated all-heap headroom'
+        $vulkanCampaign.gpu_identity.memory_total_bytes = 1536
+        foreach ($run in $vulkanCampaign.runs | Where-Object { $_.target -ceq 'gpu' }) {
+            $run.raw_provider_memory.before.memory_total_bytes = 1536
+            $run.raw_provider_memory.after.memory_total_bytes = 1536
+            $run.available_device_memory_bytes_before = 640
+            $run.available_device_memory_bytes_after = 640
+        }
+        Write-Utf8 $syntheticCampaignPath ($vulkanCampaign | ConvertTo-Json -Depth 24)
+        $acceptedIntegrated = Read-WindowsLocalFrozenCaptureCampaignReport $syntheticCampaignPath $campaignExpected
+        Assert-Equal $acceptedIntegrated.Report.runs[1].available_device_memory_bytes_before 640 'Compatible integrated Vulkan admission memory before'
+        Assert-Equal $acceptedIntegrated.Report.runs[1].available_device_memory_bytes_after 640 'Compatible integrated Vulkan admission memory after'
         foreach ($case in @(
             @{ Change = { param($r) $r.runs[1].memory_availability.before.available_memory_bytes = 385 }; Expected = 'heap inventory is inconsistent' },
             @{ Change = { param($r) $r.runs[1].memory_availability.before.source.heaps[0].heap_index = 1 }; Expected = 'heap is noncanonical' },

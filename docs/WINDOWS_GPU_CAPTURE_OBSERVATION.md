@@ -193,10 +193,10 @@ and CPU, CUDA, Metal, non-Windows, and desktop behavior is unchanged.
 
 Both methods retain the existing generation/model/batch correlation and
 before/after validation. Cancellation, stale completion or device changes
-cannot reuse an earlier pair. No availability observation establishes that a
-model fits, supplies a performance admission input, or enables Auto. Hardware
-validation and consistent qualification/runtime admission semantics remain
-required before policy can consume these measurements.
+cannot reuse an earlier pair. No availability observation alone establishes
+that a model fits or enables Auto. Hardware validation and consistent
+qualification/runtime admission semantics remain required before policy can
+consume these measurements.
 
 ## Measurement meanings
 
@@ -554,14 +554,34 @@ An explicit earlier model load can therefore make `BeginBatch` genuinely warm;
 no campaign phase is used to manufacture these values. Existing worker binaries
 require a new build to gain this correction.
 
-Campaigns use a distinct `windows_gpu_capture_campaign` schema-2 report, bounded
+Campaigns use a distinct `windows_gpu_capture_campaign` schema-3 report, bounded
 to 32 MiB, at most 14 captured worker handshakes and 52 request records. A
 successful sequence has 50 measured records and two separately identified
 priming records. Deduplicate actual validated Hello/Ready bytes by their bound
 generation; retain timing, memory, power and transcript digests without raw
 audio, transcript text, user paths or native error messages.
 
-Schema 2 also records the worker **process** affinity at each request endpoint.
+Every campaign run, including CPU, failed and priming records, serializes
+top-level `available_device_memory_bytes_before` and
+`available_device_memory_bytes_after`. They are both null for CPU, failed,
+unavailable or mixed availability endpoints, and for a valid Vulkan
+scope-capacity mismatch. Numeric values occur only as a complete before/after
+GPU pair after each fresh typed endpoint validates against the authenticated
+worker identity and source semantics. CUDA retains its exact authenticated
+native total check. Vulkan additionally requires the selected-heap capacity to
+equal that authenticated native total at both endpoints; a valid mismatch is a
+diagnostic null/null projection, never a clamp or fabricated zero. A measured
+zero headroom remains numeric zero, and before/after values remain independent.
+
+This is a supported source-defined measurement projection from
+`memory_availability`, not a reinterpretation of `provider_memory`, D3DKMT
+telemetry, process memory, an authenticated Hello scalar, or another fallback.
+It does not create signed capture custody, an evidence adapter, a model-fit
+claim, a candidate admission floor or Auto authority. Priming records may carry
+the same projection but do not establish a cold-load or policy floor.
+
+The schema-2 worker **process** affinity fields remain in schema 3 at each
+request endpoint.
 The endpoint observer remains read-only and queries the retained
 generation-bound process handle; it never looks up a PID or sets process/thread
 affinity. The optional capture launcher job constraint above is separate.
@@ -593,11 +613,12 @@ campaigns return failure even when a diagnostic report was written.
 The report remains unsigned and unqualified, with `auto_eligible:false` and
 `release_approved:false`. Missing thermal/background-load, complete host,
 affinity and power-plan controls remain unknown, not successful facts. This
-runner does not convert reports into signed evidence, derive admission floors,
-or enable Auto. Warm availability already includes a resident model and cannot
-establish the free memory needed to load it from cold. A separately reviewed
-qualification stage must validate instrumentation overhead, retained-model
-interference, native counters, representative hardware and capture custody.
+runner does not convert reports into signed evidence, derive qualification or
+production-policy admission floors, or enable Auto. Warm availability already
+includes a resident model and cannot establish the free memory needed to load it
+from cold. A separately reviewed qualification stage must validate
+instrumentation overhead, retained-model interference, native counters,
+representative hardware and capture custody.
 
 The affinity queries use Microsoft's read-only
 [`GetProcessAffinityMask`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask)

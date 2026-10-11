@@ -106,10 +106,16 @@ alone are not construction authority.
 A complete signed campaign writer is still missing. The opt-in
 [capture observer](WINDOWS_GPU_CAPTURE_OBSERVATION.md) supports a single serial
 CPU/GPU pair (observation schema 3) or an explicit one-power campaign (distinct
-campaign schema 2). The campaign executes five cold and twenty warm pairs,
+campaign schema 3). The campaign executes five cold and twenty warm pairs,
 with two separate priming records, authenticated handshake frames, sampled
 process/device memory and request-bound raw and source-defined availability
-observations. These unsigned diagnostic reports are not performance bundles;
+observations. Campaign schema 3 also includes a nullable admission-memory
+projection: both endpoints must validate against the authenticated device and
+source semantics, and Vulkan selected-heap capacity must equal the authenticated
+native total at both endpoints. CPU, failed, unavailable or incompatible pairs
+remain null/null; observed zero remains zero. This closes a measurement-shape
+gap, not the signed writer, acquisition controls or qualification gates.
+These unsigned diagnostic reports are not performance bundles;
 their instrumented, prepared-audio windows do not establish ordinary application
 latency or qualified measurements. The older Windows Vulkan evidence
 script and ignored hardware tests produce fixture-only, metadata-only timing
