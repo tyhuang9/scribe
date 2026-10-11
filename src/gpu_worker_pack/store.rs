@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CStr;
@@ -330,6 +331,29 @@ impl<'a> PackStore<'a> {
         self.stage_and_install_inner(signed_source, |_| {}, |_| {}, |_| {})
     }
 
+    /// Copy-only execution materialization, authorized by a currently admitted
+    /// bundled lease. Never reads/recovers/changes the global activation pointer.
+    pub(crate) fn stage_and_open_verified(
+        &self,
+        source: &Arc<VerifiedPackLease>,
+    ) -> Result<VerifiedPackLease, PackStoreError> {
+        if source.has_execution_source() {
+            return Err(PackStoreError::DescriptorChanged);
+        }
+        source.recheck()?;
+        let mut installed = self.stage_and_open_inner(
+            &source.verified_pack().root,
+            Some(source),
+            |_| {},
+            |_| {},
+            |_| {},
+        )?;
+        require_same_lease(source, &installed)?;
+        source.recheck()?;
+        installed.retain_execution_source(Arc::clone(source))?;
+        Ok(installed)
+    }
+
     fn stage_and_install_inner(
         &self,
         signed_source: &Path,
@@ -337,18 +361,39 @@ impl<'a> PackStore<'a> {
         after_version_anchor: impl FnOnce(&Path),
         after_staging_anchor: impl FnOnce(&Path),
     ) -> Result<VerifiedPack, PackStoreError> {
+        self.stage_and_open_inner(
+            signed_source,
+            None,
+            after_source_verify,
+            after_version_anchor,
+            after_staging_anchor,
+        )
+        .map(|lease| lease.verified_pack().clone())
+    }
+
+    fn stage_and_open_inner(
+        &self,
+        signed_source: &Path,
+        expected: Option<&VerifiedPackLease>,
+        after_source_verify: impl FnOnce(&Path),
+        after_version_anchor: impl FnOnce(&Path),
+        after_staging_anchor: impl FnOnce(&Path),
+    ) -> Result<VerifiedPackLease, PackStoreError> {
         let source_root = AnchoredDirectory::open_root(signed_source)?;
         let initially_verified = self.verifier.verify_pinned(source_root.verifier_lease()?)?;
+        if let Some(expected) = expected {
+            require_same_lease(expected, &initially_verified)?;
+            expected.recheck()?;
+        }
         after_source_verify(signed_source);
         initially_verified.recheck()?;
         let source_lease = self.verifier.verify_pinned(source_root.verifier_lease()?)?;
-        require_same_pack(
-            initially_verified.verified_pack(),
-            source_lease.verified_pack(),
-        )?;
+        require_same_lease(&initially_verified, &source_lease)?;
         let source = source_lease.verified_pack().clone();
         let lock = self.acquire_lock()?;
-        self.recover_pending_activation_with_lock(&lock)?;
+        if expected.is_none() {
+            self.recover_pending_activation_with_lock(&lock)?;
+        }
         let epochs = self.load_epochs_with_lock(&lock)?;
         require_epoch_from(&source, &epochs)?;
         validate_descriptor_identity(&source)?;
@@ -359,8 +404,8 @@ impl<'a> PackStore<'a> {
         after_version_anchor(&version.path);
         if let Ok(existing) = version.open_child(&source.pack_digest, false) {
             let installed = self.verify_anchored_identity(&source, &existing, false)?;
-            require_same_pack(&source, installed.verified_pack())?;
-            return Ok(installed.verified_pack().clone());
+            require_same_lease(&source_lease, &installed)?;
+            return Ok(installed);
         }
 
         let staging_name = format!(".{}.staging-{}", source.pack_digest, random_suffix()?);
@@ -369,9 +414,9 @@ impl<'a> PackStore<'a> {
         let prepared = (|| {
             copy_verified_inventory_anchored(&source_lease, &staging)?;
             let source_after_copy = self.verifier.verify_pinned(source_root.verifier_lease()?)?;
-            require_same_pack(&source, source_after_copy.verified_pack())?;
+            require_same_lease(&source_lease, &source_after_copy)?;
             let staged = self.verifier.verify_pinned(staging.verifier_lease()?)?;
-            require_same_pack(&source, staged.verified_pack())?;
+            require_same_lease(&source_lease, &staged)?;
             staged.recheck()?;
             drop(staged);
             make_payload_readonly_anchored(&staging)?;
@@ -390,25 +435,28 @@ impl<'a> PackStore<'a> {
                 version.path.join(&staging_name),
             ));
         }
-        let result = (|| {
-            let installed_root =
-                match durable_rename_new_anchored(&staging, &version, &source.pack_digest)? {
-                    PublishOutcome::Published => {
-                        staging.rebound(version.path.join(&source.pack_digest))?
-                    }
-                    PublishOutcome::DestinationExists => {
-                        remove_staging_tree_anchored(&staging)?;
-                        version.open_child(&source.pack_digest, false)?
-                    }
-                };
-            let installed = self.verify_anchored_identity(&source, &installed_root, false)?;
-            require_same_pack(&source, installed.verified_pack())?;
-            Ok(installed.verified_pack().clone())
-        })();
-        if result.is_err() {
-            let _ = remove_staging_tree_anchored(&staging);
+        let outcome = match durable_rename_new_anchored(&staging, &version, &source.pack_digest) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = remove_staging_tree_anchored(&staging);
+                return Err(error);
+            }
+        };
+        if outcome == PublishOutcome::DestinationExists {
+            remove_staging_tree_anchored(&staging)?;
         }
-        result
+        // Staging owns DELETE access on Windows for atomic publication. Do not
+        // retain it in an execution lease: its access would prevent subsequent
+        // deny-delete readers. Keep the parent anchored, reopen without DELETE,
+        // and require the exact published directory identity before reverifying.
+        drop(staging);
+        let installed_root = version.open_child(&source.pack_digest, false)?;
+        if outcome == PublishOutcome::Published && installed_root.identity()? != staging_identity {
+            return Err(PackStoreError::UnsafeFilesystemEntry(installed_root.path));
+        }
+        let installed = self.verify_anchored_identity(&source, &installed_root, false)?;
+        require_same_lease(&source_lease, &installed)?;
+        Ok(installed)
     }
 
     pub(crate) fn activate(&self, descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
@@ -1025,6 +1073,19 @@ fn require_same_pack(
         || expected.target_os != observed.target_os
         || expected.target_arch != observed.target_arch
         || expected.worker_relative_path != observed.worker_relative_path
+    {
+        return Err(PackStoreError::DescriptorChanged);
+    }
+    Ok(())
+}
+
+fn require_same_lease(
+    expected: &VerifiedPackLease,
+    observed: &VerifiedPackLease,
+) -> Result<(), PackStoreError> {
+    require_same_pack(expected.verified_pack(), observed.verified_pack())?;
+    if expected.copy_entries() != observed.copy_entries()
+        || expected.frozen_worker_approval() != observed.frozen_worker_approval()
     {
         return Err(PackStoreError::DescriptorChanged);
     }
@@ -3044,6 +3105,107 @@ mod tests {
         }
 
         drop(anchored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execution_copy_retains_exact_source_and_ignores_activation_state() {
+        let (root, workers, state, verifier, _) = store_fixture("exec-copy");
+        let store = PackStore::new(&workers, &state, &verifier);
+        fs::create_dir(&state).unwrap();
+        fs::write(store.activation_path(), b"not activation authority").unwrap();
+        fs::write(store.pending_path(), b"not recovery authority").unwrap();
+        let source_root = AnchoredDirectory::open_root(&root.join("source")).unwrap();
+        let source = Arc::new(
+            verifier
+                .verify_pinned(source_root.verifier_lease().unwrap())
+                .unwrap(),
+        );
+        let installed = store.stage_and_open_verified(&source).unwrap();
+        require_same_lease(&source, &installed).unwrap();
+        assert!(installed.has_execution_source());
+        assert_eq!(Arc::strong_count(&source), 2);
+        assert_eq!(
+            verifier.launchable_worker(&installed).unwrap().path(),
+            installed.worker_path()
+        );
+        assert_eq!(
+            fs::read(store.activation_path()).unwrap(),
+            b"not activation authority"
+        );
+        assert_eq!(
+            fs::read(store.pending_path()).unwrap(),
+            b"not recovery authority"
+        );
+        assert!(!store.epoch_path().exists());
+        let cached = store.stage_and_open_verified(&source).unwrap();
+        assert_eq!(cached.verified_pack(), installed.verified_pack());
+        assert_eq!(cached.copy_entries(), source.copy_entries());
+        assert!(
+            store.stage_and_open_verified(&Arc::new(cached)).is_err(),
+            "execution provenance must never chain"
+        );
+        drop(installed);
+        drop(source);
+        drop(source_root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execution_copy_rejects_incoming_identity_before_creating_store() {
+        let (root, workers, state, verifier, _) = store_fixture("exec-source");
+        let (other, _) = additional_source(&root, "2.0.0", 1);
+        let expected_root = AnchoredDirectory::open_root(&other).unwrap();
+        let expected = verifier
+            .verify_pinned(expected_root.verifier_lease().unwrap())
+            .unwrap();
+        let store = PackStore::new(&workers, &state, &verifier);
+        assert!(matches!(
+            store.stage_and_open_inner(
+                &root.join("source"),
+                Some(&expected),
+                |_| {},
+                |_| {},
+                |_| {}
+            ),
+            Err(PackStoreError::DescriptorChanged)
+        ));
+        assert!(!workers.exists());
+        assert!(!state.exists());
+        drop(expected);
+        drop(expected_root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execution_copy_cache_never_authorizes_changed_source_or_corrupt_destination() {
+        let (root, workers, state, verifier, _) = store_fixture("exec-cache");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let source_root = AnchoredDirectory::open_root(&root.join("source")).unwrap();
+        let source = Arc::new(
+            verifier
+                .verify_pinned(source_root.verifier_lease().unwrap())
+                .unwrap(),
+        );
+        let installed = store.stage_and_open_verified(&source).unwrap();
+        // Existing retained files cannot be overwritten on Windows. An added
+        // file still changes the exact tree and must invalidate cached launch.
+        let unexpected_source = root.join("source/unexpected");
+        fs::write(&unexpected_source, b"changed source").unwrap();
+        assert!(verifier.launchable_worker(&installed).is_err());
+        assert!(store.stage_and_open_verified(&source).is_err());
+        fs::remove_file(unexpected_source).unwrap();
+        verifier.launchable_worker(&installed).unwrap();
+        let destination_root = installed.verified_pack().root.clone();
+        drop(installed);
+        fs::write(destination_root.join("unexpected"), b"corrupt cache").unwrap();
+        assert!(store.stage_and_open_verified(&source).is_err());
+        assert!(
+            destination_root.join("unexpected").exists(),
+            "corrupt immutable copies must not be replaced or deleted"
+        );
+        drop(source);
+        drop(source_root);
         fs::remove_dir_all(root).unwrap();
     }
 

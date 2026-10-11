@@ -53,9 +53,15 @@ Collector builds also expose a narrower, probe-only command:
 --scribe-windows-gpu-pack-probe --ack-local-security-records
 ```
 
-Those are the only accepted arguments. The acknowledgement is required because
+The security-record acknowledgement is required because
 ordinary production pack discovery may create or update Scribe's local GPU
-security-epoch record and lock file. The command accepts no pack root, worker
+security-epoch record and lock file. The only optional argument is the final
+`--ack-local-execution-copies`: it separately permits creating/reusing verified
+app-private execution copies for overlong Windows Vulkan paths. Without it,
+those candidates are rejected before execution-cache IO; short-path candidates
+remain eligible. No execution-copy permission is implied by the security-record
+acknowledgement alone. Preparation precedes the provider deadline and is not
+GPU hardware qualification. The command accepts no pack root, worker
 path, trust key, device selector, model, audio, output path or timeout override.
 It runs before every other private command dispatcher, so combining it with an
 installer smoke, verifier, capture or benchmark mode is rejected before that

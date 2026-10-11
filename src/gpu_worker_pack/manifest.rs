@@ -178,6 +178,9 @@ pub(crate) struct VerifiedPackLease {
     root: PinnedPackRoot,
     copy_entries: Vec<VerifiedCopyEntry>,
     _retained_files: Vec<File>,
+    // Execution copies are never independent discovery authority. Keep the
+    // original bundled tree pinned and reverify it before every launch.
+    execution_source: Option<std::sync::Arc<VerifiedPackLease>>,
     #[cfg(test)]
     test_reverification_trust: Option<&'static dyn TrustRoot>,
 }
@@ -212,7 +215,43 @@ impl VerifiedPackLease {
     }
 
     pub(crate) fn recheck(&self) -> Result<(), PackVerificationError> {
+        if let Some(source) = &self.execution_source {
+            source.root.recheck()?;
+        }
         self.root.recheck()
+    }
+
+    pub(super) fn has_execution_source(&self) -> bool {
+        self.execution_source.is_some()
+    }
+
+    pub(super) fn retain_execution_source(
+        &mut self,
+        source: std::sync::Arc<Self>,
+    ) -> Result<(), PackVerificationError> {
+        // Exactly one hop; no cache-to-cache provenance or self binding.
+        if self.execution_source.is_some()
+            || source.execution_source.is_some()
+            || self.verified_pack.root == source.verified_pack.root
+        {
+            return Err(PackVerificationError::DescriptorChanged);
+        }
+        let mut relocated = source.verified_pack.clone();
+        relocated.root.clone_from(&self.verified_pack.root);
+        if relocated != self.verified_pack
+            || source.copy_entries != self.copy_entries
+            || source.frozen_worker_approval != self.frozen_worker_approval
+        {
+            return Err(PackVerificationError::DescriptorChanged);
+        }
+        source.recheck()?;
+        self.recheck()?;
+        #[cfg(test)]
+        {
+            self.test_reverification_trust = source.test_reverification_trust;
+        }
+        self.execution_source = Some(source);
+        Ok(())
     }
 
     pub(crate) fn copy_entries(&self) -> &[VerifiedCopyEntry] {
@@ -508,6 +547,7 @@ impl<'a> PackVerifier<'a> {
             root,
             copy_entries,
             _retained_files: retained_files,
+            execution_source: None,
             #[cfg(test)]
             test_reverification_trust: None,
         })
@@ -597,15 +637,14 @@ impl<'a> PackVerifier<'a> {
         &self,
         expected: &'lease VerifiedPackLease,
     ) -> Result<LaunchableWorker<'lease>, PackVerificationError> {
-        expected.recheck()?;
-        let verification_root = expected.root.verification_root();
-        let (observed, frozen_worker_approval, _copy_entries, _launch_files) =
-            self.verify_inner(&verification_root, Some(&expected.root))?;
-        if &observed != expected.verified_pack()
-            || frozen_worker_approval != expected.frozen_worker_approval
-        {
-            return Err(PackVerificationError::DescriptorChanged);
-        }
+        // Use this same current verifier on both trees, without recursively
+        // following execution copies. Fresh file handles live through admission.
+        let _source_contents = expected
+            .execution_source
+            .as_ref()
+            .map(|source| self.reverify_retained_contents(source))
+            .transpose()?;
+        let _contents = self.reverify_retained_contents(expected)?;
         expected.recheck()?;
         // The original retained worker handle remains part of the lease.
         // Stage 4 must hand this lease into the exact-image launcher instead
@@ -614,6 +653,23 @@ impl<'a> PackVerifier<'a> {
             path: expected.worker_path(),
             _lease: expected,
         })
+    }
+
+    fn reverify_retained_contents(
+        &self,
+        expected: &VerifiedPackLease,
+    ) -> Result<VerifiedPackContents, PackVerificationError> {
+        expected.recheck()?;
+        let contents =
+            self.verify_inner(&expected.root.verification_root(), Some(&expected.root))?;
+        if &contents.0 != expected.verified_pack()
+            || contents.1 != expected.frozen_worker_approval
+            || contents.2 != expected.copy_entries
+        {
+            return Err(PackVerificationError::DescriptorChanged);
+        }
+        expected.recheck()?;
+        Ok(contents)
     }
 
     #[cfg(test)]
@@ -2223,6 +2279,42 @@ mod tests {
             manifest.security_epoch,
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn execution_source_binding_requires_exact_envelope_and_frozen_approval() {
+        let root = temp_root("execution-binding");
+        let (verifier, source) = leased_fixture(&root.join("s"));
+        let source = std::sync::Arc::new(source);
+        let (_, mut destination) = leased_fixture(&root.join("d"));
+        destination.copy_entries[0].sha256 = "0".repeat(64);
+        assert!(matches!(
+            destination.retain_execution_source(source.clone()),
+            Err(PackVerificationError::DescriptorChanged)
+        ));
+        destination.copy_entries.clone_from(&source.copy_entries);
+
+        let mut foreign = base_manifest();
+        foreign.app_build = "local-transcriber@0.9.0#approved-origin".into();
+        foreign.worker_build = "scribe-inference-worker@0.9.0#approved-origin".into();
+        foreign.pack_digest = compute_pack_digest(&foreign).unwrap();
+        let policy = frozen_gpu_policy(&foreign);
+        destination.frozen_worker_approval =
+            crate::worker_compatibility::with_test_frozen_worker_policy(&policy, || {
+                verifier.validate_manifest_with_approval(&foreign)
+            })
+            .unwrap();
+        assert!(destination.frozen_worker_approval.is_some());
+        assert!(matches!(
+            destination.retain_execution_source(source.clone()),
+            Err(PackVerificationError::DescriptorChanged)
+        ));
+        destination.frozen_worker_approval = None;
+        destination.retain_execution_source(source.clone()).unwrap();
+        verifier.launchable_worker(&destination).unwrap();
+        drop(destination);
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
