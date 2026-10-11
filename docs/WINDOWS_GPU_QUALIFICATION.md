@@ -193,14 +193,21 @@ cannot complete an integrated/unified runtime bucket without battery
 performance.
 
 For v4, only the `before` values of complete numeric admission pairs on
-successful GPU **runs** contribute to the exercised floor. Scenario admission,
-raw provider readings, and local/non-local segment counters never contribute.
+successful **cold** GPU runs (`fresh_process_fresh_model`) contribute to the
+exercised floor. Warm-before readings include a resident model and cannot
+establish the free memory needed for a cold load. Scenario admission, raw
+provider readings, and local/non-local segment counters never contribute.
 If either admission value is null on any successful GPU run for a power, that
 power's available-memory floor and the common floor are null; the candidate
 projection is suppressed and the decision records a power-specific missing-
-admission reason. The evaluator does not compare the declared identity threshold
-to a null floor. This preserves scenarios' separate installer and lifecycle
+admission reason. A power with no successful cold GPU run likewise has no floor;
+warm successes cannot supply one. The evaluator does not compare the declared
+identity threshold to a null floor. Completeness checking still includes every
+successful warm run. This preserves scenarios' separate installer and lifecycle
 semantics without allowing them to repair an incomplete performance observation.
+Legacy schemas 2/3 retain their existing aggregation behavior. The correction
+changes the bound evaluator digest, so old contracts cannot be silently reused
+or rebound to relabel historical captures as newly qualified evidence.
 
 The evaluator recomputes nearest-rank p50 and p95 using integers. The cold p95
 is rank 5 of 5; the warm p95 is rank 19 of 20. Both cold and warm pass only

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly)
+param([switch]$PerformanceSmokeOnly, [switch]$PerformanceOnly, [switch]$V4Only, [switch]$MaintainerReviewOnly, [switch]$CaptureAdmissionOnly, [switch]$ColdAdmissionOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -931,6 +931,136 @@ function Invoke-FailingFixture($Documents, [string]$Name, [string]$ExpectedReaso
     return $decision
 }
 
+function New-ColdAdmissionDocuments([string]$Route, [string]$DeviceClass, [Int64]$WarmAvailable) {
+    $documents = switch -CaseSensitive ($Route) {
+        'performance' { New-PerformanceDocuments $DeviceClass }
+        'reviewed-performance' { New-MaintainerReviewDocuments 'performance' $DeviceClass }
+        'v4' { New-V4FixtureDocuments $DeviceClass }
+        default { throw "Unsupported cold-admission fixture route: $Route" }
+    }
+    $lane = $documents.Evidence.lanes[0]
+    $blocks = [ordered]@{ ac = $lane }
+    if ($null -ne $lane.battery) { $blocks.battery = $lane.battery }
+    foreach ($power in $blocks.Keys) {
+        # Neither the first nor maximum cold reading is the minimum. AC and
+        # battery differ so their independent minima and conservative max matter.
+        [Int64[]]$coldBefore = if ($power -ceq 'ac') { @(9000000000, 8000000000, 10000000000, 8500000000, 8700000000) } else { @(10000000000, 9500000000, 9700000000, 9000000000, 9300000000) }
+        for ($index = 0; $index -lt 5; $index++) {
+            $blocks[$power].run_sets.cold.gpu[$index].available_device_memory_bytes_before = $coldBefore[$index]
+            $blocks[$power].run_sets.cold.gpu[$index].available_device_memory_bytes_after = [Int64]500000000
+        }
+        foreach ($run in @($blocks[$power].run_sets.warm.gpu)) {
+            $run.available_device_memory_bytes_before = $WarmAvailable
+            $run.available_device_memory_bytes_after = [Int64]500000000
+        }
+    }
+    if ($Route -ceq 'v4') { $lane.identity.device.qualified_minimum_available_memory_bytes = if ($DeviceClass -ceq 'discrete_gpu') { [Int64]8000000000 } else { [Int64]9000000000 } }
+    return $documents
+}
+
+function Invoke-ColdAdmissionFixture($Documents, [string]$Name, [string]$Route) {
+    if ($Route -ceq 'reviewed-performance') {
+        $bundle = New-MaintainerReviewBundle $Documents $Name
+        $result = Invoke-MaintainerReviewEvaluator $bundle
+    }
+    else {
+        $bundle = New-Bundle $Documents $Name
+        $result = Invoke-Evaluator $bundle
+    }
+    Assert-True ($result.ExitCode -eq 0) "$Name was rejected before its cold-admission decision: $($result.Stderr)"
+    $decision = $result.Stdout | ConvertFrom-Json -AsHashtable -Depth 64
+    Assert-True ($decision.fixture_only -and -not $decision.auto_eligible) "$Name escaped the fixture-only/default-deny boundary."
+    if ($Route -cne 'v4') { Assert-True (-not $decision.release_approved) "$Name granted performance release approval." }
+    return $decision
+}
+
+function Invoke-ColdAdmissionContractTests {
+    $positive = 0
+    $negative = 0
+    foreach ($route in @('performance', 'reviewed-performance', 'v4')) {
+        foreach ($deviceClass in @('discrete_gpu', 'integrated_gpu')) {
+            foreach ($warmCase in @(
+                [pscustomobject]@{ Name = 'low-warm'; Available = [Int64]1000000000 },
+                [pscustomobject]@{ Name = 'high-warm'; Available = [Int64]11000000000 }
+            )) {
+                $name = "cold-admission-$route-$deviceClass-$($warmCase.Name)"
+                $documents = New-ColdAdmissionDocuments $route $deviceClass $warmCase.Available
+                $decision = Invoke-ColdAdmissionFixture $documents $name $route
+                $passedField = if ($route -ceq 'v4') { 'qualification_passed' } else { 'performance_passed' }
+                Assert-True $decision[$passedField] "$name did not pass with complete cold and warm admission pairs."
+                $floor = $decision.lanes[0].evidence_memory_floor
+                [Int64]$expectedCommon = if ($deviceClass -ceq 'discrete_gpu') { 8000000000 } else { 9000000000 }
+                Assert-True ($floor.per_power_minimum_available_memory_bytes.ac -eq 8000000000) "$name did not use the minimum of all five successful cold AC starts."
+                Assert-True ($floor.common_minimum_available_memory_bytes -eq $expectedCommon) "$name let warm or after readings change the cold-load floor."
+                if ($deviceClass -ceq 'discrete_gpu') {
+                    Assert-True ($null -eq $floor.per_power_minimum_available_memory_bytes.battery -and $null -eq $decision.lanes[0].metrics.battery) "$name invented a discrete battery floor or metrics."
+                }
+                else {
+                    Assert-True ($floor.per_power_minimum_available_memory_bytes.battery -eq 9000000000) "$name failed to derive battery's cold minimum independently."
+                }
+                $entry = if ($route -ceq 'v4') { $decision.lanes[0].auto_entry_projection } else { $decision.lanes[0].candidate_entry }
+                Assert-True ($entry.minimum_available_memory_bytes -eq $expectedCommon) "$name projected a non-cold admission floor."
+                if ($route -cne 'v4') {
+                    $policy = $decision.candidate_policy | ConvertFrom-Json -AsHashtable -Depth 64
+                    Assert-True (@($policy.entries).Count -eq 1 -and $policy.entries[0].minimum_available_memory_bytes -eq $expectedCommon) "$name candidate policy disagreed with its cold-load projection."
+                }
+                $positive++
+            }
+        }
+        foreach ($power in @('ac', 'battery')) {
+            foreach ($failure in @('missing-warm-pair', 'no-successful-cold')) {
+                $name = "cold-admission-$route-$power-$failure"
+                $documents = New-ColdAdmissionDocuments $route 'integrated_gpu' ([Int64]1000000000)
+                $lane = $documents.Evidence.lanes[0]
+                $block = if ($power -ceq 'ac') { $lane } else { $lane.battery }
+                if ($failure -ceq 'missing-warm-pair') {
+                    $block.run_sets.warm.gpu[0].available_device_memory_bytes_before = $null
+                    $block.run_sets.warm.gpu[0].available_device_memory_bytes_after = $null
+                }
+                else {
+                    foreach ($run in @($block.run_sets.cold.gpu)) {
+                        Set-RunFailure $run 'provider_error'
+                        $run.available_device_memory_bytes_before = $null
+                        $run.available_device_memory_bytes_after = $null
+                    }
+                    Assert-True (@($block.run_sets.warm.gpu | Where-Object outcome -ceq 'success').Count -eq 20) "$name did not retain twenty successful warm requests."
+                }
+                $decision = Invoke-ColdAdmissionFixture $documents $name $route
+                $passedField = if ($route -ceq 'v4') { 'qualification_passed' } else { 'performance_passed' }
+                Assert-True (-not $decision[$passedField]) "$name passed without complete successful cold-start evidence."
+                $reason = if ($failure -ceq 'missing-warm-pair') { "${power}_available_memory_admission_inputs_missing" } else { "${power}_reliability_not_equivalent" }
+                Assert-True ($decision.lanes[0].reasons -ccontains $reason) "$name did not retain its $reason hard gate."
+                $floor = $decision.lanes[0].evidence_memory_floor
+                Assert-True ($null -eq $floor.per_power_minimum_available_memory_bytes[$power] -and $null -eq $floor.common_minimum_available_memory_bytes) "$name fabricated a warm-derived or zero cold-load floor."
+                $otherPower = if ($power -ceq 'ac') { 'battery' } else { 'ac' }
+                $otherFloor = if ($otherPower -ceq 'ac') { 8000000000 } else { 9000000000 }
+                Assert-True ($floor.per_power_minimum_available_memory_bytes[$otherPower] -eq $otherFloor) "$name damaged the other independent power floor."
+                Assert-True (-not $decision.lanes[0].checks.by_power[$power].available_memory_admission_inputs_complete) "$name reported cold admission completeness without an exercised floor."
+                if ($route -ceq 'v4') { Assert-True ($null -eq $decision.lanes[0].auto_entry_projection) "$name emitted an Auto projection." }
+                else { Assert-True ($null -eq $decision.candidate_policy -and $null -eq $decision.candidate_policy_sha256 -and $null -eq $decision.lanes[0].candidate_entry) "$name emitted a performance candidate." }
+                $negative++
+            }
+        }
+        $name = "cold-admission-$route-failed-lowest-cold"
+        $documents = New-ColdAdmissionDocuments $route 'integrated_gpu' ([Int64]11000000000)
+        $failed = $documents.Evidence.lanes[0].run_sets.cold.gpu[0]
+        $failed.available_device_memory_bytes_before = [Int64]1000000000
+        Set-RunFailure $failed 'provider_error'
+        $decision = Invoke-ColdAdmissionFixture $documents $name $route
+        $passedField = if ($route -ceq 'v4') { 'qualification_passed' } else { 'performance_passed' }
+        Assert-True (-not $decision[$passedField] -and $decision.lanes[0].reasons -ccontains 'ac_reliability_not_equivalent') "$name lost its reliability failure."
+        Assert-True ($decision.lanes[0].evidence_memory_floor.per_power_minimum_available_memory_bytes.ac -eq 8000000000 -and $decision.lanes[0].evidence_memory_floor.common_minimum_available_memory_bytes -eq 9000000000) "$name included a failed cold start in its exercised minima."
+        $negative++
+    }
+    foreach ($deviceClass in @('discrete_gpu', 'integrated_gpu')) {
+        $documents = New-ColdAdmissionDocuments 'v4' $deviceClass ([Int64]1000000000)
+        $documents.Evidence.lanes[0].identity.device.qualified_minimum_available_memory_bytes = [Int64]1000000000
+        Assert-Rejected (Invoke-Evaluator (New-Bundle $documents "cold-admission-v4-$deviceClass-stale-warm-declaration")) 'V4 stale warm-derived declared floor' 'conservative maximum'
+        $negative++
+    }
+    return [pscustomobject]@{ Positive = $positive; Negative = $negative }
+}
+
 function Invoke-CaptureAdmission($Request, [string]$Name, [string[]]$ExtraArguments = @(), [bool]$FixtureAllowed = $true, [bool]$FixtureClockProvided = $true, $Pins = $null, [scriptblock]$Rewrite = $null, [Int64]$Clock = $FixtureNow, [string[]]$OmitPins = @()) {
     $script:CaseCounter++
     $root = Join-Path $TestRoot ('{0:d2}-admission-{1}' -f $script:CaseCounter, $Name)
@@ -1395,7 +1525,14 @@ try {
     $checkedProbe = [pscustomobject]@{ PlanPath = $CheckedPlanPath; EvidencePath = $checkedEvidencePath; ArtifactRoot = $TestRoot }
     Assert-Rejected (Invoke-Evaluator $checkedProbe $false) 'Checked-in default-deny plan validation' 'not approved by the protected production authority'
 
-    if ($CaptureAdmissionOnly -or (-not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+    if ($ColdAdmissionOnly -or (-not $CaptureAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
+        $coldAdmissionCounts = Invoke-ColdAdmissionContractTests
+        Assert-True ($coldAdmissionCounts.Positive -eq 12 -and $coldAdmissionCounts.Negative -eq 17) 'Cold-admission suite did not discover all twelve positive and seventeen negative cases.'
+        foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Cold-admission tests modified immutable repository input: $name." }
+        Write-Output "Windows GPU cold-load admission contract tests passed ($($coldAdmissionCounts.Positive) positive, $($coldAdmissionCounts.Negative) negative)."
+        if ($ColdAdmissionOnly) { return }
+    }
+    if ($CaptureAdmissionOnly -or (-not $ColdAdmissionOnly -and -not $MaintainerReviewOnly -and -not $V4Only -and -not $PerformanceSmokeOnly -and -not $PerformanceOnly)) {
         $admissionCounts = Invoke-CaptureAdmissionContractTests
         foreach ($name in $immutablePaths.Keys) { Assert-True ([Security.Cryptography.CryptographicOperations]::FixedTimeEquals($immutableBefore[$name], [IO.File]::ReadAllBytes($immutablePaths[$name]))) "Admission tests modified immutable repository input: $name." }
         Write-Output "Windows GPU pre-capture admission contract tests passed ($($admissionCounts.Positive) positive, $($admissionCounts.Negative) negative)."
