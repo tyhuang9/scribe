@@ -6,6 +6,8 @@
 //! Auto remains default-denied to every GPU pack.
 
 mod device_release_epoch;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod execution_path;
 pub(crate) mod health;
 pub(crate) mod manifest;
 pub(crate) mod store;
@@ -421,6 +423,9 @@ pub(crate) enum PackDiscoveryIssue {
     CatalogRejected,
     EntryIncompatible,
     PackRootRejected,
+    ExecutionCopyNotAcknowledged,
+    ExecutionPathRejected,
+    ExecutionStoreRejected,
     SignatureOrInventoryRejected,
     CatalogInventoryMismatch,
     SecurityEpochStateRejected,
@@ -481,6 +486,15 @@ impl PackDiscoveryDiagnostic {
             PackDiscoveryIssue::PackRootRejected => {
                 format!("{subject} immutable root was rejected")
             }
+            PackDiscoveryIssue::ExecutionCopyNotAcknowledged => {
+                format!("{subject} requires explicit local execution-copy acknowledgement")
+            }
+            PackDiscoveryIssue::ExecutionPathRejected => {
+                format!("{subject} has no supported private execution path")
+            }
+            PackDiscoveryIssue::ExecutionStoreRejected => {
+                format!("{subject} verified execution copy was rejected")
+            }
             PackDiscoveryIssue::SignatureOrInventoryRejected => {
                 format!("{subject} signature or installed inventory was rejected")
             }
@@ -514,6 +528,35 @@ pub(crate) struct PackLeaseDiscovery {
     pub(crate) leases: Vec<Arc<manifest::VerifiedPackLease>>,
     pub(crate) diagnostics: Vec<PackDiscoveryDiagnostic>,
     pub(crate) catalog_generation: Option<String>,
+}
+
+/// Called only after route eligibility/pins and cache-miss admission, before
+/// starting the provider deadline. Discovery remains the bundled catalog's.
+pub(crate) fn prepare_pack_execution(discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    prepare_pack_execution_with_permission(discovery, true)
+}
+
+pub(crate) fn prepare_pack_execution_with_permission(
+    discovery: PackLeaseDiscovery,
+    allow_execution_copy: bool,
+) -> PackLeaseDiscovery {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        if execution_path::needs_preparation(&discovery) {
+            return execution_path::prepare_with_permission(
+                discovery,
+                allow_execution_copy,
+                |discovery| {
+                    let discovery = enforce_production_discovery_epochs(discovery);
+                    let prepared = execution_path::prepare(discovery);
+                    enforce_production_discovery_epochs(prepared)
+                },
+            );
+        }
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = allow_execution_copy;
+    discovery
 }
 
 impl PackLeaseDiscovery {

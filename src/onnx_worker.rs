@@ -9057,22 +9057,20 @@ impl CaptureObservationWorkerFactory {
                 pack_id,
                 backend,
             )?;
-            let probes = discovery
-                .leases
-                .into_iter()
-                .map(|lease| PendingPackProbe {
-                    pack_id: lease.verified_pack().pack_id.clone(),
-                    backend: lease.verified_pack().backend,
-                    supervisor: Self::supervisor(
+            let (probes, diagnostics) = prepare_pack_probes(
+                discovery,
+                crate::gpu_worker_pack::prepare_pack_execution,
+                |lease| {
+                    Self::supervisor(
                         OsWorkerLauncher::for_pack_probe(lease)
                             .with_capture_pins(Some(pins.clone()))
                             .with_capture_affinity(affinity.clone()),
-                    ),
-                })
-                .collect();
+                    )
+                },
+            );
             discover_pack_launch_bindings_with_budget(
                 probes,
-                discovery.diagnostics,
+                diagnostics,
                 GPU_PROVIDER_DISCOVERY_BUDGET,
             )
         } else {
@@ -9857,6 +9855,30 @@ fn discover_pack_launch_bindings_with_budget(
 fn discover_production_pack_launch_bindings(
     discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
 ) -> crate::gpu_worker_pack::ProductionPackRegistry {
+    let (probes, diagnostics) = prepare_pack_probes(
+        discovery,
+        crate::gpu_worker_pack::prepare_pack_execution,
+        InferenceWorkerSupervisor::for_pack_probe,
+    );
+    discover_pack_launch_bindings_with_budget(probes, diagnostics, GPU_PROVIDER_DISCOVERY_BUDGET)
+}
+
+fn prepare_pack_probes(
+    mut discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+    prepare: impl FnOnce(
+        crate::gpu_worker_pack::PackLeaseDiscovery,
+    ) -> crate::gpu_worker_pack::PackLeaseDiscovery,
+    mut supervisor: impl FnMut(Arc<VerifiedPackLease>) -> InferenceWorkerSupervisor,
+) -> (
+    Vec<PendingPackProbe>,
+    Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
+) {
+    discovery.leases.truncate(MAX_GPU_PROVIDER_PROBES);
+    let discovery = if discovery.leases.is_empty() {
+        discovery
+    } else {
+        prepare(discovery)
+    };
     let probes = discovery
         .leases
         .into_iter()
@@ -9864,14 +9886,11 @@ fn discover_production_pack_launch_bindings(
         .map(|lease| PendingPackProbe {
             pack_id: lease.verified_pack().pack_id.clone(),
             backend: lease.verified_pack().backend,
-            supervisor: InferenceWorkerSupervisor::for_pack_probe(lease),
+            supervisor: supervisor(lease),
         })
         .collect();
-    discover_pack_launch_bindings_with_budget(
-        probes,
-        discovery.diagnostics,
-        GPU_PROVIDER_DISCOVERY_BUDGET,
-    )
+    // The caller starts the provider deadline only after this returns.
+    (probes, discovery.diagnostics)
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -9883,6 +9902,9 @@ pub(crate) enum GpuPackProbeIssue {
     CatalogRejected,
     EntryIncompatible,
     PackRootRejected,
+    ExecutionCopyNotAcknowledged,
+    ExecutionPathRejected,
+    ExecutionStoreRejected,
     SignatureOrInventoryRejected,
     CatalogInventoryMismatch,
     SecurityEpochStateRejected,
@@ -9964,6 +9986,11 @@ fn probe_issue(issue: crate::gpu_worker_pack::PackDiscoveryIssue) -> GpuPackProb
         PackDiscoveryIssue::CatalogRejected => GpuPackProbeIssue::CatalogRejected,
         PackDiscoveryIssue::EntryIncompatible => GpuPackProbeIssue::EntryIncompatible,
         PackDiscoveryIssue::PackRootRejected => GpuPackProbeIssue::PackRootRejected,
+        PackDiscoveryIssue::ExecutionCopyNotAcknowledged => {
+            GpuPackProbeIssue::ExecutionCopyNotAcknowledged
+        }
+        PackDiscoveryIssue::ExecutionPathRejected => GpuPackProbeIssue::ExecutionPathRejected,
+        PackDiscoveryIssue::ExecutionStoreRejected => GpuPackProbeIssue::ExecutionStoreRejected,
         PackDiscoveryIssue::SignatureOrInventoryRejected => {
             GpuPackProbeIssue::SignatureOrInventoryRejected
         }
@@ -10119,8 +10146,25 @@ fn bounded_probe_projection<T>(mut items: Vec<T>, limit: usize) -> (Vec<T>, usiz
 /// privacy-safe worker Hello facts. Pack verification (including local epoch
 /// records) precedes the shared ten-second provider-launch/Hello budget.
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
-    let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+pub(crate) fn run_production_gpu_pack_probe(
+    allow_execution_copy: bool,
+) -> ProductionGpuPackProbeReport {
+    let mut discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+    let pack_limit_exceeded = enforce_gpu_probe_pack_limit(&mut discovery.leases);
+    // Verification/copying is not provider work and must not consume its ten
+    // second Hello deadline. These failures are not device-health observations.
+    let discovery = crate::gpu_worker_pack::prepare_pack_execution_with_permission(
+        discovery,
+        allow_execution_copy,
+    );
+    let preparation_rejected = discovery.diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.issue,
+            crate::gpu_worker_pack::PackDiscoveryIssue::ExecutionCopyNotAcknowledged
+                | crate::gpu_worker_pack::PackDiscoveryIssue::ExecutionPathRejected
+                | crate::gpu_worker_pack::PackDiscoveryIssue::ExecutionStoreRejected
+        )
+    });
     let mut diagnostics = discovery
         .diagnostics
         .into_iter()
@@ -10134,12 +10178,12 @@ pub(crate) fn run_production_gpu_pack_probe() -> ProductionGpuPackProbeReport {
         "GPU provider cleanup",
     )
     .expect("constant provider cleanup budget is valid");
-    let mut probe_completed = true;
+    let mut probe_completed = !preparation_rejected;
     let mut cleanup_confirmed = true;
     let mut devices = Vec::new();
     let mut probe_states = Vec::new();
-    let mut leases = discovery.leases;
-    if enforce_gpu_probe_pack_limit(&mut leases) {
+    let leases = discovery.leases;
+    if pack_limit_exceeded {
         probe_completed = false;
         diagnostics.push(GpuPackProbeDiagnostic {
             stage: GpuPackProbeStage::PackCatalog,
@@ -10547,6 +10591,9 @@ fn verified_gpu_route_catalog(
             diagnostic.issue,
             crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
                 | crate::gpu_worker_pack::PackDiscoveryIssue::DriverVersionUnavailable
+                | crate::gpu_worker_pack::PackDiscoveryIssue::ExecutionCopyNotAcknowledged
+                | crate::gpu_worker_pack::PackDiscoveryIssue::ExecutionPathRejected
+                | crate::gpu_worker_pack::PackDiscoveryIssue::ExecutionStoreRejected
         )
     });
     let mut routes = bindings
@@ -17527,6 +17574,125 @@ mod tests {
                 .contains("inventory omitted its adjacent policy loader")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_pack_execution_preparation_precedes_probe_creation_and_keeps_identity() {
+        use crate::gpu_worker_pack::manifest::test_support::{leased_fixture, temp_root};
+        let root = temp_root("execution-order");
+        let (_, lease) = leased_fixture(&root);
+        let source = Arc::new(lease);
+        let expectation = pack_expectation(&source);
+        let prepared = std::cell::Cell::new(false);
+        let discovery = crate::gpu_worker_pack::PackLeaseDiscovery {
+            leases: vec![Arc::clone(&source)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("original-generation".into()),
+        };
+        let launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let (probes, diagnostics) = prepare_pack_probes(
+            discovery,
+            |discovery| {
+                assert!(!prepared.replace(true));
+                assert_eq!(
+                    discovery.catalog_generation.as_deref(),
+                    Some("original-generation")
+                );
+                assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
+                discovery
+            },
+            |lease| {
+                assert!(prepared.get());
+                assert_eq!(pack_expectation(&lease), expectation);
+                assert!(Arc::ptr_eq(&lease, &source));
+                inference_supervisor_with_launcher(Arc::clone(&launcher))
+            },
+        );
+        assert_eq!(probes.len(), 1);
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
+        // The provider deadline is created inside this call, after preparation.
+        let registry = discover_pack_launch_bindings_with_budget(
+            probes,
+            diagnostics,
+            GPU_PROVIDER_DISCOVERY_BUDGET,
+        );
+        let (bindings, diagnostics) = registry.into_parts();
+        assert!(bindings.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_pack_execution_prepared_lease_survives_hello_into_inference_resolver() {
+        use crate::gpu_worker_pack::manifest::test_support::{leased_fixture, temp_root};
+        let root = temp_root("execution-hello");
+        let (verifier, source) = leased_fixture(&root.join("s"));
+        let source = Arc::new(source);
+        let source_path = source.verified_pack().root.clone();
+        let store = crate::gpu_worker_pack::store::PackStore::new(
+            root.join("e/workers"),
+            root.join("e/state"),
+            &verifier,
+        );
+        let prepared = Arc::new(store.stage_and_open_verified(&source).unwrap());
+        let context = PackLaunchContext::fixture(Arc::clone(&prepared), None);
+        let capability = WorkerPackCapability {
+            expectation: pack_expectation(&source),
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: "native:pci:0000:01:00.0".into(),
+                process_index: 2,
+                display_name: "Fixture GPU".into(),
+                driver_version: Some("windows-display:32.0.15.8088".into()),
+                device_class: DeviceClass::DiscreteGpu,
+                vendor: GpuVendor::Nvidia,
+                memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            }],
+        };
+        let mut bindings = bind_pack_hello(&context, &capability).unwrap();
+        assert_eq!(bindings.len(), 1);
+        let resolver = VerifiedPackWorkerExecutableResolver {
+            binding: bindings.remove(0),
+        };
+        assert!(Arc::ptr_eq(
+            &resolver.binding.verified_pack_lease_arc(),
+            &prepared
+        ));
+        assert_eq!(Arc::strong_count(&source), 2);
+        drop(context);
+        drop(prepared);
+        drop(source);
+        // Only the inference binding now retains both trees. A changed bundled
+        // origin must still reject launch despite an intact execution copy.
+        std::fs::write(source_path.join("unexpected"), b"changed bundled source").unwrap();
+        let error = resolver.resolve(WorkerRole::Inference).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("GPU worker pack changed before launch")
+        );
+        drop(resolver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_pack_execution_empty_eligibility_never_prepares_or_creates_probes() {
+        let discovery = crate::gpu_worker_pack::PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: Vec::new(),
+            catalog_generation: Some("empty-or-denied-auto".into()),
+        };
+        let (probes, diagnostics) = prepare_pack_probes(
+            discovery,
+            |_| panic!("no eligible GPU candidate may trigger preparation"),
+            |_| panic!("no eligible GPU candidate may create a probe"),
+        );
+        assert!(probes.is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

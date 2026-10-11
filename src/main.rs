@@ -306,7 +306,9 @@ fn main() -> eframe::Result<()> {
     }
     #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
     if std::env::args_os().skip(1).any(|arg| {
-        arg == "--scribe-windows-gpu-pack-probe" || arg == "--ack-local-security-records"
+        arg == "--scribe-windows-gpu-pack-probe"
+            || arg == "--ack-local-security-records"
+            || arg == "--ack-local-execution-copies"
     }) {
         eprintln!("Windows GPU pack probing is unavailable in this collector build");
         std::process::exit(2);

@@ -125,6 +125,40 @@ OS `LongPathsEnabled` policy, which Scribe does not change. This declaration
 does not prove third-party driver/library compatibility, GPU startup success,
 or Auto qualification; those remain separate installed/hardware checks.
 
+## Bounded Windows Vulkan execution path
+
+Eligible Windows x64 Vulkan packs whose canonical worker or inventory paths
+exceed the conservative 260-UTF-16-unit compatibility budget (including NUL)
+are copied on demand into the app-private local-data `gpu-exec` directory.
+The hierarchy remains `workers/packs/<id>/<version>/<full-digest>`; the complete
+signed manifest, signature, payload and adjacent policy loader are preserved
+byte-for-byte. Short-path Vulkan packs, CUDA, CPU and other platforms keep their
+existing launch paths. This is a third-party path-compatibility mitigation, not
+a diagnosed vendor defect or a guarantee for every possible profile path.
+
+The original bundled catalog and discovery epoch ledger remain authoritative.
+The execution store is never enumerated as a catalog and never uses the global
+activation/rollback pointer. Each returned execution lease retains its original
+bundled source; both exact trees are reverified with the same current trust and
+compatibility policy before launch. Existing copies are reverified, never
+blindly reused or overwritten when corrupt. Previous immutable copies remain
+on disk but cannot authorize a pack absent from the current bundled discovery.
+
+Preparation occurs after eligibility/Auto qualification and capture-pin
+admission, on provider-cache misses, before the provider's ten-second deadline.
+It requires no download, separate GPU installation, alias, registry change or
+elevation. A first copy adds local disk use and preparation time. Long/redirected
+profiles, insufficient space, unsafe roots or a destination still over budget
+fail with path-free execution diagnostics; there is no TEMP/global-directory
+fallback or retry of the known-overlong original path. These local failures do
+not quarantine GPU hardware. Existing strict GPU and CPU-safe Auto semantics
+are unchanged. Actual installed long-path GPU startup and end-to-end hardware
+qualification remain required; source tests do not establish runtime efficacy.
+The opt-in diagnostic pack probe additionally requires the separate final
+`--ack-local-execution-copies` flag before creating/reusing these execution
+copies. Its existing security-record acknowledgement alone never grants that
+side effect; overlong candidates are skipped with a categorical diagnostic.
+
 ## Stage 5 Windows Auto qualification
 
 `runtime-manifests/gpu-auto-qualification-windows-x64.json` is a compact,

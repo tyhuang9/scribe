@@ -9,34 +9,26 @@ use std::io::{self, Write};
 
 const COMMAND_FLAG: &str = "--scribe-windows-gpu-pack-probe";
 const SECURITY_RECORD_ACK: &str = "--ack-local-security-records";
+const EXECUTION_COPY_ACK: &str = "--ack-local-execution-copies";
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 
 pub(crate) fn maybe_run_local_command() -> Option<i32> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if !args
-        .iter()
-        .any(|arg| arg == OsStr::new(COMMAND_FLAG) || arg == OsStr::new(SECURITY_RECORD_ACK))
-    {
+    if !args.iter().any(|arg| is_probe_argument(arg)) {
         return None;
     }
     Some(run_local_command(&args))
 }
 
 fn run_local_command(args: &[OsString]) -> i32 {
-    let expected = [OsStr::new(COMMAND_FLAG), OsStr::new(SECURITY_RECORD_ACK)];
-    if args.len() != expected.len()
-        || args
-            .iter()
-            .zip(expected)
-            .any(|(actual, expected)| actual != expected)
-    {
+    let Some(allow_execution_copy) = execution_copy_acknowledgement(args) else {
         eprintln!(
-            "GPU pack probing requires exactly its command flag and local security-record acknowledgement"
+            "GPU pack probing requires its command flag, local security-record acknowledgement and optional final execution-copy acknowledgement"
         );
         return 2;
-    }
+    };
 
-    let report = crate::onnx_worker::run_production_gpu_pack_probe();
+    let report = crate::onnx_worker::run_production_gpu_pack_probe(allow_execution_copy);
     let successful = probe_exit_code(
         report.probe_completed,
         report.cleanup_confirmed,
@@ -56,6 +48,31 @@ fn run_local_command(args: &[OsString]) -> i32 {
     if successful { 0 } else { 1 }
 }
 
+fn is_probe_argument(arg: &OsStr) -> bool {
+    [COMMAND_FLAG, SECURITY_RECORD_ACK, EXECUTION_COPY_ACK]
+        .iter()
+        .any(|flag| arg == OsStr::new(flag))
+}
+
+fn execution_copy_acknowledgement(args: &[OsString]) -> Option<bool> {
+    match args {
+        [command, security]
+            if command == OsStr::new(COMMAND_FLAG)
+                && security == OsStr::new(SECURITY_RECORD_ACK) =>
+        {
+            Some(false)
+        }
+        [command, security, copies]
+            if command == OsStr::new(COMMAND_FLAG)
+                && security == OsStr::new(SECURITY_RECORD_ACK)
+                && copies == OsStr::new(EXECUTION_COPY_ACK) =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 fn probe_exit_code(probe_completed: bool, cleanup_confirmed: bool, device_count: usize) -> i32 {
     if probe_completed && cleanup_confirmed && device_count != 0 {
         0
@@ -73,6 +90,11 @@ mod tests {
         for args in [
             vec![OsString::from(COMMAND_FLAG)],
             vec![OsString::from(SECURITY_RECORD_ACK)],
+            vec![OsString::from(EXECUTION_COPY_ACK)],
+            vec![
+                OsString::from(COMMAND_FLAG),
+                OsString::from(EXECUTION_COPY_ACK),
+            ],
             vec![
                 OsString::from(SECURITY_RECORD_ACK),
                 OsString::from(COMMAND_FLAG),
@@ -82,9 +104,32 @@ mod tests {
                 OsString::from(SECURITY_RECORD_ACK),
                 OsString::from("--output"),
             ],
+            vec![
+                OsString::from(COMMAND_FLAG),
+                OsString::from(EXECUTION_COPY_ACK),
+                OsString::from(SECURITY_RECORD_ACK),
+            ],
+            vec![
+                OsString::from(COMMAND_FLAG),
+                OsString::from(SECURITY_RECORD_ACK),
+                OsString::from(EXECUTION_COPY_ACK),
+                OsString::from(EXECUTION_COPY_ACK),
+            ],
         ] {
             assert_eq!(run_local_command(&args), 2);
         }
+    }
+
+    #[test]
+    fn execution_copy_ack_is_separate_optional_and_exact_without_starting_probe() {
+        let arguments = [
+            OsString::from(COMMAND_FLAG),
+            OsString::from(SECURITY_RECORD_ACK),
+        ];
+        assert_eq!(execution_copy_acknowledgement(&arguments), Some(false));
+        let mut arguments = arguments.to_vec();
+        arguments.push(OsString::from(EXECUTION_COPY_ACK));
+        assert_eq!(execution_copy_acknowledgement(&arguments), Some(true));
     }
 
     #[test]
@@ -101,10 +146,7 @@ mod tests {
     }
 
     fn maybe_run_local_command_for_test(args: &[OsString]) -> Option<i32> {
-        if !args
-            .iter()
-            .any(|arg| arg == OsStr::new(COMMAND_FLAG) || arg == OsStr::new(SECURITY_RECORD_ACK))
-        {
+        if !args.iter().any(|arg| is_probe_argument(arg)) {
             None
         } else {
             Some(run_local_command(args))

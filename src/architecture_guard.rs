@@ -875,7 +875,9 @@ fn windows_gpu_probe_stays_early_opt_in_and_probe_only() {
     for required in [
         "--scribe-windows-gpu-pack-probe",
         "--ack-local-security-records",
-        "run_production_gpu_pack_probe()",
+        "--ack-local-execution-copies",
+        "run_production_gpu_pack_probe(allow_execution_copy)",
+        "execution_copy_acknowledgement(args)",
         "MAX_REPORT_BYTES",
     ] {
         assert!(
@@ -1725,7 +1727,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
     assert!(module.contains("PackBackend::Metal"));
     for required in [
         "fn discover_production_pack_launch_bindings(",
-        "InferenceWorkerSupervisor::for_pack_probe(lease)",
+        "InferenceWorkerSupervisor::for_pack_probe,",
         "verified_pack_bindings()",
         "ProductionPackRegistry::from_launch_bindings(bindings)",
         "preference == AccelerationPreference::Auto",
@@ -1743,6 +1745,25 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
             "Stage 5 verified discovery/evidence-bound Auto contract lost {required:?}"
         );
     }
+    let discovery_route = production_worker
+        .split("fn discover_production_pack_launch_bindings(")
+        .nth(1)
+        .and_then(|source| source.split("fn prepare_pack_probes(").next())
+        .expect("production pack discovery remains structurally visible");
+    for required in [
+        "crate::gpu_worker_pack::prepare_pack_execution,",
+        "InferenceWorkerSupervisor::for_pack_probe,",
+    ] {
+        assert!(discovery_route.contains(required));
+    }
+    let prepared = discovery_route.find("prepare_pack_probes(").unwrap();
+    let probed = discovery_route
+        .find("discover_pack_launch_bindings_with_budget(")
+        .unwrap();
+    assert!(
+        prepared < probed,
+        "execution preparation must precede the provider budget"
+    );
     assert!(qualification.contains("serde(deny_unknown_fields)"));
     assert!(qualification.contains("cold_runs < 5"));
     assert!(qualification.contains("warm_runs < 20"));
