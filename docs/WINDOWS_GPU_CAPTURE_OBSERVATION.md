@@ -672,10 +672,20 @@ behavior. Do not relax inheritance assertions or skip the native checks.
 
 For a provider-enabled worker check, use the same command with
 `-GpuProviderCheck Vulkan` or `-GpuProviderCheck Cuda` after provisioning the
-reviewed backend SDK and compiler. This additionally checks the independent
-worker, strictly lints all targets in the provider-enabled test configuration,
-and runs the deterministic worker-observation/provider test groups in that
-configuration. It never enables a GPU provider on the collector.
+reviewed backend SDK and compiler. Vulkan additionally checks the independent
+worker, strictly lints all targets in the developer Vulkan test configuration,
+and runs the five deterministic worker-observation/provider test groups in that
+configuration. CUDA instead runs locked, offline **release worker-bin only**
+Cargo check and strict worker-bin lint with `cuda-acceleration`. These source
+checks do not link or produce a CUDA worker executable. Its worker
+build flag and absent CPU-worker digest are scoped to those two commands and
+the caller's exact environment state is restored on success or failure.
+Windows CUDA is intentionally worker-only: do not enable it on a desktop or
+test target, or mark those targets as workers to bypass the build guard.
+The CUDA worker has no test harness; CUDA-specific test-only code is not
+compiled or executed by this command. The normal provider-free deterministic
+contract groups still run, without claiming CUDA test coverage. Neither option
+enables a GPU provider on the collector or performs GPU inference.
 `-ScriptOnly` rejects a simultaneous provider check rather than silently
 skipping it. The command does not install or authenticate a toolchain itself;
 toolchain provenance remains a separate prerequisite.
