@@ -56,7 +56,7 @@ if (($actualCaptureFilters -join "`0") -cne ($expectedCaptureFilters -join "`0")
     ($actualProviderFilters -join "`0") -cne ($expectedProviderFilters -join "`0")) {
     throw 'Capture runner changed its exact canonical Hello-memory test commands.'
 }
-$definitions = foreach ($name in @('Invoke-CaptureCargo', 'Invoke-CaptureTests')) {
+$definitions = foreach ($name in @('Invoke-CaptureCargo', 'Invoke-CaptureTests', 'Invoke-CaptureProviderChecks')) {
     $functions = @($ast.FindAll({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
@@ -110,7 +110,7 @@ try {
             }
             if ($state.Case -eq 'execution_failure') { $global:LASTEXITCODE = 1 }
         }
-        foreach ($features in @('windows-gpu-capture-observation', 'ui-harness,cuda-acceleration',
+        foreach ($features in @('windows-gpu-capture-observation', 'ui-harness,inference-worker',
                 'ui-harness,vulkan-acceleration')) {
             foreach ($case in @('success', 'empty', 'wrong_filter', 'discovery_failure', 'execution_failure')) {
                 $state.Features = $features
@@ -142,6 +142,145 @@ finally {
     else { Set-Variable LASTEXITCODE -Scope Global -Value $originalExitCode }
 }
 Write-Output 'Capture runner contracts passed (15 mocked cases); no Cargo process was launched.'
+
+# Execute the actual provider dispatcher with fake Cargo. CUDA must never
+# compile/lint a desktop target or enter the Vulkan provider test loop.
+$providerCalls = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq 'Invoke-CaptureProviderChecks'
+}, $true))
+if ($providerCalls.Count -ne 1 -or $providerCalls[0].CommandElements.Count -ne 2 -or
+    $providerCalls[0].CommandElements[1].Extent.Text -cne '$GpuProviderCheck') {
+    throw 'Capture runner must route its optional provider through the tested dispatcher.'
+}
+$providerGuards = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -ceq '$GpuProviderCheck -ne ''None'''
+}, $true))
+if ($providerGuards.Count -ne 1 -or
+    $providerCalls[0].Extent.StartOffset -lt $providerGuards[0].Extent.StartOffset -or
+    $providerCalls[0].Extent.EndOffset -gt $providerGuards[0].Extent.EndOffset) {
+    throw 'Capture runner must skip provider checks for None.'
+}
+$providerOriginalEnvironment = [Environment]::GetEnvironmentVariables('Process')
+try {
+    & {
+        param([string[]]$Definitions, [string[]]$ExpectedFilters)
+        . ([scriptblock]::Create($Definitions -join "`n"))
+        $names = @('SCRIBE_BUILDING_WORKER', 'SCRIBE_BUNDLED_WORKER_SHA256')
+        $state = @{ Calls = 0; Filters = @(); Commands = @(); Backend = ''; Case = ''; Initial = $null }
+        function Assert-ProviderEnvironmentRestored {
+            $actual = [Environment]::GetEnvironmentVariables('Process')
+            foreach ($name in $names) {
+                if ($actual.Contains($name) -ne $state.Initial.Contains($name) -or
+                    $actual[$name] -cne $state.Initial[$name]) {
+                    throw "Provider verification did not preserve the presence and value of $name."
+                }
+            }
+        }
+        function cargo {
+            $actual = @($args)
+            $state.Calls++
+            if ($state.Calls -gt $state.Commands.Count) { throw 'Unexpected provider Cargo call.' }
+            $expected = $state.Commands[$state.Calls - 1]
+            if (($actual -join "`0") -cne ($expected -join "`0")) {
+                throw 'Provider Cargo command changed its exact target, profile, features or lint boundary.'
+            }
+            if ($state.Backend -eq 'Cuda') {
+                if ($env:SCRIBE_BUILDING_WORKER -cne '1' -or (Test-Path -LiteralPath 'Env:SCRIBE_BUNDLED_WORKER_SHA256')) {
+                    throw 'CUDA worker verification must use worker mode and a truly absent CPU digest.'
+                }
+            }
+            else { Assert-ProviderEnvironmentRestored }
+            $global:LASTEXITCODE = 0
+            if ($state.Case -eq "failure_$($state.Calls)") { $global:LASTEXITCODE = 1 }
+            if ($state.Case -eq "throw_$($state.Calls)") { throw 'Injected provider Cargo exception.' }
+        }
+        function Invoke-CaptureTests([string]$Features, [string]$Filter) {
+            if ($state.Backend -ne 'Vulkan' -or $Features -cne 'ui-harness,vulkan-acceleration') {
+                throw 'CUDA worker verification must never enter a desktop/provider test configuration.'
+            }
+            Assert-ProviderEnvironmentRestored
+            $state.Filters += $Filter
+        }
+        $caseCount = 0
+        # ValidateSet accepts case-insensitive input; both routes must too.
+        foreach ($backend in @('Cuda', 'cuda', 'Vulkan', 'vUlKaN')) {
+            foreach ($workerValue in @($null, '', 'inherited-worker-mode')) {
+                foreach ($digestValue in @($null, '', 'inherited-cpu-digest')) {
+                    foreach ($case in @('success', 'failure_1', 'failure_2', 'throw_1', 'throw_2')) {
+                        foreach ($entry in @(
+                            @{ Name = $names[0]; Value = $workerValue },
+                            @{ Name = $names[1]; Value = $digestValue }
+                        )) {
+                            if ($null -eq $entry.Value) {
+                                Remove-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction SilentlyContinue
+                            }
+                            else { Set-Item -LiteralPath "Env:$($entry.Name)" -Value $entry.Value }
+                            if ((Test-Path -LiteralPath "Env:$($entry.Name)") -ne ($null -ne $entry.Value) -or
+                                ($null -ne $entry.Value -and (Get-Item -LiteralPath "Env:$($entry.Name)").Value -cne $entry.Value)) {
+                                throw 'Provider fixture did not establish its exact absent, empty or inherited environment state.'
+                            }
+                        }
+                        $state.Initial = [Environment]::GetEnvironmentVariables('Process')
+                        $state.Backend = $backend
+                        $state.Case = $case
+                        $state.Calls = 0
+                        $state.Filters = @()
+                        if ($backend -eq 'Cuda') {
+                            $state.Commands = @(
+                                @('check', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'cuda-acceleration'),
+                                @('clippy', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'cuda-acceleration', '--', '-D', 'warnings')
+                            )
+                            $success = 'CUDA release worker source check and worker-only lint passed; executable linking, CUDA test-only code, GPU execution and hardware qualification not run.'
+                        }
+                        else {
+                            $state.Commands = @(
+                                @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', 'vulkan-acceleration'),
+                                @('clippy', '--locked', '--offline', '--all-targets', '--features', 'ui-harness,vulkan-acceleration', '--', '-D', 'warnings')
+                            )
+                            $success = 'Vulkan worker compilation and deterministic observation tests passed; hardware qualification not run.'
+                        }
+                        $output = @()
+                        $actualError = $null
+                        try { $output = @(Invoke-CaptureProviderChecks $backend) }
+                        catch { $actualError = $_.Exception.Message }
+                        $expectedError = if ($case.StartsWith('failure_')) { 'Capture observation Cargo verification failed.' }
+                            elseif ($case.StartsWith('throw_')) { 'Injected provider Cargo exception.' }
+                            else { $null }
+                        if ($actualError -cne $expectedError) { throw "Provider contract failed for $backend/$case`: $actualError" }
+                        Assert-ProviderEnvironmentRestored
+                        $expectedCalls = if ($case.EndsWith('_1')) { 1 } else { 2 }
+                        if ($state.Calls -ne $expectedCalls) { throw 'Provider continued Cargo work after a failed command.' }
+                        $expectedGroups = if ($backend -eq 'Vulkan' -and $case -eq 'success') { $ExpectedFilters } else { @() }
+                        if (($state.Filters -join "`0") -cne ($expectedGroups -join "`0")) {
+                            throw 'Provider test groups changed or ran after failed worker verification.'
+                        }
+                        if ($case -eq 'success') {
+                            if ($output.Count -ne 1 -or $output[0] -cne $success) { throw 'Provider success message misstates verification coverage.' }
+                        }
+                        elseif ($output.Count -ne 0) { throw 'Provider reported success after failure.' }
+                        $caseCount++
+                    }
+                }
+            }
+        }
+        if ($caseCount -ne 180) { throw 'Expected provider-boundary fixtures were not all discovered.' }
+    } -Definitions $definitions -ExpectedFilters $expectedProviderFilters
+}
+finally {
+    foreach ($name in @('SCRIBE_BUILDING_WORKER', 'SCRIBE_BUNDLED_WORKER_SHA256')) {
+        if ($providerOriginalEnvironment.Contains($name)) {
+            Set-Item -LiteralPath "Env:$name" -Value $providerOriginalEnvironment[$name]
+        }
+        else { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+    }
+    if (-not $hadExitCode) { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    else { Set-Variable LASTEXITCODE -Scope Global -Value $originalExitCode }
+}
+Write-Output 'Capture provider boundary contracts passed (180 mocked cases); no Cargo process was launched.'
 
 # Test the actual argument builder without running a collector, accessing
 # inputs, or composing a shell command. Keep spaces/metacharacters as values.

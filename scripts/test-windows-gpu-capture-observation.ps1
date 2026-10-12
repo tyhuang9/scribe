@@ -37,6 +37,46 @@ function Invoke-CaptureTests([string]$Features, [string]$Filter) {
     Invoke-CaptureCargo @('test', '--locked', '--offline', '--bin', 'local-transcriber', '--features', $Features, $Filter, '--', '--test-threads=1')
 }
 
+function Invoke-CaptureProviderChecks([ValidateSet('Cuda', 'Vulkan')][string]$Backend) {
+    if ($Backend -eq 'Cuda') {
+        # CUDA is a Windows worker-only build contract. Never mark desktop or
+        # test targets as workers to get around that boundary. Restore even an
+        # inherited empty value distinctly from an absent environment entry.
+        $names = @('SCRIBE_BUILDING_WORKER', 'SCRIBE_BUNDLED_WORKER_SHA256')
+        $original = [Environment]::GetEnvironmentVariables('Process')
+        try {
+            $env:SCRIBE_BUILDING_WORKER = '1'
+            Remove-Item -LiteralPath 'Env:SCRIBE_BUNDLED_WORKER_SHA256' -ErrorAction SilentlyContinue
+            Invoke-CaptureCargo @('check', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'cuda-acceleration')
+            Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'cuda-acceleration', '--', '-D', 'warnings')
+        }
+        finally {
+            foreach ($name in $names) {
+                if ($original.Contains($name)) {
+                    Set-Item -LiteralPath "Env:$name" -Value $original[$name]
+                }
+                else {
+                    Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        Write-Output 'CUDA release worker source check and worker-only lint passed; executable linking, CUDA test-only code, GPU execution and hardware qualification not run.'
+        return
+    }
+
+    $providerFeature = 'vulkan-acceleration'
+    Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', $providerFeature)
+    # Keep the developer Vulkan feature's existing all-target test coverage.
+    Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$providerFeature", '--', '-D', 'warnings')
+    foreach ($filter in @('onnx_worker::tests::capture_observation',
+            'onnx_worker::tests::vulkan_hello_memory',
+            'embedded_runtime::tests::provider_memory_observation',
+            'embedded_runtime::tests::retained_gguf', 'runtime_router::tests::retained_gguf')) {
+        Invoke-CaptureTests "ui-harness,$providerFeature" $filter
+    }
+    Write-Output 'Vulkan worker compilation and deterministic observation tests passed; hardware qualification not run.'
+}
+
 Push-Location $repositoryRoot
 try {
     if ($CargoTargetDirectory) { $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($CargoTargetDirectory) }
@@ -412,19 +452,7 @@ try {
     if ($GpuProviderCheck -ne 'None') {
         # The caller must provision the reviewed SDK/toolchain first. This
         # command neither installs tools nor grants pack/signing authority.
-        # Never combine a GPU provider with the desktop collector feature.
-        $providerFeature = $GpuProviderCheck.ToLowerInvariant() + '-acceleration'
-        Invoke-CaptureCargo @('check', '--locked', '--offline', '--bin', 'scribe-inference-worker', '--features', $providerFeature)
-        # Include test-only code in the provider configuration, matching the
-        # release lint. A production-only check cannot catch unused test helpers.
-        Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$providerFeature", '--', '-D', 'warnings')
-        foreach ($filter in @('onnx_worker::tests::capture_observation',
-                'onnx_worker::tests::vulkan_hello_memory',
-                'embedded_runtime::tests::provider_memory_observation',
-                'embedded_runtime::tests::retained_gguf', 'runtime_router::tests::retained_gguf')) {
-            Invoke-CaptureTests "ui-harness,$providerFeature" $filter
-        }
-        Write-Output "$GpuProviderCheck worker compilation and deterministic observation tests passed; hardware qualification not run."
+        Invoke-CaptureProviderChecks $GpuProviderCheck
     }
     Write-Output 'Windows GPU capture observation verification passed.'
 }
