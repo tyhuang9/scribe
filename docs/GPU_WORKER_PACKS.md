@@ -49,6 +49,51 @@ packs for publication.
 - GPU health uses the exact pack/runtime/OS/driver/device/model key described
   below.
 
+### Priority-staged provider discovery
+
+The complete installed catalog still passes signature, exact-inventory, hash,
+platform, ABI, and security-epoch verification before any provider is prepared.
+Auto additionally applies its pack/model qualification allowlist first. Those
+verified leases are grouped in backend priority order: CUDA before Vulkan on
+Windows, or the single Metal stage on macOS. This does not enable Linux GPU
+launches or make any pack Auto-eligible.
+
+Only the current stage is prepared and capability-probed. If CUDA supplies an
+eligible route and that route succeeds, deferred Vulkan packs are neither
+execution-copied nor launched, including on warm reuse. If the current stage has
+no eligible route, or its bounded routes fail with an existing replay-safe
+pre-output category, the next stage is considered before Auto's CPU fallback
+only when a GPU execution position remains within the shared attempt bound.
+An exhausted GPU attempt bound leaves lower stages unprepared; Auto proceeds
+to its reserved CPU position, while explicit GPU returns a clear error.
+Cancellation, invalid input, model corruption, decode/content failure, and
+partial output never authorize another stage. An exact-target Retry GPU remains
+separate from ordinary fallback and cannot widen into another target.
+
+All stages in one discovery generation share at most eight provider-probe slots
+and ten seconds of cumulative active capability-probe time, including existing
+probe retirement. Execution preparation remains before the probe timer. Model
+loading, inference, and idle time do not consume the remaining probe allowance;
+promoting a stage does not replenish it. An exhausted allowance never prepares
+or launches a lower stage. Promotion also requires confirmed previous-worker
+exit within a 250 ms confirmation bound and remaining active allowance.
+Unconfirmed cleanup blocks further launches instead of overlapping workers.
+The inference operation separately keeps its existing
+four-candidate bound across stages: explicit GPU has at most four GPU routes;
+Auto reserves one position for CPU and has at most three GPU routes. Targets
+filtered out before queue admission do not consume those execution positions.
+
+Deferred leases remain bound to the verified catalog/adapter generation and
+model, with Auto also bound to its qualification policy. Promotion rechecks that
+authority and current power eligibility. Intentional deferral is not a provider
+failure or quarantine event. Windows health continues to use the physical
+adapter-set witness, so discovering a lower stage cannot clear CUDA quarantine.
+A healthy exact warm owner remains reusable; after retirement, Auto requires
+fresh preferred-provider admission rather than treating deferral as a failure.
+Diagnostics identify deferred backends/packs without inventing unprobed devices;
+device targets and fallback history come only from authenticated observations
+and actual attempts.
+
 Successful GPU diagnostics use the parent's verified route plan after the
 supervisor validates the selected worker identity. They retain actual parent
 skips and pre-output failure history, not the worker's raw discovery context.
