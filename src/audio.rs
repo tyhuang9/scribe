@@ -976,6 +976,31 @@ impl RecordingSession {
         stop_reason: CaptureStopReason,
         stop_delay: Duration,
     ) -> (Self, SimulatedCaptureProbe) {
+        Self::simulated_with_optional_completion_gate(audio, stop_reason, stop_delay, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated_with_completion_gate(
+        audio: Option<Arc<PreparedAudio>>,
+        stop_reason: CaptureStopReason,
+        stop_delay: Duration,
+        completion_gate: Receiver<()>,
+    ) -> (Self, SimulatedCaptureProbe) {
+        Self::simulated_with_optional_completion_gate(
+            audio,
+            stop_reason,
+            stop_delay,
+            Some(completion_gate),
+        )
+    }
+
+    #[cfg(test)]
+    fn simulated_with_optional_completion_gate(
+        audio: Option<Arc<PreparedAudio>>,
+        stop_reason: CaptureStopReason,
+        stop_delay: Duration,
+        completion_gate: Option<Receiver<()>>,
+    ) -> (Self, SimulatedCaptureProbe) {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_requested);
         let discard_requested = Arc::new(AtomicBool::new(false));
@@ -990,6 +1015,12 @@ impl RecordingSession {
                 && started.elapsed() < Duration::from_secs(2)
             {
                 thread::sleep(Duration::from_millis(1));
+            }
+            if let Some(completion_gate) = completion_gate {
+                // The deterministic release/reaper test holds the sole sender
+                // until the controller has attempted release. A normal message
+                // or unwind-driven disconnection both release this worker.
+                let _ = completion_gate.recv();
             }
             if worker_discard.load(Ordering::Acquire) {
                 worker_probe.stream_dropped.store(true, Ordering::Release);
