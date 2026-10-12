@@ -862,6 +862,20 @@ mod tests {
     use super::*;
     use crate::audio::{ABORT_STREAM_DROP_BUDGET, CaptureStopReason};
 
+    struct CompletionGateRelease(Option<Sender<()>>);
+
+    impl CompletionGateRelease {
+        fn disconnect(&mut self) {
+            self.0.take();
+        }
+    }
+
+    impl Drop for CompletionGateRelease {
+        fn drop(&mut self) {
+            self.disconnect();
+        }
+    }
+
     fn controller_with_counter(calls: Arc<AtomicUsize>) -> CaptureController {
         CaptureController::with_start_capture(Arc::new(move |_request, cancellation| {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -1477,17 +1491,26 @@ mod tests {
 
     #[test]
     fn release_reaper_spawn_failure_fails_closed_without_leaking_owner() {
+        let (completion_release, completion_gate) = bounded(0);
+        let reaper_spawns = Arc::new(AtomicUsize::new(0));
+        let observed_reaper_spawns = Arc::clone(&reaper_spawns);
         let controller = CaptureController::with_reaper_spawner_for_test(
-            Arc::new(|_, _| {
-                Ok(RecordingSession::simulated_with_stop_delay(
+            Arc::new(move |_, _| {
+                Ok(RecordingSession::simulated_with_completion_gate(
                     None,
                     CaptureStopReason::Explicit,
-                    Duration::from_millis(25),
-                ))
+                    Duration::ZERO,
+                    completion_gate.clone(),
+                )
+                .0)
             }),
-            Arc::new(|_, _| Err("injected spawn failure".to_owned())),
+            Arc::new(move |_, _| {
+                observed_reaper_spawns.fetch_add(1, Ordering::AcqRel);
+                Err("injected spawn failure".to_owned())
+            }),
         )
         .unwrap();
+        let mut completion_release = CompletionGateRelease(Some(completion_release));
         let handle = controller.handle();
         let ticket = handle
             .start_capture(
@@ -1498,24 +1521,25 @@ mod tests {
                 CaptureOptions::default(),
             )
             .unwrap();
-        let ready = (0..100).find_map(|_| {
-            let event = controller.poll_events().into_iter().find(|event| {
-                matches!(
-                    event,
-                    CaptureLifecycleEvent::Ready { capture_id, .. }
-                        if *capture_id == ticket.capture_id
-                )
-            });
-            if event.is_none() {
-                thread::sleep(Duration::from_millis(1));
+        let ready_session = loop {
+            match controller
+                .lifecycle_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+            {
+                CaptureLifecycleEvent::Ready {
+                    capture_id,
+                    session,
+                    ..
+                } if capture_id == ticket.capture_id => break session,
+                _ => {}
             }
-            event
-        });
-        assert!(ready.is_some());
+        };
 
         handle.abort(ticket.capture_id).unwrap();
         handle.release(ticket.capture_id.0).unwrap();
 
+        assert_eq!(reaper_spawns.load(Ordering::Acquire), 1);
         assert!(handle.owner().is_none());
         assert!(matches!(
             handle.start_capture(
@@ -1537,5 +1561,9 @@ mod tests {
                 } if capture_id == ticket.capture_id && message.contains("injected spawn failure")
             )
         }));
+        completion_release.disconnect();
+        ready_session
+            .stop_and_discard(Duration::from_secs(1))
+            .unwrap();
     }
 }
