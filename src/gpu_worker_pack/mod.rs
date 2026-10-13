@@ -1513,8 +1513,8 @@ pub(crate) fn maybe_run_pack_verifier() -> Option<i32> {
             manifest::PackBackend::Metal,
         ]),
     );
-    match verifier.verify(&root) {
-        Ok(descriptor) => match serde_json::to_string(&descriptor) {
+    match verify_pack_for_packaging(&verifier, &root) {
+        Ok(lease) => match serde_json::to_string(lease.verified_pack()) {
             Ok(serialized) => {
                 println!("{serialized}");
                 Some(0)
@@ -1531,6 +1531,19 @@ pub(crate) fn maybe_run_pack_verifier() -> Option<i32> {
     }
 }
 
+fn verify_pack_for_packaging(
+    verifier: &manifest::PackVerifier<'_>,
+    root: &std::path::Path,
+) -> anyhow::Result<manifest::VerifiedPackLease> {
+    // Preserve relative CLI inputs without canonicalizing through links.
+    let root = std::path::absolute(root)?;
+    let lease = store::open_verified_pack_source(verifier, &root)?;
+    #[cfg(windows)]
+    crate::windows_vulkan_loader::validate_verified_pack_loader(&lease)?;
+    lease.recheck()?;
+    Ok(lease)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1540,6 +1553,85 @@ mod tests {
     use super::manifest::VerifiedPackLease;
     use super::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
     use super::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
+
+    fn packaging_fixture(
+        backend: PackBackend,
+        loader: Option<&[u8]>,
+    ) -> (std::path::PathBuf, super::manifest::PackVerifier<'static>) {
+        use super::manifest::test_support::{base_manifest, temp_root, write_signed};
+        use super::manifest::{Compatibility, PackVerifier, PayloadEntry};
+        use sha2::{Digest, Sha256};
+        let root = temp_root("packaging-admission");
+        let mut manifest = base_manifest();
+        manifest.backend = backend;
+        if let Some(bytes) = loader {
+            std::fs::create_dir(root.join("bin")).unwrap();
+            std::fs::write(root.join("bin/vulkan-1.dll"), bytes).unwrap();
+            manifest.payload.push(PayloadEntry {
+                path: "bin/vulkan-1.dll".to_owned(),
+                size_bytes: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            });
+        }
+        manifest
+            .payload
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        let trust = write_signed(&root, manifest);
+        let verifier = PackVerifier::new(
+            trust,
+            Compatibility::current(&[PackBackend::Cuda, PackBackend::Vulkan, PackBackend::Metal]),
+        );
+        (root, verifier)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packaging_admission_rejects_signed_vulkan_without_current_policy_loader() {
+        for loader in [None, Some(b"old signed loader".as_slice())] {
+            let (root, verifier) = packaging_fixture(PackBackend::Vulkan, loader);
+            let before = verifier.verify(&root).unwrap();
+            let error = super::verify_pack_for_packaging(&verifier, &root)
+                .map(drop)
+                .err();
+            assert_eq!(verifier.verify(&root).unwrap(), before);
+            std::fs::remove_dir_all(root).unwrap();
+            let error = error.expect("packaging must reject a missing or stale policy loader");
+            assert!(error.to_string().contains(if loader.is_some() {
+                "identity differs"
+            } else {
+                "omitted"
+            }));
+        }
+    }
+
+    #[test]
+    fn packaging_admission_keeps_cuda_descriptor_and_exact_tree_unchanged() {
+        let (root, verifier) = packaging_fixture(PackBackend::Cuda, None);
+        let before = verifier.verify(&root).unwrap();
+        let lease = super::verify_pack_for_packaging(&verifier, &root).unwrap();
+        assert_eq!(lease.verified_pack(), &before);
+        assert_eq!(
+            serde_json::to_string(lease.verified_pack()).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+        lease.recheck().unwrap();
+        assert_eq!(verifier.verify(&root).unwrap(), before);
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn packaging_admission_keeps_non_windows_provider_descriptors_unchanged() {
+        for backend in [PackBackend::Vulkan, PackBackend::Metal] {
+            let (root, verifier) = packaging_fixture(backend, None);
+            let before = verifier.verify(&root).unwrap();
+            let lease = super::verify_pack_for_packaging(&verifier, &root).unwrap();
+            assert_eq!(lease.verified_pack(), &before);
+            drop(lease);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[derive(Default)]
     struct FixtureDeviceStore {
