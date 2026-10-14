@@ -22290,18 +22290,63 @@ mod tests {
     }
 
     #[test]
+    fn health_witness_changes_preserve_eligible_routes_without_idle_recovery() {
+        let route = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let catalog = verified_gpu_catalog(vec![route.clone()]);
+        let model_digest = "b".repeat(64);
+        let key = route_health_key(&route, &model_digest).unwrap();
+        for stale in [
+            HealthWitnesses {
+                app_build: "old-app-build".to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            },
+            HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: "f".repeat(64),
+            },
+        ] {
+            let root = test_root("gpu-health-valid-witness-change");
+            let path = Arc::new(root.join("health.json"));
+            let mut old = HealthCache::open(&*path, stale, &GPU_HEALTH_CLOCK);
+            old.record_provider_failure(
+                key.clone(),
+                crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+            )
+            .unwrap();
+            let before = std::fs::read(&*path).unwrap();
+            let plan =
+                health_filtered_gpu_route_plan(catalog.clone(), &model_digest, Some(&path), false);
+            assert_eq!(plan.routes.len(), 1);
+            assert_eq!(plan.routes[0].target, route.target);
+            assert!(!plan.routes[0].consume_retry_bypass);
+            assert!(plan.skipped_targets.is_empty());
+            assert_eq!(
+                plan.health.as_ref().unwrap().cache().decision(&key),
+                HealthDecision::Available
+            );
+            assert_eq!(std::fs::read(&*path).unwrap(), before);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn invalid_health_state_allows_only_two_step_idle_probe_recovery() {
         #[derive(Clone, Copy, Debug)]
         enum InvalidFixture {
             Corrupt,
             OversizedUnreadable,
-            WitnessMismatch,
+            MalformedStaleWitness,
         }
 
         for fixture in [
             InvalidFixture::Corrupt,
             InvalidFixture::OversizedUnreadable,
-            InvalidFixture::WitnessMismatch,
+            InvalidFixture::MalformedStaleWitness,
         ] {
             let root = test_root(&format!("gpu-health-recovery-{fixture:?}"));
             let path = Arc::new(root.join("health.json"));
@@ -22329,7 +22374,7 @@ mod tests {
                 InvalidFixture::OversizedUnreadable => {
                     std::fs::write(&*path, vec![b'x'; 256 * 1024 + 1]).unwrap();
                 }
-                InvalidFixture::WitnessMismatch => {
+                InvalidFixture::MalformedStaleWitness => {
                     let mut stale = HealthCache::open(
                         &*path,
                         HealthWitnesses {
@@ -22344,6 +22389,10 @@ mod tests {
                             crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
                         )
                         .unwrap();
+                    let mut invalid: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
+                    invalid["schema_version"] = serde_json::json!(0);
+                    std::fs::write(&*path, serde_json::to_vec(&invalid).unwrap()).unwrap();
                 }
             }
 
@@ -23286,7 +23335,7 @@ mod tests {
 
     #[test]
     fn explicit_gpu_retry_recovers_invalid_health_only_after_two_persisted_idle_probes() {
-        for state in ["corrupt", "oversized", "stale", "quarantined"] {
+        for state in ["corrupt", "oversized", "malformed-stale", "quarantined"] {
             let fixture = gguf_artifact_fixture(&format!("gpu-retry-recovery-{state}"));
             let path = Arc::new(fixture.root.join("health.json"));
             let target = verified_gpu_route(
@@ -23363,9 +23412,9 @@ mod tests {
             match state {
                 "corrupt" => std::fs::write(&*path, b"{broken").unwrap(),
                 "oversized" => std::fs::write(&*path, vec![b'x'; 256 * 1024 + 1]).unwrap(),
-                "stale" | "quarantined" => {
+                "malformed-stale" | "quarantined" => {
                     let mut initial = witnesses.clone();
-                    if state == "stale" {
+                    if state == "malformed-stale" {
                         initial.app_build = "old-build".to_owned();
                     }
                     HealthCache::open(&*path, initial, &GPU_HEALTH_CLOCK)
@@ -23374,6 +23423,12 @@ mod tests {
                             crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
                         )
                         .unwrap();
+                    if state == "malformed-stale" {
+                        let mut invalid: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
+                        invalid["schema_version"] = serde_json::json!(0);
+                        std::fs::write(&*path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+                    }
                     if state == "quarantined" {
                         // The cold-failure case must have no other available
                         // GPU; exact retry must still leave this route alone.
