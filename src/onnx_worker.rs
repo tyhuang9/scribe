@@ -18062,7 +18062,12 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let temporary_directory = std::env::temp_dir();
+        // macOS exposes its temp directory through /var, but the store correctly
+        // rejects symlink ancestors. Resolve only the fixture base before setup.
+        #[cfg(target_os = "macos")]
+        let temporary_directory = temporary_directory.canonicalize().unwrap();
+        let root = temporary_directory.join(format!(
             "scribe-onnx-{label}-{}-{suffix}",
             std::process::id()
         ));
