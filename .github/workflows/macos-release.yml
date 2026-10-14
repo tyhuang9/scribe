@@ -13,6 +13,8 @@ on:
       - 'native/**'
       - 'runtime-manifests/gpu-*-macos-*.json'
       - 'scripts/*macos*'
+      - 'scripts/test-worker-pack-admission.sh'
+      - 'scripts/test-worker-pack-admission-contract.sh'
       - 'src/**'
       - 'tools/worker-pack-author/**'
   push:
@@ -28,6 +30,8 @@ on:
       - 'native/**'
       - 'runtime-manifests/gpu-*-macos-*.json'
       - 'scripts/*macos*'
+      - 'scripts/test-worker-pack-admission.sh'
+      - 'scripts/test-worker-pack-admission-contract.sh'
       - 'src/**'
       - 'tools/worker-pack-author/**'
   workflow_dispatch:
@@ -73,6 +77,8 @@ jobs:
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
           cargo test --manifest-path tools/worker-pack-author/Cargo.toml --locked -- --test-threads=1
+          bash scripts/test-worker-pack-admission-contract.sh
+          bash scripts/test-worker-pack-admission.sh
       - name: Build ad hoc signed universal structural package
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc

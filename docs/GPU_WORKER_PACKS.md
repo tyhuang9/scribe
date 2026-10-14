@@ -897,6 +897,18 @@ handshake checks the same parent expectation before output is accepted.
 
 ## Build and verification commands
 
+`bash scripts/test-worker-pack-admission-contract.sh` is the fast, credential-free
+check for the packaging-admission test runner. It uses fake Cargo to verify exact
+arguments, positive test discovery, and fail-fast behavior without native builds
+or GPU execution. After the normal native test dependencies are prepared,
+`bash scripts/test-worker-pack-admission.sh` is the canonical locked/offline check
+for parent packaging admission, retained read-only source admission, and release
+packaging architecture guards. Each group must discover at least two distinct
+tests before serial execution, including any tests annotated ignored so a group
+cannot pass without execution. The macOS structural CI matrix runs both commands
+on Intel and Apple Silicon; these fixture checks do not qualify Metal hardware,
+enable Auto, or establish Linux runtime/rollback qualification.
+
 `scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture,
 prepared unsigned candidate, or legacy one-shot pack from the pinned contract in
 `runtime-manifests/gpu-worker-toolchain-windows-x64.json`.
