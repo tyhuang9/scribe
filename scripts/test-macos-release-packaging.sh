@@ -27,21 +27,23 @@ gpu_health_fixture_cargo() {
         echo 'fixture health execution'
       fi
       ;;
-    onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery)
+    onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery|gpu_worker_pack::store::tests::preexisting_state_parent_link_is_rejected_before_lock_or_state_creation)
+      local fixture_kind=route
+      if [[ "$6" == gpu_worker_pack::store::* ]]; then fixture_kind=link; fi
       [[ "${8:-}" == --exact ]] || return 90
       if [[ "${9:-}" == --list ]]; then
         [[ $# -eq 9 ]] || return 90
-        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != route-list-failure ]] || return 23
-        if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != route-missing ]]; then
-          echo 'onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery: test'
+        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != "$fixture_kind-list-failure" ]] || return 23
+        if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != "$fixture_kind-missing" ]]; then
+          printf '%s: test\n' "$6"
         fi
-        if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" == route-duplicate ]]; then
-          echo 'onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery: test'
+        if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" == "$fixture_kind-duplicate" ]]; then
+          printf '%s: test\n' "$6"
         fi
       else
         [[ $# -eq 10 && "$9" == --include-ignored && "${10}" == --test-threads=1 ]] || return 90
-        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != route-run-failure ]] || return 37
-        echo 'fixture route execution'
+        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != "$fixture_kind-run-failure" ]] || return 37
+        echo "fixture $fixture_kind execution"
       fi
       ;;
     *) return 90 ;;
@@ -67,24 +69,29 @@ test_gpu_health_workflow_contract() {
   [[ -n "$commands" && "$commands" != *'${{'* ]] || { echo 'health check must have a standalone executable shell block.' >&2; return 1; }
   fixture_program="$(declare -f gpu_health_fixture_cargo)"$'\n''cargo() { gpu_health_fixture_cargo "$@"; }'$'\n'"$commands"
   gpu_health_case() {
-    local fixture="$1" expected_status="$2" expected_health="$3" expected_route="$4"
+    local fixture="$1" expected_status="$2" expected_health="$3" expected_route="$4" expected_link="$5"
     if output="$(SCRIBE_HEALTH_FIXTURE_CASE="$fixture" bash -c "$fixture_program" 2>&1)"; then status=0; else status=$?; fi
     [[ "$status" -eq "$expected_status" ]] || { echo "health workflow fixture failed: $fixture (exit $status)." >&2; return 1; }
     [[ "$(grep -Fxc 'fixture health execution' <<<"$output")" -eq "$expected_health" ]] || { echo "unexpected health execution: $fixture" >&2; return 1; }
     [[ "$(grep -Fxc 'fixture route execution' <<<"$output")" -eq "$expected_route" ]] || { echo "unexpected route execution: $fixture" >&2; return 1; }
+    [[ "$(grep -Fxc 'fixture link execution' <<<"$output")" -eq "$expected_link" ]] || { echo "unexpected link execution: $fixture" >&2; return 1; }
     fixture_count=$((fixture_count + 1))
   }
-  gpu_health_case success 0 1 1
+  gpu_health_case success 0 1 1 1
   for test in valid_witness_changes_clear_history_without_selection_writes stale_witnesses_cannot_mask_malformed_envelopes invalid_current_witnesses_fail_closed_for_missing_matching_and_stale_files; do
-    gpu_health_case "missing-$test" 1 0 0
-    gpu_health_case "duplicate-$test" 1 0 0
+    gpu_health_case "missing-$test" 1 0 0 0
+    gpu_health_case "duplicate-$test" 1 0 0 0
   done
-  gpu_health_case health-list-failure 23 0 0
-  gpu_health_case health-run-failure 37 0 0
-  gpu_health_case route-missing 1 1 0
-  gpu_health_case route-duplicate 1 1 0
-  gpu_health_case route-list-failure 23 1 0
-  gpu_health_case route-run-failure 37 1 0
+  gpu_health_case health-list-failure 23 0 0 0
+  gpu_health_case health-run-failure 37 0 0 0
+  gpu_health_case route-missing 1 1 0 0
+  gpu_health_case route-duplicate 1 1 0 0
+  gpu_health_case route-list-failure 23 1 0 0
+  gpu_health_case route-run-failure 37 1 0 0
+  gpu_health_case link-missing 1 1 1 0
+  gpu_health_case link-duplicate 1 1 1 0
+  gpu_health_case link-list-failure 23 1 1 0
+  gpu_health_case link-run-failure 37 1 1 0
   echo "macOS GPU health workflow contracts passed ($fixture_count fake-Cargo cases)."
 }
 

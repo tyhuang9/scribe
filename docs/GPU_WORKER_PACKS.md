@@ -948,8 +948,12 @@ It executes the actual workflow shell block with fake Cargo, checking required
 test discovery, exact arguments, fail-fast behavior and secret-free placement.
 The default packaging contract runs the same checks plus its existing packaging
 checks. Both native macOS structural jobs execute the shared health-cache suite
-and the exact witness-change route regression, serially and offline after native
-test preparation. These fixture-only groups include ignored tests to prevent
+and the exact witness-change route and prelinked-state-parent rejection
+regressions, serially and offline after native test preparation. macOS ONNX
+fixtures resolve the system temporary-directory alias before creating their
+test roots, matching the pack fixtures; links introduced inside a fixture are
+not resolved, and production no-follow validation is unchanged.
+These fixture-only groups include ignored tests to prevent
 discovery without execution; manual hardware tests must stay outside them.
 This covers macOS health-file persistence, locking and route projection, not
 Metal execution, hardware/performance qualification, signing or Auto eligibility.

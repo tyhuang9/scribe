@@ -89,6 +89,10 @@ jobs:
           route_listing="$(cargo test --locked --offline --bin local-transcriber "$route_test" -- --exact --list)"
           [[ "$(grep -Fxc -- "$route_test: test" <<<"$route_listing")" -eq 1 ]] || { echo 'Missing or duplicate exact health route regression.' >&2; exit 1; }
           cargo test --locked --offline --bin local-transcriber "$route_test" -- --exact --include-ignored --test-threads=1
+          link_test='gpu_worker_pack::store::tests::preexisting_state_parent_link_is_rejected_before_lock_or_state_creation'
+          link_listing="$(cargo test --locked --offline --bin local-transcriber "$link_test" -- --exact --list)"
+          [[ "$(grep -Fxc -- "$link_test: test" <<<"$link_listing")" -eq 1 ]] || { echo 'Missing or duplicate exact state-parent link regression.' >&2; exit 1; }
+          cargo test --locked --offline --bin local-transcriber "$link_test" -- --exact --include-ignored --test-threads=1
       - name: Build ad hoc signed universal structural package
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc
