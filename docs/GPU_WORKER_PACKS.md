@@ -451,10 +451,15 @@ device-loss, out-of-memory, and protocol categories may update quarantine.
 Invalid input, artifact/model corruption, content/decode failure, cancellation,
 and partial output never do. Mutations take a private OS-backed lock and reload
 state before replacement, so separate app instances cannot lose updates or
-consume one retry twice. A truly missing first-run cache is available; corrupt,
-unreadable, noncanonical, app-build-mismatched, or device-set-mismatched state is
-explicitly invalid/unprobed for GPU while CPU remains eligible. Two successful
-idle probes atomically replace that state and restore availability.
+consume one retry twice. With valid current witnesses, a truly missing first-run
+cache is available. A fully valid cache from a different app build or physical
+device set is stale: selection discards its old failures, retry grants and probe
+history without writing. The next mutation reloads under the same lock and
+atomically persists the current witnesses; its first failure starts at 15 minutes.
+Invalid current witnesses or corrupt, unreadable or noncanonical persisted state
+remain explicitly invalid/unprobed for GPU while CPU remains eligible. A stale
+witness never masks a malformed envelope. Two successful idle probes atomically
+replace corrupt state and restore exact-key availability.
 
 The diagnostics **Retry GPU** action admits only idle application state and
 retains the exact model/backend/provider/device/driver/pack identity. It reprobes

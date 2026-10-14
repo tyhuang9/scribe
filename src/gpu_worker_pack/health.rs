@@ -520,6 +520,9 @@ fn load_cache_locked(
     path: &Path,
     witnesses: &HealthWitnesses,
 ) -> CacheLoad {
+    if validate_witnesses(witnesses).is_err() {
+        return CacheLoad::Invalid;
+    }
     match lock.exists(path) {
         Ok(false) => return CacheLoad::Missing,
         Err(_) => return CacheLoad::Invalid,
@@ -528,8 +531,14 @@ fn load_cache_locked(
     let Ok(envelope) = lock.read::<HealthEnvelope>(path) else {
         return CacheLoad::Invalid;
     };
-    if envelope.witnesses != *witnesses || validate_envelope(&envelope).is_err() {
+    if validate_envelope(&envelope).is_err() {
         return CacheLoad::Invalid;
+    }
+    if envelope.witnesses != *witnesses {
+        // A valid prior app/device context is stale, not corrupt. Selection
+        // discards its health history without writing; the next mutation
+        // reloads under this same lock and atomically persists the new context.
+        return CacheLoad::Valid(HealthEnvelope::empty(witnesses.clone()));
     }
     CacheLoad::Valid(envelope)
 }
@@ -588,12 +597,10 @@ fn quarantine_eligible_code(observation: FailureObservation) -> Option<FailureCo
 }
 
 fn validate_envelope(envelope: &HealthEnvelope) -> Result<(), HealthCacheError> {
+    validate_witnesses(&envelope.witnesses)?;
     if envelope.schema_version != HEALTH_SCHEMA_VERSION
         || envelope.records.len() + envelope.recovery_probes.len() + envelope.recovered_keys.len()
             > MAX_RECORDS
-        || envelope.witnesses.app_build.is_empty()
-        || envelope.witnesses.app_build.len() > MAX_TEXT_BYTES
-        || !valid_sha256(&envelope.witnesses.device_set_digest)
     {
         return Err(HealthCacheError::InvalidCache);
     }
@@ -625,6 +632,16 @@ fn validate_envelope(envelope: &HealthEnvelope) -> Result<(), HealthCacheError> 
         if !keys.insert(recovered) {
             return Err(HealthCacheError::InvalidCache);
         }
+    }
+    Ok(())
+}
+
+fn validate_witnesses(witnesses: &HealthWitnesses) -> Result<(), HealthCacheError> {
+    if witnesses.app_build.is_empty()
+        || witnesses.app_build.len() > MAX_TEXT_BYTES
+        || !valid_sha256(&witnesses.device_set_digest)
+    {
+        return Err(HealthCacheError::InvalidCache);
     }
     Ok(())
 }
@@ -907,53 +924,131 @@ mod tests {
         let changed_app = HealthCache::open(&path, witnesses("app-b"), &clock);
         assert_eq!(
             changed_app.decision(&original_key),
-            HealthDecision::InvalidOrUnprobed
+            HealthDecision::Available
         );
         let mut changed_device_set_witness = witnesses("app-a");
         changed_device_set_witness.device_set_digest = "f".repeat(64);
         let changed_device_set = HealthCache::open(&path, changed_device_set_witness, &clock);
         assert_eq!(
             changed_device_set.decision(&original_key),
-            HealthDecision::InvalidOrUnprobed
-        );
-        let recovered_key = distinct_key("witness-recovered");
-        let blocked_key = key("witness-blocked");
-        let mut changed_app = HealthCache::open(&path, witnesses("app-b"), &clock);
-        assert_eq!(
-            changed_app.decision(&recovered_key),
-            HealthDecision::InvalidOrUnprobed
-        );
-        assert!(
-            !changed_app
-                .record_idle_probe_success(&recovered_key)
-                .unwrap()
-        );
-        assert!(
-            changed_app
-                .record_idle_probe_success(&recovered_key)
-                .unwrap()
-        );
-        assert_eq!(
-            changed_app.decision(&recovered_key),
             HealthDecision::Available
         );
-        assert_eq!(
-            changed_app.decision(&blocked_key),
-            HealthDecision::InvalidOrUnprobed
-        );
-        drop(changed_app);
+        fs::remove_dir_all(root).unwrap();
+    }
 
-        let reopened = HealthCache::open(&path, witnesses("app-b"), &clock);
-        assert_eq!(reopened.decision(&recovered_key), HealthDecision::Available);
-        assert_eq!(
-            reopened.decision(&blocked_key),
-            HealthDecision::InvalidOrUnprobed
-        );
-        let reset_by_witness = HealthCache::open(&path, witnesses("app-c"), &clock);
-        assert_eq!(
-            reset_by_witness.decision(&recovered_key),
-            HealthDecision::InvalidOrUnprobed
-        );
+    #[test]
+    fn valid_witness_changes_clear_history_without_selection_writes() {
+        let old = witnesses("old-context");
+        let mut changed_devices = old.clone();
+        changed_devices.device_set_digest = "f".repeat(64);
+        for current in [witnesses("new-app"), changed_devices] {
+            let root = temp_root("health-valid-witness-change");
+            let path = root.join("health.json");
+            let clock = ManualClock::new(4_100_000);
+            let key = key("witness-reset");
+            let mut previous = HealthCache::open(&path, old.clone(), &clock);
+            for _ in 0..3 {
+                previous
+                    .record_provider_failure(key.clone(), FailureCode::WorkerCrash)
+                    .unwrap();
+            }
+            assert!(!previous.record_idle_probe_success(&key).unwrap());
+            assert!(previous.grant_explicit_retry(&key).unwrap());
+            let original_bytes = fs::read(&path).unwrap();
+            let mut reset = HealthCache::open(&path, current.clone(), &clock);
+            assert_eq!(reset.decision(&key), HealthDecision::Available);
+            assert!(!reset.invalid);
+            assert_eq!(reset.envelope, HealthEnvelope::empty(current.clone()));
+            assert!(!reset.consume_explicit_retry(&key).unwrap());
+            assert_eq!(fs::read(&path).unwrap(), original_bytes);
+            assert_eq!(
+                reset
+                    .record_provider_failure(key.clone(), FailureCode::DeviceLost)
+                    .unwrap(),
+                HealthDecision::Quarantined {
+                    until_unix_seconds: clock.now_unix_seconds() + FIRST_QUARANTINE_SECONDS,
+                }
+            );
+            let persisted = HealthCache::open(&path, current.clone(), &clock);
+            assert_eq!(persisted.envelope.witnesses, current);
+            assert_eq!(persisted.envelope.records.len(), 1);
+            assert_eq!(persisted.envelope.records[0].failure_count, 1);
+            assert_eq!(persisted.envelope.records[0].successful_idle_probes, 0);
+            assert!(!persisted.envelope.records[0].retry_grant_remaining);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_witnesses_cannot_mask_malformed_envelopes() {
+        let root = temp_root("health-malformed-stale-witnesses");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(4_200_000);
+        let key = key("malformed-witness");
+        let mut seed = HealthCache::open(&path, witnesses("old-app"), &clock);
+        seed.record_provider_failure(key.clone(), FailureCode::WorkerCrash)
+            .unwrap();
+        let valid = seed.envelope.clone();
+        for case in 0..6 {
+            let mut malformed = valid.clone();
+            match case {
+                0 => malformed.schema_version += 1,
+                1 => malformed.records[0].failure_count = 0,
+                2 => malformed.records[0].key.pack_digest = "bad-digest".to_owned(),
+                3 => malformed.records.push(malformed.records[0].clone()),
+                4 => malformed.recovered_keys.push(distinct_key("invalid-mode")),
+                5 => malformed.witnesses.device_set_digest = "bad-digest".to_owned(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&malformed).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let cache = HealthCache::open(&path, witnesses("current-app"), &clock);
+            assert_eq!(cache.decision(&key), HealthDecision::InvalidOrUnprobed);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_current_witnesses_fail_closed_for_missing_matching_and_stale_files() {
+        let root = temp_root("health-invalid-current-witnesses");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(4_300_000);
+        let key = key("invalid-current-witness");
+        for invalid in [
+            HealthWitnesses {
+                app_build: String::new(),
+                ..witnesses("current")
+            },
+            HealthWitnesses {
+                app_build: "x".repeat(MAX_TEXT_BYTES + 1),
+                ..witnesses("current")
+            },
+            HealthWitnesses {
+                device_set_digest: "bad-digest".to_owned(),
+                ..witnesses("current")
+            },
+        ] {
+            for stored in [None, Some(invalid.clone()), Some(witnesses("old-app"))] {
+                let before = stored.map(|witnesses| {
+                    serde_json::to_vec(&HealthEnvelope::empty(witnesses)).unwrap()
+                });
+                if let Some(bytes) = &before {
+                    fs::write(&path, bytes).unwrap();
+                }
+                let mut cache = HealthCache::open(&path, invalid.clone(), &clock);
+                assert_eq!(cache.decision(&key), HealthDecision::InvalidOrUnprobed);
+                assert!(
+                    cache
+                        .record_provider_failure(key.clone(), FailureCode::Protocol)
+                        .is_err()
+                );
+                assert_eq!(fs::read(&path).ok(), before);
+                if path.exists() {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1206,6 +1301,12 @@ mod tests {
         let path = root.join("health.json");
         let clock = ManualClock::new(8_000_000);
         let key = key("concurrent-updates");
+        let mut stale = HealthCache::open(&path, witnesses("previous-app"), &clock);
+        for _ in 0..3 {
+            stale
+                .record_provider_failure(key.clone(), FailureCode::Protocol)
+                .unwrap();
+        }
         let mut left = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
         let mut right = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
         std::thread::scope(|scope| {
@@ -1223,6 +1324,11 @@ mod tests {
         });
         let observed = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
         assert_eq!(observed.envelope.records[0].failure_count, 2);
+        assert_eq!(observed.envelope.witnesses, witnesses("concurrent-updates"));
+        assert_eq!(
+            observed.envelope.records[0].quarantined_until_unix_seconds,
+            clock.now_unix_seconds() + SECOND_QUARANTINE_SECONDS
+        );
 
         let mut left = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
         let mut right = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
