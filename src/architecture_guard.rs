@@ -1945,6 +1945,42 @@ fn worker_pack_health_persistence_stays_bounded_and_content_free() {
 }
 
 #[test]
+fn release_packaging_retains_pack_authority_through_windows_loader_admission() {
+    let source = include_str!("gpu_worker_pack/mod.rs");
+    let entrypoint = source
+        .split("pub(crate) fn maybe_run_pack_verifier()")
+        .nth(1)
+        .unwrap()
+        .split("fn verify_pack_for_packaging(")
+        .next()
+        .unwrap();
+    assert!(entrypoint.contains("verify_pack_for_packaging(&verifier, &root)"));
+    assert!(entrypoint.contains("serde_json::to_string(lease.verified_pack())"));
+    let admission = source
+        .split("fn verify_pack_for_packaging(")
+        .nth(1)
+        .unwrap()
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    let retained = admission.find("store::open_verified_pack_source").unwrap();
+    let loader = admission
+        .find("crate::windows_vulkan_loader::validate_verified_pack_loader(&lease)?")
+        .unwrap();
+    let returned = admission.find("Ok(lease)").unwrap();
+    assert!(retained < loader && loader < returned);
+    assert!(admission.contains("#[cfg(windows)]"));
+    for forbidden in [
+        "bootstrap_mapped_policy_loader",
+        ".spawn(",
+        "PackStore::",
+        ".canonicalize(",
+    ] {
+        assert!(!admission.contains(forbidden));
+    }
+}
+
+#[test]
 fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     let build = include_str!("../scripts/build-windows-release.ps1");
     let stage = include_str!("../scripts/stage-verified-worker-packs.ps1");

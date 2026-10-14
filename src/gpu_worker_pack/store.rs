@@ -129,6 +129,16 @@ struct AnchoredDirectory {
     chain: Vec<File>,
 }
 
+/// Read-only source admission, without constructing a store or creating state.
+/// Retain the complete no-follow directory chain and signed payload handles.
+pub(super) fn open_verified_pack_source(
+    verifier: &PackVerifier<'_>,
+    source: &Path,
+) -> Result<VerifiedPackLease, PackStoreError> {
+    let root = AnchoredDirectory::open_root(source)?;
+    Ok(verifier.verify_pinned(root.verifier_lease()?)?)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct UnixDirectoryStream(*mut libc::DIR);
 
@@ -2798,6 +2808,35 @@ mod tests {
     #[cfg(unix)]
     use std::cell::Cell;
     use std::sync::Arc;
+
+    #[test]
+    fn read_only_source_admission_retains_exact_pack_without_store_state() {
+        let root = temp_root("read-only-source");
+        let (verifier, descriptor) = fixture(&root);
+        let lease = open_verified_pack_source(&verifier, &root).unwrap();
+        assert_eq!(lease.verified_pack(), &descriptor);
+        lease.recheck().unwrap();
+        verifier.launchable_worker(&lease).unwrap();
+        assert_eq!(verifier.verify(&root).unwrap(), descriptor);
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_only_source_admission_rejects_missing_and_linked_ancestors_without_writes() {
+        let root = temp_root("read-only-source-failures");
+        let source = root.join("source");
+        let (verifier, _) = fixture(&source);
+        let missing = root.join("missing");
+        assert!(open_verified_pack_source(&verifier, &missing).is_err());
+        assert!(!missing.exists());
+        let link = root.join("linked-source");
+        create_directory_link(&link, &source);
+        assert!(open_verified_pack_source(&verifier, &link).is_err());
+        remove_directory_link(&link);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn current_descriptor(store: &PackStore<'_>) -> Option<VerifiedPack> {
         store

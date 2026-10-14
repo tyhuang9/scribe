@@ -454,6 +454,11 @@ pack directory. See `docs/LINUX_RELEASE_PACKAGING.md`.
 
 `scripts/stage-verified-worker-packs.ps1` accepts only prebuilt, pre-signed pack
 roots. It invokes the compiled production verifier before and after copying,
+retaining the signed payload and no-follow local directory handles through
+admission. On Windows, Vulkan packs must also match the desktop's pinned policy
+loader before either source or staged descriptor is accepted; this reads and
+hashes files without loading a GPU library. Descriptor roots are absolute local
+paths, and linked ancestors or Windows network roots fail closed. The staging script
 stages the immutable layout, writes the bounded catalog, reports installed and
 compressed sizes, and generates the installer preflight allowlist. Every pack
 file is also included in the top-level bundle inventory, preserving portable
