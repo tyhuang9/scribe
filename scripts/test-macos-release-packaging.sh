@@ -4,6 +4,96 @@ IFS=$'\n\t'
 trap 'status=$?; echo "macOS release packaging contract check failed at line $LINENO (exit $status)." >&2; exit "$status"' ERR
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+gpu_health_fixture_cargo() {
+  [[ "${1:-}" == test && "${2:-}" == --locked && "${3:-}" == --offline &&
+     "${4:-}" == --bin && "${5:-}" == local-transcriber && "${7:-}" == -- ]] || return 90
+  case "${6:-}" in
+    gpu_worker_pack::health::tests::)
+      if [[ "${8:-}" == --list ]]; then
+        [[ $# -eq 8 ]] || return 90
+        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != health-list-failure ]] || return 23
+        local test
+        for test in valid_witness_changes_clear_history_without_selection_writes stale_witnesses_cannot_mask_malformed_envelopes invalid_current_witnesses_fail_closed_for_missing_matching_and_stale_files; do
+          [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != "missing-$test" ]] || continue
+          printf 'gpu_worker_pack::health::tests::%s: test\n' "$test"
+          if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" == "duplicate-$test" ]]; then
+            printf 'gpu_worker_pack::health::tests::%s: test\n' "$test"
+          fi
+        done
+      else
+        [[ $# -eq 9 && "$8" == --include-ignored && "$9" == --test-threads=1 ]] || return 90
+        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != health-run-failure ]] || return 37
+        echo 'fixture health execution'
+      fi
+      ;;
+    onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery)
+      [[ "${8:-}" == --exact ]] || return 90
+      if [[ "${9:-}" == --list ]]; then
+        [[ $# -eq 9 ]] || return 90
+        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != route-list-failure ]] || return 23
+        if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != route-missing ]]; then
+          echo 'onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery: test'
+        fi
+        if [[ "$SCRIBE_HEALTH_FIXTURE_CASE" == route-duplicate ]]; then
+          echo 'onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery: test'
+        fi
+      else
+        [[ $# -eq 10 && "$9" == --include-ignored && "${10}" == --test-threads=1 ]] || return 90
+        [[ "$SCRIBE_HEALTH_FIXTURE_CASE" != route-run-failure ]] || return 37
+        echo 'fixture route execution'
+      fi
+      ;;
+    *) return 90 ;;
+  esac
+}
+
+test_gpu_health_workflow_contract() {
+  local workflow structural official commands fixture_program output status test fixture_count=0
+  workflow="$repo_root/.github/workflows/macos-release.yml"
+  structural="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$workflow")"
+  official="$(sed -n '/^  official-sign-notarize:/,$p' "$workflow")"
+  [[ "$(grep -Fxc '      - name: Run shared GPU health regressions' <<<"$structural")" -eq 1 ]] || { echo 'native GPU health step must occur exactly once in the structural job.' >&2; return 1; }
+  ! grep -F 'Run shared GPU health regressions' <<<"$official" >/dev/null || { echo 'GPU health fixtures must not run in the protected signing job.' >&2; return 1; }
+  ! grep -F 'secrets.' <<<"$structural" >/dev/null || { echo 'structural health checks must not receive production secrets.' >&2; return 1; }
+  grep -F 'runner: macos-15-intel' <<<"$structural" >/dev/null
+  grep -F 'runner: macos-14' <<<"$structural" >/dev/null
+  commands="$(awk '
+    /^      - name: Run shared GPU health regressions$/ { step = 1; next }
+    step && /^      - / { exit }
+    step && /^        run: \|$/ { body = 1; next }
+    step && body && /^          / { sub(/^          /, ""); print }
+  ' <<<"$structural")"
+  [[ -n "$commands" && "$commands" != *'${{'* ]] || { echo 'health check must have a standalone executable shell block.' >&2; return 1; }
+  fixture_program="$(declare -f gpu_health_fixture_cargo)"$'\n''cargo() { gpu_health_fixture_cargo "$@"; }'$'\n'"$commands"
+  gpu_health_case() {
+    local fixture="$1" expected_status="$2" expected_health="$3" expected_route="$4"
+    if output="$(SCRIBE_HEALTH_FIXTURE_CASE="$fixture" bash -c "$fixture_program" 2>&1)"; then status=0; else status=$?; fi
+    [[ "$status" -eq "$expected_status" ]] || { echo "health workflow fixture failed: $fixture (exit $status)." >&2; return 1; }
+    [[ "$(grep -Fxc 'fixture health execution' <<<"$output")" -eq "$expected_health" ]] || { echo "unexpected health execution: $fixture" >&2; return 1; }
+    [[ "$(grep -Fxc 'fixture route execution' <<<"$output")" -eq "$expected_route" ]] || { echo "unexpected route execution: $fixture" >&2; return 1; }
+    fixture_count=$((fixture_count + 1))
+  }
+  gpu_health_case success 0 1 1
+  for test in valid_witness_changes_clear_history_without_selection_writes stale_witnesses_cannot_mask_malformed_envelopes invalid_current_witnesses_fail_closed_for_missing_matching_and_stale_files; do
+    gpu_health_case "missing-$test" 1 0 0
+    gpu_health_case "duplicate-$test" 1 0 0
+  done
+  gpu_health_case health-list-failure 23 0 0
+  gpu_health_case health-run-failure 37 0 0
+  gpu_health_case route-missing 1 1 0
+  gpu_health_case route-duplicate 1 1 0
+  gpu_health_case route-list-failure 23 1 0
+  gpu_health_case route-run-failure 37 1 0
+  echo "macOS GPU health workflow contracts passed ($fixture_count fake-Cargo cases)."
+}
+
+if [[ $# -gt 0 ]]; then
+  [[ $# -eq 1 && "$1" == --gpu-health-contract-only ]] || { echo 'usage: test-macos-release-packaging.sh [--gpu-health-contract-only]' >&2; exit 2; }
+  test_gpu_health_workflow_contract
+  exit 0
+fi
+
 scripts=(build-macos-metal-worker-pack.sh build-macos-release.sh prepare-macos-release-inputs.sh sign-notarize-macos-release.sh verify-macos-release-package.sh report-macos-worker-pack-sizes.sh)
 for script in "${scripts[@]}"; do bash -n "$repo_root/scripts/$script"; done
 for manifest in "$repo_root"/runtime-manifests/gpu-{worker-toolchain,auto-qualification}-macos-{aarch64,x86_64}.json; do jq -e . "$manifest" >/dev/null; done
@@ -63,6 +153,7 @@ sign_line="$(grep -Fn 'codesign "${codesign_args[@]}" --entitlements "$desktop_e
 [[ "$embed_line" =~ ^[0-9]+$ && "$sign_line" =~ ^[0-9]+$ && "$embed_line" -lt "$sign_line" ]] || { echo 'provisioning profile must be embedded before final app signing.' >&2; exit 1; }
 structural_job="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
 ! grep -F 'secrets.' <<<"$structural_job" >/dev/null || { echo 'pull-request structural job must not receive production secrets.' >&2; exit 1; }
+test_gpu_health_workflow_contract
 grep -F 'lipo "$worker" -verify_arch "$pack_lipo_arch"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
 grep -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
 grep -F 'catalog Metal worker has no Metal load command' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'Metal worker load-command requirement is missing.' >&2; exit 1; }

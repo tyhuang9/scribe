@@ -942,6 +942,18 @@ handshake checks the same parent expectation before output is accepted.
 
 ## Build and verification commands
 
+`bash scripts/test-macos-release-packaging.sh --gpu-health-contract-only` is the
+dependency-free fast check for native macOS health-regression workflow wiring.
+It executes the actual workflow shell block with fake Cargo, checking required
+test discovery, exact arguments, fail-fast behavior and secret-free placement.
+The default packaging contract runs the same checks plus its existing packaging
+checks. Both native macOS structural jobs execute the shared health-cache suite
+and the exact witness-change route regression, serially and offline after native
+test preparation. These fixture-only groups include ignored tests to prevent
+discovery without execution; manual hardware tests must stay outside them.
+This covers macOS health-file persistence, locking and route projection, not
+Metal execution, hardware/performance qualification, signing or Auto eligibility.
+
 `scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture,
 prepared unsigned candidate, or legacy one-shot pack from the pinned contract in
 `runtime-manifests/gpu-worker-toolchain-windows-x64.json`.

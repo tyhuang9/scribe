@@ -73,6 +73,22 @@ jobs:
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
           cargo test --manifest-path tools/worker-pack-author/Cargo.toml --locked -- --test-threads=1
+      - name: Run shared GPU health regressions
+        env:
+          SCRIBE_BUILD_REVISION: stage6-macos-ci
+        run: |
+          set -euo pipefail
+          health_filter='gpu_worker_pack::health::tests::'
+          health_listing="$(cargo test --locked --offline --bin local-transcriber "$health_filter" -- --list)"
+          for required_test in valid_witness_changes_clear_history_without_selection_writes stale_witnesses_cannot_mask_malformed_envelopes invalid_current_witnesses_fail_closed_for_missing_matching_and_stale_files; do
+            [[ "$(grep -Fxc -- "${health_filter}${required_test}: test" <<<"$health_listing")" -eq 1 ]] || { echo "Missing or duplicate health regression: $required_test" >&2; exit 1; }
+          done
+          # These fixture-only groups must execute even if annotated ignored.
+          cargo test --locked --offline --bin local-transcriber "$health_filter" -- --include-ignored --test-threads=1
+          route_test='onnx_worker::tests::health_witness_changes_preserve_eligible_routes_without_idle_recovery'
+          route_listing="$(cargo test --locked --offline --bin local-transcriber "$route_test" -- --exact --list)"
+          [[ "$(grep -Fxc -- "$route_test: test" <<<"$route_listing")" -eq 1 ]] || { echo 'Missing or duplicate exact health route regression.' >&2; exit 1; }
+          cargo test --locked --offline --bin local-transcriber "$route_test" -- --exact --include-ignored --test-threads=1
       - name: Build ad hoc signed universal structural package
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc
