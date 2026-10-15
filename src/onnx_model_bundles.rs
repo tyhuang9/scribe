@@ -891,6 +891,20 @@ fn acquire_bundle_disk_reservation_with_control_root(
     target: &Path,
     requested_bytes: u64,
 ) -> Result<BundleDiskReservation, InstallError> {
+    acquire_bundle_disk_reservation_with_control_root_and_preflight(
+        control_root,
+        target,
+        requested_bytes,
+        disk_space::preflight_download_destination,
+    )
+}
+
+fn acquire_bundle_disk_reservation_with_control_root_and_preflight(
+    control_root: &Path,
+    target: &Path,
+    requested_bytes: u64,
+    preflight_destination: impl FnOnce(&Path, u64) -> Result<DiskSpacePreflight, String>,
+) -> Result<BundleDiskReservation, InstallError> {
     let initial_volume_identity =
         disk_space::physical_volume_identity(target).map_err(InstallError::Failed)?;
     create_verified_reservation_directory(control_root)?;
@@ -967,8 +981,8 @@ fn acquire_bundle_disk_reservation_with_control_root(
     let aggregate_request = active_reserved_bytes
         .checked_add(requested_bytes)
         .ok_or_else(|| failed("aggregate ONNX bundle disk requirement overflowed"))?;
-    let preflight = disk_space::preflight_download_destination(target, aggregate_request)
-        .map_err(InstallError::Failed)?;
+    let preflight =
+        preflight_destination(target, aggregate_request).map_err(InstallError::Failed)?;
     let admitted_volume_identity =
         disk_space::physical_volume_identity(target).map_err(InstallError::Failed)?;
     if admitted_volume_identity != initial_volume_identity {
@@ -2705,6 +2719,22 @@ mod tests {
         ))
     }
 
+    fn fixed_capacity_preflight(
+        target: &Path,
+        additional_bytes: u64,
+        available_bytes: u64,
+    ) -> Result<DiskSpacePreflight, String> {
+        let required_bytes = additional_bytes
+            .checked_add(disk_space::SAFETY_HEADROOM_BYTES)
+            .ok_or_else(|| "fixture download-space requirement overflowed".to_owned())?;
+        Ok(DiskSpacePreflight {
+            volume: target.display().to_string(),
+            available_bytes,
+            additional_bytes,
+            required_bytes,
+        })
+    }
+
     #[test]
     fn normalized_receipt_binding_matches_private_bundle_authority() {
         let model_id = crate::transcription::ModelId::new("moonshine-tiny-en-int8-onnx");
@@ -4173,11 +4203,132 @@ mod tests {
     }
 
     #[test]
-    fn consumed_disk_reduces_live_reservations_without_allowing_overcommit() {
-        const CONSUMED_BYTES: u64 = 16 * 1024 * 1024;
-        const ADMISSION_SLACK: u64 = 2 * 1024 * 1024;
-        const WRITE_CHUNK_BYTES: usize = 64 * 1024;
+    fn reservation_preflight_error_creates_no_candidate_and_releases_ledger() {
+        let root = unique_root("reservation-preflight-error");
+        let control = root.join("control");
+        let target = root.join("storage").join("model");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let identity = disk_space::physical_volume_identity(&target).unwrap();
+        let reservation_root = volume_reservation_root(&control, &identity);
+        let mut preflight_calls = 0;
 
+        let error = acquire_bundle_disk_reservation_with_control_root_and_preflight(
+            &control,
+            &target,
+            7,
+            |observed_target, aggregate_request| {
+                preflight_calls += 1;
+                assert_eq!(observed_target, target.as_path());
+                assert_eq!(aggregate_request, 7);
+                Err("fixture reservation preflight failed".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(preflight_calls, 1);
+        assert!(
+            error
+                .to_string()
+                .contains("fixture reservation preflight failed")
+        );
+        assert_eq!(
+            fs::read_dir(&reservation_root)
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "reservation")
+                })
+                .count(),
+            0
+        );
+        let ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), false).unwrap();
+        drop(ledger);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reservation_aggregate_overflow_precedes_preflight_callback() {
+        let root = unique_root("reservation-aggregate-overflow");
+        let control = root.join("control");
+        let first_target = root.join("first-storage").join("model");
+        let second_target = root.join("second-storage").join("model");
+        fs::create_dir_all(first_target.parent().unwrap()).unwrap();
+        fs::create_dir_all(second_target.parent().unwrap()).unwrap();
+        let capacity = disk_space::SAFETY_HEADROOM_BYTES.checked_add(1).unwrap();
+        let first = acquire_bundle_disk_reservation_with_control_root_and_preflight(
+            &control,
+            &first_target,
+            1,
+            |target, aggregate_request| {
+                fixed_capacity_preflight(target, aggregate_request, capacity)
+            },
+        )
+        .unwrap();
+        let mut preflight_called = false;
+
+        let error = acquire_bundle_disk_reservation_with_control_root_and_preflight(
+            &control,
+            &second_target,
+            u64::MAX,
+            |_, _| {
+                preflight_called = true;
+                Err("fixture preflight must not run after overflow".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate ONNX bundle disk requirement overflowed")
+        );
+        assert!(!preflight_called);
+        drop(first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reservation_consumption_underflow_preserves_ledger_entry() {
+        let root = unique_root("reservation-consumption-underflow");
+        let control = root.join("control");
+        let target = root.join("storage").join("model");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let capacity = disk_space::SAFETY_HEADROOM_BYTES.checked_add(1).unwrap();
+        let mut reservation = acquire_bundle_disk_reservation_with_control_root_and_preflight(
+            &control,
+            &target,
+            1,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, target.as_path());
+                assert_eq!(aggregate_request, 1);
+                fixed_capacity_preflight(observed_target, aggregate_request, capacity)
+            },
+        )
+        .unwrap();
+        let ledger_before = fs::read_to_string(&reservation.entry_path).unwrap();
+
+        let error = reservation.consume_allocated_bytes(2).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("attempted to consume 2 bytes from a 1-byte reservation")
+        );
+        assert_eq!(reservation.remaining_bytes, 1);
+        assert_eq!(
+            fs::read_to_string(&reservation.entry_path).unwrap(),
+            ledger_before
+        );
+        drop(reservation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consumed_disk_reduces_live_reservations_at_fixed_capacity_boundaries() {
+        const CONSUMED_BYTES: u64 = 4 * 1024;
         let root = unique_root("reservation-consumption");
         let control = root.join("control");
         let first_storage = root.join("first-storage");
@@ -4186,34 +4337,41 @@ mod tests {
         fs::create_dir_all(&second_storage).unwrap();
         let first_target = first_storage.join("model");
         let second_target = second_storage.join("other-model");
-        let mut first = acquire_bundle_disk_reservation_with_control_root(
+        let third_target = root.join("third-storage").join("third-model");
+        let steady_capacity = disk_space::SAFETY_HEADROOM_BYTES
+            .checked_add(CONSUMED_BYTES)
+            .unwrap();
+        let initial_capacity = steady_capacity.checked_add(CONSUMED_BYTES).unwrap();
+        let mut first = acquire_bundle_disk_reservation_with_control_root_and_preflight(
             &control,
             &first_target,
             CONSUMED_BYTES,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, first_target.as_path());
+                assert_eq!(aggregate_request, CONSUMED_BYTES);
+                fixed_capacity_preflight(observed_target, aggregate_request, initial_capacity)
+            },
         )
         .unwrap();
 
         let allocated_path = first_storage.join("consumed.bin");
         let mut allocated = File::create(&allocated_path).unwrap();
-        let chunk = [0xa5_u8; WRITE_CHUNK_BYTES];
-        for _ in 0..(CONSUMED_BYTES / WRITE_CHUNK_BYTES as u64) {
-            allocated.write_all(&chunk).unwrap();
-        }
+        let allocated_bytes = [0xa5_u8; CONSUMED_BYTES as usize];
+        allocated.write_all(&allocated_bytes).unwrap();
         allocated.sync_all().unwrap();
         drop(allocated);
 
-        let available_after_allocation =
-            disk_space::preflight_download_destination(&second_target, 0)
-                .unwrap()
-                .available_bytes;
-        let second_request = available_after_allocation
-            .checked_sub(disk_space::SAFETY_HEADROOM_BYTES + ADMISSION_SLACK)
-            .expect("test volume needs enough free space for the safety floor and slack");
+        let second_request = CONSUMED_BYTES - 2;
 
-        let stale_error = acquire_bundle_disk_reservation_with_control_root(
+        let stale_error = acquire_bundle_disk_reservation_with_control_root_and_preflight(
             &control,
             &second_target,
             second_request,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, second_target.as_path());
+                assert_eq!(aggregate_request, CONSUMED_BYTES + second_request);
+                fixed_capacity_preflight(observed_target, aggregate_request, steady_capacity)
+            },
         )
         .unwrap_err();
         assert!(stale_error.to_string().contains("insufficient unreserved"));
@@ -4221,21 +4379,59 @@ mod tests {
         first.consume_allocated_bytes(CONSUMED_BYTES).unwrap();
         assert_eq!(first.remaining_bytes, 0);
         assert_eq!(fs::read_to_string(&first.entry_path).unwrap().trim(), "0");
-        let second = acquire_bundle_disk_reservation_with_control_root(
+        let second = acquire_bundle_disk_reservation_with_control_root_and_preflight(
             &control,
             &second_target,
             second_request,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, second_target.as_path());
+                assert_eq!(aggregate_request, second_request);
+                fixed_capacity_preflight(observed_target, aggregate_request, steady_capacity)
+            },
         )
         .unwrap();
 
-        let overcommit = acquire_bundle_disk_reservation_with_control_root(
+        let exact = acquire_bundle_disk_reservation_with_control_root_and_preflight(
             &control,
-            &root.join("third-storage").join("third-model"),
-            ADMISSION_SLACK + 1,
+            &third_target,
+            2,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, third_target.as_path());
+                assert_eq!(aggregate_request, CONSUMED_BYTES);
+                fixed_capacity_preflight(observed_target, aggregate_request, steady_capacity)
+            },
+        )
+        .unwrap();
+        drop(exact);
+
+        let overcommit = acquire_bundle_disk_reservation_with_control_root_and_preflight(
+            &control,
+            &third_target,
+            3,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, third_target.as_path());
+                assert_eq!(aggregate_request, CONSUMED_BYTES + 1);
+                fixed_capacity_preflight(observed_target, aggregate_request, steady_capacity)
+            },
         )
         .unwrap_err();
         assert!(overcommit.to_string().contains("insufficient unreserved"));
 
+        let increased_capacity = steady_capacity.checked_add(1).unwrap();
+        let third = acquire_bundle_disk_reservation_with_control_root_and_preflight(
+            &control,
+            &third_target,
+            3,
+            |observed_target, aggregate_request| {
+                assert_eq!(observed_target, third_target.as_path());
+                assert_eq!(aggregate_request, CONSUMED_BYTES + 1);
+                fixed_capacity_preflight(observed_target, aggregate_request, increased_capacity)
+            },
+        )
+        .unwrap();
+        assert_eq!(third.remaining_bytes, 3);
+
+        drop(third);
         drop(second);
         drop(first);
         fs::remove_dir_all(root).unwrap();
