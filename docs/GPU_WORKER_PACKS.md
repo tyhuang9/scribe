@@ -204,6 +204,46 @@ The opt-in diagnostic pack probe additionally requires the separate final
 copies. Its existing security-record acknowledgement alone never grants that
 side effect; overlong candidates are skipped with a categorical diagnostic.
 
+## Supervised Windows GPU idle-lifetime diagnostic
+
+The collector-only `--scribe-windows-gpu-idle-diagnostic` command is a manual
+development check for the real five-minute GGUF warm-model lifetime. It accepts
+only an absolute, retained-digest model input and an exact CUDA or Vulkan
+backend, pack ID, and stable-device identity; it also requires separate
+acknowledgements for local GPU security records and local execution copies.
+Unknown, duplicated, incomplete, Auto, CPU, arbitrary audio, and idle-TTL
+override arguments fail before model I/O or worker launch.
+
+The expected backend, pack, and device values are post-execution assertions,
+not routing controls. The command exercises only the healthy GPU route chosen
+by ordinary explicit-GPU priority (currently CUDA before Vulkan on Windows); it
+does not force a provider or device. A different installed backend or adapter
+needs a separately selected production route and supervised run, rather than a
+new path, provider, or target override.
+
+The command uses the ordinary process worker and a generated one-second silent
+`PreparedAudio` input. It performs cold, immediate-warm, and post-idle cold
+requests with explicit GPU, rejects CPU/fallback or route/generation drift, and
+compares transcript digests without reporting transcript text. Between the
+second and third request it issues no runtime command: a no-launch,
+model-bound observation lease polls for the acknowledged automatic `Unload`.
+An unload before the full 300 seconds from immediately-before the warm request
+fails; absence after the reply-based 300-second deadline plus its fixed
+15-second settlement window also fails (the deadline itself is inclusive; a
+later observation after suspend or scheduling delay fails). A successful report
+is metadata-only, unsigned and unqualified, and is emitted only after bounded
+worker shutdown.
+It records the fixed `warm_model_ttl_ms` and the monotonic
+`automatic_unload_observed_after_warm_request_ms`: the first is anchored before
+the immediate-warm request for the earliest legal expiry, while the second is
+the read-only acknowledged-Unload observation timestamp. Neither is a
+configurable timer.
+
+This command is not part of ordinary CI, installer smoke, protected hardware
+qualification, pack publication, or Auto enablement. Its fast fake-clock and
+no-launch observer tests are included in the Windows capture-observation
+script; an actual five-minute run remains supervised and opt-in.
+
 ## Stage 5 Windows Auto qualification
 
 `runtime-manifests/gpu-auto-qualification-windows-x64.json` is a compact,

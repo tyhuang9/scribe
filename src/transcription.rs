@@ -33,6 +33,8 @@ pub use crate::model_catalog::{CompatibilityStatus, ModelDescriptor};
 use crate::models::SttModelInfo;
 #[cfg(test)]
 use crate::onnx_model_bundles::OnnxBundleManifest;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+use crate::onnx_worker::ActiveGpuModelObservation;
 use crate::onnx_worker::InferenceWorkerRegistry;
 #[cfg(test)]
 use crate::onnx_worker::InferenceWorkerSupervisor;
@@ -60,6 +62,11 @@ const INSTALL_SMOKE_HELPER_FLAG: &str = "--scribe-install-smoke";
 const INSTALL_SMOKE_PARENT_FLAG: &str = "--scribe-install-smoke-parent";
 const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+mod gpu_idle_diagnostic;
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+pub(crate) use gpu_idle_diagnostic::maybe_run_windows_gpu_idle_diagnostic;
 
 fn runtime_request_error(failure: RuntimeRequestFailure) -> anyhow::Error {
     let error = anyhow!(failure.error);
@@ -719,6 +726,26 @@ impl RuntimeWorker {
         response
             .recv()
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+
+    /// Reads only the live model binding held by the process worker. The
+    /// development idle diagnostic uses this while the dispatch loop waits for
+    /// its normal five-minute timeout; it must never enqueue a command that
+    /// refreshes that timeout or launches a replacement.
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn current_active_gpu_model_observation(
+        &self,
+        artifact: &RuntimeArtifact,
+    ) -> Result<ActiveGpuModelObservation, RuntimeError> {
+        self.inner
+            .inference
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::WorkerUnavailable(
+                    "process inference worker is unavailable for idle observation".to_owned(),
+                )
+            })?
+            .current_active_gpu_model_observation(artifact)
     }
 
     fn shutdown_and_join(&self, timeout: Duration) -> bool {
