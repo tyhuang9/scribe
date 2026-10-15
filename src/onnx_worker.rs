@@ -1318,6 +1318,9 @@ trait WorkerProcess: Send + Sync {
     }
     fn terminate(&self) -> Result<()>;
     fn wait(&self) -> Result<()>;
+    fn wait_for_retirement(&self, _progress: &RetirementReapProgress) -> Result<()> {
+        self.wait()
+    }
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn wait_before(&self, _deadline: MonotonicDeadline) -> Result<()> {
         self.wait()
@@ -5306,12 +5309,17 @@ impl WorkerProcess for OsWorkerProcess {
     }
 
     fn wait(&self) -> Result<()> {
-        let _ = self
-            .child
-            .lock()
-            .map_err(|_| anyhow!("process worker process lock was poisoned"))?
-            .wait()?;
-        Ok(())
+        wait_on_child_mutex(&self.child, None, |child| {
+            let _ = child.wait()?;
+            Ok(())
+        })
+    }
+
+    fn wait_for_retirement(&self, progress: &RetirementReapProgress) -> Result<()> {
+        wait_on_child_mutex(&self.child, Some(progress), |child| {
+            let _ = child.wait()?;
+            Ok(())
+        })
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -5546,6 +5554,7 @@ enum RetirementReapPhase {
     WaitEntered = 1,
     WaitFailed = 2,
     WaitReturnedSuccessfully = 3,
+    ChildMutexAcquiredWaitReturnPending = 4,
 }
 
 impl RetirementReapPhase {
@@ -5555,6 +5564,7 @@ impl RetirementReapPhase {
             1 => Some(Self::WaitEntered),
             2 => Some(Self::WaitFailed),
             3 => Some(Self::WaitReturnedSuccessfully),
+            4 => Some(Self::ChildMutexAcquiredWaitReturnPending),
             _ => None,
         }
     }
@@ -5597,6 +5607,20 @@ fn wait_for_retirement_reap(
     }
 }
 
+fn wait_on_child_mutex<T>(
+    child: &Mutex<T>,
+    progress: Option<&RetirementReapProgress>,
+    wait: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<()> {
+    let mut child = child
+        .lock()
+        .map_err(|_| anyhow!("process worker process lock was poisoned"))?;
+    if let Some(progress) = progress {
+        progress.store_phase(RetirementReapPhase::ChildMutexAcquiredWaitReturnPending);
+    }
+    wait(&mut child)
+}
+
 fn retirement_reap_progress_advisory(progress: &RetirementReapProgress) -> &'static str {
     match progress.phase() {
         Some(RetirementReapPhase::PendingWaitNotObserved) => "retirement wait not observed",
@@ -5604,6 +5628,9 @@ fn retirement_reap_progress_advisory(progress: &RetirementReapProgress) -> &'sta
         Some(RetirementReapPhase::WaitFailed) => "retirement wait call returned failure",
         Some(RetirementReapPhase::WaitReturnedSuccessfully) => {
             "retirement wait call returned successfully; receipt pending"
+        }
+        Some(RetirementReapPhase::ChildMutexAcquiredWaitReturnPending) => {
+            "child process wait mutex acquired; process wait return not observed"
         }
         None => "retirement wait progress unavailable",
     }
@@ -8119,8 +8146,10 @@ fn reap_process(
     let reaper_progress = Arc::clone(&progress);
     if let Err(error) = std::thread::Builder::new()
         .name(format!("scribe-process-worker-reaper-{generation}"))
-        .spawn(
-            move || match wait_for_retirement_reap(&reaper_progress, || reaper_process.wait()) {
+        .spawn(move || {
+            match wait_for_retirement_reap(&reaper_progress, || {
+                reaper_process.wait_for_retirement(&reaper_progress)
+            }) {
                 Ok(()) => {
                     if let Some(owner) = reaper_owner.as_ref() {
                         mark_retirement_settled(owner, generation);
@@ -8129,12 +8158,12 @@ fn reap_process(
                 Err(error) => {
                     eprintln!("process worker generation {generation} reaper failed: {error:#}");
                 }
-            },
-        )
+            }
+        })
     {
         // Thread creation failure is exceptional, but the child must still be
         // reaped before this process can safely forget it.
-        wait_for_retirement_reap(&progress, || process.wait()).with_context(|| {
+        wait_for_retirement_reap(&progress, || process.wait_for_retirement(&progress)).with_context(|| {
             format!(
                 "could not start process worker generation {generation} reaper ({error}) and synchronous reaping failed"
             )
@@ -27073,7 +27102,8 @@ mod tests {
     #[test]
     fn retirement_reaper_progress_projection_is_static_and_bounded() {
         let mut receipts = BTreeMap::new();
-        let max_advisory_len = "retirement wait call returned successfully; receipt pending".len();
+        let max_advisory_len =
+            "child process wait mutex acquired; process wait return not observed".len();
         let assert_static_advisory = |actual: &str, expected: &str| {
             assert_eq!(actual, expected);
             assert!(actual.len() <= max_advisory_len, "{actual}");
@@ -27104,6 +27134,10 @@ mod tests {
             (
                 RetirementReapPhase::WaitReturnedSuccessfully,
                 "retirement wait call returned successfully; receipt pending",
+            ),
+            (
+                RetirementReapPhase::ChildMutexAcquiredWaitReturnPending,
+                "child process wait mutex acquired; process wait return not observed",
             ),
         ] {
             receipts.clear();
@@ -27195,9 +27229,34 @@ mod tests {
                 .insert(42, Arc::clone(&succeeded))
                 .is_none()
         );
+        let succeeded_child = Mutex::new(());
         wait_for_retirement_reap(&succeeded, || {
             assert_eq!(succeeded.phase(), Some(RetirementReapPhase::WaitEntered));
-            Ok(())
+            wait_on_child_mutex(&succeeded_child, Some(&succeeded), |_| {
+                assert_eq!(
+                    succeeded.phase(),
+                    Some(RetirementReapPhase::ChildMutexAcquiredWaitReturnPending)
+                );
+                let state = succeeded_transport.inner.state.lock().unwrap();
+                assert!(Arc::ptr_eq(
+                    &succeeded,
+                    state
+                        .retiring_generations
+                        .get(&42)
+                        .expect("mutex-acquired progress retains its receipt"),
+                ));
+                drop(state);
+                assert_eq!(
+                    succeeded_transport
+                        .ensure_generation()
+                        .unwrap_err()
+                        .to_string(),
+                    "process worker retirement did not settle before provider discovery; child process wait mutex acquired; process wait return not observed"
+                );
+                assert_eq!(succeeded_launcher.launch_attempts.load(Ordering::Acquire), 0);
+                assert_eq!(succeeded_launcher.launches.load(Ordering::Acquire), 0);
+                Ok(())
+            })
         })
         .unwrap();
         assert_eq!(
@@ -27239,6 +27298,85 @@ mod tests {
         assert_eq!(
             succeeded_launcher.launch_attempts.load(Ordering::Acquire),
             0
+        );
+    }
+
+    #[test]
+    fn retirement_child_mutex_progress_follows_acquisition_and_preserves_result() {
+        let child = Mutex::new(());
+        let succeeded = RetirementReapProgress::new();
+        wait_for_retirement_reap(&succeeded, || {
+            wait_on_child_mutex(&child, Some(&succeeded), |_| {
+                assert_eq!(
+                    succeeded.phase(),
+                    Some(RetirementReapPhase::ChildMutexAcquiredWaitReturnPending)
+                );
+                assert!(matches!(
+                    child.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            succeeded.phase(),
+            Some(RetirementReapPhase::WaitReturnedSuccessfully)
+        );
+
+        let failed = RetirementReapProgress::new();
+        let error = wait_for_retirement_reap(&failed, || {
+            wait_on_child_mutex(&child, Some(&failed), |_| {
+                Err(anyhow!("fixture wait root").context("fixture wait context"))
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["fixture wait context", "fixture wait root"]
+        );
+        assert_eq!(failed.phase(), Some(RetirementReapPhase::WaitFailed));
+
+        let poisoned_child = Mutex::new(());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = poisoned_child.lock().unwrap();
+                panic!("fixture child mutex poison");
+            })
+            .is_err()
+        );
+        let poisoned = RetirementReapProgress::new();
+        let callback_reached = AtomicBool::new(false);
+        let error = wait_on_child_mutex(&poisoned_child, Some(&poisoned), |_| {
+            callback_reached.store(true, Ordering::Release);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "process worker process lock was poisoned"
+        );
+        assert_eq!(
+            poisoned.phase(),
+            Some(RetirementReapPhase::PendingWaitNotObserved)
+        );
+        assert!(!callback_reached.load(Ordering::Acquire));
+
+        let default_process = CooperativeCancelProcess::new(
+            false,
+            Correlation {
+                generation: 61,
+                session_id: 62,
+                request_id: 63,
+            },
+        );
+        let default_progress = RetirementReapProgress::new();
+        default_process
+            .wait_for_retirement(&default_progress)
+            .unwrap();
+        assert_eq!(
+            default_progress.phase(),
+            Some(RetirementReapPhase::PendingWaitNotObserved)
         );
     }
 
