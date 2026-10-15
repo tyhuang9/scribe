@@ -8194,6 +8194,29 @@ pub(crate) struct InferenceWorkerSupervisor {
     next_correlation: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InferenceCancellationCleanupFailure {
+    ActiveRequestCancellation,
+    CurrentGenerationLookup,
+    BetweenRequestRetirement,
+}
+
+impl InferenceCancellationCleanupFailure {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::ActiveRequestCancellation => {
+                "inference cancellation cleanup failed: active-request cancellation"
+            }
+            Self::CurrentGenerationLookup => {
+                "inference cancellation cleanup failed: current-generation lookup"
+            }
+            Self::BetweenRequestRetirement => {
+                "inference cancellation cleanup failed: between-request retirement"
+            }
+        }
+    }
+}
+
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 struct RuntimeObservationStart {
     generation: u64,
@@ -8921,25 +8944,47 @@ impl InferenceWorkerSupervisor {
             .map_err(worker_unavailable)
     }
 
-    pub(crate) fn cancel_active(&self) {
+    fn cancel_active_with_cleanup_diagnostics(
+        &self,
+        mut report: impl FnMut(InferenceCancellationCleanupFailure),
+    ) {
         let outcome = self.transport.cancel_active_outcome();
         if matches!(
-            outcome,
+            &outcome,
             Ok(CancelOutcome::CooperativeSettled | CancelOutcome::HardInvalidated)
         ) {
             return;
+        }
+        if outcome.is_err() {
+            report(InferenceCancellationCleanupFailure::ActiveRequestCancellation);
         }
         // If cancellation landed between two correlated batch requests there
         // may have been no active waiter for cancel_active() to retire. Kill
         // the still-current generation as well so that the next batch frame
         // cannot cross the cancellation boundary.
-        if let Ok(Some(generation)) = self.transport.current_generation() {
-            let _ = self.transport.invalidate_generation(
-                generation,
-                "inference batch cancelled between requests",
-                true,
-            );
+        match self.transport.current_generation() {
+            Ok(Some(generation)) => {
+                if self
+                    .transport
+                    .invalidate_generation(
+                        generation,
+                        "inference batch cancelled between requests",
+                        true,
+                    )
+                    .is_err()
+                {
+                    report(InferenceCancellationCleanupFailure::BetweenRequestRetirement);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => report(InferenceCancellationCleanupFailure::CurrentGenerationLookup),
         }
+    }
+
+    pub(crate) fn cancel_active(&self) {
+        self.cancel_active_with_cleanup_diagnostics(|failure| {
+            eprintln!("{}", failure.message());
+        });
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), RuntimeError> {
@@ -16120,6 +16165,7 @@ mod tests {
         output: TestSender<PipeChunk>,
         worker: Mutex<Option<JoinHandle<()>>>,
         wait_mode: Mutex<Option<TestWaitMode>>,
+        terminate_fails: AtomicBool,
         kill_started: Option<TestSender<()>>,
         reaped: Option<TestSender<()>>,
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -16309,6 +16355,9 @@ mod tests {
             }
             if let Some(kill_started) = &self.kill_started {
                 let _ = kill_started.send(());
+            }
+            if self.terminate_fails.swap(false, Ordering::AcqRel) {
+                bail!("fixture private termination detail must not reach diagnostics")
             }
             self.running.store(false, Ordering::Release);
             let _ = self.input.send(PipeChunk::Eof);
@@ -16517,6 +16566,9 @@ mod tests {
             mode: Box<TestMode>,
             wait: TestWaitMode,
         },
+        WithProcessTerminationFailure {
+            mode: Box<TestMode>,
+        },
         BlockedHello {
             started: TestSender<()>,
         },
@@ -16700,9 +16752,10 @@ mod tests {
                 }
                 mode => mode,
             };
-            let (mode, wait_mode) = match mode {
-                TestMode::WithProcessWait { mode, wait } => (*mode, Some(wait)),
-                mode => (mode, None),
+            let (mode, wait_mode, terminate_fails) = match mode {
+                TestMode::WithProcessWait { mode, wait } => (*mode, Some(wait), false),
+                TestMode::WithProcessTerminationFailure { mode } => (*mode, None, true),
+                mode => (mode, None, false),
             };
             self.launches.fetch_add(1, Ordering::AcqRel);
             let (parent_input, worker_input) = channel();
@@ -16713,6 +16766,7 @@ mod tests {
                 output: worker_output.clone(),
                 worker: Mutex::new(None),
                 wait_mode: Mutex::new(wait_mode),
+                terminate_fails: AtomicBool::new(terminate_fails),
                 kill_started: self.kill_started.clone(),
                 reaped: self.reaped.clone(),
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -17133,6 +17187,7 @@ mod tests {
         match mode {
             TestMode::DelayedLaunch { .. }
             | TestMode::WithProcessWait { .. }
+            | TestMode::WithProcessTerminationFailure { .. }
             | TestMode::CompatibilityNormal { .. }
             | TestMode::CompatibilityPack { .. }
             | TestMode::CompatibilityPackLegacyReject { .. }
@@ -26901,19 +26956,164 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_between_batch_requests_retires_the_current_generation() {
-        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+    fn cancellation_between_batch_requests_reaps_before_replacement_launches() {
+        let (reap_started_tx, reap_started_rx) = channel();
+        let (reap_release_tx, reap_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: reap_started_tx,
+                    release: reap_release_rx,
+                },
+            },
+            TestMode::Normal,
+        ]));
         let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
-            launcher,
-            SupervisorDeadlines::default(),
+            launcher.clone(),
+            short_deadlines(),
         );
-        transport.ensure_generation().unwrap();
+        let generation = transport.ensure_generation().unwrap();
         let supervisor = InferenceWorkerSupervisor {
             transport: transport.clone(),
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
+        let mut reap_release = ReleaseOnDrop(Some(reap_release_tx));
+
         supervisor.cancel_active();
+        reap_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(transport.current_generation().unwrap(), None);
+        let blocked_replacement = transport.ensure_generation().unwrap_err();
+        assert!(
+            blocked_replacement
+                .to_string()
+                .contains("retirement did not settle before provider discovery")
+        );
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .contains(&generation),
+            "the held reaper must retain the exact-generation receipt"
+        );
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+
+        reap_release.release();
+        transport
+            .await_retirement_settlement_before(
+                MonotonicDeadline::after(Duration::from_secs(1)).unwrap(),
+            )
+            .unwrap();
+        let replacement_generation = transport.ensure_generation().unwrap();
+        assert!(replacement_generation > generation);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        transport.terminate_current().unwrap();
+    }
+
+    #[test]
+    fn failed_between_request_cancellation_reports_static_cleanup_and_blocks_relaunch() {
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessTerminationFailure {
+                mode: Box::new(TestMode::Normal),
+            },
+            TestMode::Normal,
+        ]));
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        let generation = transport.ensure_generation().unwrap();
+        let supervisor = InferenceWorkerSupervisor {
+            transport: transport.clone(),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let mut diagnostics = Vec::new();
+
+        supervisor.cancel_active_with_cleanup_diagnostics(|failure| {
+            diagnostics.push(failure.message());
+        });
+
+        assert_eq!(
+            diagnostics,
+            vec!["inference cancellation cleanup failed: between-request retirement"]
+        );
+        assert!(diagnostics.iter().all(|message| {
+            !message.contains("fixture private termination detail must not reach diagnostics")
+        }));
+        assert_eq!(transport.current_generation().unwrap(), Some(generation));
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .contains(&generation),
+            "a failed termination must retain its exact-generation receipt"
+        );
+        assert!(transport.ensure_generation().is_err());
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cancellation_cleanup_phase_reports_are_static_after_state_poisoning() {
+        let launcher = Arc::new(TestLauncher::new([]));
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        let supervisor = InferenceWorkerSupervisor {
+            transport: transport.clone(),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let inner = Arc::clone(&transport.inner);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _state = inner.state.lock().unwrap();
+            std::panic::resume_unwind(Box::new(()));
+        }));
+        let mut diagnostics = Vec::new();
+
+        supervisor.cancel_active_with_cleanup_diagnostics(|failure| {
+            diagnostics.push(failure.message());
+        });
+
+        assert_eq!(
+            diagnostics,
+            vec![
+                "inference cancellation cleanup failed: active-request cancellation",
+                "inference cancellation cleanup failed: current-generation lookup",
+            ]
+        );
+        let all_messages = [
+            InferenceCancellationCleanupFailure::ActiveRequestCancellation.message(),
+            InferenceCancellationCleanupFailure::CurrentGenerationLookup.message(),
+            InferenceCancellationCleanupFailure::BetweenRequestRetirement.message(),
+        ];
+        assert_eq!(
+            all_messages,
+            [
+                "inference cancellation cleanup failed: active-request cancellation",
+                "inference cancellation cleanup failed: current-generation lookup",
+                "inference cancellation cleanup failed: between-request retirement",
+            ]
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|message| !message.contains("lock poisoned"))
+        );
+        assert!(
+            all_messages
+                .iter()
+                .all(|message| !message.contains("fixture private"))
+        );
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
