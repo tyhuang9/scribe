@@ -30,6 +30,11 @@ fresh directories with the reviewed MSVC 19.44.35227 toolchain. Other compiler
 payload profiles must reproduce that digest or undergo a separately reviewed
 repin; an unexpected output must never be admitted merely because it compiled.
 
+The authenticated source patch is deliberately applied with Git's
+`core.autocrlf=true` command setting. This preserves the CRLF bytes bound by
+the three patched-source digests and is not a general attempt to isolate or
+override the build host's Git configuration.
+
 The Windows module-path helper retries only when `GetModuleFileNameW` returns
 the supplied capacity. A successful shorter result is complete even if the
 thread still carries `ERROR_INSUFFICIENT_BUFFER` from an earlier call. This

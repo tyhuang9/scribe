@@ -131,6 +131,11 @@ function Invoke-LoaderNative([string]$Executable, [string[]]$Arguments) {
     if ($result.Stderr) { Write-Verbose $result.Stderr }
 }
 
+function Invoke-LoaderPatch([string]$Git, [string]$SourceRoot, [string]$PatchPath) {
+    Invoke-LoaderNative $Git @('-c', 'core.autocrlf=true', '-C', $SourceRoot, 'apply', '--check', $PatchPath)
+    Invoke-LoaderNative $Git @('-c', 'core.autocrlf=true', '-C', $SourceRoot, 'apply', $PatchPath)
+}
+
 function Get-LoaderModulePathFunction([string]$Source) {
     if ($Source.Length -gt 33554432) { throw 'Vulkan module-path test source exceeds its bound.' }
     $functions = [regex]::Matches($Source,
@@ -279,8 +284,7 @@ try {
     Expand-LoaderSource $streams[1] $manifest.headers.root $buildRoot
     $loader = Join-Path $buildRoot $manifest.loader.root
     $headers = Join-Path $buildRoot $manifest.headers.root
-    Invoke-LoaderNative $git @('-C', $loader, 'apply', '--check', $patchPath)
-    Invoke-LoaderNative $git @('-C', $loader, 'apply', $patchPath)
+    Invoke-LoaderPatch $git $loader $patchPath
     foreach ($patched in $manifest.patch.patched_files) {
         $verified = Open-LoaderInput (Join-Path $loader $patched.path) $patched.sha256
         $verified.Dispose()

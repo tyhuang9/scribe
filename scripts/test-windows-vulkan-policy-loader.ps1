@@ -12,8 +12,9 @@ $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($builderPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw 'Vulkan policy builder did not parse.' }
-# Exercise the actual pure/input helpers without executing the native builder.
-foreach ($name in @('Assert-LoaderProperties', 'Open-LoaderInput', 'Expand-LoaderSource', 'Assert-NoLoaderBuildOverrides', 'Get-LoaderModulePathFunction')) {
+# Exercise the actual pure/input helpers and Git patch policy without executing
+# the native builder.
+foreach ($name in @('Assert-LoaderProperties', 'Open-LoaderInput', 'Expand-LoaderSource', 'Assert-NoLoaderBuildOverrides', 'Get-LoaderModulePathFunction', 'Invoke-LoaderNative', 'Invoke-LoaderPatch')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $false))
@@ -30,6 +31,187 @@ function Assert-PolicyRejected([scriptblock]$Action, [string]$Message) {
     $rejected = $false
     try { & $Action | Out-Null } catch { $rejected = $true }
     Assert-Policy $rejected $Message
+}
+function Assert-PolicyBytes([byte[]]$Actual, [byte[]]$Expected, [string]$Message) {
+    $matches = $Actual.Length -eq $Expected.Length
+    if ($matches) {
+        for ($index = 0; $index -lt $Actual.Length; $index++) {
+            if ($Actual[$index] -ne $Expected[$index]) {
+                $matches = $false
+                break
+            }
+        }
+    }
+    Assert-Policy $matches $Message
+}
+function Get-PolicyGitEnvironmentNames([hashtable]$Values) {
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @('GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_PARAMETERS',
+        'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+        'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES')) {
+        $null = $names.Add($name)
+    }
+    foreach ($key in [Environment]::GetEnvironmentVariables('Process').Keys) {
+        $name = [string]$key
+        if ($name -match '^GIT_CONFIG_(?:KEY|VALUE)_\d+$') { $null = $names.Add($name) }
+    }
+    foreach ($key in $Values.Keys) { $null = $names.Add([string]$key) }
+    return @($names)
+}
+function Get-PolicyEnvironmentSnapshot([string[]]$Names) {
+    $snapshot = @{}
+    foreach ($name in $Names) {
+        $path = "Env:$name"
+        if (Test-Path -LiteralPath $path) {
+            $snapshot[$name] = [pscustomobject]@{
+                Present = $true
+                Value = (Get-Item -LiteralPath $path).Value
+            }
+        } else {
+            $snapshot[$name] = [pscustomobject]@{ Present = $false; Value = $null }
+        }
+    }
+    return $snapshot
+}
+function Restore-PolicyEnvironmentSnapshot([hashtable]$Snapshot) {
+    foreach ($entry in $Snapshot.GetEnumerator()) {
+        $path = "Env:$($entry.Key)"
+        if ($entry.Value.Present) {
+            [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value.Value, 'Process')
+        } elseif (Test-Path -LiteralPath $path) {
+            # Passing null through PowerShell's .NET string binding can leave an
+            # empty variable behind, which is not equivalent to absence.
+            Remove-Item -LiteralPath $path -ErrorAction Stop
+        }
+    }
+}
+function Assert-PolicyEnvironmentSnapshot([hashtable]$Expected, [string]$Message) {
+    $actual = Get-PolicyEnvironmentSnapshot @($Expected.Keys)
+    $matches = $true
+    foreach ($name in $Expected.Keys) {
+        if ($actual[$name].Present -ne $Expected[$name].Present -or
+            ($actual[$name].Present -and $actual[$name].Value -cne $Expected[$name].Value)) {
+            $matches = $false
+            break
+        }
+    }
+    Assert-Policy $matches $Message
+}
+function Invoke-PolicyWithGitEnvironment([hashtable]$Values, [scriptblock]$Action) {
+    $names = @(Get-PolicyGitEnvironmentNames $Values)
+    $saved = Get-PolicyEnvironmentSnapshot $names
+    try {
+        foreach ($name in $names) {
+            $path = "Env:$name"
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -ErrorAction Stop }
+        }
+        foreach ($entry in $Values.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
+        }
+        & $Action
+    } finally {
+        Restore-PolicyEnvironmentSnapshot $saved
+    }
+}
+function Assert-PolicyFixtureOutsideGitRepository([string]$Source) {
+    $current = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Source))
+    while ($null -ne $current) {
+        Assert-Policy (-not (Test-Path -LiteralPath (Join-Path $current.FullName '.git'))) "Fixture is inside a Git repository: $Source"
+        $parent = $current.Parent
+        if ($null -eq $parent -or $parent.FullName -ceq $current.FullName) { break }
+        $current = $parent
+    }
+}
+function Invoke-PolicyWithHostileGitOverrides([string]$Root, [scriptblock]$Action) {
+    $overrides = @{
+        GIT_CONFIG_PARAMETERS = "'core.autocrlf=false'"
+        GIT_CONFIG_GLOBAL = ''
+        GIT_CONFIG_COUNT = '1'
+        GIT_CONFIG_KEY_0 = 'core.eol'
+        GIT_CONFIG_VALUE_0 = 'lf'
+        GIT_CONFIG_KEY_9 = 'core.attributesFile'
+        GIT_CONFIG_VALUE_9 = ''
+        GIT_DIR = (Join-Path $Root 'hostile-git-dir')
+        GIT_WORK_TREE = (Join-Path $Root 'hostile-work-tree')
+        GIT_COMMON_DIR = (Join-Path $Root 'hostile-common-dir')
+        GIT_INDEX_FILE = (Join-Path $Root 'hostile-index')
+        GIT_OBJECT_DIRECTORY = (Join-Path $Root 'hostile-objects')
+        GIT_ALTERNATE_OBJECT_DIRECTORIES = (Join-Path $Root 'hostile-alternate-objects')
+    }
+    $saved = Get-PolicyEnvironmentSnapshot @($overrides.Keys)
+    foreach ($entry in $overrides.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
+    }
+    try {
+        & $Action
+    } finally {
+        Restore-PolicyEnvironmentSnapshot $saved
+        Assert-PolicyEnvironmentSnapshot $saved 'Hostile Git override restoration changed the caller environment.'
+    }
+}
+function Invoke-PolicyGitEnvironmentFailureCase {
+    $values = @{
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = 'NUL'
+        GIT_CONFIG_COUNT = '1'
+        GIT_CONFIG_KEY_0 = 'core.autocrlf'
+        GIT_CONFIG_VALUE_0 = 'true'
+    }
+    $callerEnvironment = Get-PolicyEnvironmentSnapshot @(Get-PolicyGitEnvironmentNames $values)
+    $failure = $null
+    try {
+        Invoke-PolicyWithGitEnvironment $values { throw 'controlled Git environment action failure' }
+    } catch {
+        $failure = $_.Exception
+    }
+    Assert-Policy ($null -ne $failure -and $failure.Message -ceq 'controlled Git environment action failure') 'Git environment action failure was not propagated exactly.'
+    Assert-PolicyEnvironmentSnapshot $callerEnvironment 'Git environment action failure changed the caller environment.'
+    return 'action-failure-restores-caller-git-environment'
+}
+function Invoke-PolicyLoaderPatchCase([string]$Name, [string]$Git, [string]$Root,
+    [hashtable]$Config, [bool]$InvalidPatch) {
+    $source = Join-Path $Root "$Name-source"
+    [IO.Directory]::CreateDirectory($source) | Out-Null
+    $sourcePath = Join-Path $source 'fixture.txt'
+    $patchPath = Join-Path $Root "$Name.patch"
+    $attributesPath = Join-Path $Root "$Name.attributes"
+    $original = [Text.Encoding]::UTF8.GetBytes("first`nsecond`n")
+    $expected = [Text.Encoding]::UTF8.GetBytes("first`r`nsecond patched`r`nthird`r`n")
+    [IO.File]::WriteAllBytes($sourcePath, $original)
+    [IO.File]::WriteAllBytes($attributesPath, [byte[]]::new(0))
+    $removedLine = if ($InvalidPatch) { '-missing' } else { '-second' }
+    $patch = [string]::Join("`n", @(
+        '--- a/fixture.txt', '+++ b/fixture.txt', '@@ -1,2 +1,3 @@', ' first',
+        $removedLine, '+second patched', '+third')) + "`n"
+    [IO.File]::WriteAllText($patchPath, $patch, [Text.UTF8Encoding]::new($false))
+    $effectiveConfig = @{ 'core.attributesFile' = $attributesPath }
+    foreach ($entry in $Config.GetEnumerator()) {
+        if ($effectiveConfig.ContainsKey($entry.Key)) { throw "Duplicate Git fixture configuration: $($entry.Key)" }
+        $effectiveConfig[[string]$entry.Key] = [string]$entry.Value
+    }
+    $environment = @{ GIT_CONFIG_NOSYSTEM = '1'; GIT_CONFIG_GLOBAL = 'NUL'; GIT_CONFIG_COUNT = [string]$effectiveConfig.Count }
+    $index = 0
+    foreach ($entry in $effectiveConfig.GetEnumerator() | Sort-Object Key) {
+        $environment["GIT_CONFIG_KEY_$index"] = [string]$entry.Key
+        $environment["GIT_CONFIG_VALUE_$index"] = [string]$entry.Value
+        $index++
+    }
+    $callerEnvironment = Get-PolicyEnvironmentSnapshot @(Get-PolicyGitEnvironmentNames $environment)
+    Invoke-PolicyWithGitEnvironment $environment {
+        Assert-PolicyFixtureOutsideGitRepository $source
+        if ($InvalidPatch) {
+            Assert-PolicyRejected { Invoke-LoaderPatch $Git $source $patchPath } "$Name invalid patch was accepted."
+        } else {
+            Invoke-LoaderPatch $Git $source $patchPath
+        }
+    }
+    Assert-PolicyEnvironmentSnapshot $callerEnvironment "$Name changed caller Git environment."
+    if ($InvalidPatch) {
+        Assert-PolicyBytes ([IO.File]::ReadAllBytes($sourcePath)) $original "$Name invalid check changed source bytes."
+    } else {
+        Assert-PolicyBytes ([IO.File]::ReadAllBytes($sourcePath)) $expected "$Name patch output was not exact CRLF bytes."
+    }
+    return $Name
 }
 function New-PolicyZip([object[]]$Entries) {
     $stream = [IO.MemoryStream]::new()
@@ -145,7 +327,21 @@ try {
         Assert-PolicyRejected { Assert-NoLoaderBuildOverrides $hostileEnvironment } "Ambient override $name was accepted."
         Assert-Policy ($hostileEnvironment.Count -eq 2 -and $hostileEnvironment[$name] -ceq 'untrusted value') 'Environment rejection mutated caller input.'
     }
-    Assert-Policy ($script:checks -ge 110) 'Expected policy tests were not executed.'
+    $git = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source
+    $patchCases = @(
+        (Invoke-PolicyGitEnvironmentFailureCase),
+        (Invoke-PolicyLoaderPatchCase 'absent-autocrlf-global-system-disabled' $git $scratch @{} $false),
+        (Invoke-PolicyLoaderPatchCase 'inherited-false-core-eol-lf' $git $scratch @{ 'core.autocrlf' = 'false'; 'core.eol' = 'lf' } $false),
+        (Invoke-PolicyWithHostileGitOverrides $scratch { Invoke-PolicyLoaderPatchCase 'inherited-true' $git $scratch @{ 'core.autocrlf' = 'true' } $false }),
+        (Invoke-PolicyLoaderPatchCase 'invalid-patch-preserves-original-bytes' $git $scratch @{ 'core.autocrlf' = 'true' } $true)
+    )
+    foreach ($name in @('action-failure-restores-caller-git-environment',
+        'absent-autocrlf-global-system-disabled', 'inherited-false-core-eol-lf', 'inherited-true',
+        'invalid-patch-preserves-original-bytes')) {
+        Assert-Policy ($patchCases -ccontains $name) "Loader patch case $name did not execute."
+    }
+    Assert-Policy ($patchCases.Count -eq 5) 'Unexpected loader patch case inventory.'
+    Assert-Policy ($script:checks -ge 119) 'Expected policy tests were not executed.'
     Write-Output "Windows Vulkan policy loader input tests passed ($script:checks checks)."
 } finally {
     # Delete only this invocation's exact physical scratch tree. Do not follow
