@@ -312,12 +312,43 @@ This is **STT-03a only**, not completion of STT-03: normal GUI flow, other model
 other GPUs/platforms, active-decode cancellation, real-speech punctuation-exact
 CPU/GPU parity, performance, protected qualification and Auto remain unverified.
 
+### Supervised Windows Vulkan idle-lifetime checkpoint
+
+Recorded 2026-10-15 against tested source `31170f93de3062558a3fd5bb781164da00393f89`.
+This separately exercised the collector-only [GPU idle-lifetime diagnostic](GPU_WORKER_PACKS.md#supervised-windows-gpu-idle-lifetime-diagnostic)
+through the real desktop dispatcher with its verified local diagnostic Vulkan
+pack and three generated one-second-silence requests. No microphone or user
+recording was used. The expected backend, pack and device were assertions on
+ordinary explicit-GPU selection, not routing overrides. A separate model-free
+startup probe authenticated capabilities; capability enumeration is not
+inference or qualification of every enumerated adapter.
+
+Both the startup probe and lifecycle run completed with product and harness
+exit code zero. The retained lifecycle report validated cold/warm/post-idle-cold
+reuse flags `[false,true,false]`, zero immediate-warm model-load time, and
+acknowledged automatic unload after the real five-minute lifetime within its
+fixed settlement window. The selected Vulkan device/driver/provider/pack/model
+tuple matched fresh authenticated startup evidence, with no CPU fallback.
+Settings/history and other unapproved app state were unchanged. Compiled worker
+admission was verified before execution, bundle/source revalidation passed
+afterwards, and no Scribe test process survived shutdown.
+
+Before execution, the report-preserving bounded harness passed 14 capture and
+eight probe-contract cases. It retained bounded stdout before validation and
+only counts/hash for inherited native stderr, not raw stderr logs.
+
+This is **STT-03b only**, not completion of STT-03 or qualification of later
+source revisions. Normal GUI flow, other models/GPUs/platforms, active-decode
+cancellation, real-speech punctuation-exact CPU/GPU parity, performance,
+protected qualification, release approval and Auto remain unverified.
+
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | STT-01 | Win/Linux/macOS | P1, P2, P3, P4 | Install/select the known-good model; transcribe fixture through the normal flow. | Non-empty final transcript appears, backend/model identity is visible in diagnostics, and exactly one finalized output is produced. | **NOT VERIFIED** |
 | STT-02 | Win/Linux/macOS | P1, P2, P3 | Run the same WAV in Playground for every installed/ready model. | Each selected ready model completes independently; missing runtime/model blocks only that card with repair guidance. | **NOT VERIFIED** |
 | STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle for more than five minutes. | The persistent STT worker reports immediate warm reuse; it unloads the model after the five-minute idle timeout and the next request reloads it. Record worker generation/PID, load/decode metrics, and whether the worker was reused or replaced. | **NOT VERIFIED** |
 | STT-03a | Windows x64, explicit CUDA | CPU-safe collector build, its admitted verified CUDA pack and pinned GGUF model | Run the supervised GPU idle-lifetime diagnostic with generated silence and a report-preserving bounded harness. | Cold/warm/post-idle-cold reuse flags are `[false,true,false]`; automatic unload is acknowledged after the real five-minute lifetime; exact authenticated route identity, no CPU fallback, unchanged settings/history and bounded cleanup are validated. See the dated scoped checkpoint above. | **PASS — scoped development lifecycle only** |
+| STT-03b | Windows x64, explicit Vulkan | CPU-safe collector build, its verified Vulkan pack and pinned GGUF model | Run the supervised GPU idle-lifetime diagnostic with generated silence and a report-preserving bounded harness after authenticated model-free startup. | Cold/warm/post-idle-cold reuse flags are `[false,true,false]`; automatic unload is acknowledged after the real five-minute lifetime; selected Vulkan tuple matches fresh startup evidence, with no CPU fallback, unchanged settings/history and complete bounded cleanup. See the dated Vulkan checkpoint above. | **PASS — scoped development lifecycle only** |
 | STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | Native inference does not run; actionable status identifies what to install/repair; no paste occurs. Record whether lazy worker startup was needed for the rejected request. | **NOT VERIFIED** |
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Terminate the active STT worker generation or force a non-zero child exit during transcription. | Failure is surfaced, app returns to Idle/Error, the supervisor can create a fresh generation, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
 | STT-06 | Win/Linux/macOS | P1, P2 | Remain silent, then repeat with audible non-speech/noise until endpoint or stop. | Empty/no-speech results never paste. Exact sequential 512-sample Silero decisions alone classify speech in a separate VAD-only worker; that worker never receives STT controls. RMS remains a meter/diagnostic: after Silero reports no speech, only a capture whose maximum diagnostic RMS stayed below the low-input guidance floor receives silent/too-low hardware guidance. | **NOT VERIFIED** |
