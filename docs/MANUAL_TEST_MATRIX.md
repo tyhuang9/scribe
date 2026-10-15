@@ -4,7 +4,8 @@
 snapshots in this document are historical evidence, not a current rebaseline.
 No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
-during the Phase 0-11 automated work. Every manual row below therefore remains **NOT VERIFIED** until
+during the Phase 0-11 automated work. Later dated, scoped records below apply
+only to their stated scenarios; other manual rows remain **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -284,11 +285,39 @@ Reproduce the hardware smoke only with the exact ignored-test environment
 documented in `GPU_WORKER_PACKS.md`; fixture trust must never be used for a
 release artifact. The production manual rows below remain unchanged.
 
+### Supervised Windows CUDA idle-lifetime checkpoint
+
+Recorded 2026-10-15 against tested source `d8b366d4495d060b8d59e7f778e995d9f3be7d86`.
+This is the collector-only [GPU idle-lifetime diagnostic](GPU_WORKER_PACKS.md#supervised-windows-gpu-idle-lifetime-diagnostic),
+using the real desktop dispatcher, the existing verified local diagnostic CUDA
+worker and three generated one-second-silence requests. No microphone or user
+recording was used. This record does not claim native execution of later
+documentation-only revisions.
+
+The fresh supervised run completed with product and harness exit code zero.
+Its retained structured report validated cold load, immediate warm reuse with
+zero model-load time, acknowledged automatic unload after the full five-minute
+idle lifetime within the fixed settlement window, and post-idle cold reload.
+The authenticated device/driver/provider/pack/model tuple remained consistent,
+with explicit CUDA and no CPU fallback. Settings/history and other unapproved
+app state were unchanged; no Scribe test process survived shutdown. Post-run
+bundle, compiled-admission and source-integrity checks passed.
+
+The corrected private harness passed 14 fake-output cases before this run. It
+preserves bounded stdout before validation and accepts bounded inherited native
+stderr while retaining only its counts/hash, never raw stderr logs. The earlier
+incomplete wrapper capture remains a separate failed record, not a clean pass.
+
+This is **STT-03a only**, not completion of STT-03: normal GUI flow, other models,
+other GPUs/platforms, active-decode cancellation, real-speech punctuation-exact
+CPU/GPU parity, performance, protected qualification and Auto remain unverified.
+
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | STT-01 | Win/Linux/macOS | P1, P2, P3, P4 | Install/select the known-good model; transcribe fixture through the normal flow. | Non-empty final transcript appears, backend/model identity is visible in diagnostics, and exactly one finalized output is produced. | **NOT VERIFIED** |
 | STT-02 | Win/Linux/macOS | P1, P2, P3 | Run the same WAV in Playground for every installed/ready model. | Each selected ready model completes independently; missing runtime/model blocks only that card with repair guidance. | **NOT VERIFIED** |
 | STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle for more than five minutes. | The persistent STT worker reports immediate warm reuse; it unloads the model after the five-minute idle timeout and the next request reloads it. Record worker generation/PID, load/decode metrics, and whether the worker was reused or replaced. | **NOT VERIFIED** |
+| STT-03a | Windows x64, explicit CUDA | CPU-safe collector build, its admitted verified CUDA pack and pinned GGUF model | Run the supervised GPU idle-lifetime diagnostic with generated silence and a report-preserving bounded harness. | Cold/warm/post-idle-cold reuse flags are `[false,true,false]`; automatic unload is acknowledged after the real five-minute lifetime; exact authenticated route identity, no CPU fallback, unchanged settings/history and bounded cleanup are validated. See the dated scoped checkpoint above. | **PASS — scoped development lifecycle only** |
 | STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | Native inference does not run; actionable status identifies what to install/repair; no paste occurs. Record whether lazy worker startup was needed for the rejected request. | **NOT VERIFIED** |
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Terminate the active STT worker generation or force a non-zero child exit during transcription. | Failure is surfaced, app returns to Idle/Error, the supervisor can create a fresh generation, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
 | STT-06 | Win/Linux/macOS | P1, P2 | Remain silent, then repeat with audible non-speech/noise until endpoint or stop. | Empty/no-speech results never paste. Exact sequential 512-sample Silero decisions alone classify speech in a separate VAD-only worker; that worker never receives STT controls. RMS remains a meter/diagnostic: after Silero reports no speech, only a capture whose maximum diagnostic RMS stayed below the low-input guidance floor receives silent/too-low hardware guidance. | **NOT VERIFIED** |
