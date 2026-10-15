@@ -305,6 +305,18 @@ fn main() -> eframe::Result<()> {
         std::process::exit(exit_code);
     }
     #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "--scribe-windows-gpu-idle-diagnostic")
+    {
+        eprintln!("Windows GPU idle diagnostics are unavailable in this collector build");
+        std::process::exit(2);
+    }
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    if let Some(exit_code) = transcription::maybe_run_windows_gpu_idle_diagnostic() {
+        std::process::exit(exit_code);
+    }
+    #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
     if std::env::args_os().skip(1).any(|arg| {
         arg == "--scribe-windows-gpu-pack-probe"
             || arg == "--ack-local-security-records"

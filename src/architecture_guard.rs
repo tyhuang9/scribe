@@ -936,6 +936,38 @@ fn windows_gpu_probe_stays_early_opt_in_and_probe_only() {
     );
 }
 
+#[test]
+fn windows_gpu_idle_diagnostic_claims_its_acknowledgements_before_probe_dispatch() {
+    let main = production_source(include_str!("main.rs"));
+    let idle = main
+        .find("transcription::maybe_run_windows_gpu_idle_diagnostic()")
+        .expect("idle diagnostic remains an explicit collector entry point");
+    let probe = main
+        .find("windows_gpu_probe::maybe_run_local_command()")
+        .expect("GPU pack probe remains an explicit collector entry point");
+    let startup = main
+        .find("support_assets::materialize_bundled_support_assets()")
+        .expect("normal desktop startup remains distinct");
+    assert!(
+        idle < probe,
+        "idle diagnostic must parse its acknowledgement flags before broad probe dispatch"
+    );
+    assert!(idle < startup, "idle diagnostic must not initialize the UI");
+
+    let idle_source = production_source(include_str!("transcription/gpu_idle_diagnostic.rs"));
+    for required in [
+        "--scribe-windows-gpu-idle-diagnostic",
+        "--ack-local-security-records",
+        "--ack-local-execution-copies",
+        "parse_command(args)",
+    ] {
+        assert!(
+            idle_source.contains(required),
+            "idle diagnostic must retain strict dispatch boundary {required:?}"
+        );
+    }
+}
+
 const NATIVE_RUNTIME_OWNER_PATHS: [&str; 4] = [
     "embedded_runtime.rs",
     "inference_server.rs",

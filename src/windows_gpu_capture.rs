@@ -39,7 +39,7 @@ use affinity::{CaptureWorkerAffinity, CollectorAffinityGuard, RequestedWorkerAff
 use telemetry::{SamplingSession, TelemetrySummary, VideoMemorySummary};
 
 const COMMAND_FLAG: &str = "--scribe-windows-gpu-capture-observation";
-const MAX_MODEL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_MODEL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_WAV_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_REPORT_BYTES: usize = 1024 * 1024;
 const MAX_SELECTOR_BYTES: usize = 256;
@@ -76,11 +76,11 @@ impl CampaignPower {
     }
 }
 
-struct VerifiedInput {
-    path: PathBuf,
-    file: File,
-    size: u64,
-    sha256: String,
+pub(crate) struct VerifiedInput {
+    pub(crate) path: PathBuf,
+    pub(crate) file: File,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
 }
 
 #[derive(Serialize)]
@@ -824,7 +824,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     })
 }
 
-fn canonical_sha256(value: &str) -> Result<String> {
+pub(crate) fn canonical_sha256(value: &str) -> Result<String> {
     if value.len() != 64
         || !value
             .bytes()
@@ -835,7 +835,12 @@ fn canonical_sha256(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn verify_input(path: &Path, expected: &str, max_bytes: u64, label: &str) -> Result<VerifiedInput> {
+pub(crate) fn verify_input(
+    path: &Path,
+    expected: &str,
+    max_bytes: u64,
+    label: &str,
+) -> Result<VerifiedInput> {
     if !path.is_absolute() {
         bail!("{label} input must use an absolute path")
     }
@@ -866,7 +871,7 @@ fn verify_input(path: &Path, expected: &str, max_bytes: u64, label: &str) -> Res
     })
 }
 
-fn require_retained_digest(input: &mut VerifiedInput) -> Result<()> {
+pub(crate) fn require_retained_digest(input: &mut VerifiedInput) -> Result<()> {
     if hash_file(&mut input.file)? != input.sha256 {
         bail!("retained capture input changed before worker launch")
     }

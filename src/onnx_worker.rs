@@ -5427,6 +5427,10 @@ pub(crate) struct WorkerObservationLease {
     process: Arc<dyn WorkerProcess>,
     process_handle: Arc<OwnedHandle>,
     handshake: ValidatedWorkerHandshake,
+    /// A diagnostic may retain the exact loaded model that made this lease
+    /// useful. Ordinary capture leases intentionally leave this unset because
+    /// they observe a live generation before any model command.
+    active_model_identity: Option<String>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -5444,25 +5448,90 @@ impl WorkerObservationLease {
     }
 
     pub(crate) fn require_current(&self) -> Result<()> {
+        self.require_model_state(None).map(|_| ())
+    }
+
+    /// Returns the model residency observed through this exact, authenticated
+    /// generation. It never starts or replaces a worker. A changed generation,
+    /// process, or model identity is an error rather than an observation of a
+    /// different worker.
+    pub(crate) fn model_residency(&self) -> Result<WorkerModelResidency> {
+        let expected_identity = self
+            .active_model_identity
+            .as_deref()
+            .ok_or_else(|| anyhow!("worker observation lease is not model-bound"))?;
+        self.require_model_state(Some(expected_identity))
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn require_model_state(&self, expected_identity: Option<&str>) -> Result<WorkerModelResidency> {
         let inner = self
             .supervisor
             .upgrade()
             .ok_or_else(|| anyhow!("worker observation supervisor was dropped"))?;
-        let current = inner
-            .state
-            .lock()
-            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
-            .current
-            .as_ref()
-            .is_some_and(|current| {
-                current.generation == self.generation
-                    && Arc::ptr_eq(&current.process, &self.process)
-            });
-        if !current || !self.process.is_running()? {
+        let model_state = Self::model_state_while_current(
+            &inner,
+            self.generation,
+            &self.process,
+            expected_identity,
+        )?;
+        if !self.process.is_running()? {
             bail!("worker observation lease is no longer current")
         }
-        Ok(())
+        // Re-checking only generation/process after liveness ensures a
+        // retirement cannot be mistaken for an acknowledged Unload. The model
+        // state itself is intentionally a single linearizable sample: Loaded
+        // may legitimately become Unloaded immediately after that sample.
+        Self::model_state_while_current(&inner, self.generation, &self.process, None)?;
+        Ok(model_state)
     }
+
+    fn model_state_while_current(
+        inner: &SupervisorInner,
+        generation: u64,
+        process: &Arc<dyn WorkerProcess>,
+        expected_identity: Option<&str>,
+    ) -> Result<WorkerModelResidency> {
+        let state = inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_ref()
+            .ok_or_else(|| anyhow!("worker observation lease is no longer current"))?;
+        if current.generation != generation || !Arc::ptr_eq(&current.process, process) {
+            bail!("worker observation lease is no longer current")
+        }
+        if state.retiring_generations.contains(&generation) {
+            bail!("worker observation lease generation is retiring")
+        }
+        match expected_identity {
+            None => Ok(WorkerModelResidency::NotObserved),
+            Some(expected_identity) => match state.active_model.as_ref() {
+                Some((loaded_generation, loaded_identity))
+                    if *loaded_generation == generation && loaded_identity == expected_identity =>
+                {
+                    Ok(WorkerModelResidency::Loaded)
+                }
+                None => Ok(WorkerModelResidency::Unloaded),
+                _ => bail!("worker observation model identity is no longer current"),
+            },
+        }
+    }
+}
+
+/// The only model states exposed by a model-bound diagnostic lease. It does
+/// not infer process loss or replacement as an unload.
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerModelResidency {
+    Loaded,
+    Unloaded,
+    NotObserved,
 }
 
 #[derive(Clone, Copy)]
@@ -6845,8 +6914,58 @@ impl ProcessWorkerSupervisor {
             process,
             process_handle,
             handshake,
+            active_model_identity: None,
         };
         lease.require_current()?;
+        Ok(lease)
+    }
+
+    /// Retains a read-only lease for the currently loaded exact artifact.
+    ///
+    /// Unlike `observation_lease`, this method deliberately does not call
+    /// `ensure_generation`: the idle diagnostic must fail if the expected
+    /// generation disappeared rather than recreate it while observing expiry.
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn current_active_model_observation(
+        &self,
+        expected_identity: &str,
+    ) -> Result<WorkerObservationLease> {
+        let (generation, process, handshake) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let current = state.current.as_ref().ok_or_else(|| {
+                anyhow!("no current worker generation is available for idle observation")
+            })?;
+            if state.retiring_generations.contains(&current.generation) {
+                bail!("current worker generation is retiring during idle observation")
+            }
+            let active_model = state
+                .active_model
+                .as_ref()
+                .ok_or_else(|| anyhow!("no active model is available for idle observation"))?;
+            if active_model.0 != current.generation || active_model.1 != expected_identity {
+                bail!("current worker model does not match the idle observation artifact")
+            }
+            let handshake = current.validated_handshake.clone().ok_or_else(|| {
+                anyhow!("worker idle observation requires a validated Hello/Ready")
+            })?;
+            (current.generation, Arc::clone(&current.process), handshake)
+        };
+        let process_handle = Arc::new(process.duplicate_observation_handle()?);
+        let lease = WorkerObservationLease {
+            supervisor: Arc::downgrade(&self.inner),
+            generation,
+            process,
+            process_handle,
+            handshake,
+            active_model_identity: Some(expected_identity.to_owned()),
+        };
+        if lease.model_residency()? != WorkerModelResidency::Loaded {
+            bail!("current worker model is no longer loaded for idle observation")
+        }
         Ok(lease)
     }
 
@@ -8356,6 +8475,18 @@ impl InferenceWorkerSupervisor {
         self.transport
             .current_generation_has_active_model(&identity)
             .unwrap_or(false)
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    fn current_active_model_observation(
+        &self,
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<WorkerObservationLease, RuntimeError> {
+        let identity = Self::artifact_identity(artifact, preference)?;
+        self.transport
+            .current_active_model_observation(&identity)
+            .map_err(worker_unavailable)
     }
 
     #[cfg(test)]
@@ -10058,7 +10189,30 @@ struct InferenceRouteIdentity {
 #[derive(Clone)]
 struct ActiveInferenceRoute {
     identity: InferenceRouteIdentity,
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    target: BackendTarget,
     supervisor: InferenceWorkerSupervisor,
+}
+
+/// A read-only observation of the current GPU route and its loaded model.
+/// This can be used only by the opt-in Windows diagnostic feature. Keeping the
+/// exact target beside the generation lease prevents a later discovery snapshot
+/// from being mistaken for the worker that actually owns the model.
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+pub(crate) struct ActiveGpuModelObservation {
+    pub(crate) target: BackendTarget,
+    lease: WorkerObservationLease,
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+impl ActiveGpuModelObservation {
+    pub(crate) fn generation(&self) -> u64 {
+        self.lease.generation()
+    }
+
+    pub(crate) fn model_residency(&self) -> Result<WorkerModelResidency, RuntimeError> {
+        self.lease.model_residency().map_err(worker_unavailable)
+    }
 }
 
 #[derive(Clone)]
@@ -12096,6 +12250,8 @@ impl InferenceWorkerRegistry {
             ))
         })? = Some(ActiveInferenceRoute {
             identity,
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: route.supervisor.clone(),
         });
         Ok(())
@@ -13834,6 +13990,62 @@ impl InferenceWorkerRegistry {
             active.supervisor.unload_if_idle()?;
         }
         Ok(())
+    }
+
+    /// Captures only the already-live explicit GPU route. This is intentionally
+    /// outside `route_execution`: polling an idle model must not prevent the
+    /// dispatch loop from receiving and acknowledging its ordinary TTL Unload.
+    /// It performs no provider discovery, health mutation, generation launch,
+    /// replacement, or fallback.
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    pub(crate) fn current_active_gpu_model_observation(
+        &self,
+        artifact: &RuntimeArtifact,
+    ) -> Result<ActiveGpuModelObservation, RuntimeError> {
+        let active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .clone()
+            .ok_or_else(|| {
+                RuntimeError::WorkerUnavailable(
+                    "no active inference route is available for idle observation".to_owned(),
+                )
+            })?;
+        if !active.target.is_gpu() {
+            return Err(RuntimeError::WorkerUnavailable(
+                "active inference route is not a GPU route for idle observation".to_owned(),
+            ));
+        }
+        let lease = active
+            .supervisor
+            .current_active_model_observation(artifact, AccelerationPreference::Gpu)?;
+        // Re-check publication after the model-bound lease has validated the
+        // process. A concurrent route replacement is never rebound to a new
+        // target merely because it happens to have matching display metadata.
+        let still_active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .as_ref()
+            .is_some_and(|current| {
+                current.identity == active.identity
+                    && current.target.has_same_runtime_identity(&active.target)
+                    && Self::same_supervisor(&current.supervisor, &active.supervisor)
+            });
+        if !still_active {
+            return Err(RuntimeError::WorkerUnavailable(
+                "active inference route changed during idle observation".to_owned(),
+            ));
+        }
+        Ok(ActiveGpuModelObservation {
+            target: active.target,
+            lease,
+        })
     }
 
     pub(crate) fn cancel_active(&self) {
@@ -21525,6 +21737,8 @@ mod tests {
         registry.gpu_routes_for_testing = Some(verified_gpu_catalog(Vec::new()));
         *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&warm_route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: warm_route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: warm_supervisor,
         });
         let mut plan = InferenceWorkerRoutePlan {
@@ -21654,6 +21868,8 @@ mod tests {
         registry.gpu_routes_for_testing = Some(verified_gpu_catalog(Vec::new()));
         *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&warm_route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: warm_route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: warm_supervisor,
         });
         // Created after the registry so unwinding releases the gated reaper
@@ -21728,6 +21944,8 @@ mod tests {
         registry.gpu_routes_for_testing = Some(verified_gpu_catalog(Vec::new()));
         *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&warm_route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: warm_route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: warm_supervisor,
         });
         let mut plan = InferenceWorkerRoutePlan {
@@ -21829,6 +22047,8 @@ mod tests {
         registry.gpu_routes_for_testing = Some(catalog);
         *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&warm_route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: warm_route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: warm_supervisor,
         });
 
@@ -21896,6 +22116,8 @@ mod tests {
         );
         let active = ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: route.supervisor.clone(),
         };
         let mut catalog = verified_gpu_catalog(vec![route]);
@@ -22063,6 +22285,8 @@ mod tests {
         );
         let active = ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: route.supervisor.clone(),
         };
         let catalog = verified_gpu_catalog(vec![route]);
@@ -25664,6 +25888,8 @@ mod tests {
             .unwrap();
         let active = ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap_or_else(BackendTarget::cpu),
             supervisor: route.supervisor.clone(),
         };
         let mut catalog = verified_gpu_catalog(vec![route.clone()]);
@@ -26721,6 +26947,108 @@ mod tests {
         );
         transport.terminate_current().unwrap();
         assert!(lease.require_current().is_err());
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_idle_model_observer_never_launches_missing_or_stale_generations() {
+        let missing_launcher = Arc::new(TestLauncher::new([]));
+        let missing = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            missing_launcher.clone(),
+            short_deadlines(),
+        );
+        assert!(missing.current_active_model_observation("fixture").is_err());
+        assert_eq!(missing_launcher.launches.load(Ordering::Acquire), 0);
+
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        let generation = transport.ensure_generation().unwrap();
+        {
+            let mut state = transport.inner.state.lock().unwrap();
+            state.active_model = Some((generation.wrapping_add(1), "fixture".to_owned()));
+        }
+        assert!(
+            transport
+                .current_active_model_observation("fixture")
+                .is_err()
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        transport.terminate_current().unwrap();
+
+        let retiring_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let retiring = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            retiring_launcher.clone(),
+            short_deadlines(),
+        );
+        let retiring_generation = retiring.ensure_generation().unwrap();
+        retiring
+            .record_active_model(retiring_generation, "fixture".to_owned())
+            .unwrap();
+        {
+            let mut state = retiring.inner.state.lock().unwrap();
+            assert!(state.retiring_generations.insert(retiring_generation));
+        }
+        assert!(
+            retiring
+                .current_active_model_observation("fixture")
+                .is_err()
+        );
+        assert_eq!(retiring_launcher.launches.load(Ordering::Acquire), 1);
+        retiring
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .retiring_generations
+            .remove(&retiring_generation);
+        retiring.terminate_current().unwrap();
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
+    fn capture_observation_idle_model_lease_observes_acknowledged_unload_without_relaunch() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        let generation = transport.ensure_generation().unwrap();
+        transport
+            .record_active_model(generation, "fixture".to_owned())
+            .unwrap();
+        let lease = transport
+            .current_active_model_observation("fixture")
+            .unwrap();
+        assert_eq!(
+            lease.model_residency().unwrap(),
+            WorkerModelResidency::Loaded
+        );
+
+        {
+            let mut state = transport.inner.state.lock().unwrap();
+            assert!(state.retiring_generations.insert(generation));
+        }
+        assert!(lease.model_residency().is_err());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        transport
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .retiring_generations
+            .remove(&generation);
+
+        transport.unload().unwrap();
+
+        assert_eq!(
+            lease.model_residency().unwrap(),
+            WorkerModelResidency::Unloaded
+        );
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        transport.terminate_current().unwrap();
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]

@@ -403,10 +403,12 @@ try {
             'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',
             'windows_gpu_probe::tests', 'onnx_worker::tests::gpu_pack_probe',
-            'onnx_worker::tests::capture_observation', 'onnx_worker::tests::vulkan_hello_memory',
+            'onnx_worker::tests::capture_observation', 'transcription::gpu_idle_diagnostic::tests',
+            'onnx_worker::tests::vulkan_hello_memory',
             'embedded_runtime::tests::provider_memory_observation',
             'embedded_runtime::tests::retained_gguf', 'runtime_router::tests::retained_gguf',
-            'architecture_guard::windows_gpu_capture', 'architecture_guard::windows_gpu_probe')) {
+            'architecture_guard::windows_gpu_capture', 'architecture_guard::windows_gpu_probe',
+            'architecture_guard::windows_gpu_idle_diagnostic')) {
         Invoke-CaptureTests $feature $filter
     }
     if ($GpuProviderCheck -ne 'None') {
