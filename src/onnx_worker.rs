@@ -11,9 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -5506,7 +5504,7 @@ impl WorkerObservationLease {
         if current.generation != generation || !Arc::ptr_eq(&current.process, process) {
             bail!("worker observation lease is no longer current")
         }
-        if state.retiring_generations.contains(&generation) {
+        if state.retiring_generations.contains_key(&generation) {
             bail!("worker observation lease generation is retiring")
         }
         match expected_identity {
@@ -5541,11 +5539,96 @@ struct SupervisorStream {
     last_request_id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum RetirementReapPhase {
+    PendingWaitNotObserved = 0,
+    WaitEntered = 1,
+    WaitFailed = 2,
+    WaitReturnedSuccessfully = 3,
+}
+
+impl RetirementReapPhase {
+    fn from_atomic(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::PendingWaitNotObserved),
+            1 => Some(Self::WaitEntered),
+            2 => Some(Self::WaitFailed),
+            3 => Some(Self::WaitReturnedSuccessfully),
+            _ => None,
+        }
+    }
+}
+
+struct RetirementReapProgress {
+    phase: AtomicU8,
+}
+
+impl RetirementReapProgress {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(RetirementReapPhase::PendingWaitNotObserved as u8),
+        }
+    }
+
+    fn store_phase(&self, phase: RetirementReapPhase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn phase(&self) -> Option<RetirementReapPhase> {
+        RetirementReapPhase::from_atomic(self.phase.load(Ordering::Acquire))
+    }
+}
+
+fn wait_for_retirement_reap(
+    progress: &RetirementReapProgress,
+    wait: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    progress.store_phase(RetirementReapPhase::WaitEntered);
+    match wait() {
+        Ok(()) => {
+            progress.store_phase(RetirementReapPhase::WaitReturnedSuccessfully);
+            Ok(())
+        }
+        Err(error) => {
+            progress.store_phase(RetirementReapPhase::WaitFailed);
+            Err(error)
+        }
+    }
+}
+
+fn retirement_reap_progress_advisory(progress: &RetirementReapProgress) -> &'static str {
+    match progress.phase() {
+        Some(RetirementReapPhase::PendingWaitNotObserved) => "retirement wait not observed",
+        Some(RetirementReapPhase::WaitEntered) => "retirement wait call entered",
+        Some(RetirementReapPhase::WaitFailed) => "retirement wait call returned failure",
+        Some(RetirementReapPhase::WaitReturnedSuccessfully) => {
+            "retirement wait call returned successfully; receipt pending"
+        }
+        None => "retirement wait progress unavailable",
+    }
+}
+
+fn retirement_receipts_advisory(
+    receipts: &BTreeMap<u64, Arc<RetirementReapProgress>>,
+) -> &'static str {
+    match receipts.len() {
+        0 => "retirement wait progress unavailable",
+        1 => retirement_reap_progress_advisory(
+            receipts
+                .values()
+                .next()
+                .expect("one retirement receipt has one progress value"),
+        ),
+        _ => "multiple retirement receipts pending",
+    }
+}
+
 #[derive(Default)]
 struct SupervisorState {
     next_generation: u64,
     current: Option<CurrentGeneration>,
-    retiring_generations: BTreeSet<u64>,
+    retiring_generations: BTreeMap<u64, Arc<RetirementReapProgress>>,
     active_request: Option<Correlation>,
     active_stream: Option<SupervisorStream>,
     active_model: Option<(u64, String)>,
@@ -6091,7 +6174,10 @@ impl ProcessWorkerSupervisor {
                 .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             state = next_state;
             if timeout.timed_out() && !state.retiring_generations.is_empty() {
-                bail!("process worker retirement did not settle before provider discovery");
+                bail!(
+                    "process worker retirement did not settle before provider discovery; {}",
+                    retirement_receipts_advisory(&state.retiring_generations)
+                );
             }
         }
         Ok(())
@@ -6657,7 +6743,7 @@ impl ProcessWorkerSupervisor {
                     .current
                     .as_ref()
                     .is_some_and(|current| current.generation == generation)
-                    && !state.retiring_generations.contains(&generation) =>
+                    && !state.retiring_generations.contains_key(&generation) =>
             {
                 if state.active_request.is_some() {
                     Some(anyhow!("a process worker request is already active"))
@@ -6939,7 +7025,7 @@ impl ProcessWorkerSupervisor {
             let current = state.current.as_ref().ok_or_else(|| {
                 anyhow!("no current worker generation is available for idle observation")
             })?;
-            if state.retiring_generations.contains(&current.generation) {
+            if state.retiring_generations.contains_key(&current.generation) {
                 bail!("current worker generation is retiring during idle observation")
             }
             let active_model = state
@@ -6978,7 +7064,7 @@ impl ProcessWorkerSupervisor {
         if !Arc::ptr_eq(&owner, &self.inner) {
             bail!("worker observation lease belongs to another supervisor")
         }
-        let process = {
+        let (process, progress) = {
             let mut state = self
                 .inner
                 .state
@@ -7005,16 +7091,23 @@ impl ProcessWorkerSupervisor {
                 bail!("cannot retire an observation generation with an active stream")
             }
             let process = Arc::clone(&current.process);
-            if !state.retiring_generations.insert(lease.generation) {
-                bail!("worker observation generation is already being retired")
+            let progress = Arc::new(RetirementReapProgress::new());
+            match state.retiring_generations.entry(lease.generation) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::clone(&progress));
+                    (process, progress)
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    bail!("worker observation generation is already being retired")
+                }
             }
-            process
         };
         self.finish_generation_invalidation(
             lease.generation,
             "capture observation generation was explicitly retired",
             true,
             process,
+            progress,
         )
     }
 
@@ -7048,7 +7141,7 @@ impl ProcessWorkerSupervisor {
                 .as_ref()
                 .filter(|current| current.generation == generation)
                 .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))?;
-            if state.retiring_generations.contains(&generation) {
+            if state.retiring_generations.contains_key(&generation) {
                 bail!("process worker generation {generation} is being retired")
             }
             Arc::clone(&current.process)
@@ -7068,7 +7161,7 @@ impl ProcessWorkerSupervisor {
                 current.generation == generation && Arc::ptr_eq(&current.process, &process)
             })
             .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))?;
-        if state.retiring_generations.contains(&generation) {
+        if state.retiring_generations.contains_key(&generation) {
             bail!("process worker generation {generation} is being retired")
         }
         Ok(WorkerGenerationContext {
@@ -7195,7 +7288,7 @@ impl ProcessWorkerSupervisor {
     }
 
     fn invalidate_generation(&self, generation: u64, reason: &str, force_kill: bool) -> Result<()> {
-        let process = {
+        let (process, progress) = {
             let mut state = self
                 .inner
                 .state
@@ -7204,7 +7297,7 @@ impl ProcessWorkerSupervisor {
             loop {
                 let current_generation = state.current.as_ref().map(|current| current.generation);
                 if current_generation != Some(generation) {
-                    if !state.retiring_generations.contains(&generation) {
+                    if !state.retiring_generations.contains_key(&generation) {
                         return Ok(());
                     }
                     let wait_budget = self.inner.deadlines.cancel;
@@ -7216,7 +7309,7 @@ impl ProcessWorkerSupervisor {
                             anyhow!("process worker supervisor state lock was poisoned")
                         })?;
                     state = next_state;
-                    if timeout.timed_out() && state.retiring_generations.contains(&generation) {
+                    if timeout.timed_out() && state.retiring_generations.contains_key(&generation) {
                         bail!(
                             "process worker generation {generation} termination did not complete within {} ms",
                             wait_budget.as_millis()
@@ -7229,8 +7322,12 @@ impl ProcessWorkerSupervisor {
                     .as_ref()
                     .expect("matching current generation was checked above");
                 let process = Arc::clone(&current.process);
-                if state.retiring_generations.insert(generation) {
-                    break process;
+                let progress = Arc::new(RetirementReapProgress::new());
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    state.retiring_generations.entry(generation)
+                {
+                    entry.insert(Arc::clone(&progress));
+                    break (process, progress);
                 }
                 let wait_budget = self.inner.deadlines.cancel;
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -7244,7 +7341,7 @@ impl ProcessWorkerSupervisor {
                     .wait_timeout(state, wait_budget)
                     .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
                 state = next_state;
-                if timeout.timed_out() && state.retiring_generations.contains(&generation) {
+                if timeout.timed_out() && state.retiring_generations.contains_key(&generation) {
                     bail!(
                         "process worker generation {generation} termination did not complete within {} ms",
                         wait_budget.as_millis()
@@ -7252,7 +7349,7 @@ impl ProcessWorkerSupervisor {
                 }
             }
         };
-        self.finish_generation_invalidation(generation, reason, force_kill, process)
+        self.finish_generation_invalidation(generation, reason, force_kill, process, progress)
     }
 
     fn finish_generation_invalidation(
@@ -7261,6 +7358,7 @@ impl ProcessWorkerSupervisor {
         reason: &str,
         force_kill: bool,
         process: Arc<dyn WorkerProcess>,
+        progress: Arc<RetirementReapProgress>,
     ) -> Result<()> {
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
@@ -7310,9 +7408,12 @@ impl ProcessWorkerSupervisor {
         }
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
-            process.wait_before(diagnostic_probe.cleanup_deadline)?;
+            wait_for_retirement_reap(&progress, || {
+                process.wait_before(diagnostic_probe.cleanup_deadline)
+            })?;
             diagnostic_probe.cleanup_confirmed();
-            self.inner
+            let _ = self
+                .inner
                 .state
                 .lock()
                 .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
@@ -7320,10 +7421,20 @@ impl ProcessWorkerSupervisor {
                 .remove(&generation);
             self.inner.retirement_changed.notify_all();
         } else {
-            reap_process(process, generation, Some(Arc::downgrade(&self.inner)))?;
+            reap_process(
+                process,
+                generation,
+                Some(Arc::downgrade(&self.inner)),
+                progress,
+            )?;
         }
         #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
-        reap_process(process, generation, Some(Arc::downgrade(&self.inner)))?;
+        reap_process(
+            process,
+            generation,
+            Some(Arc::downgrade(&self.inner)),
+            progress,
+        )?;
         // Invalidation, especially cancellation, must never wait for a pipe
         // writer that is blocked in an OS write. Killing the process releases
         // that writer; a later generation replaces the stale slot. Clear it
@@ -7929,7 +8040,7 @@ fn retire_unpublished_worker(worker: SpawnedWorker) {
     if let Err(error) = process.terminate() {
         eprintln!("could not terminate late process worker launch: {error:#}");
     }
-    if let Err(error) = reap_process(process, 0, None) {
+    if let Err(error) = reap_process(process, 0, None, Arc::new(RetirementReapProgress::new())) {
         eprintln!("could not reap late process worker launch: {error:#}");
     }
 }
@@ -7989,7 +8100,7 @@ fn mark_retirement_settled(owner: &Weak<SupervisorInner>, generation: u64) {
         return;
     };
     if let Ok(mut state) = inner.state.lock() {
-        state.retiring_generations.remove(&generation);
+        let _ = state.retiring_generations.remove(&generation);
     }
     inner.retirement_changed.notify_all();
 }
@@ -7998,28 +8109,32 @@ fn reap_process(
     process: Arc<dyn WorkerProcess>,
     generation: u64,
     owner: Option<Weak<SupervisorInner>>,
+    progress: Arc<RetirementReapProgress>,
 ) -> Result<()> {
     // Termination, when needed, has already been initiated by the caller.
     // Waiting happens on a generation-local thread, so an indefinitely stalled
     // wait can never delay termination of a later generation.
     let reaper_process = Arc::clone(&process);
     let reaper_owner = owner.clone();
+    let reaper_progress = Arc::clone(&progress);
     if let Err(error) = std::thread::Builder::new()
         .name(format!("scribe-process-worker-reaper-{generation}"))
-        .spawn(move || match reaper_process.wait() {
-            Ok(()) => {
-                if let Some(owner) = reaper_owner.as_ref() {
-                    mark_retirement_settled(owner, generation);
+        .spawn(
+            move || match wait_for_retirement_reap(&reaper_progress, || reaper_process.wait()) {
+                Ok(()) => {
+                    if let Some(owner) = reaper_owner.as_ref() {
+                        mark_retirement_settled(owner, generation);
+                    }
                 }
-            }
-            Err(error) => {
-                eprintln!("process worker generation {generation} reaper failed: {error:#}");
-            }
-        })
+                Err(error) => {
+                    eprintln!("process worker generation {generation} reaper failed: {error:#}");
+                }
+            },
+        )
     {
         // Thread creation failure is exceptional, but the child must still be
         // reaped before this process can safely forget it.
-        process.wait().with_context(|| {
+        wait_for_retirement_reap(&progress, || process.wait()).with_context(|| {
             format!(
                 "could not start process worker generation {generation} reaper ({error}) and synchronous reaping failed"
             )
@@ -19915,7 +20030,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .retiring_generations
-                        .contains(&1)
+                        .contains_key(&1)
                 );
                 let (registered_tx, registered_rx) = sync_channel(1);
                 *fixture.state.retirement_waiter_registered.lock().unwrap() = Some(registered_tx);
@@ -26956,6 +27071,178 @@ mod tests {
     }
 
     #[test]
+    fn retirement_reaper_progress_projection_is_static_and_bounded() {
+        let mut receipts = BTreeMap::new();
+        let max_advisory_len = "retirement wait call returned successfully; receipt pending".len();
+        let assert_static_advisory = |actual: &str, expected: &str| {
+            assert_eq!(actual, expected);
+            assert!(actual.len() <= max_advisory_len, "{actual}");
+            assert!(
+                actual.bytes().all(|byte| !byte.is_ascii_digit()),
+                "{actual}"
+            );
+            assert!(!actual.contains("fixture"), "{actual}");
+        };
+
+        assert_static_advisory(
+            retirement_receipts_advisory(&receipts),
+            "retirement wait progress unavailable",
+        );
+        for (phase, expected) in [
+            (
+                RetirementReapPhase::PendingWaitNotObserved,
+                "retirement wait not observed",
+            ),
+            (
+                RetirementReapPhase::WaitEntered,
+                "retirement wait call entered",
+            ),
+            (
+                RetirementReapPhase::WaitFailed,
+                "retirement wait call returned failure",
+            ),
+            (
+                RetirementReapPhase::WaitReturnedSuccessfully,
+                "retirement wait call returned successfully; receipt pending",
+            ),
+        ] {
+            receipts.clear();
+            let progress = Arc::new(RetirementReapProgress::new());
+            progress.store_phase(phase);
+            assert!(receipts.insert(73, progress).is_none());
+            let advisory = retirement_receipts_advisory(&receipts);
+            assert_static_advisory(advisory, expected);
+        }
+
+        assert!(
+            receipts
+                .insert(74, Arc::new(RetirementReapProgress::new()))
+                .is_none()
+        );
+        assert_static_advisory(
+            retirement_receipts_advisory(&receipts),
+            "multiple retirement receipts pending",
+        );
+
+        receipts.clear();
+        let unavailable = Arc::new(RetirementReapProgress::new());
+        unavailable.phase.store(u8::MAX, Ordering::Release);
+        assert!(receipts.insert(75, unavailable).is_none());
+        assert_static_advisory(
+            retirement_receipts_advisory(&receipts),
+            "retirement wait progress unavailable",
+        );
+    }
+
+    #[test]
+    fn retirement_wait_progress_is_advisory_and_preserves_result() {
+        let failed_launcher = Arc::new(TestLauncher::new([]));
+        let failed_transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            failed_launcher.clone(),
+            short_deadlines(),
+        );
+        let failed = Arc::new(RetirementReapProgress::new());
+        assert!(
+            failed_transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .insert(41, Arc::clone(&failed))
+                .is_none()
+        );
+
+        let error = wait_for_retirement_reap(&failed, || {
+            assert_eq!(failed.phase(), Some(RetirementReapPhase::WaitEntered));
+            Err(anyhow!("fixture wait sentinel"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "fixture wait sentinel");
+        assert_eq!(failed.phase(), Some(RetirementReapPhase::WaitFailed));
+        assert!(
+            failed_transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .contains_key(&41)
+        );
+        assert_eq!(
+            failed_transport
+                .ensure_generation()
+                .unwrap_err()
+                .to_string(),
+            "process worker retirement did not settle before provider discovery; retirement wait call returned failure"
+        );
+        assert_eq!(failed_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(failed_launcher.launches.load(Ordering::Acquire), 0);
+
+        let succeeded_launcher = Arc::new(TestLauncher::new([]));
+        let succeeded_transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            succeeded_launcher.clone(),
+            short_deadlines(),
+        );
+        let succeeded = Arc::new(RetirementReapProgress::new());
+        assert!(
+            succeeded_transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .insert(42, Arc::clone(&succeeded))
+                .is_none()
+        );
+        wait_for_retirement_reap(&succeeded, || {
+            assert_eq!(succeeded.phase(), Some(RetirementReapPhase::WaitEntered));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            succeeded.phase(),
+            Some(RetirementReapPhase::WaitReturnedSuccessfully)
+        );
+        assert!(
+            succeeded_transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .contains_key(&42)
+        );
+        assert_eq!(
+            succeeded_transport
+                .ensure_generation()
+                .unwrap_err()
+                .to_string(),
+            "process worker retirement did not settle before provider discovery; retirement wait call returned successfully; receipt pending"
+        );
+        assert_eq!(
+            succeeded_launcher.launch_attempts.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(succeeded_launcher.launches.load(Ordering::Acquire), 0);
+
+        mark_retirement_settled(&Arc::downgrade(&succeeded_transport.inner), 42);
+        assert!(
+            !succeeded_transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .contains_key(&42)
+        );
+        assert_eq!(
+            succeeded_launcher.launch_attempts.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
     fn cancellation_between_batch_requests_reaps_before_replacement_launches() {
         let (reap_started_tx, reap_started_rx) = channel();
         let (reap_release_tx, reap_release_rx) = channel();
@@ -26986,21 +27273,50 @@ mod tests {
             .unwrap();
         assert_eq!(transport.current_generation().unwrap(), None);
         let blocked_replacement = transport.ensure_generation().unwrap_err();
-        assert!(
-            blocked_replacement
-                .to_string()
-                .contains("retirement did not settle before provider discovery")
+        assert_eq!(
+            blocked_replacement.to_string(),
+            "process worker retirement did not settle before provider discovery; retirement wait call entered"
         );
-        assert!(
+        let (held_receipt, held_phase) = {
+            let state = transport.inner.state.lock().unwrap();
+            assert!(
+                state.retiring_generations.contains_key(&generation),
+                "the held reaper must retain the exact-generation receipt"
+            );
+            let receipt = Arc::clone(
+                state
+                    .retiring_generations
+                    .get(&generation)
+                    .expect("the held receipt retains its progress"),
+            );
+            let phase = receipt.phase();
+            assert_eq!(phase, Some(RetirementReapPhase::WaitEntered));
+            (receipt, phase)
+        };
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+
+        assert_eq!(
             transport
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .retiring_generations
-                .contains(&generation),
-            "the held reaper must retain the exact-generation receipt"
+                .invalidate_generation(generation, "fixture duplicate retirement", true)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "process worker generation {generation} termination did not complete within 40 ms"
+            )
         );
+        let state = transport.inner.state.lock().unwrap();
+        let duplicate_receipt = state
+            .retiring_generations
+            .get(&generation)
+            .expect("duplicate invalidation retains the exact-generation receipt");
+        assert!(Arc::ptr_eq(&held_receipt, duplicate_receipt));
+        assert_eq!(
+            duplicate_receipt.phase(),
+            Some(RetirementReapPhase::WaitEntered)
+        );
+        assert_eq!(duplicate_receipt.phase(), held_phase);
+        drop(state);
         assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
 
@@ -27054,7 +27370,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .retiring_generations
-                .contains(&generation),
+                .contains_key(&generation),
             "a failed termination must retain its exact-generation receipt"
         );
         assert!(transport.ensure_generation().is_err());
@@ -27189,7 +27505,12 @@ mod tests {
             .unwrap();
         {
             let mut state = retiring.inner.state.lock().unwrap();
-            assert!(state.retiring_generations.insert(retiring_generation));
+            assert!(
+                state
+                    .retiring_generations
+                    .insert(retiring_generation, Arc::new(RetirementReapProgress::new()),)
+                    .is_none()
+            );
         }
         assert!(
             retiring
@@ -27197,7 +27518,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(retiring_launcher.launches.load(Ordering::Acquire), 1);
-        retiring
+        let _ = retiring
             .inner
             .state
             .lock()
@@ -27229,11 +27550,16 @@ mod tests {
 
         {
             let mut state = transport.inner.state.lock().unwrap();
-            assert!(state.retiring_generations.insert(generation));
+            assert!(
+                state
+                    .retiring_generations
+                    .insert(generation, Arc::new(RetirementReapProgress::new()))
+                    .is_none()
+            );
         }
         assert!(lease.model_residency().is_err());
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
-        transport
+        let _ = transport
             .inner
             .state
             .lock()
@@ -27675,7 +28001,12 @@ mod tests {
         let frame = control_frame(41, 42, &Control::Health).unwrap();
         {
             let mut state = transport.inner.state.lock().unwrap();
-            assert!(state.retiring_generations.insert(generation));
+            assert!(
+                state
+                    .retiring_generations
+                    .insert(generation, Arc::new(RetirementReapProgress::new()))
+                    .is_none()
+            );
         }
         assert!(
             transport
@@ -27687,7 +28018,7 @@ mod tests {
             let mut state = transport.inner.state.lock().unwrap();
             assert!(state.active_request.is_none());
             assert_eq!(state.current.as_ref().unwrap().generation, generation);
-            assert!(state.retiring_generations.remove(&generation));
+            assert!(state.retiring_generations.remove(&generation).is_some());
         }
         let frame = control_frame(41, 43, &Control::Health).unwrap();
         assert!(matches!(
