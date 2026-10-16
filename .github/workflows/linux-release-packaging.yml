@@ -8,8 +8,10 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'build.rs'
+      - 'build_support/linux_release_authority.rs'
       - 'runtime-manifests/linux-release-package-x86_64.json'
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'runtime-manifests/gpu-pack-release-authority-linux-empty.json'
       - 'scripts/build-linux-release-package.sh'
       - 'scripts/linux-release-package-common.sh'
       - 'scripts/verify-linux-release-package.sh'
@@ -17,7 +19,11 @@ on:
       - 'scripts/report-linux-worker-pack-sizes.sh'
       - 'scripts/test-linux-release-packaging.sh'
       - 'src/gpu_worker_pack/manifest.rs'
+      - 'src/gpu_worker_pack/linux_release_authority.rs'
+      - 'src/gpu_worker_pack/mod.rs'
       - 'src/gpu_worker_pack/store.rs'
+      - 'src/linux_release_authority_architecture_guard.rs'
+      - 'src/onnx_worker.rs'
       - 'src/worker_pack_authoring.rs'
       - 'src/worker_identity.rs'
       - 'tools/worker-pack-author/**'
@@ -31,8 +37,10 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'build.rs'
+      - 'build_support/linux_release_authority.rs'
       - 'runtime-manifests/linux-release-package-x86_64.json'
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'runtime-manifests/gpu-pack-release-authority-linux-empty.json'
       - 'scripts/build-linux-release-package.sh'
       - 'scripts/linux-release-package-common.sh'
       - 'scripts/verify-linux-release-package.sh'
@@ -40,7 +48,11 @@ on:
       - 'scripts/report-linux-worker-pack-sizes.sh'
       - 'scripts/test-linux-release-packaging.sh'
       - 'src/gpu_worker_pack/manifest.rs'
+      - 'src/gpu_worker_pack/linux_release_authority.rs'
+      - 'src/gpu_worker_pack/mod.rs'
       - 'src/gpu_worker_pack/store.rs'
+      - 'src/linux_release_authority_architecture_guard.rs'
+      - 'src/onnx_worker.rs'
       - 'src/worker_pack_authoring.rs'
       - 'src/worker_identity.rs'
       - 'tools/worker-pack-author/**'
@@ -62,9 +74,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
+      - name: Fetch worker-pack author dependencies
+        run: cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
       - name: Test deterministic fail-closed Debian packaging
         run: ./scripts/test-linux-release-packaging.sh
-      - name: Test author, verifier, immutable store, activation, and rollback
+      - name: Test worker-pack author, verifier, immutable store, activation, and rollback
         env:
           SCRIBE_BUILD_REVISION: ${{ github.sha }}
-        run: cargo test --locked --manifest-path tools/worker-pack-author/Cargo.toml -- --test-threads=1
+        run: cargo test --locked --offline --manifest-path tools/worker-pack-author/Cargo.toml -- --test-threads=1

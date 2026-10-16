@@ -10889,6 +10889,8 @@ fn prepare_pack_probes(
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GpuPackProbeIssue {
     UnsupportedPlatform,
+    LinuxReleaseSupportDisabled,
+    LinuxReleaseMetadataRejected,
     CatalogUnavailable,
     CatalogRejected,
     EntryIncompatible,
@@ -10973,6 +10975,12 @@ fn probe_issue(issue: crate::gpu_worker_pack::PackDiscoveryIssue) -> GpuPackProb
 
     match issue {
         PackDiscoveryIssue::UnsupportedPlatform => GpuPackProbeIssue::UnsupportedPlatform,
+        PackDiscoveryIssue::LinuxReleaseSupportDisabled => {
+            GpuPackProbeIssue::LinuxReleaseSupportDisabled
+        }
+        PackDiscoveryIssue::LinuxReleaseMetadataRejected => {
+            GpuPackProbeIssue::LinuxReleaseMetadataRejected
+        }
         PackDiscoveryIssue::CatalogUnavailable => GpuPackProbeIssue::CatalogUnavailable,
         PackDiscoveryIssue::CatalogRejected => GpuPackProbeIssue::CatalogRejected,
         PackDiscoveryIssue::EntryIncompatible => GpuPackProbeIssue::EntryIncompatible,

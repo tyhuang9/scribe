@@ -429,6 +429,8 @@ const MAX_PRODUCTION_PACKS: usize = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackDiscoveryIssue {
     UnsupportedPlatform,
+    LinuxReleaseSupportDisabled,
+    LinuxReleaseMetadataRejected,
     CatalogUnavailable,
     CatalogRejected,
     EntryIncompatible,
@@ -483,6 +485,12 @@ impl PackDiscoveryDiagnostic {
         match self.issue {
             PackDiscoveryIssue::UnsupportedPlatform => {
                 format!("{subject} are unsupported on this platform")
+            }
+            PackDiscoveryIssue::LinuxReleaseSupportDisabled => {
+                format!("{subject} are disabled by the reviewed Linux release metadata")
+            }
+            PackDiscoveryIssue::LinuxReleaseMetadataRejected => {
+                format!("{subject} Linux release metadata was rejected")
             }
             PackDiscoveryIssue::CatalogUnavailable => {
                 format!("{subject} were not found in this installation")
@@ -675,6 +683,9 @@ const EMBEDDED_PACK_RELEASE_AUTHORITY: &[u8] = include_bytes!(concat!(
     "/scribe_gpu_pack_release_authority.json"
 ));
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+const LINUX_EMPTY_PACK_CATALOG: &[u8] = br#"{"schema_version":1,"packs":[]}"#;
+
 fn validated_release_authority(
     catalog_bytes: &[u8],
     authority_bytes: &[u8],
@@ -820,12 +831,49 @@ pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     discover_pack_leases_from_current_install()
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
+    linux_release_package_discovery(linux_release_authority::linux_release_policy_decision(
+        LINUX_EMPTY_PACK_CATALOG,
+        EMBEDDED_PACK_RELEASE_AUTHORITY,
+        linux_release_authority::ExpectedBuild {
+            app_version: env!("CARGO_PKG_VERSION"),
+            build_revision: env!("SCRIBE_BUILD_REVISION"),
+            app_protocol_version: manifest::APP_PROTOCOL_VERSION,
+            runtime_abi_version: manifest::RUNTIME_ABI_VERSION,
+        },
+    ))
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    test
+))]
+fn linux_release_package_discovery(
+    decision: linux_release_authority::LinuxReleasePolicyDecision,
+) -> PackLeaseDiscovery {
+    let issue = match decision {
+        linux_release_authority::LinuxReleasePolicyDecision::SupportDisabled => {
+            PackDiscoveryIssue::LinuxReleaseSupportDisabled
+        }
+        linux_release_authority::LinuxReleasePolicyDecision::MetadataRejected => {
+            PackDiscoveryIssue::LinuxReleaseMetadataRejected
+        }
+    };
+    PackLeaseDiscovery {
+        leases: Vec::new(),
+        diagnostics: vec![PackDiscoveryDiagnostic::catalog(issue)],
+        catalog_generation: None,
+    }
+}
+
 #[cfg(not(any(
     all(windows, target_arch = "x86_64"),
     all(
         target_os = "macos",
         any(target_arch = "aarch64", target_arch = "x86_64")
-    )
+    ),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")
 )))]
 pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     PackLeaseDiscovery {
@@ -1774,6 +1822,64 @@ mod tests {
             !state.exists(),
             "empty authority must not create epoch state"
         );
+    }
+
+    #[test]
+    fn linux_release_package_policy_projects_to_zero_lease_categorical_discovery() {
+        const EMPTY_CATALOG: &[u8] = br#"{"schema_version":1,"packs":[]}"#;
+        const REVIEWED_EMPTY_AUTHORITY: &[u8] = br#"{"schema_version":1,"target":"x86_64-unknown-linux-gnu","catalog_sha256":"c3f19154f1b2265dac92206eae3a35c130a078be46705e1be6032bc442c3b9dc","release_security_epoch":0,"entries":[]}"#;
+        const DIGEST_MISMATCH: &[u8] = br#"{"schema_version":1,"target":"x86_64-unknown-linux-gnu","catalog_sha256":"0000000000000000000000000000000000000000000000000000000000000000","release_security_epoch":0,"entries":[]}"#;
+        let positive_empty = std::str::from_utf8(REVIEWED_EMPTY_AUTHORITY)
+            .unwrap()
+            .replace(
+                "\"release_security_epoch\":0",
+                "\"release_security_epoch\":1",
+            );
+        let invalid_nonempty = std::str::from_utf8(REVIEWED_EMPTY_AUTHORITY)
+            .unwrap()
+            .replace("\"entries\":[]", "\"entries\":[{}]");
+
+        for (authority, expected_issue) in [
+            (
+                REVIEWED_EMPTY_AUTHORITY,
+                PackDiscoveryIssue::LinuxReleaseSupportDisabled,
+            ),
+            (
+                b"{}".as_slice(),
+                PackDiscoveryIssue::LinuxReleaseMetadataRejected,
+            ),
+            (
+                DIGEST_MISMATCH,
+                PackDiscoveryIssue::LinuxReleaseMetadataRejected,
+            ),
+            (
+                positive_empty.as_bytes(),
+                PackDiscoveryIssue::LinuxReleaseMetadataRejected,
+            ),
+            (
+                invalid_nonempty.as_bytes(),
+                PackDiscoveryIssue::LinuxReleaseMetadataRejected,
+            ),
+        ] {
+            let decision = super::linux_release_authority::linux_release_policy_decision(
+                EMPTY_CATALOG,
+                authority,
+                super::linux_release_authority::ExpectedBuild {
+                    app_version: env!("CARGO_PKG_VERSION"),
+                    build_revision: env!("SCRIBE_BUILD_REVISION"),
+                    app_protocol_version: super::manifest::APP_PROTOCOL_VERSION,
+                    runtime_abi_version: super::manifest::RUNTIME_ABI_VERSION,
+                },
+            );
+            let discovery = super::linux_release_package_discovery(decision);
+            assert!(discovery.leases.is_empty());
+            assert_eq!(discovery.catalog_generation, None);
+            assert_eq!(
+                discovery.diagnostics,
+                vec![PackDiscoveryDiagnostic::catalog(expected_issue)]
+            );
+            assert!(!discovery.diagnostics[0].safe_summary().contains("signed"));
+        }
     }
 
     #[test]

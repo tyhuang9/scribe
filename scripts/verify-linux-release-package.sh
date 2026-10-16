@@ -12,6 +12,8 @@ package="$(realpath -e -- "$2")"
 for command in python3 sha256sum stat tar xz; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/linux-release-package-common.sh"
+reviewed_linux_release_authority='{"schema_version":1,"target":"x86_64-unknown-linux-gnu","catalog_sha256":"c3f19154f1b2265dac92206eae3a35c130a078be46705e1be6032bc442c3b9dc","release_security_epoch":0,"entries":[]}'
+reviewed_empty_catalog='{"schema_version":1,"packs":[]}'
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/scribe-linux-verify.XXXXXX")"
 trap 'status=$?; rm -rf -- "$temp_root"; exit "$status"' EXIT
 
@@ -101,12 +103,13 @@ printf '%s\n' usr usr/bin usr/lib usr/lib/scribe usr/lib/scribe/workers usr/lib/
 (cd "$root" && find . -mindepth 1 -type d -printf '%P\n' | LC_ALL=C sort) >"$actual_directories"
 cmp -s "$expected_directories" "$actual_directories" || { echo 'package directory tree is not exact.' >&2; exit 1; }
 while IFS= read -r directory; do [[ "$(stat -c %a -- "$root/$directory")" == 755 ]] || { echo "directory mode mismatch: $directory" >&2; exit 1; }; done <"$expected_directories"
-for path in "$root/usr/bin/local-transcriber" "$authority/scribe-inference-worker" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
+for path in "$root/usr/bin/local-transcriber" "$authority/scribe-inference-worker" "$authority/gpu-pack-release-authority.json" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
   [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || { echo "required package file is missing or unsafe: $path" >&2; exit 1; }
 done
 expected_package_files="$temp_root/expected-package-files"; actual_package_files="$temp_root/actual-package-files"
 printf '%s\n' \
   usr/bin/local-transcriber \
+  usr/lib/scribe/gpu-pack-release-authority.json \
   usr/lib/scribe/linux-release-inventory.json \
   usr/lib/scribe/linux-release-package.json \
   usr/lib/scribe/scribe-inference-worker \
@@ -115,13 +118,16 @@ printf '%s\n' \
 cmp -s "$expected_package_files" "$actual_package_files" || { echo 'CPU-only package file set is not independently authorized.' >&2; exit 1; }
 [[ "$(stat -c %a -- "$root/usr/bin/local-transcriber")" == 755 ]] || { echo 'packaged desktop mode is not 0755.' >&2; exit 1; }
 [[ "$(stat -c %a -- "$authority/scribe-inference-worker")" == 755 ]] || { echo 'packaged CPU worker mode is not 0755.' >&2; exit 1; }
-for metadata in "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
+for metadata in "$authority/gpu-pack-release-authority.json" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
   [[ "$(stat -c %a -- "$metadata")" == 644 ]] || { echo "packaged metadata mode is not 0644: $metadata" >&2; exit 1; }
 done
 linux_require_x86_64_elf "$root/usr/bin/local-transcriber" 'packaged desktop'
 linux_require_x86_64_elf "$authority/scribe-inference-worker" 'packaged CPU worker'
 cmp -s "$authority/linux-release-package.json" "$repo_root/runtime-manifests/linux-release-package-x86_64.json" || { echo 'package release contract differs from the reviewed manifest.' >&2; exit 1; }
-[[ "$(cat "$authority/worker-pack-catalog.json")" == '{"schema_version":1,"packs":[]}' ]] || { echo 'production Linux pack catalog must remain canonical and empty.' >&2; exit 1; }
+cmp -s "$authority/gpu-pack-release-authority.json" \
+  <(printf '%s' "$reviewed_linux_release_authority") || { echo 'production Linux release authority differs from the reviewed canonical empty metadata.' >&2; exit 1; }
+cmp -s "$authority/worker-pack-catalog.json" \
+  <(printf '%s' "$reviewed_empty_catalog") || { echo 'production Linux pack catalog must remain byte-exact, canonical, and empty.' >&2; exit 1; }
 [[ -z "$(find "$authority/workers/packs" -mindepth 1 -print -quit)" ]] || { echo 'production Linux package contains an untrusted GPU pack.' >&2; exit 1; }
 
 expected_paths="$temp_root/expected"; actual_paths="$temp_root/actual"

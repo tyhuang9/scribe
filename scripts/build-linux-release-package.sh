@@ -27,6 +27,13 @@ for command in dpkg-deb python3 sha256sum stat tar; do command -v "$command" >/d
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/linux-release-package-common.sh"
+reviewed_linux_release_authority='{"schema_version":1,"target":"x86_64-unknown-linux-gnu","catalog_sha256":"c3f19154f1b2265dac92206eae3a35c130a078be46705e1be6032bc442c3b9dc","release_security_epoch":0,"entries":[]}'
+reviewed_empty_catalog='{"schema_version":1,"packs":[]}'
+cmp -s "$repo_root/runtime-manifests/gpu-pack-release-authority-linux-empty.json" \
+  <(printf '%s\n' "$reviewed_linux_release_authority") || {
+  echo 'reviewed Linux GPU release authority source differs from the canonical empty authority.' >&2
+  exit 1
+}
 [[ ! -L "$desktop" && ! -L "$cpu_worker" ]] || { echo 'release input arguments must not be symlinks.' >&2; exit 1; }
 desktop="$(realpath -e -- "$desktop")"; cpu_worker="$(realpath -e -- "$cpu_worker")"
 for input in "$desktop" "$cpu_worker"; do
@@ -39,7 +46,7 @@ linux_require_x86_64_elf "$cpu_worker" 'CPU worker input'
 output_parent="$(dirname -- "$output")"; mkdir -p -- "$output_parent"
 output="$(cd "$output_parent" && pwd -P)/$(basename -- "$output")"
 [[ "$output" == *.deb ]] || { echo 'output must have a .deb suffix.' >&2; exit 2; }
-[[ ! -e "$output" && ! -e "$output.sizes.json" ]] || { echo 'release output already exists; refusing to overwrite it.' >&2; exit 1; }
+[[ ! -e "$output" && ! -L "$output" && ! -e "$output.sizes.json" && ! -L "$output.sizes.json" ]] || { echo 'release output already exists; refusing to overwrite it.' >&2; exit 1; }
 
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
 [[ "$source_date_epoch" =~ ^[1-9][0-9]{8,10}$ ]] || { echo 'SOURCE_DATE_EPOCH must be a canonical positive Unix timestamp.' >&2; exit 2; }
@@ -69,8 +76,20 @@ LC_ALL=C grep -aF -- "$worker_sha256" "$package_root/usr/bin/local-transcriber" 
   exit 1
 }
 
-printf '%s' '{"schema_version":1,"packs":[]}' >"$authority_root/worker-pack-catalog.json"
+printf '%s' "$reviewed_empty_catalog" >"$authority_root/worker-pack-catalog.json"
 chmod 0644 "$authority_root/worker-pack-catalog.json"
+cmp -s "$authority_root/worker-pack-catalog.json" \
+  <(printf '%s' "$reviewed_empty_catalog") || {
+  echo 'internal error: production Linux pack catalog differs from the canonical empty catalog.' >&2
+  exit 1
+}
+printf '%s' "$reviewed_linux_release_authority" >"$authority_root/gpu-pack-release-authority.json"
+chmod 0644 "$authority_root/gpu-pack-release-authority.json"
+cmp -s "$authority_root/gpu-pack-release-authority.json" \
+  <(printf '%s' "$reviewed_linux_release_authority") || {
+  echo 'internal error: packaged Linux GPU release authority differs from reviewed bytes.' >&2
+  exit 1
+}
 install -m 0644 -- "$repo_root/runtime-manifests/linux-release-package-x86_64.json" "$authority_root/linux-release-package.json"
 
 for pack in "${gpu_packs[@]}"; do
@@ -79,7 +98,7 @@ done
 if ((${#gpu_packs[@]})); then
   command -v cargo >/dev/null || { echo 'cargo is required to verify a requested GPU pack.' >&2; exit 1; }
   export SCRIBE_BUILD_REVISION="$build_revision"
-  cargo build --locked --release --manifest-path "$repo_root/tools/worker-pack-author/Cargo.toml"
+  cargo build --locked --offline --release --manifest-path "$repo_root/tools/worker-pack-author/Cargo.toml"
   pack_tool="$repo_root/tools/worker-pack-author/target/release/scribe-worker-pack-tool"
   for pack in "${gpu_packs[@]}"; do
     "$pack_tool" install-production-linux --pack-root "$pack" --packs-root "$packs_root" --state-root "$temp_root/pack-state"
@@ -123,7 +142,7 @@ EOF
 chmod 0644 "$package_root/DEBIAN/control"
 find "$package_root" -type d -exec chmod 0755 -- {} +
 chmod 0755 "$package_root/usr/bin/local-transcriber" "$authority_root/scribe-inference-worker"
-chmod 0644 "$authority_root/worker-pack-catalog.json" "$authority_root/linux-release-package.json" "$authority_root/linux-release-inventory.json" "$package_root/DEBIAN/control"
+chmod 0644 "$authority_root/gpu-pack-release-authority.json" "$authority_root/worker-pack-catalog.json" "$authority_root/linux-release-package.json" "$authority_root/linux-release-inventory.json" "$package_root/DEBIAN/control"
 
 find "$package_root" -exec touch --no-dereference --date="@$source_date_epoch" -- {} +
 temporary_deb="$(mktemp "$output_parent/.scribe-linux-release.XXXXXX.deb")"
@@ -131,7 +150,7 @@ rm -f -- "$temporary_deb"
 SOURCE_DATE_EPOCH="$source_date_epoch" dpkg-deb --root-owner-group --build -Zxz -z9 --uniform-compression "$package_root" "$temporary_deb" >/dev/null
 chmod 0644 "$temporary_deb"
 mv --no-clobber -- "$temporary_deb" "$output"
-[[ ! -e "$temporary_deb" ]] || { echo 'release output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
+[[ ! -e "$temporary_deb" && ! -L "$temporary_deb" ]] || { echo 'release output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
 package_bytes="$(stat -c %s -- "$output")"
 temporary_report="$(mktemp "$output_parent/.scribe-linux-release-size.XXXXXX.json")"
 python3 - "$temporary_report" "$installed_bytes" "$package_bytes" <<'PY'
@@ -141,5 +160,5 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(document, sort_keys=True, separa
 PY
 chmod 0644 "$temporary_report"
 mv --no-clobber -- "$temporary_report" "$output.sizes.json"
-[[ ! -e "$temporary_report" ]] || { echo 'size report output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
+[[ ! -e "$temporary_report" && ! -L "$temporary_report" ]] || { echo 'size report output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
 echo "$output"

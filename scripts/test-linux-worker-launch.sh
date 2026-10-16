@@ -168,12 +168,15 @@ require_exact_test_set \
 linux_release_authority_tests=(
   "tests::linux_release_authority_default_emission_validates_empty_runtime_binding"
   "tests::linux_release_authority_positive_cuda_and_vulkan_fixture_binds_exactly"
+  "tests::linux_release_authority_rejects_malformed_and_digest_mismatched_release_metadata"
   "tests::linux_release_authority_rejects_malformed_noncanonical_and_unbounded_documents"
   "tests::linux_release_authority_rejects_nonempty_linux_build_inputs"
+  "tests::linux_release_authority_rejects_structurally_valid_positive_and_nonempty_release_metadata"
   "tests::linux_release_authority_rejects_tampered_build_catalog_target_abi_provider_epoch_and_inventory"
+  "tests::linux_release_authority_reviewed_empty_metadata_disables_gpu_support"
   "tests::linux_release_authority_target_selection_preserves_non_linux_defaults"
 )
-if (( ${#linux_release_authority_tests[@]} != 6 )); then
+if (( ${#linux_release_authority_tests[@]} != 9 )); then
   echo "Canonical Linux release authority test inventory has the wrong count" >&2
   exit 1
 fi
@@ -201,11 +204,12 @@ rustc --edition=2024 --test \
 
 linux_release_authority_architecture_tests=(
   "build_policy_selects_and_reviews_the_linux_empty_authority_before_publication"
+  "linux_release_package_consumer_is_data_only_default_deny_and_exactly_tested"
   "linux_authority_is_private_semantic_binding_not_pack_or_epoch_admission"
   "platform_dispatch_preserves_existing_non_linux_release_authority_behavior"
   "portable_authority_suites_are_exactly_discovered_on_both_ubuntu_lanes"
 )
-if (( ${#linux_release_authority_architecture_tests[@]} != 4 )); then
+if (( ${#linux_release_authority_architecture_tests[@]} != 5 )); then
   echo "Canonical Linux release authority architecture test inventory has the wrong count" >&2
   exit 1
 fi

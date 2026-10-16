@@ -31,6 +31,27 @@ the independently fixed reviewed zero-epoch, empty authority. Positive epochs,
 nonempty entries and other overrides fail before authority output publication.
 Changing the checked-in default alone cannot bypass this policy.
 
+## CPU-only production consumer and package inventory
+
+Supported Linux x86_64 GNU desktop discovery now validates the embedded bytes
+against the canonical empty catalog using the typed Linux validator. Only
+epoch-zero, empty metadata produces the production-support-disabled diagnostic;
+malformed, mismatched, positive-empty and nonempty metadata are rejected. Both
+outcomes return zero leases and no catalog generation. Other Linux targets
+remain unsupported. Windows and macOS behavior is unchanged.
+
+The consumer is data-only: it performs no filesystem, floor, health, signature,
+provider or process operations. Metadata rejection affects GPU diagnostics,
+not the bundled CPU startup path. Structurally valid positive fixture metadata
+is still not production admission.
+
+The CPU-only Debian package carries the normalized reviewed empty authority at
+`/usr/lib/scribe/gpu-pack-release-authority.json`. Assembly and independent
+verification require fixed reviewed bytes, the exact empty catalog, and the
+six-file inventory. An unsigned, self-consistent inventory cannot authorize
+new metadata. See `LINUX_RELEASE_PACKAGING.md` for the package checks and the
+explicit limitation that arbitrary supplied ELF provenance is not verified.
+
 ## Typed document and catalog binding
 
 The private Linux validator parses a Linux-specific schema and binds it to the
