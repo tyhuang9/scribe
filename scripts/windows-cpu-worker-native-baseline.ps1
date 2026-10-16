@@ -10,7 +10,8 @@ function Get-WindowsCpuWorkerBaselineEnvironmentNames {
     return @(
         'CARGO_TARGET_DIR',
         'TRANSCRIBE_CMAKE_ARGS',
-        'RUSTFLAGS'
+        'RUSTFLAGS',
+        'LOCALAPPDATA'
     )
 }
 
@@ -97,6 +98,10 @@ function New-WindowsCpuWorkerBaselineBuild([string]$TargetTriple) {
     # Cargo's environment-level RUSTFLAGS override target-specific Cargo
     # configuration. Keep the project's static CRT but deny host ISA tuning.
     $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    # Keep native build-tool scratch aliases (including transcribe-cpp-sys's tcs directory)
+    # within this retained, per-worker target. Do not create the namespace here:
+    # Cargo/CMake owns any required directory creation after the target exists.
+    $env:LOCALAPPDATA = Join-Path $targetRoot 'native-env'
     return [pscustomobject]@{
         TargetRoot = $targetRoot
         TargetTriple = $TargetTriple

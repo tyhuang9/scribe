@@ -158,6 +158,14 @@ record needed for local investigation. The cache/flag check establishes the
 build contract; real GGUF execution on the oldest supported Windows x64 CPU is
 still the acceptance test for hardware compatibility.
 
+For each CPU worker build, the shared helper also sets process-local
+`LOCALAPPDATA` to that target's `native-env` child. It does not eagerly create
+that directory: Cargo and native tooling create their own scratch aliases (such
+as `tcs`) beneath the retained target namespace when needed. The caller's
+`LOCALAPPDATA` is restored exactly on success and failure. This isolates build
+scratch aliases only; it neither establishes an ACL cause nor proves a complete
+CPU build, production acceptance, worker trust, or Auto eligibility.
+
 The record is **unsigned local integrity data**, not authenticated producer
 provenance. A clean Git checkout, a matching hash, or a locally successful
 build does not prove protected-branch membership, trusted runner identity, or
