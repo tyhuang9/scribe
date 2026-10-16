@@ -9,6 +9,11 @@ mod device_release_epoch;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod execution_path;
 pub(crate) mod health;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    test
+))]
+mod linux_release_epoch;
 pub(crate) mod manifest;
 pub(crate) mod store;
 
