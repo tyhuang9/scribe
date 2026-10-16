@@ -403,6 +403,9 @@ $previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 $previousGitHubActions = $env:GITHUB_ACTIONS
 $previousCi = $env:CI
+$previousLocalApplicationData = Get-Item -LiteralPath 'Env:LOCALAPPDATA' -ErrorAction SilentlyContinue
+$previousLocalApplicationDataExists = $null -ne $previousLocalApplicationData
+$previousLocalApplicationDataValue = if ($previousLocalApplicationDataExists) { [string]$previousLocalApplicationData.Value } else { $null }
 $cpuBaselineAmbientNamePattern = '^(?i:CMAKE_ARGS|TRANSCRIBE_CMAKE_ARGS|CMAKE_TOOLCHAIN_FILE(?:_.+)?|HOST_CMAKE_TOOLCHAIN_FILE|CMAKE_X86_64_PC_WINDOWS_MSVC(?:_.+)?|(?:(?:HOST|TARGET)_)?(?:C|CXX|CPP)FLAGS(?:_.+)?|(?:(?:HOST|TARGET)_)?(?:CC|CXX)(?:_.+)?|CL|_CL_|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS)$'
 $previousCpuBaselineAmbient = @{}
 foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
@@ -645,6 +648,8 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
             if (Test-Path -LiteralPath "Env:$name") { Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop }
         }
         $absentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        Assert-Equal $env:LOCALAPPDATA (Join-Path $absentEnvironmentBuild.TargetRoot 'native-env') 'Absent-state LOCALAPPDATA uses the fresh target namespace'
+        Assert-True (-not (Test-Path -LiteralPath $absentEnvironmentBuild.TargetRoot)) 'Environment-only namespace setup created a target directory.'
         foreach ($attempt in @(1, 2)) {
             Restore-WindowsCpuWorkerBaselineEnvironment $absentEnvironmentBuild
             foreach ($name in $baselineEnvironmentNames) {
@@ -659,6 +664,7 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
         # and an empty override are equivalent on runtimes that distinguish them.
         $emptyEnvironmentBefore = [Environment]::GetEnvironmentVariables()
         $emptyEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        Assert-Equal $env:LOCALAPPDATA (Join-Path $emptyEnvironmentBuild.TargetRoot 'native-env') 'Empty-state LOCALAPPDATA uses the fresh target namespace'
         foreach ($attempt in @(1, 2)) {
             Restore-WindowsCpuWorkerBaselineEnvironment $emptyEnvironmentBuild
             $after = [Environment]::GetEnvironmentVariables()
@@ -670,8 +676,10 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
         }
         $env:CARGO_TARGET_DIR = 'C:\fixture\original-target'
         $env:TRANSCRIBE_CMAKE_ARGS = ' '
+        $env:LOCALAPPDATA = Join-Path $testRoot 'present-localappdata'
         $presentEnvironmentBefore = [Environment]::GetEnvironmentVariables()
         $presentEnvironmentBuild = New-WindowsCpuWorkerBaselineBuild 'x86_64-pc-windows-msvc'
+        Assert-Equal $env:LOCALAPPDATA (Join-Path $presentEnvironmentBuild.TargetRoot 'native-env') 'Present-state LOCALAPPDATA uses the fresh target namespace'
         foreach ($attempt in @(1, 2)) {
             Restore-WindowsCpuWorkerBaselineEnvironment $presentEnvironmentBuild
             $after = [Environment]::GetEnvironmentVariables()
@@ -887,6 +895,10 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
 
     $fixtureContext = Get-WindowsFrozenCpuWorkerSourceContext $fixtureRoot
     $env:CARGO_TARGET_DIR = $fixtureTarget
+    $fixtureLocalApplicationData = Join-Path $testRoot 'ambient-localappdata'
+    $fixtureAmbientNativeTcs = Join-Path $fixtureLocalApplicationData 'tcs'
+    $env:LOCALAPPDATA = $fixtureLocalApplicationData
+    Assert-True (-not (Test-Path -LiteralPath $fixtureAmbientNativeTcs)) 'Fixture ambient LOCALAPPDATA already contains native tcs scratch.'
     $env:SCRIBE_BUILD_REVISION = 'inherited-test-revision'
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = 'f' * 64 -join ''
     $env:SCRIBE_BUILDING_WORKER = 'inherited-worker-flag'
@@ -923,6 +935,7 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
             CargoTargetDirectory = $env:CARGO_TARGET_DIR
             TranscribeCmakeArgs = $env:TRANSCRIBE_CMAKE_ARGS
             RustFlags = $env:RUSTFLAGS
+            LocalApplicationData = $env:LOCALAPPDATA
         })
         if (($global:WindowsFrozenCpuWorkerTestFailWorkerBuild -and $binary -ceq 'scribe-inference-worker') -or
             ($global:WindowsFrozenCpuWorkerTestFailDesktopBuild -and $binary -ceq 'local-transcriber')) {
@@ -932,6 +945,7 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
         $output = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\$binary.exe"
         if ($binary -ceq 'scribe-inference-worker') {
             $null = $global:WindowsFrozenCpuWorkerTestBaselineTargetRoots.Add($env:CARGO_TARGET_DIR)
+            New-Item -ItemType Directory -Path (Join-Path $env:LOCALAPPDATA 'tcs') -Force | Out-Null
             New-TestReviewedPe $output 3
             Write-TestCpuWorkerBaselineEvidence $env:CARGO_TARGET_DIR
             if ($global:WindowsFrozenCpuWorkerTestRaceFreezeOutput) {
@@ -990,6 +1004,11 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
         Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64) 'Manifest rejection restored worker anchor'
         Assert-Equal $env:SCRIBE_BUILDING_WORKER 'inherited-worker-flag' 'Manifest rejection restored worker marker'
         Assert-Equal $env:CARGO_TARGET_DIR $fixtureTarget 'Manifest rejection restored Cargo target'
+        Assert-Equal $env:LOCALAPPDATA $fixtureLocalApplicationData 'Manifest rejection restored LOCALAPPDATA'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].LocalApplicationData `
+            (Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'native-env') `
+            'Manifest rejection worker used its target-local native namespace'
+        Assert-True (-not (Test-Path -LiteralPath $fixtureAmbientNativeTcs)) 'Manifest rejection wrote native tcs scratch to ambient LOCALAPPDATA.'
         $releasedPaths = @((Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'x86_64-pc-windows-msvc/release/scribe-inference-worker.exe'))
         if ($rejectedLeaf -ceq 'local-transcriber.exe') {
             $releasedPaths += Join-Path $fixtureTarget 'x86_64-pc-windows-msvc/release/local-transcriber.exe'
@@ -1017,6 +1036,12 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
     Assert-True ($global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory -cne $fixtureTarget) 'Normal CPU worker did not use a fresh isolated Cargo target.'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].TranscribeCmakeArgs (Get-WindowsCpuWorkerBaselineCmakeArgs) 'Normal CPU worker exact native CMake baseline'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].RustFlags '-C target-feature=+crt-static' 'Normal CPU worker exact Rust ISA baseline'
+    $normalWorkerNativeEnvironment = Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'native-env'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].LocalApplicationData $normalWorkerNativeEnvironment 'Normal CPU worker uses its target-local native namespace'
+    Assert-True (Test-Path -LiteralPath (Join-Path $normalWorkerNativeEnvironment 'tcs')) 'Normal CPU worker did not create native tcs scratch beneath its target namespace.'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].LocalApplicationData $fixtureLocalApplicationData 'Normal desktop build did not restore ambient LOCALAPPDATA'
+    Assert-Equal $env:LOCALAPPDATA $fixtureLocalApplicationData 'Normal packaging restored ambient LOCALAPPDATA'
+    Assert-True (-not (Test-Path -LiteralPath $fixtureAmbientNativeTcs)) 'Normal CPU worker wrote native tcs scratch to ambient LOCALAPPDATA.'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest)) 'Normal worker build inherited a desktop digest.'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[1].BuildingWorker)) 'Normal desktop build inherited the worker build marker.'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[1].WorkerDigest (Get-FileHash -LiteralPath (Join-Path $normalBundle 'scribe-inference-worker.exe') -Algorithm SHA256).Hash.ToLowerInvariant() 'Normal desktop embeds the exact packaged worker digest'
@@ -1040,6 +1065,12 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
     Assert-True ($global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory -cne $fixtureTarget) 'Freeze producer did not use a fresh isolated Cargo target.'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].TranscribeCmakeArgs (Get-WindowsCpuWorkerBaselineCmakeArgs) 'Freeze producer exact native CMake baseline'
     Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].RustFlags '-C target-feature=+crt-static' 'Freeze producer exact Rust ISA baseline'
+    $frozenWorkerNativeEnvironment = Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'native-env'
+    Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].LocalApplicationData $frozenWorkerNativeEnvironment 'Freeze producer worker uses its target-local native namespace'
+    Assert-True ($frozenWorkerNativeEnvironment -cne $normalWorkerNativeEnvironment) 'Freeze producer reused the normal worker native namespace.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $frozenWorkerNativeEnvironment 'tcs')) 'Freeze producer did not create native tcs scratch beneath its target namespace.'
+    Assert-Equal $env:LOCALAPPDATA $fixtureLocalApplicationData 'Freeze producer restored ambient LOCALAPPDATA'
+    Assert-True (-not (Test-Path -LiteralPath $fixtureAmbientNativeTcs)) 'Freeze producer wrote native tcs scratch to ambient LOCALAPPDATA.'
     Assert-True ([string]::IsNullOrEmpty($global:WindowsFrozenCpuWorkerTestCargoCalls[0].WorkerDigest)) 'Freeze producer did not clear the desktop worker digest.'
     Assert-Equal $env:SCRIBE_BUILD_REVISION 'inherited-test-revision' 'Freeze producer revision environment restoration'
     Assert-Equal $env:SCRIBE_BUNDLED_WORKER_SHA256 ('f' * 64 -join '') 'Freeze producer digest environment restoration'
@@ -1120,11 +1151,48 @@ function Get-WindowsApplicationManifestBytes([string]$Path) {
         if ($LASTEXITCODE -ne 0) { throw 'Could not restore the test-owned worktree configuration.' }
     }
 
+    Reset-TestCalls
+    $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $true
+    $failedNormalBundle = Join-Path $testRoot 'failed-normal-worker-build'
+    try {
+        Invoke-ExpectedFailure {
+            & $fixtureBuilder `
+                -ModelSource $modelSource `
+                -BundlePath $failedNormalBundle `
+                -InstallerPackAllowlistPath $installerAllowlist
+        } 'release build failed'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Failed normal worker build Cargo call count'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Failed normal worker build stopped before desktop Cargo'
+        Assert-WorkerCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'Failed normal CPU worker exact Cargo argv'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].LocalApplicationData `
+            (Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'native-env') `
+            'Failed normal worker build used its target-local native namespace'
+        Assert-True (-not (Test-Path -LiteralPath $failedNormalBundle)) 'Failed normal worker build published a bundle.'
+        Assert-Equal $env:LOCALAPPDATA $fixtureLocalApplicationData 'Failed normal worker build restored LOCALAPPDATA'
+        Assert-True (-not (Test-Path -LiteralPath $fixtureAmbientNativeTcs)) 'Failed normal worker build wrote native tcs scratch to ambient LOCALAPPDATA.'
+    }
+    finally {
+        $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $false
+    }
+
+    Reset-TestCalls
     $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $true
     $failedFreezeOutput = Join-Path $testRoot 'failed-freeze'
-    Invoke-ExpectedFailure { & $fixtureProducer -OutputDirectory $failedFreezeOutput } 'release build failed'
-    Assert-True (-not (Test-Path -LiteralPath $failedFreezeOutput)) 'Failed worker build left a freeze output.'
-    $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $false
+    try {
+        Invoke-ExpectedFailure { & $fixtureProducer -OutputDirectory $failedFreezeOutput } 'release build failed'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls.Count 1 'Failed freeze producer Cargo call count'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].Binary 'scribe-inference-worker' 'Failed freeze producer did not invoke desktop Cargo'
+        Assert-WorkerCargoArguments $global:WindowsFrozenCpuWorkerTestCargoCalls[0] 'Failed freeze producer exact CPU worker Cargo argv'
+        Assert-Equal $global:WindowsFrozenCpuWorkerTestCargoCalls[0].LocalApplicationData `
+            (Join-Path $global:WindowsFrozenCpuWorkerTestCargoCalls[0].CargoTargetDirectory 'native-env') `
+            'Failed freeze producer used its target-local native namespace'
+        Assert-True (-not (Test-Path -LiteralPath $failedFreezeOutput)) 'Failed worker build left a freeze output.'
+        Assert-Equal $env:LOCALAPPDATA $fixtureLocalApplicationData 'Failed freeze producer restored LOCALAPPDATA'
+        Assert-True (-not (Test-Path -LiteralPath $fixtureAmbientNativeTcs)) 'Failed freeze producer wrote native tcs scratch to ambient LOCALAPPDATA.'
+    }
+    finally {
+        $global:WindowsFrozenCpuWorkerTestFailWorkerBuild = $false
+    }
 
     $global:WindowsFrozenCpuWorkerTestRaceFreezeOutput = Join-Path $testRoot 'raced-freeze'
     Invoke-ExpectedFailure { & $fixtureProducer -OutputDirectory $global:WindowsFrozenCpuWorkerTestRaceFreezeOutput } 'appeared during construction'
@@ -1649,6 +1717,12 @@ finally {
     $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
     $env:GITHUB_ACTIONS = $previousGitHubActions
     $env:CI = $previousCi
+    if ($previousLocalApplicationDataExists) {
+        [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $previousLocalApplicationDataValue, 'Process')
+    }
+    elseif (Test-Path -LiteralPath 'Env:LOCALAPPDATA') {
+        Remove-Item -LiteralPath 'Env:LOCALAPPDATA' -ErrorAction Stop
+    }
     foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
         if ([string]$entry.Key -match $cpuBaselineAmbientNamePattern) {
             Remove-Item -LiteralPath "Env:$($entry.Key)"
