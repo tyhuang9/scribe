@@ -1128,3 +1128,11 @@ available. `gpu-auto-qualification-linux-x86_64.json` is canonical
 introduce production trust. A Linux release-authority document is intentionally
 deferred until the root-owned epoch authority is implemented; the current
 schema is macOS Keychain-specific and is not reused as a Linux trust contract.
+
+The read-only admission-snapshot prerequisite is specified in
+`docs/LINUX_GPU_RELEASE_EPOCH.md`. It accepts only an already committed,
+root-owned floor equal to the authenticated candidate and never creates or
+advances authority. Privileged monotonic advancement, updater coordination,
+uninstall persistence and authenticated Linux release-authority wiring remain
+separate prerequisites; this reader does not enable production Linux discovery,
+pack launch, nonempty packaging or Auto.
