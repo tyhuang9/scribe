@@ -5605,6 +5605,48 @@ impl RetirementReapProgress {
     }
 }
 
+struct PendingLaunchCleanup {
+    progress: Arc<RetirementReapProgress>,
+    process: Mutex<Option<Arc<dyn WorkerProcess>>>,
+    cleanup_claimed: AtomicBool,
+}
+
+impl PendingLaunchCleanup {
+    fn new() -> Self {
+        Self {
+            progress: Arc::new(RetirementReapProgress::new()),
+            process: Mutex::new(None),
+            cleanup_claimed: AtomicBool::new(false),
+        }
+    }
+
+    fn retain_process(&self, process: Arc<dyn WorkerProcess>) -> Result<()> {
+        *self
+            .process
+            .lock()
+            .map_err(|_| anyhow!("pending process worker launch receipt lock was poisoned"))? =
+            Some(process);
+        Ok(())
+    }
+
+    fn retained_process(&self) -> Result<Option<Arc<dyn WorkerProcess>>> {
+        self.process
+            .lock()
+            .map_err(|_| anyhow!("pending process worker launch receipt lock was poisoned"))
+            .map(|process| process.clone())
+    }
+
+    fn try_claim_cleanup(&self) -> bool {
+        self.cleanup_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release_cleanup_claim(&self) {
+        self.cleanup_claimed.store(false, Ordering::Release);
+    }
+}
+
 fn wait_for_retirement_reap(
     progress: &RetirementReapProgress,
     wait: impl FnOnce() -> Result<()>,
@@ -5666,11 +5708,30 @@ fn retirement_receipts_advisory(
     }
 }
 
+fn pending_launch_receipts_advisory(
+    receipts: &BTreeMap<u64, Arc<PendingLaunchCleanup>>,
+) -> &'static str {
+    match receipts.len() {
+        0 => "pending launch cleanup progress unavailable",
+        1 => retirement_reap_progress_advisory(
+            receipts
+                .values()
+                .next()
+                .expect("one pending launch receipt has one progress value")
+                .progress
+                .as_ref(),
+        ),
+        _ => "multiple pending launch cleanup receipts",
+    }
+}
+
 #[derive(Default)]
 struct SupervisorState {
     next_generation: u64,
+    next_pending_launch: u64,
     current: Option<CurrentGeneration>,
     retiring_generations: BTreeMap<u64, Arc<RetirementReapProgress>>,
+    pending_launches: BTreeMap<u64, Arc<PendingLaunchCleanup>>,
     active_request: Option<Correlation>,
     active_stream: Option<SupervisorStream>,
     active_model: Option<(u64, String)>,
@@ -5681,6 +5742,14 @@ struct RetirementSnapshotGate {
     reached: SyncSender<()>,
     release: Receiver<()>,
     receipt_observed: SyncSender<()>,
+}
+
+#[cfg(test)]
+struct LaunchHandoffGate {
+    receiver_reached: SyncSender<()>,
+    receiver_release: Receiver<()>,
+    sender_ready: SyncSender<()>,
+    sender_finished: SyncSender<()>,
 }
 
 struct SupervisorInner {
@@ -5699,6 +5768,8 @@ struct SupervisorInner {
     retirement_snapshot_gate: Mutex<Option<RetirementSnapshotGate>>,
     #[cfg(test)]
     retirement_wait_observer: Mutex<Option<std::sync::mpsc::Sender<MonotonicDeadline>>>,
+    #[cfg(test)]
+    launch_handoff_gate: Mutex<Option<LaunchHandoffGate>>,
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     diagnostic_probe: Option<Arc<DiagnosticProbeState>>,
 }
@@ -5756,6 +5827,8 @@ impl ProcessWorkerSupervisor {
                 retirement_snapshot_gate: Mutex::new(None),
                 #[cfg(test)]
                 retirement_wait_observer: Mutex::new(None),
+                #[cfg(test)]
+                launch_handoff_gate: Mutex::new(None),
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                 diagnostic_probe: None,
             }),
@@ -5780,6 +5853,8 @@ impl ProcessWorkerSupervisor {
                 retirement_snapshot_gate: Mutex::new(None),
                 #[cfg(test)]
                 retirement_wait_observer: Mutex::new(None),
+                #[cfg(test)]
+                launch_handoff_gate: Mutex::new(None),
                 diagnostic_probe: Some(diagnostic_probe),
             }),
         }
@@ -6186,6 +6261,10 @@ impl ProcessWorkerSupervisor {
     /// supervisor implementations whose `load` errors do not invalidate their
     /// own process generation.
     pub(crate) fn terminate_current(&self) -> Result<()> {
+        self.terminate_current_before(None)
+    }
+
+    fn terminate_current_before(&self, deadline: Option<MonotonicDeadline>) -> Result<()> {
         let generation = self
             .inner
             .state
@@ -6195,10 +6274,11 @@ impl ProcessWorkerSupervisor {
             .as_ref()
             .map(|current| current.generation);
         if let Some(generation) = generation {
-            self.invalidate_generation(
+            self.invalidate_generation_before(
                 generation,
                 "process worker generation was explicitly retired",
                 true,
+                deadline,
             )?;
         }
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -6209,12 +6289,13 @@ impl ProcessWorkerSupervisor {
     }
 
     fn await_retirement_settlement_before(&self, deadline: MonotonicDeadline) -> Result<()> {
+        self.retry_failed_pending_launch_cleanup()?;
         let mut state = self
             .inner
             .state
             .lock()
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
-        while !state.retiring_generations.is_empty() {
+        while !state.retiring_generations.is_empty() || !state.pending_launches.is_empty() {
             #[cfg(test)]
             if let Ok(observer) = self.inner.retirement_wait_observer.lock()
                 && let Some(observer) = observer.as_ref()
@@ -6227,12 +6308,57 @@ impl ProcessWorkerSupervisor {
                 .wait_timeout(state, deadline.remaining()?)
                 .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             state = next_state;
-            if timeout.timed_out() && !state.retiring_generations.is_empty() {
+            if timeout.timed_out()
+                && (!state.retiring_generations.is_empty() || !state.pending_launches.is_empty())
+            {
+                if !state.pending_launches.is_empty() {
+                    bail!(
+                        "process worker pending launch cleanup did not settle before provider discovery; {}",
+                        pending_launch_receipts_advisory(&state.pending_launches)
+                    );
+                }
                 bail!(
                     "process worker retirement did not settle before provider discovery; {}",
                     retirement_receipts_advisory(&state.retiring_generations)
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn retry_failed_pending_launch_cleanup(&self) -> Result<()> {
+        let receipts = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .pending_launches
+            .iter()
+            .map(|(launch_id, receipt)| (*launch_id, Arc::clone(receipt)))
+            .collect::<Vec<_>>();
+        for (launch_id, receipt) in receipts {
+            if !matches!(
+                receipt.progress.phase(),
+                Some(RetirementReapPhase::PendingWaitNotObserved)
+                    | Some(RetirementReapPhase::WaitFailed)
+            ) {
+                continue;
+            }
+            let Some(process) = receipt.retained_process()? else {
+                continue;
+            };
+            if !receipt.try_claim_cleanup() {
+                continue;
+            }
+            if let Err(error) = process.terminate() {
+                receipt.release_cleanup_claim();
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not retry termination of unpublished process worker launch {launch_id}"
+                    )
+                });
+            }
+            begin_pending_launch_reap(process, Arc::downgrade(&self.inner), launch_id, receipt)?;
         }
         Ok(())
     }
@@ -6259,6 +6385,11 @@ impl ProcessWorkerSupervisor {
         *self.inner.retirement_wait_observer.lock().unwrap() = Some(observer);
     }
 
+    #[cfg(test)]
+    fn gate_launch_handoff_for_test(&self, gate: LaunchHandoffGate) {
+        *self.inner.launch_handoff_gate.lock().unwrap() = Some(gate);
+    }
+
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn await_diagnostic_retirement_settlement(&self, probe: &DiagnosticProbeState) -> Result<()> {
         let mut state = self
@@ -6266,7 +6397,7 @@ impl ProcessWorkerSupervisor {
             .state
             .lock()
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
-        while !state.retiring_generations.is_empty() {
+        while !state.retiring_generations.is_empty() || !state.pending_launches.is_empty() {
             let remaining = probe.cleanup_deadline.remaining()?;
             #[cfg(test)]
             if let Some(registered) = probe.retirement_waiter_registered.lock().unwrap().take() {
@@ -6399,9 +6530,12 @@ impl ProcessWorkerSupervisor {
             diagnostic_probe.set_stage(GpuPackProbeStage::Launch);
         }
         require_admission()?;
-        let spawned = match deadline {
-            Some(deadline) => self.launch_before(deadline, cancelled)?,
-            None => self.inner.launcher.launch()?,
+        let (spawned, pending_launch) = match deadline {
+            Some(deadline) => {
+                let (spawned, launch_id) = self.launch_before(deadline, cancelled)?;
+                (spawned, Some(launch_id))
+            }
+            None => (self.inner.launcher.launch()?, None),
         };
         let SpawnedWorker {
             stdin,
@@ -6431,8 +6565,18 @@ impl ProcessWorkerSupervisor {
             });
             state.active_stream = None;
             state.active_model = None;
+            if let Some(launch_id) = pending_launch {
+                let removed = state.pending_launches.remove(&launch_id);
+                debug_assert!(
+                    removed.is_some(),
+                    "published launch retained its cleanup ticket"
+                );
+            }
             generation
         };
+        if pending_launch.is_some() {
+            self.inner.retirement_changed.notify_all();
+        }
         *self
             .inner
             .writer
@@ -6503,29 +6647,83 @@ impl ProcessWorkerSupervisor {
         &self,
         deadline: MonotonicDeadline,
         cancelled: Option<&AtomicBool>,
-    ) -> Result<SpawnedWorker> {
+    ) -> Result<(SpawnedWorker, u64)> {
+        let (launch_id, launch_receipt) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            state.next_pending_launch = state.next_pending_launch.saturating_add(1).max(1);
+            let launch_id = state.next_pending_launch;
+            let receipt = Arc::new(PendingLaunchCleanup::new());
+            state
+                .pending_launches
+                .insert(launch_id, Arc::clone(&receipt));
+            (launch_id, receipt)
+        };
         let launcher = Arc::clone(&self.inner.launcher);
+        let launch_owner = Arc::downgrade(&self.inner);
+        #[cfg(test)]
+        let handoff_gate = self
+            .inner
+            .launch_handoff_gate
+            .lock()
+            .map_err(|_| anyhow!("process worker launch handoff test gate lock was poisoned"))?
+            .take();
+        #[cfg(test)]
+        let sender_ready = handoff_gate.as_ref().map(|gate| gate.sender_ready.clone());
+        #[cfg(test)]
+        let sender_finished = handoff_gate
+            .as_ref()
+            .map(|gate| gate.sender_finished.clone());
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         let diagnostic_probe = self.inner.diagnostic_probe.clone();
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         if let Some(diagnostic_probe) = &diagnostic_probe {
             diagnostic_probe.launch_started();
         }
-        let (result_tx, result_rx) = sync_channel(1);
+        // A successful send must transfer the child directly to the receiver.
+        // A buffered success could be abandoned on cancellation or deadline
+        // expiry without either side retaining the exact process to clean up.
+        let (result_tx, result_rx) = sync_channel(0);
+        let launch_owner_on_spawn_failure = launch_owner.clone();
+        let thread_launch_receipt = Arc::clone(&launch_receipt);
         std::thread::Builder::new()
             .name("scribe-process-worker-launch".to_owned())
             .spawn(move || {
                 let result = launcher.launch();
                 if deadline.remaining().is_err() {
-                    if let Ok(worker) = result {
-                        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-                        if let Some(diagnostic_probe) = &diagnostic_probe {
-                            let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
-                        } else {
-                            retire_unpublished_worker_synchronously(worker);
+                    match result {
+                        Ok(worker) => {
+                            let cleanup = {
+                                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                                if let Some(diagnostic_probe) = &diagnostic_probe {
+                                    retire_unpublished_diagnostic_worker_tracked(
+                                        worker,
+                                        diagnostic_probe,
+                                        &thread_launch_receipt,
+                                    )
+                                } else {
+                                    retire_unpublished_worker_synchronously(
+                                        worker,
+                                        &thread_launch_receipt,
+                                    )
+                                }
+                                #[cfg(not(all(
+                                    windows,
+                                    feature = "windows-gpu-capture-observation"
+                                )))]
+                                retire_unpublished_worker_synchronously(
+                                    worker,
+                                    &thread_launch_receipt,
+                                )
+                            };
+                            if cleanup.is_ok() {
+                                mark_pending_launch_settled(&launch_owner, launch_id);
+                            }
                         }
-                        #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
-                        retire_unpublished_worker_synchronously(worker);
+                        Err(_) => mark_pending_launch_settled(&launch_owner, launch_id),
                     }
                     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                     if let Some(diagnostic_probe) = &diagnostic_probe {
@@ -6540,20 +6738,57 @@ impl ProcessWorkerSupervisor {
                 if let Some(diagnostic_probe) = &diagnostic_probe {
                     diagnostic_probe.launch_finished();
                 }
-                if let Err(send_error) = result_tx.send(result)
-                    && let Ok(worker) = send_error.0
-                {
-                    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-                    if let Some(diagnostic_probe) = &diagnostic_probe {
-                        let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
-                    } else {
-                        retire_unpublished_worker_synchronously(worker);
+                match result {
+                    Ok(worker) => {
+                        #[cfg(test)]
+                        if let Some(sender_ready) = &sender_ready {
+                            let _ = sender_ready.send(());
+                        }
+                        let sent = result_tx.send(Ok(worker));
+                        #[cfg(test)]
+                        if let Some(sender_finished) = &sender_finished {
+                            let _ = sender_finished.send(());
+                        }
+                        if let Err(send_error) = sent {
+                            let worker = send_error
+                                .0
+                                .expect("successful launch send failure retains its worker");
+                            let cleanup = {
+                                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+                                if let Some(diagnostic_probe) = &diagnostic_probe {
+                                    retire_unpublished_diagnostic_worker_tracked(
+                                        worker,
+                                        diagnostic_probe,
+                                        &thread_launch_receipt,
+                                    )
+                                } else {
+                                    retire_unpublished_worker_synchronously(
+                                        worker,
+                                        &thread_launch_receipt,
+                                    )
+                                }
+                                #[cfg(not(all(
+                                    windows,
+                                    feature = "windows-gpu-capture-observation"
+                                )))]
+                                retire_unpublished_worker_synchronously(
+                                    worker,
+                                    &thread_launch_receipt,
+                                )
+                            };
+                            if cleanup.is_ok() {
+                                mark_pending_launch_settled(&launch_owner, launch_id);
+                            }
+                        }
                     }
-                    #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
-                    retire_unpublished_worker_synchronously(worker);
+                    Err(error) => {
+                        mark_pending_launch_settled(&launch_owner, launch_id);
+                        let _ = result_tx.send(Err(error));
+                    }
                 }
             })
             .map_err(|error| {
+                mark_pending_launch_settled(&launch_owner_on_spawn_failure, launch_id);
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                 if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
                     diagnostic_probe.launch_finished();
@@ -6561,11 +6796,29 @@ impl ProcessWorkerSupervisor {
                 anyhow!("could not start bounded process worker launcher: {error}")
             })?;
 
+        #[cfg(test)]
+        if let Some(handoff_gate) = handoff_gate {
+            handoff_gate
+                .receiver_reached
+                .send(())
+                .map_err(|_| anyhow!("process worker launch receiver gate disconnected"))?;
+            handoff_gate
+                .receiver_release
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| anyhow!("process worker launch receiver gate timed out"))?;
+        }
+
         loop {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-                if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
-                    await_diagnostic_launch_cleanup(&result_rx, diagnostic_probe);
+                if let Some(diagnostic_probe) = &self.inner.diagnostic_probe
+                    && await_diagnostic_launch_cleanup(
+                        &result_rx,
+                        diagnostic_probe,
+                        Some(&launch_receipt),
+                    )
+                {
+                    mark_pending_launch_settled(&Arc::downgrade(&self.inner), launch_id);
                 }
                 bail!("Silero VAD acquisition was cancelled");
             }
@@ -6573,8 +6826,14 @@ impl ProcessWorkerSupervisor {
                 Ok(remaining) => remaining,
                 Err(error) => {
                     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-                    if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
-                        await_diagnostic_launch_cleanup(&result_rx, diagnostic_probe);
+                    if let Some(diagnostic_probe) = &self.inner.diagnostic_probe
+                        && await_diagnostic_launch_cleanup(
+                            &result_rx,
+                            diagnostic_probe,
+                            Some(&launch_receipt),
+                        )
+                    {
+                        mark_pending_launch_settled(&Arc::downgrade(&self.inner), launch_id);
                     }
                     return Err(error);
                 }
@@ -6585,26 +6844,68 @@ impl ProcessWorkerSupervisor {
                     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
-                            let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+                            if retire_unpublished_diagnostic_worker_tracked(
+                                worker,
+                                diagnostic_probe,
+                                &launch_receipt,
+                            )
+                            .is_ok()
+                            {
+                                mark_pending_launch_settled(
+                                    &Arc::downgrade(&self.inner),
+                                    launch_id,
+                                );
+                            }
                         } else {
-                            retire_unpublished_worker(worker);
+                            retire_unpublished_worker(
+                                worker,
+                                Arc::downgrade(&self.inner),
+                                launch_id,
+                                Arc::clone(&launch_receipt),
+                            )?;
                         }
                         #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
-                        retire_unpublished_worker(worker);
+                        retire_unpublished_worker(
+                            worker,
+                            Arc::downgrade(&self.inner),
+                            launch_id,
+                            Arc::clone(&launch_receipt),
+                        )?;
                         bail!("Silero VAD acquisition was cancelled");
                     }
                     if let Err(error) = deadline.remaining() {
                         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
-                            let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+                            if retire_unpublished_diagnostic_worker_tracked(
+                                worker,
+                                diagnostic_probe,
+                                &launch_receipt,
+                            )
+                            .is_ok()
+                            {
+                                mark_pending_launch_settled(
+                                    &Arc::downgrade(&self.inner),
+                                    launch_id,
+                                );
+                            }
                         } else {
-                            retire_unpublished_worker(worker);
+                            retire_unpublished_worker(
+                                worker,
+                                Arc::downgrade(&self.inner),
+                                launch_id,
+                                Arc::clone(&launch_receipt),
+                            )?;
                         }
                         #[cfg(not(all(windows, feature = "windows-gpu-capture-observation")))]
-                        retire_unpublished_worker(worker);
+                        retire_unpublished_worker(
+                            worker,
+                            Arc::downgrade(&self.inner),
+                            launch_id,
+                            Arc::clone(&launch_receipt),
+                        )?;
                         return Err(error);
                     }
-                    return Ok(worker);
+                    return Ok((worker, launch_id));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -7396,6 +7697,42 @@ impl ProcessWorkerSupervisor {
     }
 
     fn invalidate_generation(&self, generation: u64, reason: &str, force_kill: bool) -> Result<()> {
+        self.invalidate_generation_before(generation, reason, force_kill, None)
+    }
+
+    fn retirement_join_wait_budget(
+        &self,
+        join_deadline: Option<MonotonicDeadline>,
+    ) -> Result<Duration> {
+        #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+        if let Some(probe) = &self.inner.diagnostic_probe {
+            let wait_deadline = match join_deadline {
+                Some(deadline) if deadline.expires_at <= probe.cleanup_deadline.expires_at => {
+                    deadline
+                }
+                _ => probe.cleanup_deadline,
+            };
+            #[cfg(test)]
+            if let Ok(observer) = self.inner.retirement_wait_observer.lock()
+                && let Some(observer) = observer.as_ref()
+            {
+                let _ = observer.send(wait_deadline);
+            }
+            return wait_deadline.remaining();
+        }
+        match join_deadline {
+            Some(deadline) => deadline.remaining(),
+            None => Ok(self.inner.deadlines.cancel),
+        }
+    }
+
+    fn invalidate_generation_before(
+        &self,
+        generation: u64,
+        reason: &str,
+        force_kill: bool,
+        join_deadline: Option<MonotonicDeadline>,
+    ) -> Result<()> {
         let (process, progress) = {
             let mut state = self
                 .inner
@@ -7408,7 +7745,7 @@ impl ProcessWorkerSupervisor {
                     if !state.retiring_generations.contains_key(&generation) {
                         return Ok(());
                     }
-                    let wait_budget = self.inner.deadlines.cancel;
+                    let wait_budget = self.retirement_join_wait_budget(join_deadline)?;
                     let (next_state, timeout) = self
                         .inner
                         .retirement_changed
@@ -7437,12 +7774,7 @@ impl ProcessWorkerSupervisor {
                     entry.insert(Arc::clone(&progress));
                     break (process, progress);
                 }
-                let wait_budget = self.inner.deadlines.cancel;
-                #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
-                let wait_budget = match &self.inner.diagnostic_probe {
-                    Some(probe) => probe.cleanup_deadline.remaining()?,
-                    None => wait_budget,
-                };
+                let wait_budget = self.retirement_join_wait_budget(join_deadline)?;
                 let (next_state, timeout) = self
                     .inner
                     .retirement_changed
@@ -8136,7 +8468,12 @@ fn expect_ok(response: Control) -> Result<()> {
     }
 }
 
-fn retire_unpublished_worker(worker: SpawnedWorker) {
+fn retire_unpublished_worker(
+    worker: SpawnedWorker,
+    owner: Weak<SupervisorInner>,
+    launch_id: u64,
+    receipt: Arc<PendingLaunchCleanup>,
+) -> Result<()> {
     let SpawnedWorker {
         stdin,
         stdout,
@@ -8145,15 +8482,21 @@ fn retire_unpublished_worker(worker: SpawnedWorker) {
     } = worker;
     drop(stdin);
     drop(stdout);
+    receipt.retain_process(Arc::clone(&process))?;
+    if !receipt.try_claim_cleanup() {
+        bail!("unpublished process worker launch cleanup is already in progress");
+    }
     if let Err(error) = process.terminate() {
-        eprintln!("could not terminate late process worker launch: {error:#}");
+        receipt.release_cleanup_claim();
+        return Err(error).context("could not terminate unpublished process worker launch");
     }
-    if let Err(error) = reap_process(process, 0, None, Arc::new(RetirementReapProgress::new())) {
-        eprintln!("could not reap late process worker launch: {error:#}");
-    }
+    begin_pending_launch_reap(process, owner, launch_id, receipt)
 }
 
-fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
+fn retire_unpublished_worker_synchronously(
+    worker: SpawnedWorker,
+    receipt: &PendingLaunchCleanup,
+) -> Result<()> {
     let SpawnedWorker {
         stdin,
         stdout,
@@ -8162,12 +8505,22 @@ fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
     } = worker;
     drop(stdin);
     drop(stdout);
+    receipt.retain_process(Arc::clone(&process))?;
+    if !receipt.try_claim_cleanup() {
+        bail!("late process worker launch cleanup is already in progress");
+    }
     if let Err(error) = process.terminate() {
-        eprintln!("could not terminate late process worker launch: {error:#}");
+        receipt.release_cleanup_claim();
+        return Err(error).context("could not terminate late process worker launch");
     }
-    if let Err(error) = process.wait() {
-        eprintln!("could not reap late process worker launch: {error:#}");
+    let result = wait_for_retirement_reap(&receipt.progress, || {
+        process.wait_for_retirement(&receipt.progress)
+    })
+    .context("could not reap late process worker launch");
+    if result.is_err() {
+        receipt.release_cleanup_claim();
     }
+    result
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -8191,16 +8544,87 @@ fn retire_unpublished_diagnostic_worker(
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+fn retire_unpublished_diagnostic_worker_tracked(
+    worker: SpawnedWorker,
+    diagnostic_probe: &DiagnosticProbeState,
+    receipt: &PendingLaunchCleanup,
+) -> Result<()> {
+    receipt.retain_process(Arc::clone(&worker.process))?;
+    if !receipt.try_claim_cleanup() {
+        bail!("diagnostic process worker launch cleanup is already in progress");
+    }
+    let result = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+    if result.is_err() {
+        receipt.release_cleanup_claim();
+    }
+    result
+}
+
+#[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 fn await_diagnostic_launch_cleanup(
     result: &Receiver<Result<SpawnedWorker>>,
     diagnostic_probe: &DiagnosticProbeState,
-) {
+    receipt: Option<&PendingLaunchCleanup>,
+) -> bool {
     let Ok(remaining) = diagnostic_probe.cleanup_deadline.remaining() else {
+        return false;
+    };
+    match result.recv_timeout(remaining) {
+        Ok(Ok(worker)) => match receipt {
+            Some(receipt) => {
+                retire_unpublished_diagnostic_worker_tracked(worker, diagnostic_probe, receipt)
+                    .is_ok()
+            }
+            None => retire_unpublished_diagnostic_worker(worker, diagnostic_probe).is_ok(),
+        },
+        Ok(Err(_)) => true,
+        Err(_) => false,
+    }
+}
+
+fn mark_pending_launch_settled(owner: &Weak<SupervisorInner>, launch_id: u64) {
+    let Some(inner) = owner.upgrade() else {
         return;
     };
-    if let Ok(Ok(worker)) = result.recv_timeout(remaining) {
-        let _ = retire_unpublished_diagnostic_worker(worker, diagnostic_probe);
+    if let Ok(mut state) = inner.state.lock() {
+        let _ = state.pending_launches.remove(&launch_id);
     }
+    inner.retirement_changed.notify_all();
+}
+
+fn begin_pending_launch_reap(
+    process: Arc<dyn WorkerProcess>,
+    owner: Weak<SupervisorInner>,
+    launch_id: u64,
+    receipt: Arc<PendingLaunchCleanup>,
+) -> Result<()> {
+    let reaper_process = Arc::clone(&process);
+    let reaper_owner = owner.clone();
+    let reaper_receipt = Arc::clone(&receipt);
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!(
+            "scribe-process-worker-pending-launch-reaper-{launch_id}"
+        ))
+        .spawn(move || {
+            match wait_for_retirement_reap(&reaper_receipt.progress, || {
+                reaper_process.wait_for_retirement(&reaper_receipt.progress)
+            }) {
+                Ok(()) => mark_pending_launch_settled(&reaper_owner, launch_id),
+                Err(error) => {
+                    reaper_receipt.release_cleanup_claim();
+                    eprintln!(
+                        "unpublished process worker launch {launch_id} reaper failed: {error:#}"
+                    );
+                }
+            }
+        })
+    {
+        receipt.release_cleanup_claim();
+        return Err(anyhow!(
+            "could not start unpublished process worker launch {launch_id} reaper: {error}"
+        ));
+    }
+    Ok(())
 }
 
 fn mark_retirement_settled(owner: &Weak<SupervisorInner>, generation: u64) {
@@ -9172,6 +9596,12 @@ impl InferenceWorkerSupervisor {
             .map_err(worker_unavailable)
     }
 
+    fn retire_before(&self, deadline: MonotonicDeadline) -> Result<(), RuntimeError> {
+        self.transport
+            .terminate_current_before(Some(deadline))
+            .map_err(worker_unavailable)
+    }
+
     fn await_retirement_before_provider_discovery(
         &self,
         deadline: MonotonicDeadline,
@@ -9356,6 +9786,7 @@ pub(crate) struct CaptureObservationWorker {
     supervisor: InferenceWorkerSupervisor,
     pub(crate) gpu_identity: Option<GpuCaptureObservationIdentity>,
     affinity: Option<Arc<CaptureWorkerAffinity>>,
+    provider_probe_cleanup: Arc<ProviderProbeCleanupFence>,
 }
 
 /// Caller-supplied denial constraints, not executable or signing authority.
@@ -9521,6 +9952,7 @@ pub(crate) struct CaptureObservationWorkerFactory {
     gpu_identity: Option<GpuCaptureObservationIdentity>,
     pins: Option<Arc<CaptureFrozenInputs>>,
     affinity: Option<Arc<CaptureWorkerAffinity>>,
+    provider_probe_cleanup: Arc<ProviderProbeCleanupFence>,
 }
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -9531,6 +9963,7 @@ impl CaptureObservationWorkerFactory {
             gpu_identity: None,
             pins,
             affinity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         }
     }
 
@@ -9583,6 +10016,7 @@ impl CaptureObservationWorkerFactory {
         } else {
             None
         };
+        let provider_probe_cleanup = production_provider_probe_cleanup_fence();
         let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
         let registry = if let Some(pins) = &pins {
             // Reject other packs before even a provider-discovery worker starts.
@@ -9608,7 +10042,12 @@ impl CaptureObservationWorkerFactory {
                 },
             );
             let mut allowance = ProviderDiscoveryAllowance::production();
-            discover_pack_launch_bindings_with_budget(probes, diagnostics, &mut allowance)
+            discover_pack_launch_bindings_with_budget(
+                probes,
+                diagnostics,
+                &mut allowance,
+                &provider_probe_cleanup,
+            )?
         } else {
             let mut discovery = discovery;
             discovery.leases.retain(|lease| {
@@ -9619,7 +10058,12 @@ impl CaptureObservationWorkerFactory {
                         | (PackBackend::Metal, BackendKind::Metal)
                 )
             });
-            discover_production_pack_launch_bindings(discovery, Duration::ZERO).registry
+            discover_production_pack_launch_bindings(
+                discovery,
+                Duration::ZERO,
+                &provider_probe_cleanup,
+            )?
+            .registry
         };
         drop(cpu_admission);
         let (bindings, _) = registry.into_parts();
@@ -9690,6 +10134,7 @@ impl CaptureObservationWorkerFactory {
             gpu_identity: Some(identity),
             pins,
             affinity,
+            provider_probe_cleanup,
         })
     }
 
@@ -9718,6 +10163,7 @@ impl CaptureObservationWorkerFactory {
             supervisor: Self::supervisor(self.launcher()),
             gpu_identity: self.gpu_identity.clone(),
             affinity: self.affinity.clone(),
+            provider_probe_cleanup: Arc::clone(&self.provider_probe_cleanup),
         }
     }
 
@@ -9728,7 +10174,22 @@ impl CaptureObservationWorkerFactory {
 
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 impl CaptureObservationWorker {
+    fn settle_provider_probe_cleanup(&self) -> Result<()> {
+        let deadline = MonotonicDeadline::after_for(
+            self.supervisor
+                .transport
+                .inner
+                .deadlines
+                .replacement_retirement,
+            "GPU provider cleanup before capture worker launch",
+        )?;
+        self.provider_probe_cleanup
+            .settle_before(deadline)
+            .map_err(anyhow::Error::new)
+    }
+
     pub(crate) fn prepare_observation(&self) -> Result<WorkerObservationLease> {
+        self.settle_provider_probe_cleanup()?;
         let lease = self.supervisor.transport.observation_lease()?;
         self.validate_affinity_retained(&lease)?;
         Ok(lease)
@@ -9763,6 +10224,7 @@ impl CaptureObservationWorker {
         if self.affinity.is_some() {
             bail!("capture affinity negotiation requires its retained preflight lease");
         }
+        self.settle_provider_probe_cleanup()?;
         self.supervisor
             .negotiate_runtime_observation()
             .map_err(anyhow::Error::new)
@@ -9807,6 +10269,7 @@ impl CaptureObservationWorker {
         if self.affinity.is_some() {
             bail!("capture affinity transcription requires its retained preflight lease");
         }
+        self.settle_provider_probe_cleanup()?;
         self.supervisor
             .transcribe_with_runtime_observation(
                 artifact,
@@ -10559,9 +11022,270 @@ pub(crate) struct InferenceWorkerRegistry {
     gpu_health_path: Option<Arc<PathBuf>>,
     active_route: Arc<Mutex<Option<ActiveInferenceRoute>>>,
     retiring_workers: Arc<Mutex<Vec<InferenceWorkerSupervisor>>>,
+    provider_probe_cleanup: Arc<ProviderProbeCleanupFence>,
     route_execution: Arc<Mutex<()>>,
     #[cfg(test)]
     gpu_routes_for_testing: Option<VerifiedGpuRouteCatalog>,
+}
+
+#[derive(Default)]
+struct ProviderProbeCleanupFence {
+    admission: Mutex<bool>,
+    admission_changed: Condvar,
+    supervisors: Mutex<Vec<InferenceWorkerSupervisor>>,
+    #[cfg(test)]
+    confirmed_cleanup_gate: Mutex<Option<ConfirmedProviderCleanupGate>>,
+}
+
+#[cfg(test)]
+struct ConfirmedProviderCleanupGate {
+    reached: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+struct ProviderProbeAdmission<'a> {
+    fence: &'a ProviderProbeCleanupFence,
+}
+
+enum ProviderProbeAdmissionFailure {
+    Deadline,
+    Fatal(RuntimeError),
+}
+
+impl Drop for ProviderProbeAdmission<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut admitted) = self.fence.admission.lock() {
+            *admitted = false;
+        }
+        self.fence.admission_changed.notify_one();
+    }
+}
+
+impl ProviderProbeCleanupFence {
+    #[cfg(test)]
+    fn gate_confirmed_cleanup_for_test(&self, gate: ConfirmedProviderCleanupGate) {
+        *self.confirmed_cleanup_gate.lock().unwrap() = Some(gate);
+    }
+
+    fn acquire_before(
+        &self,
+        deadline: MonotonicDeadline,
+    ) -> Result<ProviderProbeAdmission<'_>, ProviderProbeAdmissionFailure> {
+        let mut admitted = self.admission.lock().map_err(|_| {
+            ProviderProbeAdmissionFailure::Fatal(RuntimeError::WorkerUnavailable(
+                "GPU provider cleanup admission lock poisoned".to_owned(),
+            ))
+        })?;
+        while *admitted {
+            let remaining = deadline
+                .remaining()
+                .map_err(|_| self.admission_deadline_failure())?;
+            let (next, timeout) = self
+                .admission_changed
+                .wait_timeout(admitted, remaining)
+                .map_err(|_| {
+                    ProviderProbeAdmissionFailure::Fatal(RuntimeError::WorkerUnavailable(
+                        "GPU provider cleanup admission lock poisoned".to_owned(),
+                    ))
+                })?;
+            admitted = next;
+            if timeout.timed_out() && *admitted {
+                return Err(self.admission_deadline_failure());
+            }
+        }
+        deadline
+            .remaining()
+            .map_err(|_| self.admission_deadline_failure())?;
+        *admitted = true;
+        drop(admitted);
+        Ok(ProviderProbeAdmission { fence: self })
+    }
+
+    fn admission_deadline_failure(&self) -> ProviderProbeAdmissionFailure {
+        let supervisors = match self.supervisors.lock() {
+            Ok(supervisors) => supervisors.clone(),
+            Err(_) => {
+                return ProviderProbeAdmissionFailure::Fatal(RuntimeError::WorkerUnavailable(
+                    "GPU provider cleanup owner registry lock poisoned".to_owned(),
+                ));
+            }
+        };
+        for supervisor in supervisors {
+            match Self::cleanup_confirmed(&supervisor) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ProviderProbeAdmissionFailure::Fatal(Self::fatal_cleanup_error());
+                }
+                Err(error) => return ProviderProbeAdmissionFailure::Fatal(error),
+            }
+        }
+        ProviderProbeAdmissionFailure::Deadline
+    }
+
+    fn track(&self, supervisor: &InferenceWorkerSupervisor) -> Result<(), RuntimeError> {
+        let mut supervisors = self.supervisors.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable(
+                "GPU provider cleanup owner registry lock poisoned".to_owned(),
+            )
+        })?;
+        if !supervisors
+            .iter()
+            .any(|tracked| Arc::ptr_eq(&tracked.transport.inner, &supervisor.transport.inner))
+        {
+            if !supervisors.is_empty() {
+                return Err(Self::fatal_cleanup_error());
+            }
+            supervisors.push(supervisor.clone());
+        }
+        Ok(())
+    }
+
+    fn remove_confirmed(&self, supervisor: &InferenceWorkerSupervisor) -> Result<(), RuntimeError> {
+        self.supervisors
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable(
+                    "GPU provider cleanup owner registry lock poisoned".to_owned(),
+                )
+            })?
+            .retain(|tracked| !Arc::ptr_eq(&tracked.transport.inner, &supervisor.transport.inner));
+        Ok(())
+    }
+
+    fn cleanup_confirmed(supervisor: &InferenceWorkerSupervisor) -> Result<bool, RuntimeError> {
+        supervisor
+            .transport
+            .inner
+            .state
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable(
+                    "GPU provider cleanup supervisor state lock poisoned".to_owned(),
+                )
+            })
+            .map(|state| {
+                state.current.is_none()
+                    && state.retiring_generations.is_empty()
+                    && state.pending_launches.is_empty()
+            })
+    }
+
+    fn fatal_cleanup_error() -> RuntimeError {
+        RuntimeError::WorkerUnavailable(
+            "GPU provider probe cleanup was not confirmed; all worker launches remain fenced"
+                .to_owned(),
+        )
+    }
+
+    fn settle_tracked_locked(&self, deadline: MonotonicDeadline) -> Result<bool, RuntimeError> {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable(
+                    "GPU provider cleanup owner registry lock poisoned".to_owned(),
+                )
+            })?
+            .clone();
+        let mut failed = false;
+        for supervisor in supervisors {
+            let retirement = supervisor.retire_before(deadline);
+            let settlement = supervisor.await_retirement_before_provider_discovery(deadline);
+            let confirmed =
+                retirement.is_ok() && settlement.is_ok() && Self::cleanup_confirmed(&supervisor)?;
+            if confirmed {
+                self.remove_confirmed(&supervisor)?;
+            }
+            if !confirmed {
+                failed = true;
+            }
+        }
+        if failed {
+            return Err(Self::fatal_cleanup_error());
+        }
+        Ok(deadline.remaining().is_ok())
+    }
+
+    fn settle_before(&self, deadline: MonotonicDeadline) -> Result<(), RuntimeError> {
+        let _admission = match self.acquire_before(deadline) {
+            Ok(admission) => admission,
+            Err(ProviderProbeAdmissionFailure::Deadline) => {
+                return Err(RuntimeError::WorkerUnavailable(
+                    "GPU provider cleanup admission deadline expired after cleanup was confirmed"
+                        .to_owned(),
+                ));
+            }
+            Err(ProviderProbeAdmissionFailure::Fatal(error)) => return Err(error),
+        };
+        if self.settle_tracked_locked(deadline)? {
+            Ok(())
+        } else {
+            Err(RuntimeError::WorkerUnavailable(
+                "GPU provider cleanup was confirmed after the worker launch deadline expired"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    fn run_probe<T>(
+        &self,
+        supervisor: &InferenceWorkerSupervisor,
+        deadline: MonotonicDeadline,
+        probe: impl FnOnce() -> Result<T>,
+    ) -> Result<Result<T>, RuntimeError> {
+        let _admission = match self.acquire_before(deadline) {
+            Ok(admission) => admission,
+            Err(ProviderProbeAdmissionFailure::Deadline) => {
+                return Ok(Err(anyhow!(
+                    "GPU provider discovery admission deadline expired after cleanup was confirmed"
+                )));
+            }
+            Err(ProviderProbeAdmissionFailure::Fatal(error)) => return Err(error),
+        };
+        if !self.settle_tracked_locked(deadline)? {
+            return Ok(Err(anyhow!(
+                "GPU provider discovery deadline expired after prior cleanup was confirmed"
+            )));
+        }
+        self.track(supervisor)?;
+        let observed = probe();
+        let retirement = supervisor.retire_before(deadline);
+        let settlement = supervisor.await_retirement_before_provider_discovery(deadline);
+        let confirmed =
+            retirement.is_ok() && settlement.is_ok() && Self::cleanup_confirmed(supervisor)?;
+        if confirmed {
+            self.remove_confirmed(supervisor)?;
+        }
+        if !confirmed {
+            return Err(Self::fatal_cleanup_error());
+        }
+        #[cfg(test)]
+        let confirmed_cleanup_gate = self.confirmed_cleanup_gate.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(gate) = confirmed_cleanup_gate {
+            gate.reached.send(()).unwrap();
+            gate.release
+                .recv_timeout(Duration::from_secs(1))
+                .expect("confirmed provider cleanup test gate timed out");
+        }
+        match deadline.remaining() {
+            Ok(_) => Ok(observed),
+            Err(error) => Ok(Err(error.context(
+                "GPU provider discovery deadline expired after cleanup was confirmed",
+            ))),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn production_provider_probe_cleanup_fence() -> Arc<ProviderProbeCleanupFence> {
+    static FENCE: std::sync::OnceLock<Arc<ProviderProbeCleanupFence>> = std::sync::OnceLock::new();
+    Arc::clone(FENCE.get_or_init(|| Arc::new(ProviderProbeCleanupFence::default())))
+}
+
+#[cfg(test)]
+fn production_provider_probe_cleanup_fence() -> Arc<ProviderProbeCleanupFence> {
+    Arc::new(ProviderProbeCleanupFence::default())
 }
 
 struct PendingPackProbe {
@@ -10666,7 +11390,8 @@ fn discover_pack_launch_bindings_with_budget(
     probes: Vec<PendingPackProbe>,
     mut diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
     allowance: &mut ProviderDiscoveryAllowance,
-) -> crate::gpu_worker_pack::ProductionPackRegistry {
+    cleanup: &ProviderProbeCleanupFence,
+) -> Result<crate::gpu_worker_pack::ProductionPackRegistry, RuntimeError> {
     use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
 
     if !allowance.can_probe() {
@@ -10677,8 +11402,9 @@ fn discover_pack_launch_bindings_with_budget(
                 probe.backend,
             )
         }));
-        return crate::gpu_worker_pack::ProductionPackRegistry::empty()
-            .with_diagnostics(diagnostics);
+        return Ok(
+            crate::gpu_worker_pack::ProductionPackRegistry::empty().with_diagnostics(diagnostics)
+        );
     }
     let started = Instant::now();
     let deadline =
@@ -10688,66 +11414,67 @@ fn discover_pack_launch_bindings_with_budget(
                 diagnostics.push(PackDiscoveryDiagnostic::catalog(
                     PackDiscoveryIssue::ProviderProbeRejected,
                 ));
-                return crate::gpu_worker_pack::ProductionPackRegistry::empty()
-                    .with_diagnostics(diagnostics);
+                return Ok(crate::gpu_worker_pack::ProductionPackRegistry::empty()
+                    .with_diagnostics(diagnostics));
             }
         };
-    let mut bindings = Vec::new();
-    for probe in probes {
-        if allowance.remaining_probes == 0 {
-            diagnostics.push(PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::ProviderProbeRejected,
-                &probe.pack_id,
-                probe.backend,
-            ));
-            continue;
-        }
-        allowance.remaining_probes -= 1;
-        if deadline.remaining().is_err() {
-            diagnostics.push(PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::ProviderProbeRejected,
-                &probe.pack_id,
-                probe.backend,
-            ));
-            continue;
-        }
-        match probe.supervisor.verified_pack_bindings_before(deadline) {
-            Ok(observed) => {
-                for binding in observed {
-                    if binding.backend_target().driver_version.is_none() {
-                        diagnostics.push(PackDiscoveryDiagnostic::pack(
-                            PackDiscoveryIssue::DriverVersionUnavailable,
-                            &probe.pack_id,
-                            probe.backend,
-                        ));
-                    } else {
-                        bindings.push(binding);
+    let result = (|| {
+        let mut bindings = Vec::new();
+        for probe in probes {
+            if allowance.remaining_probes == 0 {
+                diagnostics.push(PackDiscoveryDiagnostic::pack(
+                    PackDiscoveryIssue::ProviderProbeRejected,
+                    &probe.pack_id,
+                    probe.backend,
+                ));
+                continue;
+            }
+            allowance.remaining_probes -= 1;
+            if deadline.remaining().is_err() {
+                diagnostics.push(PackDiscoveryDiagnostic::pack(
+                    PackDiscoveryIssue::ProviderProbeRejected,
+                    &probe.pack_id,
+                    probe.backend,
+                ));
+                continue;
+            }
+            match cleanup.run_probe(&probe.supervisor, deadline, || {
+                probe.supervisor.verified_pack_bindings_before(deadline)
+            })? {
+                Ok(observed) => {
+                    for binding in observed {
+                        if binding.backend_target().driver_version.is_none() {
+                            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                                PackDiscoveryIssue::DriverVersionUnavailable,
+                                &probe.pack_id,
+                                probe.backend,
+                            ));
+                        } else {
+                            bindings.push(binding);
+                        }
                     }
                 }
+                Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
+                    PackDiscoveryIssue::ProviderProbeRejected,
+                    &probe.pack_id,
+                    probe.backend,
+                )),
             }
-            Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::ProviderProbeRejected,
-                &probe.pack_id,
-                probe.backend,
-            )),
         }
-        if probe.supervisor.retire().is_err() {
-            diagnostics.push(PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::ProviderProbeRejected,
-                &probe.pack_id,
-                probe.backend,
-            ));
-        }
-    }
+        Ok(
+            crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
+                .with_diagnostics(diagnostics),
+        )
+    })();
     allowance.charge(started.elapsed());
-    crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
-        .with_diagnostics(diagnostics)
+    result
 }
 
 fn discover_production_pack_launch_bindings(
     discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
     prior_active_charge: Duration,
-) -> StagedProductionPackRegistry {
+    cleanup: &ProviderProbeCleanupFence,
+) -> Result<StagedProductionPackRegistry, RuntimeError> {
     let (mut diagnostics, mut stages) = priority_pack_discovery_stages(discovery);
     let mut allowance = ProviderDiscoveryAllowance::production();
     allowance.charge(prior_active_charge);
@@ -10763,29 +11490,34 @@ fn discover_production_pack_launch_bindings(
             InferenceWorkerSupervisor::for_pack_probe,
         );
         diagnostics.extend(stage_diagnostics);
-        let registry =
-            discover_pack_launch_bindings_with_budget(probes, diagnostics, &mut allowance);
+        let registry = discover_pack_launch_bindings_with_budget(
+            probes,
+            diagnostics,
+            &mut allowance,
+            cleanup,
+        )?;
         if !registry.is_empty() {
-            return StagedProductionPackRegistry {
+            return Ok(StagedProductionPackRegistry {
                 registry,
                 deferred: (!stages.is_empty())
                     .then_some(DeferredPackDiscovery { stages, allowance }),
-            };
+            });
         }
         let (bindings, observed_diagnostics) = registry.into_parts();
         debug_assert!(bindings.is_empty());
         diagnostics = observed_diagnostics;
     }
-    StagedProductionPackRegistry {
+    Ok(StagedProductionPackRegistry {
         registry: crate::gpu_worker_pack::ProductionPackRegistry::empty()
             .with_diagnostics(diagnostics),
         deferred: (!stages.is_empty()).then_some(DeferredPackDiscovery { stages, allowance }),
-    }
+    })
 }
 
 fn discover_next_deferred_pack_launch_bindings(
     deferred: &mut DeferredPackDiscovery,
-) -> crate::gpu_worker_pack::ProductionPackRegistry {
+    cleanup: &ProviderProbeCleanupFence,
+) -> Result<crate::gpu_worker_pack::ProductionPackRegistry, RuntimeError> {
     let mut diagnostics = Vec::new();
     while let Some(stage) = deferred.stages.pop_front() {
         if !deferred.allowance.can_probe() {
@@ -10799,16 +11531,20 @@ fn discover_next_deferred_pack_launch_bindings(
             InferenceWorkerSupervisor::for_pack_probe,
         );
         diagnostics.extend(stage_diagnostics);
-        let registry =
-            discover_pack_launch_bindings_with_budget(probes, diagnostics, &mut deferred.allowance);
+        let registry = discover_pack_launch_bindings_with_budget(
+            probes,
+            diagnostics,
+            &mut deferred.allowance,
+            cleanup,
+        )?;
         if !registry.is_empty() {
-            return registry;
+            return Ok(registry);
         }
         let (bindings, observed_diagnostics) = registry.into_parts();
         debug_assert!(bindings.is_empty());
         diagnostics = observed_diagnostics;
     }
-    crate::gpu_worker_pack::ProductionPackRegistry::empty().with_diagnostics(diagnostics)
+    Ok(crate::gpu_worker_pack::ProductionPackRegistry::empty().with_diagnostics(diagnostics))
 }
 
 fn prepare_pack_probes(
@@ -11628,7 +12364,8 @@ fn verified_gpu_route_catalog(
 
 fn materialize_next_gpu_route_catalog(
     mut deferred: DeferredGpuRouteDiscovery,
-) -> VerifiedGpuRouteCatalog {
+    cleanup: &ProviderProbeCleanupFence,
+) -> Result<VerifiedGpuRouteCatalog, RuntimeError> {
     if !deferred.packs.allowance.can_probe() {
         let mut diagnostics = Vec::new();
         diagnose_exhausted_pack_stages(&mut deferred.packs.stages, &mut diagnostics);
@@ -11647,7 +12384,7 @@ fn materialize_next_gpu_route_catalog(
         );
         catalog.device_set_digest = deferred.device_set_digest;
         catalog.model_digest = deferred.model_digest;
-        return catalog;
+        return Ok(catalog);
     }
     #[cfg(test)]
     if let Some(stage) = deferred.route_stages_for_testing.pop_front() {
@@ -11656,7 +12393,7 @@ fn materialize_next_gpu_route_catalog(
         let next = (!deferred.route_stages_for_testing.is_empty()
             || !deferred.packs.stages.is_empty())
         .then_some(deferred.clone());
-        return VerifiedGpuRouteCatalog {
+        return Ok(VerifiedGpuRouteCatalog {
             routes: Arc::new(routes),
             diagnostic: None,
             device_set_digest: deferred.device_set_digest,
@@ -11665,10 +12402,10 @@ fn materialize_next_gpu_route_catalog(
             provider_probe_incomplete: false,
             skipped_targets: Vec::new(),
             deferred_discovery: next,
-        };
+        });
     }
     let model_digest = deferred.model_digest.clone();
-    let registry = discover_next_deferred_pack_launch_bindings(&mut deferred.packs);
+    let registry = discover_next_deferred_pack_launch_bindings(&mut deferred.packs, cleanup)?;
     let staged = StagedProductionPackRegistry {
         registry,
         deferred: (!deferred.packs.stages.is_empty()).then_some(deferred.packs),
@@ -11683,7 +12420,7 @@ fn materialize_next_gpu_route_catalog(
         next.device_set_digest = deferred.device_set_digest;
         next.model_digest = model_digest;
     }
-    catalog
+    Ok(catalog)
 }
 
 fn bind_deferred_model(catalog: &mut VerifiedGpuRouteCatalog, model_digest: &str) {
@@ -12157,6 +12894,7 @@ impl InferenceWorkerRegistry {
             }),
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             #[cfg(test)]
             gpu_routes_for_testing: None,
@@ -12188,6 +12926,7 @@ impl InferenceWorkerRegistry {
             }),
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             #[cfg(test)]
             gpu_routes_for_testing: None,
@@ -12210,6 +12949,7 @@ impl InferenceWorkerRegistry {
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         }
@@ -12284,7 +13024,9 @@ impl InferenceWorkerRegistry {
                     .inner
                     .state
                     .lock()
-                    .map_or(true, |state| !state.retiring_generations.is_empty())
+                    .map_or(true, |state| {
+                        !state.retiring_generations.is_empty() || !state.pending_launches.is_empty()
+                    })
             });
         Ok(())
     }
@@ -12385,6 +13127,7 @@ impl InferenceWorkerRegistry {
     ) -> Result<(), RuntimeError> {
         let deadline = MonotonicDeadline::after_for(budget, "provider discovery worker retirement")
             .map_err(worker_unavailable)?;
+        self.provider_probe_cleanup.settle_before(deadline)?;
         let active = self
             .active_route
             .lock()
@@ -12496,6 +13239,9 @@ impl InferenceWorkerRegistry {
         )
         .map_err(worker_unavailable)
         .map_err(RoutePreparationError::Fatal)?;
+        self.provider_probe_cleanup
+            .settle_before(transition_deadline)
+            .map_err(RoutePreparationError::Fatal)?;
         self.settle_retiring_workers_before_route_launch(transition_deadline)
             .map_err(RoutePreparationError::Fatal)?;
         let identity = Self::route_identity(route);
@@ -12689,7 +13435,8 @@ impl InferenceWorkerRegistry {
         }
         let mut deferred = plan.deferred_discovery.take();
         while let Some(pending) = deferred.take() {
-            let raw_catalog = materialize_next_gpu_route_catalog(pending);
+            let raw_catalog =
+                materialize_next_gpu_route_catalog(pending, &self.provider_probe_cleanup)?;
             deferred = raw_catalog.deferred_discovery.clone();
             if preference == AccelerationPreference::Gpu {
                 self.gpu_routes
@@ -12982,7 +13729,8 @@ impl InferenceWorkerRegistry {
                         discover_production_pack_launch_bindings(
                             discovery,
                             retirement_started.elapsed(),
-                        ),
+                            &self.provider_probe_cleanup,
+                        )?,
                         discovery_fingerprint.clone(),
                     );
                     bind_deferred_model(&mut discovered, &model.expected_sha256);
@@ -13104,7 +13852,8 @@ impl InferenceWorkerRegistry {
                     discover_production_pack_launch_bindings(
                         lease_discovery,
                         retirement_started.elapsed(),
-                    ),
+                        &self.provider_probe_cleanup,
+                    )?,
                     discovery_fingerprint,
                 );
                 bind_deferred_model(&mut discovered, &model.expected_sha256);
@@ -13223,7 +13972,11 @@ impl InferenceWorkerRegistry {
         let retirement_started = Instant::now();
         self.retire_active_worker_before_provider_discovery(GPU_PROVIDER_DISCOVERY_BUDGET)?;
         let mut catalog = verified_gpu_route_catalog(
-            discover_production_pack_launch_bindings(discovery, retirement_started.elapsed()),
+            discover_production_pack_launch_bindings(
+                discovery,
+                retirement_started.elapsed(),
+                &self.provider_probe_cleanup,
+            )?,
             fingerprint,
         );
         // Exact retry authority names one backend and one retained target.
@@ -19504,8 +20257,14 @@ mod tests {
         assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
         // The provider deadline is created inside this call, after preparation.
         let mut allowance = ProviderDiscoveryAllowance::production();
-        let registry =
-            discover_pack_launch_bindings_with_budget(probes, diagnostics, &mut allowance);
+        let cleanup = ProviderProbeCleanupFence::default();
+        let registry = discover_pack_launch_bindings_with_budget(
+            probes,
+            diagnostics,
+            &mut allowance,
+            &cleanup,
+        )
+        .unwrap();
         let (bindings, diagnostics) = registry.into_parts();
         assert!(bindings.is_empty());
         assert_eq!(diagnostics.len(), 1);
@@ -20206,6 +20965,57 @@ mod tests {
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
+    fn diagnostic_duplicate_retirement_join_preserves_and_caps_the_cleanup_deadline() {
+        for supplied_join_deadline in [false, true] {
+            std::thread::scope(|scope| {
+                let cleanup_deadline = MonotonicDeadline::after_for(
+                    Duration::from_secs(5),
+                    "fixture diagnostic cleanup",
+                )
+                .unwrap();
+                let fixture = GatedDiagnosticRetirement::new(cleanup_deadline);
+                let retiring = fixture.transport.clone();
+                let reader =
+                    scope.spawn(move || retiring.invalidate_generation(1, "fixture EOF", false));
+                fixture.assert_cleanup_is_held();
+
+                let (observed_tx, observed_rx) = channel();
+                fixture
+                    .transport
+                    .observe_retirement_waits_for_test(observed_tx);
+                let join_deadline = supplied_join_deadline.then(|| {
+                    MonotonicDeadline::after_for(
+                        Duration::from_secs(1),
+                        "fixture provider retirement join",
+                    )
+                    .unwrap()
+                });
+                let joining = fixture.transport.clone();
+                let joined = scope.spawn(move || {
+                    joining.invalidate_generation_before(
+                        1,
+                        "fixture duplicate retirement",
+                        false,
+                        join_deadline,
+                    )
+                });
+                let observed = observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                match join_deadline {
+                    Some(deadline) => assert_eq!(observed.expires_at, deadline.expires_at),
+                    None => assert_eq!(observed.expires_at, cleanup_deadline.expires_at),
+                }
+
+                fixture.release.send(true).unwrap();
+                reader.join().unwrap().unwrap();
+                joined.join().unwrap().unwrap();
+                assert!(fixture.state.is_cleanup_confirmed());
+                assert_eq!(fixture.process.waits.load(Ordering::Acquire), 1);
+            });
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
     fn gpu_pack_probe_hung_hello_confirms_termination_without_replacement() {
         let (hello_started_tx, hello_started_rx) = channel();
         let (kill_started_tx, kill_started_rx) = channel();
@@ -20314,7 +21124,11 @@ mod tests {
         let (result_tx, result_rx) = sync_channel(1);
         result_tx.send(Ok(worker)).unwrap();
 
-        await_diagnostic_launch_cleanup(&result_rx, &diagnostic_probe);
+        assert!(await_diagnostic_launch_cleanup(
+            &result_rx,
+            &diagnostic_probe,
+            None,
+        ));
 
         kill_started_rx
             .recv_timeout(Duration::from_millis(200))
@@ -21459,6 +22273,7 @@ mod tests {
             remaining_active: Duration::from_secs(1),
             remaining_probes: 1,
         };
+        let cleanup = ProviderProbeCleanupFence::default();
         let first_registry = discover_pack_launch_bindings_with_budget(
             vec![probe(
                 PackBackend::Cuda,
@@ -21467,7 +22282,9 @@ mod tests {
             )],
             Vec::new(),
             &mut allowance,
-        );
+            &cleanup,
+        )
+        .unwrap();
         assert!(first_registry.is_empty());
         assert_eq!(allowance.remaining_probes, 0);
 
@@ -21479,7 +22296,9 @@ mod tests {
             )],
             Vec::new(),
             &mut allowance,
-        );
+            &cleanup,
+        )
+        .unwrap();
         assert!(deferred_registry.is_empty());
         assert_eq!(first.launch_attempts.load(Ordering::Acquire), 1);
         assert_eq!(deferred.launch_attempts.load(Ordering::Acquire), 0);
@@ -22300,7 +23119,9 @@ mod tests {
         );
         deferred.packs.allowance.remaining_active = Duration::ZERO;
 
-        let registry = discover_next_deferred_pack_launch_bindings(&mut deferred.packs);
+        let cleanup = ProviderProbeCleanupFence::default();
+        let registry =
+            discover_next_deferred_pack_launch_bindings(&mut deferred.packs, &cleanup).unwrap();
         let (bindings, diagnostics) = registry.into_parts();
 
         assert!(bindings.is_empty());
@@ -22940,6 +23761,7 @@ mod tests {
                 gpu_health_path: Some(Arc::clone(&path)),
                 active_route: Arc::new(Mutex::new(None)),
                 retiring_workers: Arc::new(Mutex::new(Vec::new())),
+                provider_probe_cleanup: production_provider_probe_cleanup_fence(),
                 route_execution: Arc::new(Mutex::new(())),
                 gpu_routes_for_testing: Some(catalog),
             };
@@ -23047,6 +23869,7 @@ mod tests {
             gpu_health_path: Some(Arc::clone(&path)),
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(catalog),
         };
@@ -23196,6 +24019,7 @@ mod tests {
             gpu_health_path: Some(Arc::clone(&path)),
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         };
@@ -25105,6 +25929,7 @@ mod tests {
                 gpu_health_path: None,
                 active_route: Arc::new(Mutex::new(None)),
                 retiring_workers: Arc::new(Mutex::new(Vec::new())),
+                provider_probe_cleanup: production_provider_probe_cleanup_fence(),
                 route_execution: Arc::new(Mutex::new(())),
                 gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                     device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
@@ -25252,6 +26077,7 @@ mod tests {
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                 device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
@@ -26783,9 +27609,17 @@ mod tests {
         let (hello_started_tx, hello_started_rx) = channel();
         let (kill_started_tx, kill_started_rx) = channel();
         let (reaped_tx, reaped_rx) = channel();
+        let (wait_started_tx, wait_started_rx) = channel();
+        let (wait_release_tx, wait_release_rx) = channel();
         let first_launcher = Arc::new(
-            TestLauncher::new([TestMode::BlockedHello {
-                started: hello_started_tx,
+            TestLauncher::new([TestMode::WithProcessWait {
+                mode: Box::new(TestMode::BlockedHello {
+                    started: hello_started_tx,
+                }),
+                wait: TestWaitMode::Gated {
+                    started: wait_started_tx,
+                    release: wait_release_rx,
+                },
             }])
             .with_process_events(kill_started_tx, reaped_tx),
         );
@@ -26825,8 +27659,9 @@ mod tests {
             remaining_active: budget,
             remaining_probes: MAX_GPU_PROVIDER_PROBES,
         };
-        let registry =
-            discover_pack_launch_bindings_with_budget(probes, Vec::new(), &mut allowance);
+        let cleanup = ProviderProbeCleanupFence::default();
+        let result =
+            discover_pack_launch_bindings_with_budget(probes, Vec::new(), &mut allowance, &cleanup);
 
         let elapsed = started_at.elapsed();
         assert!(elapsed >= budget);
@@ -26838,22 +27673,397 @@ mod tests {
         kill_started_rx
             .recv_timeout(Duration::from_millis(100))
             .unwrap();
-        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        wait_started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
         assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
         assert_eq!(second_launcher.launches.load(Ordering::Acquire), 0);
-        let (bindings, diagnostics) = registry.into_parts();
-        assert!(bindings.is_empty());
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| {
-                    diagnostic.issue
-                        == crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
-                })
-                .count(),
-            2,
-            "the timed-out active probe and skipped remaining probe are both diagnosed"
+        assert!(matches!(result, Err(RuntimeError::WorkerUnavailable(_))));
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+        wait_release_tx.send(()).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        cleanup
+            .settle_before(
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "provider cleanup after exhausted discovery budget",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_binding_and_concurrent_probe_wait_for_confirmed_cleanup() {
+        let spec = foreign_gpu_session_specs()[0];
+        let fixture = foreign_signed_gpu_session_fixture(spec);
+        let fixture_root = fixture.root.clone();
+        let (wait_started_tx, wait_started_rx) = channel();
+        let (wait_release_tx, wait_release_rx) = channel();
+        let first_launcher = Arc::new(
+            TestLauncher::new([TestMode::WithProcessWait {
+                mode: Box::new(TestMode::CompatibilityPack {
+                    local: Box::new(fixture.local.clone()),
+                    capability: fixture.capability.clone(),
+                    mutation: CompatibilityPackMutation::None,
+                    post_response: None,
+                }),
+                wait: TestWaitMode::Gated {
+                    started: wait_started_tx,
+                    release: wait_release_rx,
+                },
+            }])
+            .with_pack_launch(fixture.context.clone()),
         );
+        let first_supervisor = inference_supervisor_with_launcher(Arc::clone(&first_launcher));
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        first_supervisor
+            .transport
+            .observe_retirement_waits_for_test(retirement_wait_tx);
+        let first_probe = PendingPackProbe {
+            pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                fixture.context.expectation.pack_id.as_str(),
+            )
+            .unwrap(),
+            backend: spec.backend,
+            supervisor: first_supervisor,
+        };
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let first_cleanup = Arc::clone(&cleanup);
+        let first = std::thread::spawn(move || {
+            let mut allowance = ProviderDiscoveryAllowance {
+                remaining_active: Duration::from_secs(1),
+                remaining_probes: 1,
+            };
+            discover_pack_launch_bindings_with_budget(
+                vec![first_probe],
+                Vec::new(),
+                &mut allowance,
+                &first_cleanup,
+            )
+        });
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            !first.is_finished(),
+            "binding published before cleanup wait returned"
+        );
+
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let second = inference_supervisor_with_launcher(Arc::clone(&second_launcher));
+        let contended_deadline = MonotonicDeadline::after_for(
+            Duration::from_millis(40),
+            "contended provider probe cleanup",
+        )
+        .unwrap();
+        let contended = cleanup.run_probe(&second, contended_deadline, || {
+            second
+                .transport
+                .ensure_generation_before(Some(contended_deadline), None)
+                .map(|_| ())
+        });
+        assert!(matches!(contended, Err(RuntimeError::WorkerUnavailable(_))));
+        assert_eq!(second_launcher.launch_attempts.load(Ordering::Acquire), 0);
+
+        wait_release_tx.send(()).unwrap();
+        let first_registry = first.join().unwrap().unwrap();
+        let (bindings, _) = first_registry.into_parts();
+        assert_eq!(bindings.len(), 1);
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+
+        let later_deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "provider probe after confirmed cleanup",
+        )
+        .unwrap();
+        let later = cleanup.run_probe(&second, later_deadline, || {
+            second
+                .transport
+                .ensure_generation_before(Some(later_deadline), None)
+                .map(|_| ())
+        });
+        assert!(matches!(later, Ok(Err(_))));
+        assert_eq!(second_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+
+        drop(bindings);
+        drop(second);
+        drop(second_launcher);
+        drop(first_launcher);
+        drop(fixture);
+        remove_foreign_gpu_session_fixture(fixture_root);
+    }
+
+    #[test]
+    fn confirmed_cleanup_after_discovery_deadline_discards_gpu_binding_and_allows_auto_cpu() {
+        let spec = foreign_gpu_session_specs()[0];
+        let fixture = foreign_signed_gpu_session_fixture(spec);
+        let fixture_root = fixture.root.clone();
+        let first_launcher = Arc::new(
+            TestLauncher::new([TestMode::CompatibilityPack {
+                local: Box::new(fixture.local.clone()),
+                capability: fixture.capability.clone(),
+                mutation: CompatibilityPackMutation::None,
+                post_response: None,
+            }])
+            .with_pack_launch(fixture.context.clone()),
+        );
+        let deferred_launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let probes = vec![
+            PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    fixture.context.expectation.pack_id.as_str(),
+                )
+                .unwrap(),
+                backend: spec.backend,
+                supervisor: inference_supervisor_with_launcher(Arc::clone(&first_launcher)),
+            },
+            PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-vulkan-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Vulkan,
+                supervisor: inference_supervisor_with_launcher(Arc::clone(&deferred_launcher)),
+            },
+        ];
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let (confirmed_tx, confirmed_rx) = sync_channel(1);
+        let (confirmed_release_tx, confirmed_release_rx) = channel();
+        cleanup.gate_confirmed_cleanup_for_test(ConfirmedProviderCleanupGate {
+            reached: confirmed_tx,
+            release: confirmed_release_rx,
+        });
+        let discovery_cleanup = Arc::clone(&cleanup);
+        let discovery = std::thread::spawn(move || {
+            let mut allowance = ProviderDiscoveryAllowance {
+                remaining_active: Duration::from_millis(200),
+                remaining_probes: MAX_GPU_PROVIDER_PROBES,
+            };
+            discover_pack_launch_bindings_with_budget(
+                probes,
+                Vec::new(),
+                &mut allowance,
+                &discovery_cleanup,
+            )
+        });
+        confirmed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let contention_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let contention = inference_supervisor_with_launcher(Arc::clone(&contention_launcher));
+        let contention_deadline = MonotonicDeadline::after_for(
+            Duration::from_millis(250),
+            "provider deadline expiry witness",
+        )
+        .unwrap();
+        assert!(matches!(
+            cleanup.run_probe(&contention, contention_deadline, || Ok(())),
+            Ok(Err(_))
+        ));
+        assert_eq!(
+            contention_launcher.launch_attempts.load(Ordering::Acquire),
+            0
+        );
+        confirmed_release_tx.send(()).unwrap();
+
+        let discovered = discovery.join().unwrap().unwrap();
+        let (bindings, diagnostics) = discovered.into_parts();
+        assert!(bindings.is_empty());
+        assert!(!diagnostics.is_empty());
+        assert_eq!(deferred_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
+        );
+        registry.provider_probe_cleanup = Arc::clone(&cleanup);
+        registry.gpu_routes_for_testing = Some(verified_gpu_catalog(Vec::new()));
+        let artifact = gguf_artifact_fixture("auto-cpu-after-expired-provider-cleanup");
+        let execution = registry
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
+            .unwrap();
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(
+            execution
+                .diagnostics
+                .resolved_acceleration
+                .selection
+                .as_ref()
+                .unwrap()
+                .target
+                .backend,
+            BackendKind::Cpu
+        );
+
+        drop(bindings);
+        drop(fixture);
+        drop(first_launcher);
+        remove_foreign_gpu_session_fixture(fixture_root);
+    }
+
+    #[test]
+    fn late_provider_launch_receipt_fences_the_next_probe_until_reaped() {
+        let (launch_started_tx, launch_started_rx) = channel();
+        let (launch_release_tx, launch_release_rx) = channel();
+        let (wait_started_tx, wait_started_rx) = channel();
+        let (wait_release_tx, wait_release_rx) = channel();
+        let first_launcher = Arc::new(TestLauncher::new([TestMode::DelayedLaunch {
+            started: launch_started_tx,
+            release: launch_release_rx,
+            then: Box::new(TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: wait_started_tx,
+                    release: wait_release_rx,
+                },
+            }),
+        }]));
+        let first = inference_supervisor_with_launcher(Arc::clone(&first_launcher));
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let first_cleanup = Arc::clone(&cleanup);
+        let first_probe = first.clone();
+        let expired = std::thread::spawn(move || {
+            let deadline = MonotonicDeadline::after_for(
+                Duration::from_millis(40),
+                "late provider worker launch",
+            )
+            .unwrap();
+            first_cleanup.run_probe(&first_probe, deadline, || {
+                first_probe
+                    .transport
+                    .ensure_generation_before(Some(deadline), None)
+                    .map(|_| ())
+            })
+        });
+        launch_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            expired.join().unwrap(),
+            Err(RuntimeError::WorkerUnavailable(_))
+        ));
+        assert_eq!(first_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(first_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        first
+            .transport
+            .observe_retirement_waits_for_test(retirement_wait_tx);
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let second = inference_supervisor_with_launcher(Arc::clone(&second_launcher));
+        let second_probe = second.clone();
+        let second_cleanup = Arc::clone(&cleanup);
+        let next = std::thread::spawn(move || {
+            let deadline = MonotonicDeadline::after_for(
+                Duration::from_secs(1),
+                "probe after late provider worker launch",
+            )
+            .unwrap();
+            second_cleanup.run_probe(&second_probe, deadline, || {
+                second_probe
+                    .transport
+                    .ensure_generation_before(Some(deadline), None)
+                    .map(|_| ())
+            })
+        });
+        retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(second_launcher.launch_attempts.load(Ordering::Acquire), 0);
+
+        launch_release_tx.send(()).unwrap();
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        wait_release_tx.send(()).unwrap();
+
+        assert!(matches!(next.join().unwrap(), Ok(Err(_))));
+        assert_eq!(second_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_provider_termination_survives_cache_invalidation_and_denies_all_routes() {
+        let failed_launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessTerminationFailure {
+                mode: Box::new(TestMode::Normal),
+            },
+        ]));
+        let failed = inference_supervisor_with_launcher(Arc::clone(&failed_launcher));
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_millis(80),
+            "failed provider worker termination",
+        )
+        .unwrap();
+        let result = cleanup.run_probe(&failed, deadline, || {
+            failed
+                .transport
+                .ensure_generation_before(Some(deadline), None)
+                .map(|_| ())
+        });
+        assert!(matches!(result, Err(RuntimeError::WorkerUnavailable(_))));
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+        let state = failed.transport.inner.state.lock().unwrap();
+        assert!(state.current.is_some());
+        assert_eq!(state.retiring_generations.len(), 1);
+        drop(state);
+
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let cpu = inference_supervisor_with_launcher(Arc::clone(&cpu_launcher));
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu);
+        registry.provider_probe_cleanup = Arc::clone(&cleanup);
+        let failed_gpu_route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "driver-before-invalidation",
+            'f',
+        );
+        registry
+            .invalidate_gpu_catalog_after_runtime_failure(&failed_gpu_route, None)
+            .unwrap();
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+        let cpu_route = registry.routes[0].clone();
+        assert!(matches!(
+            registry.prepare_route(&cpu_route),
+            Err(RoutePreparationError::Fatal(
+                RuntimeError::WorkerUnavailable(_)
+            ))
+        ));
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+
+        let next_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let next = inference_supervisor_with_launcher(Arc::clone(&next_launcher));
+        let next_deadline = MonotonicDeadline::after_for(
+            Duration::from_millis(40),
+            "probe after failed provider worker termination",
+        )
+        .unwrap();
+        assert!(matches!(
+            cleanup.run_probe(&next, next_deadline, || {
+                next.transport
+                    .ensure_generation_before(Some(next_deadline), None)
+                    .map(|_| ())
+            }),
+            Err(RuntimeError::WorkerUnavailable(_))
+        ));
+        assert_eq!(next_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -27132,6 +28342,7 @@ mod tests {
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         };
@@ -27313,6 +28524,7 @@ mod tests {
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             retiring_workers: Arc::new(Mutex::new(Vec::new())),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                 device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
@@ -28040,6 +29252,216 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_launch_handoff_cannot_queue_an_unowned_child() {
+        let (wait_started_tx, wait_started_rx) = channel();
+        let (wait_release_tx, wait_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: wait_started_tx,
+                    release: wait_release_rx,
+                },
+            },
+            TestMode::Normal,
+        ]));
+        let worker_launcher: Arc<dyn WorkerLauncher> = launcher.clone();
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            worker_launcher,
+            short_deadlines(),
+        );
+        let (receiver_reached_tx, receiver_reached_rx) = sync_channel(1);
+        let (receiver_release_tx, receiver_release_rx) = channel();
+        let (sender_ready_tx, sender_ready_rx) = sync_channel(1);
+        let (sender_finished_tx, sender_finished_rx) = sync_channel(1);
+        transport.gate_launch_handoff_for_test(LaunchHandoffGate {
+            receiver_reached: receiver_reached_tx,
+            receiver_release: receiver_release_rx,
+            sender_ready: sender_ready_tx,
+            sender_finished: sender_finished_tx,
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let launching_transport = transport.clone();
+        let launching_cancelled = Arc::clone(&cancelled);
+        let launching = std::thread::spawn(move || {
+            let deadline = MonotonicDeadline::after_for(
+                Duration::from_secs(1),
+                "controlled worker launch handoff",
+            )
+            .unwrap();
+            launching_transport
+                .ensure_generation_before(Some(deadline), Some(launching_cancelled.as_ref()))
+        });
+
+        receiver_reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        sender_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            sender_finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        cancelled.store(true, Ordering::Release);
+        receiver_release_tx.send(()).unwrap();
+        sender_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(launching.join().unwrap().is_err());
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        {
+            let state = transport.inner.state.lock().unwrap();
+            assert!(state.current.is_none());
+            assert_eq!(state.pending_launches.len(), 1);
+        }
+
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        transport.observe_retirement_waits_for_test(retirement_wait_tx);
+        let replacement_transport = transport.clone();
+        let replacement = std::thread::spawn(move || {
+            replacement_transport.ensure_generation_before(
+                Some(
+                    MonotonicDeadline::after_for(
+                        Duration::from_secs(1),
+                        "replacement after cancelled launch handoff",
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+        });
+        retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        wait_release_tx.send(()).unwrap();
+        assert_eq!(replacement.join().unwrap().unwrap(), 1);
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 2);
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .pending_launches
+                .is_empty()
+        );
+        transport.terminate_current().unwrap();
+    }
+
+    #[test]
+    fn expired_launch_handoff_cannot_queue_an_unowned_child() {
+        let (wait_started_tx, wait_started_rx) = channel();
+        let (wait_release_tx, wait_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: wait_started_tx,
+                    release: wait_release_rx,
+                },
+            },
+            TestMode::Normal,
+        ]));
+        let worker_launcher: Arc<dyn WorkerLauncher> = launcher.clone();
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            worker_launcher,
+            short_deadlines(),
+        );
+        let (receiver_reached_tx, receiver_reached_rx) = sync_channel(1);
+        let (receiver_release_tx, receiver_release_rx) = channel();
+        let (sender_ready_tx, sender_ready_rx) = sync_channel(1);
+        let (sender_finished_tx, sender_finished_rx) = sync_channel(1);
+        transport.gate_launch_handoff_for_test(LaunchHandoffGate {
+            receiver_reached: receiver_reached_tx,
+            receiver_release: receiver_release_rx,
+            sender_ready: sender_ready_tx,
+            sender_finished: sender_finished_tx,
+        });
+        let (deadline_tx, deadline_rx) = sync_channel(1);
+        let launching_transport = transport.clone();
+        let launching = std::thread::spawn(move || {
+            let deadline = MonotonicDeadline::after_for(
+                Duration::from_millis(40),
+                "controlled expired worker launch handoff",
+            )
+            .unwrap();
+            deadline_tx.send(deadline).unwrap();
+            launching_transport.ensure_generation_before(Some(deadline), None)
+        });
+        let deadline = deadline_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        receiver_reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        sender_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            sender_finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        while let Ok(remaining) = deadline.remaining() {
+            let (_deadline_guard_tx, deadline_guard_rx) = channel::<()>();
+            assert!(matches!(
+                deadline_guard_rx.recv_timeout(remaining),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+        }
+        receiver_release_tx.send(()).unwrap();
+        sender_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(launching.join().unwrap().is_err());
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        {
+            let state = transport.inner.state.lock().unwrap();
+            assert!(state.current.is_none());
+            assert_eq!(state.pending_launches.len(), 1);
+        }
+
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        transport.observe_retirement_waits_for_test(retirement_wait_tx);
+        let replacement_transport = transport.clone();
+        let replacement = std::thread::spawn(move || {
+            replacement_transport.ensure_generation_before(
+                Some(
+                    MonotonicDeadline::after_for(
+                        Duration::from_secs(1),
+                        "replacement after expired launch handoff",
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+        });
+        retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        wait_release_tx.send(()).unwrap();
+        assert_eq!(replacement.join().unwrap().unwrap(), 1);
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 2);
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .pending_launches
+                .is_empty()
+        );
+        transport.terminate_current().unwrap();
+    }
+
+    #[test]
     fn failed_between_request_cancellation_reports_static_cleanup_and_blocks_relaunch() {
         let launcher = Arc::new(TestLauncher::new([
             TestMode::WithProcessTerminationFailure {
@@ -28538,6 +29960,7 @@ mod tests {
             supervisor: inference_supervisor_with_launcher(launcher.clone()),
             gpu_identity: None,
             affinity: Some(capture_affinity_policy()),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let error = worker.prepare_observation().err().unwrap().to_string();
         assert!(
@@ -28564,6 +29987,7 @@ mod tests {
             supervisor: inference_supervisor_with_launcher(launcher.clone()),
             gpu_identity: None,
             affinity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let stale = worker.prepare_observation().unwrap();
         worker.retire_observation_generation(&stale).unwrap();
@@ -28575,6 +29999,7 @@ mod tests {
             supervisor: inference_supervisor_with_launcher(Arc::new(TestLauncher::new([]))),
             gpu_identity: None,
             affinity: worker.affinity.clone(),
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         assert!(foreign.validate_affinity_retained(&replacement).is_err());
         replacement.require_current().unwrap();
@@ -28591,6 +30016,7 @@ mod tests {
             supervisor: inference_supervisor_with_launcher(launcher.clone()),
             gpu_identity: None,
             affinity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let lease = worker.prepare_observation().unwrap();
         worker.retire_observation_generation(&lease).unwrap();
@@ -28740,6 +30166,55 @@ mod tests {
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
+    fn capture_cpu_factory_denies_launch_while_failed_provider_cleanup_is_retained() {
+        let failed_launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessTerminationFailure {
+                mode: Box::new(TestMode::Normal),
+            },
+        ]));
+        let failed_probe = inference_supervisor_with_launcher(Arc::clone(&failed_launcher));
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_millis(80),
+            "failed capture provider cleanup",
+        )
+        .unwrap();
+        assert!(matches!(
+            cleanup.run_probe(&failed_probe, deadline, || {
+                failed_probe
+                    .transport
+                    .ensure_generation_before(Some(deadline), None)
+                    .map(|_| ())
+            }),
+            Err(RuntimeError::WorkerUnavailable(_))
+        ));
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let mut factory = CaptureObservationWorkerFactory::cpu(None);
+        factory.provider_probe_cleanup = Arc::clone(&cleanup);
+        let mut worker = factory.spawn();
+        worker.supervisor = inference_supervisor_with_launcher(Arc::clone(&cpu_launcher));
+        assert!(worker.prepare_observation().is_err());
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+
+        assert!(worker.negotiate_runtime_observation().is_err());
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+
+        let audio = PreparedAudio::from_captured_mono(vec![0.0], 16_000, 1, 1).unwrap();
+        assert!(
+            worker
+                .transcribe_observed(missing_gguf_artifact(), AccelerationPreference::Cpu, &audio,)
+                .is_err()
+        );
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup.supervisors.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
     fn capture_observation_retained_crash_never_launches_a_replacement() {
         let (received_tx, received_rx) = channel();
         let launcher = Arc::new(TestLauncher::new([
@@ -28757,6 +30232,7 @@ mod tests {
             affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
             gpu_identity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let lease = worker.prepare_observation().unwrap();
         lease.require_current().unwrap();
@@ -28822,12 +30298,14 @@ mod tests {
             affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
             gpu_identity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let foreign_launcher = Arc::new(TestLauncher::new([]));
         let foreign = CaptureObservationWorker {
             affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&foreign_launcher)),
             gpu_identity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let lease = worker.prepare_observation().unwrap();
         assert!(
@@ -28857,12 +30335,14 @@ mod tests {
             affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&launcher)),
             gpu_identity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
         let foreign_launcher = Arc::new(TestLauncher::new([]));
         let foreign = CaptureObservationWorker {
             affinity: None,
             supervisor: inference_supervisor_with_launcher(Arc::clone(&foreign_launcher)),
             gpu_identity: None,
+            provider_probe_cleanup: production_provider_probe_cleanup_fence(),
         };
 
         let first = worker.prepare_observation().unwrap();
@@ -29357,6 +30837,7 @@ mod tests {
                 binding: Some(binding),
                 gpu_identity: None,
                 pins: Some(pins.clone()),
+                provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             };
             assert!(Arc::ptr_eq(
                 gpu.launcher().capture_pins.as_ref().unwrap(),
@@ -30607,6 +32088,7 @@ mod tests {
                     },
                 ]))),
                 gpu_identity: None,
+                provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             };
             worker.negotiate_runtime_observation().unwrap();
             let artifact = RuntimeArtifact::Gguf(RuntimeModel {
@@ -30682,6 +32164,7 @@ mod tests {
                     pack_security_epoch: 1,
                     runtime_abi: 1,
                 }),
+                provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             };
             worker.negotiate_runtime_observation().unwrap();
             let artifact = RuntimeArtifact::Gguf(RuntimeModel {
@@ -30969,6 +32452,7 @@ mod tests {
                     pack_security_epoch: 1,
                     runtime_abi: 1,
                 }),
+                provider_probe_cleanup: production_provider_probe_cleanup_fence(),
             };
             worker.negotiate_runtime_observation().unwrap();
             let artifact = RuntimeArtifact::Gguf(RuntimeModel {
