@@ -76,12 +76,29 @@ probe retirement. Execution preparation remains before the probe timer. Model
 loading, inference, and idle time do not consume the remaining probe allowance;
 promoting a stage does not replenish it. An exhausted allowance never prepares
 or launches a lower stage. Promotion also requires confirmed previous-worker
-exit within a 250 ms confirmation bound and remaining active allowance.
+exit within the remaining active allowance. Model-route replacement has its
+separate ten-second retirement bound; active cancellation retains 250 ms.
 Unconfirmed cleanup blocks further launches instead of overlapping workers.
 The inference operation separately keeps its existing
 four-candidate bound across stages: explicit GPU has at most four GPU routes;
 Auto reserves one position for CPU and has at most three GPU routes. Targets
 filtered out before queue admission do not consume those execution positions.
+
+Provider bindings remain provisional until that capability probe has terminated
+and its process exit is confirmed. A process-wide cleanup owner retains an
+unsettled probe even when discovery or capture-factory construction returns an
+error. Catalog invalidation, a new factory, or selecting CPU cannot erase this
+ownership. Unconfirmed cleanup is a fatal lifecycle error, not permission to
+try another provider, fall back, or quarantine an otherwise unproven target.
+After confirmed cleanup, a later request may proceed normally.
+
+Probe admission and cleanup share the absolute active-discovery deadline;
+contention cannot restart or extend it. A pending launcher is also owned before
+its thread starts. Its receipt transfers atomically to a published generation,
+or remains until a late unpublished worker is terminated and reaped. A timeout,
+receiver drop, or empty published-generation list is not proof of cleanup.
+The cleanup fence coordinates probe ownership only; the existing serialized
+route registry still owns the default single active model.
 
 Deferred leases remain bound to the verified catalog/adapter generation and
 model, with Auto also bound to its qualification policy. Promotion rechecks that
