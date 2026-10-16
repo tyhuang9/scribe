@@ -342,6 +342,7 @@ struct SupervisorDeadlines {
     data: Duration,
     control: Duration,
     cancel: Duration,
+    replacement_retirement: Duration,
 }
 
 impl Default for SupervisorDeadlines {
@@ -353,9 +354,23 @@ impl Default for SupervisorDeadlines {
             data: Duration::from_secs(60 * 60),
             control: Duration::from_secs(30),
             cancel: Duration::from_millis(250),
+            // Replacement joins process retirement on a startup-scale budget;
+            // active cancellation keeps its independent 250 ms allowance.
+            replacement_retirement: Duration::from_secs(10),
         }
     }
 }
+
+#[derive(Debug)]
+struct GenerationAdmissionCancelled;
+
+impl std::fmt::Display for GenerationAdmissionCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("worker generation admission was cancelled")
+    }
+}
+
+impl std::error::Error for GenerationAdmissionCancelled {}
 
 #[derive(Clone, Copy)]
 struct VadDeadlines {
@@ -5682,6 +5697,8 @@ struct SupervisorInner {
     pending: Mutex<HashMap<Correlation, SyncSender<PendingResult>>>,
     #[cfg(test)]
     retirement_snapshot_gate: Mutex<Option<RetirementSnapshotGate>>,
+    #[cfg(test)]
+    retirement_wait_observer: Mutex<Option<std::sync::mpsc::Sender<MonotonicDeadline>>>,
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     diagnostic_probe: Option<Arc<DiagnosticProbeState>>,
 }
@@ -5737,6 +5754,8 @@ impl ProcessWorkerSupervisor {
                 pending: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 retirement_snapshot_gate: Mutex::new(None),
+                #[cfg(test)]
+                retirement_wait_observer: Mutex::new(None),
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                 diagnostic_probe: None,
             }),
@@ -5759,6 +5778,8 @@ impl ProcessWorkerSupervisor {
                 pending: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 retirement_snapshot_gate: Mutex::new(None),
+                #[cfg(test)]
+                retirement_wait_observer: Mutex::new(None),
                 diagnostic_probe: Some(diagnostic_probe),
             }),
         }
@@ -6194,6 +6215,12 @@ impl ProcessWorkerSupervisor {
             .lock()
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
         while !state.retiring_generations.is_empty() {
+            #[cfg(test)]
+            if let Ok(observer) = self.inner.retirement_wait_observer.lock()
+                && let Some(observer) = observer.as_ref()
+            {
+                let _ = observer.send(deadline);
+            }
             let (next_state, timeout) = self
                 .inner
                 .retirement_changed
@@ -6222,6 +6249,14 @@ impl ProcessWorkerSupervisor {
             release,
             receipt_observed,
         });
+    }
+
+    #[cfg(test)]
+    fn observe_retirement_waits_for_test(
+        &self,
+        observer: std::sync::mpsc::Sender<MonotonicDeadline>,
+    ) {
+        *self.inner.retirement_wait_observer.lock().unwrap() = Some(observer);
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -6259,6 +6294,23 @@ impl ProcessWorkerSupervisor {
         deadline: Option<MonotonicDeadline>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<u64> {
+        self.ensure_generation_before_admitted(deadline, cancelled, || true)
+    }
+
+    fn ensure_generation_before_admitted(
+        &self,
+        deadline: Option<MonotonicDeadline>,
+        cancelled: Option<&AtomicBool>,
+        admitted: impl Fn() -> bool,
+    ) -> Result<u64> {
+        let require_admission = || {
+            if admitted() {
+                Ok(())
+            } else {
+                Err(anyhow::Error::new(GenerationAdmissionCancelled))
+            }
+        };
+        require_admission()?;
         let _spawn_guard = self
             .inner
             .spawn_gate
@@ -6267,7 +6319,7 @@ impl ProcessWorkerSupervisor {
         let settlement_deadline = match deadline {
             Some(deadline) => deadline,
             None => MonotonicDeadline::after_for(
-                self.inner.deadlines.cancel,
+                self.inner.deadlines.replacement_retirement,
                 "process worker replacement retirement",
             )?,
         };
@@ -6276,6 +6328,7 @@ impl ProcessWorkerSupervisor {
         // the request's existing deadline instead of either racing a new
         // launch or rejecting a replacement that is about to settle.
         self.await_retirement_settlement_before(settlement_deadline)?;
+        require_admission()?;
         #[cfg(test)]
         let mut receipt_observed = if let Some(gate) = self
             .inner
@@ -6317,13 +6370,18 @@ impl ProcessWorkerSupervisor {
             // before this state snapshot. Rejoin it with the same absolute
             // deadline; never refill the cleanup allowance.
             self.await_retirement_settlement_before(settlement_deadline)?;
+            require_admission()?;
         };
         if let Some((generation, process)) = existing {
             match process.is_running() {
-                Ok(true) => return Ok(generation),
+                Ok(true) => {
+                    require_admission()?;
+                    return Ok(generation);
+                }
                 Ok(false) => {
                     self.invalidate_generation(generation, "process worker exited", false)?;
                     self.await_retirement_settlement_before(settlement_deadline)?;
+                    require_admission()?;
                 }
                 Err(error) => {
                     self.invalidate_generation(
@@ -6340,6 +6398,7 @@ impl ProcessWorkerSupervisor {
         if let Some(diagnostic_probe) = &self.inner.diagnostic_probe {
             diagnostic_probe.set_stage(GpuPackProbeStage::Launch);
         }
+        require_admission()?;
         let spawned = match deadline {
             Some(deadline) => self.launch_before(deadline, cancelled)?,
             None => self.inner.launcher.launch()?,
@@ -7153,6 +7212,28 @@ impl ProcessWorkerSupervisor {
         match expected_generation {
             Some(generation) => self.generation_context_exact(generation),
             None => self.generation_context(),
+        }
+    }
+
+    fn generation_context_for_admitted(
+        &self,
+        expected_generation: Option<u64>,
+        admitted: impl Fn() -> bool,
+    ) -> Result<WorkerGenerationContext> {
+        match expected_generation {
+            Some(generation) => {
+                if !admitted() {
+                    return Err(anyhow::Error::new(GenerationAdmissionCancelled));
+                }
+                self.generation_context_exact(generation)
+            }
+            None => {
+                let generation = self.ensure_generation_before_admitted(None, None, admitted)?;
+                Ok(WorkerGenerationContext {
+                    generation,
+                    pack_bindings: self.pack_bindings_for_generation(generation)?,
+                })
+            }
         }
     }
 
@@ -8782,8 +8863,20 @@ impl InferenceWorkerSupervisor {
             .map_err(|error| RuntimeError::Engine(error.to_string()))?;
         let context = self
             .transport
-            .generation_context_for(expected_generation)
-            .map_err(worker_unavailable)?;
+            .generation_context_for_admitted(expected_generation, || !cancelled())
+            .map_err(|error| {
+                if cancelled()
+                    || error
+                        .downcast_ref::<GenerationAdmissionCancelled>()
+                        .is_some()
+                {
+                    RuntimeError::Cancelled(
+                        "transcription request was cancelled before inference dispatch".to_owned(),
+                    )
+                } else {
+                    worker_unavailable(error)
+                }
+            })?;
         let generation = context.generation;
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Err(RuntimeError::WorkerUnavailable(
@@ -12196,7 +12289,10 @@ impl InferenceWorkerRegistry {
         Ok(())
     }
 
-    fn settle_retiring_workers_before_route_launch(&self) -> Result<(), RuntimeError> {
+    fn settle_retiring_workers_before_route_launch(
+        &self,
+        deadline: MonotonicDeadline,
+    ) -> Result<(), RuntimeError> {
         if self
             .retiring_workers
             .lock()
@@ -12209,11 +12305,6 @@ impl InferenceWorkerRegistry {
         {
             return Ok(());
         }
-        let deadline = MonotonicDeadline::after_for(
-            SupervisorDeadlines::default().cancel,
-            "inference worker retirement before route launch",
-        )
-        .map_err(worker_unavailable)?;
         self.settle_retiring_workers_before(deadline)
     }
 
@@ -12292,6 +12383,8 @@ impl InferenceWorkerRegistry {
         &self,
         budget: Duration,
     ) -> Result<(), RuntimeError> {
+        let deadline = MonotonicDeadline::after_for(budget, "provider discovery worker retirement")
+            .map_err(worker_unavailable)?;
         let active = self
             .active_route
             .lock()
@@ -12316,11 +12409,6 @@ impl InferenceWorkerRegistry {
         {
             return Ok(());
         }
-        let deadline = MonotonicDeadline::after_for(
-            budget.min(SupervisorDeadlines::default().cancel),
-            "provider discovery worker retirement",
-        )
-        .map_err(worker_unavailable)?;
         self.settle_retiring_workers_before(deadline)
     }
 
@@ -12397,7 +12485,18 @@ impl InferenceWorkerRegistry {
     }
 
     fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RoutePreparationError> {
-        self.settle_retiring_workers_before_route_launch()
+        let transition_deadline = MonotonicDeadline::after_for(
+            route
+                .supervisor
+                .transport
+                .inner
+                .deadlines
+                .replacement_retirement,
+            "inference worker retirement before route launch",
+        )
+        .map_err(worker_unavailable)
+        .map_err(RoutePreparationError::Fatal)?;
+        self.settle_retiring_workers_before_route_launch(transition_deadline)
             .map_err(RoutePreparationError::Fatal)?;
         let identity = Self::route_identity(route);
         let prior = {
@@ -12425,7 +12524,7 @@ impl InferenceWorkerRegistry {
                 .supervisor
                 .retire()
                 .map_err(RoutePreparationError::Fatal)?;
-            self.settle_retiring_workers_before_route_launch()
+            self.settle_retiring_workers_before_route_launch(transition_deadline)
                 .map_err(RoutePreparationError::Fatal)?;
         }
         self.clear_auto_live_admission();
@@ -18259,6 +18358,7 @@ mod tests {
             data: Duration::from_millis(40),
             control: Duration::from_millis(40),
             cancel: Duration::from_millis(40),
+            replacement_retirement: Duration::from_millis(40),
         }
     }
 
@@ -20082,7 +20182,21 @@ mod tests {
                     .is_empty();
                 assert_eq!(cleanup_settled, success);
                 if !success {
-                    assert!(fixture.transport.ensure_generation().is_err());
+                    assert!(
+                        fixture
+                            .transport
+                            .ensure_generation_before(
+                                Some(
+                                    MonotonicDeadline::after_for(
+                                        Duration::from_millis(40),
+                                        "fixture unresolved retirement",
+                                    )
+                                    .unwrap(),
+                                ),
+                                None,
+                            )
+                            .is_err()
+                    );
                 }
                 assert_eq!(fixture.process.waits.load(Ordering::Acquire), 1);
                 assert_eq!(fixture.launcher.launches.load(Ordering::Acquire), 0);
@@ -26743,6 +26857,176 @@ mod tests {
     }
 
     #[test]
+    fn provider_retirement_consumes_the_supplied_discovery_allowance() {
+        let (wait_started_tx, wait_started_rx) = channel();
+        let (wait_release_tx, wait_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([TestMode::WithProcessWait {
+            mode: Box::new(TestMode::Normal),
+            wait: TestWaitMode::Gated {
+                started: wait_started_tx,
+                release: wait_release_rx,
+            },
+        }]));
+        let supervisor = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(
+            supervisor.clone(),
+        ));
+        let route = registry.routes[0].clone();
+        registry.prepare_route(&route).unwrap();
+        supervisor.transport.ensure_generation().unwrap();
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        supervisor
+            .transport
+            .observe_retirement_waits_for_test(retirement_wait_tx);
+        let mut allowance = ProviderDiscoveryAllowance {
+            remaining_active: Duration::from_secs(1),
+            remaining_probes: MAX_GPU_PROVIDER_PROBES,
+        };
+        allowance.charge(Duration::from_millis(250));
+        let supplied = allowance.remaining_active;
+        let mut wait_release = ReleaseOnDrop(Some(wait_release_tx));
+        let retiring_registry = Arc::clone(&registry);
+        let retiring = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = retiring_registry.retire_active_worker_before_provider_discovery(supplied);
+            (result, started.elapsed())
+        });
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let observed = retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(observed.budget, supplied);
+        assert!(observed.budget > short_deadlines().cancel);
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        wait_release.release();
+
+        let (result, retirement_elapsed) = retiring.join().unwrap();
+        result.unwrap();
+        allowance.charge(retirement_elapsed);
+        assert!(allowance.remaining_active < supplied);
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert!(registry.retiring_workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn route_transition_reuses_one_absolute_retirement_deadline() {
+        let (first_wait_started_tx, first_wait_started_rx) = channel();
+        let (first_wait_release_tx, first_wait_release_rx) = channel();
+        let first_launcher = Arc::new(TestLauncher::new([TestMode::WithProcessWait {
+            mode: Box::new(TestMode::Normal),
+            wait: TestWaitMode::Gated {
+                started: first_wait_started_tx,
+                release: first_wait_release_rx,
+            },
+        }]));
+        let (prior_wait_started_tx, prior_wait_started_rx) = channel();
+        let (prior_wait_release_tx, prior_wait_release_rx) = channel();
+        let prior_launcher = Arc::new(TestLauncher::new([TestMode::WithProcessWait {
+            mode: Box::new(TestMode::Normal),
+            wait: TestWaitMode::Gated {
+                started: prior_wait_started_tx,
+                release: prior_wait_release_rx,
+            },
+        }]));
+        let target_launcher = Arc::new(TestLauncher::new([]));
+        let supervisor = |launcher: Arc<TestLauncher>, deadlines| InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher, deadlines,
+            ),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
+        let route = |identity: &str, supervisor| InferenceWorkerRoute {
+            provider: WorkerProvider::Cpu,
+            supervisor,
+            target: Some(backend_target(BackendKind::Cpu, identity, Some(0))),
+            health_key: None,
+            consume_retry_bypass: false,
+            auto_evidence_id: None,
+        };
+        let first = route(
+            "first-retiring-cpu",
+            supervisor(Arc::clone(&first_launcher), short_deadlines()),
+        );
+        let prior = route(
+            "prior-active-cpu",
+            supervisor(Arc::clone(&prior_launcher), short_deadlines()),
+        );
+        let mut target_deadlines = short_deadlines();
+        target_deadlines.replacement_retirement = Duration::from_secs(1);
+        let target = route(
+            "target-cpu",
+            supervisor(Arc::clone(&target_launcher), target_deadlines),
+        );
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(
+            target.supervisor.clone(),
+        ));
+        let first_generation = first.supervisor.transport.ensure_generation().unwrap();
+        prior.supervisor.transport.ensure_generation().unwrap();
+        first
+            .supervisor
+            .transport
+            .invalidate_generation(first_generation, "fixture prior retirement", true)
+            .unwrap();
+        first_wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        registry.track_retiring_worker(&first.supervisor).unwrap();
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&prior),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: prior.target.clone().unwrap(),
+            supervisor: prior.supervisor.clone(),
+        });
+        let (first_observer_tx, first_observer_rx) = channel();
+        first
+            .supervisor
+            .transport
+            .observe_retirement_waits_for_test(first_observer_tx);
+        let (prior_observer_tx, prior_observer_rx) = channel();
+        prior
+            .supervisor
+            .transport
+            .observe_retirement_waits_for_test(prior_observer_tx);
+        let mut first_release = ReleaseOnDrop(Some(first_wait_release_tx));
+        let mut prior_release = ReleaseOnDrop(Some(prior_wait_release_tx));
+
+        let preparing_registry = Arc::clone(&registry);
+        let preparing_target = target.clone();
+        let preparing =
+            std::thread::spawn(move || preparing_registry.prepare_route(&preparing_target));
+        let before_retire = first_observer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(before_retire.budget, Duration::from_secs(1));
+        assert_eq!(target_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        first_release.release();
+        prior_wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let after_retire = prior_observer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(after_retire.expires_at, before_retire.expires_at);
+        assert_eq!(after_retire.budget, before_retire.budget);
+        assert_eq!(target_launcher.launch_attempts.load(Ordering::Acquire), 0);
+
+        prior_release.release();
+        preparing.join().unwrap().unwrap();
+        assert_eq!(target_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert!(registry.active_route.lock().unwrap().as_ref().is_some_and(
+            |active| active.identity == InferenceWorkerRegistry::route_identity(&target)
+        ));
+    }
+
+    #[test]
     fn active_route_ownership_retires_cpu_gpu_and_device_switches() {
         let cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
         let gpu_one_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
@@ -27381,7 +27665,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_between_batch_requests_reaps_before_replacement_launches() {
+    fn cancellation_between_batch_requests_uses_replacement_budget_before_one_relaunch() {
         let (reap_started_tx, reap_started_rx) = channel();
         let (reap_release_tx, reap_release_rx) = channel();
         let launcher = Arc::new(TestLauncher::new([
@@ -27394,9 +27678,11 @@ mod tests {
             },
             TestMode::Normal,
         ]));
+        let mut deadlines = short_deadlines();
+        deadlines.replacement_retirement = Duration::from_secs(1);
         let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
             launcher.clone(),
-            short_deadlines(),
+            deadlines,
         );
         let generation = transport.ensure_generation().unwrap();
         let supervisor = InferenceWorkerSupervisor {
@@ -27410,11 +27696,15 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_eq!(transport.current_generation().unwrap(), None);
-        let blocked_replacement = transport.ensure_generation().unwrap_err();
-        assert_eq!(
-            blocked_replacement.to_string(),
-            "process worker retirement did not settle before provider discovery; retirement wait call entered"
-        );
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        transport.observe_retirement_waits_for_test(retirement_wait_tx);
+        let replacement = transport.clone();
+        let replacing = std::thread::spawn(move || replacement.ensure_generation());
+        let replacement_deadline = retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(replacement_deadline.budget, Duration::from_secs(1));
+        assert_eq!(deadlines.cancel, Duration::from_millis(40));
         let (held_receipt, held_phase) = {
             let state = transport.inner.state.lock().unwrap();
             assert!(
@@ -27459,15 +27749,294 @@ mod tests {
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
 
         reap_release.release();
-        transport
-            .await_retirement_settlement_before(
-                MonotonicDeadline::after(Duration::from_secs(1)).unwrap(),
-            )
-            .unwrap();
-        let replacement_generation = transport.ensure_generation().unwrap();
+        let replacement_generation = replacing.join().unwrap().unwrap();
         assert!(replacement_generation > generation);
         assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
         transport.terminate_current().unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_replacement_wait_denies_launch_and_batch_dispatch() {
+        let (reap_started_tx, reap_started_rx) = channel();
+        let (reap_release_tx, reap_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: reap_started_tx,
+                    release: reap_release_rx,
+                },
+            },
+            TestMode::RuntimeLoad,
+        ]));
+        let mut deadlines = short_deadlines();
+        deadlines.replacement_retirement = Duration::from_secs(1);
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            deadlines,
+        );
+        let supervisor = InferenceWorkerSupervisor {
+            transport: transport.clone(),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(
+            supervisor.clone(),
+        ));
+        let route = registry.routes[0].clone();
+        registry.prepare_route(&route).unwrap();
+        let generation = transport.ensure_generation().unwrap();
+        transport
+            .invalidate_generation(generation, "fixture cancelled replacement", true)
+            .unwrap();
+        reap_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let mut reap_release = ReleaseOnDrop(Some(reap_release_tx));
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        transport.observe_retirement_waits_for_test(retirement_wait_tx);
+
+        let cancellation = Arc::new(AtomicU64::new(0));
+        let request_registry = Arc::clone(&registry);
+        let request_cancellation = Arc::clone(&cancellation);
+        let artifact = gguf_artifact_fixture("cancel-during-replacement-retirement");
+        let request_artifact = artifact.artifact.clone();
+        let audio = PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap();
+        let request = std::thread::spawn(move || {
+            request_registry.transcribe(
+                request_artifact,
+                AccelerationPreference::Cpu,
+                &audio,
+                TranscriptionOptions::default(),
+                0,
+                &request_cancellation,
+            )
+        });
+
+        let observed = retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(observed.budget, Duration::from_secs(1));
+        cancellation.fetch_add(1, Ordering::AcqRel);
+        registry.cancel_active();
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+
+        reap_release.release();
+        let failure = request.join().unwrap().unwrap_err();
+        assert!(matches!(failure.error, RuntimeError::Cancelled(_)));
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cancellation_during_replacement_timeout_is_terminal_without_launch() {
+        let (reap_started_tx, reap_started_rx) = channel();
+        let (reap_release_tx, reap_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: reap_started_tx,
+                    release: reap_release_rx,
+                },
+            },
+            TestMode::RuntimeLoad,
+        ]));
+        let mut deadlines = short_deadlines();
+        deadlines.replacement_retirement = Duration::from_secs(1);
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            deadlines,
+        );
+        let supervisor = InferenceWorkerSupervisor {
+            transport: transport.clone(),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(
+            supervisor.clone(),
+        ));
+        let route = registry.routes[0].clone();
+        registry.prepare_route(&route).unwrap();
+        let generation = transport.ensure_generation().unwrap();
+        transport
+            .invalidate_generation(generation, "fixture timed-out cancelled replacement", true)
+            .unwrap();
+        reap_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let mut reap_release = ReleaseOnDrop(Some(reap_release_tx));
+        let held_receipt = {
+            let state = transport.inner.state.lock().unwrap();
+            Arc::clone(
+                state
+                    .retiring_generations
+                    .get(&generation)
+                    .expect("the gated reaper retains its exact-generation receipt"),
+            )
+        };
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        transport.observe_retirement_waits_for_test(retirement_wait_tx);
+
+        let cancellation = Arc::new(AtomicU64::new(0));
+        let request_registry = Arc::clone(&registry);
+        let request_cancellation = Arc::clone(&cancellation);
+        let artifact = gguf_artifact_fixture("cancel-during-replacement-timeout");
+        let request_artifact = artifact.artifact.clone();
+        let audio = PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap();
+        let request = std::thread::spawn(move || {
+            request_registry.transcribe(
+                request_artifact,
+                AccelerationPreference::Cpu,
+                &audio,
+                TranscriptionOptions::default(),
+                0,
+                &request_cancellation,
+            )
+        });
+
+        let observed = retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(observed.budget, Duration::from_secs(1));
+        cancellation.fetch_add(1, Ordering::AcqRel);
+        registry.cancel_active();
+
+        let failure = request.join().unwrap().unwrap_err();
+        assert!(matches!(failure.error, RuntimeError::Cancelled(_)));
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        {
+            let state = transport.inner.state.lock().unwrap();
+            let retained_receipt = state
+                .retiring_generations
+                .get(&generation)
+                .expect("a timed-out retirement wait retains its receipt");
+            assert!(Arc::ptr_eq(&held_receipt, retained_receipt));
+            assert_eq!(
+                retained_receipt.phase(),
+                Some(RetirementReapPhase::WaitEntered)
+            );
+            assert!(state.current.is_none());
+        }
+
+        reap_release.release();
+        transport
+            .await_retirement_settlement_before(
+                MonotonicDeadline::after_for(Duration::from_secs(1), "fixture retirement cleanup")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cancellation_during_generation_launch_retires_published_worker_without_dispatch() {
+        let (launch_started_tx, launch_started_rx) = channel();
+        let (launch_release_tx, launch_release_rx) = channel();
+        let (reap_started_tx, reap_started_rx) = channel();
+        let (reap_release_tx, reap_release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([TestMode::DelayedLaunch {
+            started: launch_started_tx,
+            release: launch_release_rx,
+            then: Box::new(TestMode::WithProcessWait {
+                mode: Box::new(TestMode::Normal),
+                wait: TestWaitMode::Gated {
+                    started: reap_started_tx,
+                    release: reap_release_rx,
+                },
+            }),
+        }]));
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        );
+        let next_correlation = Arc::new(AtomicU64::new(0));
+        let supervisor = InferenceWorkerSupervisor {
+            transport: transport.clone(),
+            next_correlation: Arc::clone(&next_correlation),
+        };
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(supervisor));
+        let cancellation = Arc::new(AtomicU64::new(0));
+        let request_registry = Arc::clone(&registry);
+        let request_cancellation = Arc::clone(&cancellation);
+        let artifact = gguf_artifact_fixture("cancel-during-generation-launch");
+        let request_artifact = artifact.artifact.clone();
+        let audio = PreparedAudio::from_captured_mono(vec![0.1], 16_000, 1, 1).unwrap();
+        let request = std::thread::spawn(move || {
+            request_registry.transcribe(
+                request_artifact,
+                AccelerationPreference::Cpu,
+                &audio,
+                TranscriptionOptions::default(),
+                0,
+                &request_cancellation,
+            )
+        });
+
+        launch_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let mut launch_release = ReleaseOnDrop(Some(launch_release_tx));
+        let mut reap_release = ReleaseOnDrop(Some(reap_release_tx));
+        cancellation.fetch_add(1, Ordering::AcqRel);
+        registry.cancel_active();
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+
+        launch_release.release();
+        reap_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let failure = request.join().unwrap().unwrap_err();
+        assert!(matches!(failure.error, RuntimeError::Cancelled(_)));
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(next_correlation.load(Ordering::Acquire), 0);
+        {
+            let state = transport.inner.state.lock().unwrap();
+            assert!(state.current.is_none());
+            assert_eq!(state.retiring_generations.len(), 1);
+            let (generation, receipt) = state.retiring_generations.iter().next().unwrap();
+            assert_eq!(*generation, state.next_generation);
+            assert_eq!(receipt.phase(), Some(RetirementReapPhase::WaitEntered));
+        }
+
+        reap_release.release();
+        transport
+            .await_retirement_settlement_before(
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "fixture launched generation retirement cleanup",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .retiring_generations
+                .is_empty()
+        );
     }
 
     #[test]
@@ -31167,6 +31736,8 @@ mod tests {
         let stt = SupervisorDeadlines::default();
         assert_eq!(stt.load, Duration::from_secs(15 * 60));
         assert_eq!(stt.data, Duration::from_secs(60 * 60));
+        assert_eq!(stt.cancel, Duration::from_millis(250));
+        assert_eq!(stt.replacement_retirement, Duration::from_secs(10));
 
         let vad = VadDeadlines::default();
         assert_eq!(vad.acquisition, Duration::from_secs(2));
@@ -31776,8 +32347,15 @@ mod tests {
             snapshot_release_rx,
             receipt_observed_tx,
         );
+        let transition_deadline =
+            MonotonicDeadline::after_for(Duration::from_secs(5), "fixture replacement transition")
+                .unwrap();
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        supervisor.observe_retirement_waits_for_test(retirement_wait_tx);
         let replacement = supervisor.clone();
-        let replacing = std::thread::spawn(move || replacement.ensure_generation());
+        let replacing = std::thread::spawn(move || {
+            replacement.ensure_generation_before(Some(transition_deadline), None)
+        });
 
         snapshot_reached_rx
             .recv_timeout(Duration::from_secs(1))
@@ -31792,6 +32370,11 @@ mod tests {
         receipt_observed_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
+        let rejoined_deadline = retirement_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(rejoined_deadline.expires_at, transition_deadline.expires_at);
+        assert_eq!(rejoined_deadline.budget, transition_deadline.budget);
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
 
         wait_release.release();
