@@ -661,14 +661,70 @@ try {
         'native/whisper-f049fff/PROVENANCE.md', 'native/sherpa-onnx-v1.13.5/PROVENANCE.md',
         'resources/silero-vad/LICENSE', 'resources/silero-vad/PROVENANCE.md'
     )) { Copy-FixtureSource $path }
-    # Shorten only the copied builder's fixed compiler deadline. This runs the
-    # real builder/launcher/cleanup path without a production test override or
-    # waiting fifteen minutes for a deliberately hung fixture compiler.
+    # Keep successful and diagnostic mutation cases on the production deadline;
+    # only the deliberate hang needs the one-second fixture cutoff.
     $fixtureBuilder = Join-Path $fixtureRoot 'scripts\build-windows-frozen-test-installer.ps1'
     $fixtureBuilderSource = Get-Content -LiteralPath $fixtureBuilder -Raw
     $compilerDeadline = '-TimeoutMilliseconds 900000'
     Assert-Equal ([regex]::Matches($fixtureBuilderSource, [regex]::Escape($compilerDeadline)).Count) 1 'Production compiler deadline occurrence count'
-    Write-Utf8 $fixtureBuilder ($fixtureBuilderSource.Replace($compilerDeadline, '-TimeoutMilliseconds 1000'))
+    $fixtureCompilerDeadline = '-TimeoutMilliseconds $(if ($env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE -ceq ''hang'') { 1000 } else { 900000 })'
+    Write-Utf8 $fixtureBuilder ($fixtureBuilderSource.Replace($compilerDeadline, $fixtureCompilerDeadline))
+
+    $fixtureBuilderTokens = $null
+    $fixtureBuilderParseErrors = $null
+    $fixtureBuilderAst = [Management.Automation.Language.Parser]::ParseFile(
+        $fixtureBuilder, [ref]$fixtureBuilderTokens, [ref]$fixtureBuilderParseErrors)
+    Assert-Equal @($fixtureBuilderParseErrors).Count 0 'Fixture builder deadline selector parse errors'
+    $compilerCalls = @($fixtureBuilderAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -ceq 'Invoke-WindowsLocalFrozenBoundedProcess'
+        }, $true))
+    Assert-Equal $compilerCalls.Count 1 'Fixture builder compiler invocation count'
+    $compilerCall = $compilerCalls[0]
+    $compilerTimeoutParameters = @($compilerCall.CommandElements | Where-Object {
+            $_ -is [Management.Automation.Language.CommandParameterAst] -and
+                $_.ParameterName -ceq 'TimeoutMilliseconds'
+        })
+    Assert-Equal $compilerTimeoutParameters.Count 1 'Fixture builder compiler timeout parameter count'
+    $compilerTimeoutParameterIndex = [array]::IndexOf(
+        [object[]]$compilerCall.CommandElements, $compilerTimeoutParameters[0])
+    Assert-True ($compilerTimeoutParameterIndex -eq ($compilerCall.CommandElements.Count - 2)) 'Fixture builder compiler timeout parameter is not the exact final argument'
+    $compilerTimeoutAst = $compilerCall.CommandElements[$compilerTimeoutParameterIndex + 1]
+    Assert-True ($compilerTimeoutAst -is [Management.Automation.Language.SubExpressionAst]) 'Fixture builder compiler timeout is not the generated conditional subexpression'
+    Assert-Equal $compilerTimeoutAst.Extent.Text '$(if ($env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE -ceq ''hang'') { 1000 } else { 900000 })' 'Fixture builder compiler timeout selector text'
+
+    $selectorModeWasPresent = Test-Path -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE'
+    $selectorModeBefore = if ($selectorModeWasPresent) {
+        (Get-Item -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE').Value
+    }
+    $evaluateCompilerTimeout = [scriptblock]::Create("& { $($compilerTimeoutAst.Extent.Text) }")
+    try {
+        foreach ($selectorCase in @(
+            @{ Mode = ''; Expected = 900000 },
+            @{ Mode = 'hang'; Expected = 1000 },
+            @{ Mode = 'fail'; Expected = 900000 },
+            @{ Mode = 'mutate-staged'; Expected = 900000 },
+            @{ Mode = 'mutate-source'; Expected = 900000 },
+            @{ Mode = 'HANG'; Expected = 900000 },
+            @{ Mode = 'unknown'; Expected = 900000 }
+        )) {
+            Set-Item -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE' -Value $selectorCase.Mode
+            $selectedTimeout = @(& $evaluateCompilerTimeout)
+            Assert-Equal $selectedTimeout.Count 1 "Fixture builder compiler timeout result count for mode '$($selectorCase.Mode)'"
+            Assert-Equal ([int]$selectedTimeout[0]) ([int]$selectorCase.Expected) "Fixture builder compiler timeout for mode '$($selectorCase.Mode)'"
+        }
+    }
+    finally {
+        if ($selectorModeWasPresent) {
+            Set-Item -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE' -Value $selectorModeBefore
+        }
+        elseif (Test-Path -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE') {
+            Remove-Item -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE' -ErrorAction Stop
+        }
+    }
+    Assert-Equal (Test-Path -LiteralPath 'Env:SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE') $selectorModeWasPresent 'Compiler selector restored mode environment presence'
+    Assert-Equal ([Environment]::GetEnvironmentVariable('SCRIBE_LOCAL_FROZEN_TEST_ISCC_MODE')) $selectorModeBefore 'Compiler selector restored mode environment value'
     $modelBytes = [byte[]](1, 2, 3, 4, 5)
     $modelSha256 = [Security.Cryptography.SHA256]::Create()
     try {
