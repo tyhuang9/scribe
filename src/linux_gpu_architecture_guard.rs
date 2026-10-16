@@ -1,4 +1,4 @@
-//! Source-level guards for worker-local Linux GPU identity routing.
+//! Source-level guards for parent and worker Linux GPU identity routing.
 
 fn normalized(source: &str) -> String {
     source.replace("\r\n", "\n")
@@ -19,6 +19,7 @@ fn linux_gpu_identity_is_pci_only_fixed_root_and_bounded() {
         "MAX_PROVIDER_DEVICES",
         "MAX_DRIVER_IDENTITY_BYTES",
         "MAX_SYSFS_VALUE_BYTES",
+        "MAX_PCI_SYSFS_ENTRIES",
         "MAX_NVIDIA_INFORMATION_BYTES",
         "PhysicalDevicePCIBusInfoPropertiesEXT",
         "vk::ExtPciBusInfoFn::name()",
@@ -42,6 +43,91 @@ fn linux_gpu_identity_is_pci_only_fixed_root_and_bounded() {
         assert!(
             !production.contains(forbidden),
             "production Linux GPU router contains forbidden authority: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn linux_parent_witness_is_two_sample_provider_free_and_bounded() {
+    let source = normalized(include_str!("linux_gpu.rs"));
+    for required in [
+        "pub(crate) fn discover_parent_device_driver_catalog()",
+        "let first = canonical_parent_catalog(source.snapshot()?)?",
+        "let second = canonical_parent_catalog(source.snapshot()?)?",
+        "Linux GPU parent device or driver facts changed during sampling",
+        "stable_device_identity: fact.address.canonical()",
+        "vendor: fact.vendor",
+        "kernel_release: snapshot.kernel_release",
+        "if entries.len() == MAX_PCI_SYSFS_ENTRIES",
+        "module_version_is_present(fs::metadata(&module_version_path).map(|_| ()))?",
+        "if !value.is_ascii() || value.len() != 12",
+        "byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)",
+        "fn worker_snapshot(backend: LinuxGpuBackend)",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing Linux parent witness invariant: {required}"
+        );
+    }
+    let kernel_sampler = source
+        .split("fn kernel_pci_snapshot()")
+        .nth(1)
+        .unwrap()
+        .split("fn worker_snapshot(")
+        .next()
+        .unwrap();
+    assert!(!kernel_sampler.contains("collect::<Result<Vec<_>, _>>()"));
+    assert!(!kernel_sampler.contains("module_version_path.exists()"));
+    for forbidden in [
+        "/proc/driver/nvidia/gpus",
+        "nvidia_uuid_for",
+        "cuda_pci_uuid_identities",
+        "vulkan_pci_driver_identities",
+        "ash::",
+        "dlopen",
+    ] {
+        assert!(
+            !kernel_sampler.contains(forbidden),
+            "Linux parent kernel sampler contains provider authority: {forbidden}"
+        );
+    }
+
+    let worker_enrichment = source
+        .split("fn worker_snapshot(")
+        .nth(1)
+        .unwrap()
+        .split("fn bounded_fixed_file(")
+        .next()
+        .unwrap();
+    for required in [
+        "nvidia_uuid_for(fact.address)?",
+        "cuda_pci_uuid_identities",
+        "vulkan_pci_driver_identities",
+    ] {
+        assert!(
+            worker_enrichment.contains(required),
+            "Linux worker enrichment lost required proof: {required}"
+        );
+    }
+
+    let worker = normalized(include_str!("onnx_worker.rs"));
+    let parent_catalog = worker
+        .split("struct PackDriverCatalog {\n    catalog: crate::linux_gpu::LinuxGpuParentCatalog")
+        .nth(1)
+        .unwrap()
+        .split("#[cfg(not(any(")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "transcribe_cpp",
+        "route_provider_devices",
+        "cuda_pci_uuid_identities",
+        "vulkan_pci_driver_identities",
+        "/proc/driver/nvidia/gpus",
+    ] {
+        assert!(
+            !parent_catalog.contains(forbidden),
+            "Linux parent PackDriverCatalog invokes provider discovery: {forbidden}"
         );
     }
 }

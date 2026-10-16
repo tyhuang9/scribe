@@ -2593,18 +2593,61 @@ impl PackDriverCatalog {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-struct PackDriverCatalog;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+struct PackDriverCatalog {
+    catalog: crate::linux_gpu::LinuxGpuParentCatalog,
+}
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 impl PackDriverCatalog {
     fn discover() -> Result<Self> {
-        bail!("Stage 4 GPU worker packs require Windows driver metadata")
+        let catalog = crate::linux_gpu::discover_parent_device_driver_catalog()
+            .map_err(anyhow::Error::msg)
+            .context("could not obtain bounded Linux parent GPU witnesses")?;
+        Ok(Self { catalog })
+    }
+
+    #[cfg(any(feature = "inference-worker", test))]
+    fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
+        self.catalog
+            .identity_for(stable_device_identity)
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        update_health_digest(&mut digest, "linux-parent-kernel-device-driver-v1");
+        update_health_digest(&mut digest, self.catalog.kernel_release());
+        digest.update((self.catalog.devices().len() as u64).to_le_bytes());
+        for device in self.catalog.devices() {
+            update_health_digest(&mut digest, device.stable_device_identity());
+            update_health_digest(&mut digest, device.vendor().witness_name());
+            update_health_digest(&mut digest, device.driver_identity());
+        }
+        format!("{:x}", digest.finalize())
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")
+)))]
+struct PackDriverCatalog;
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")
+)))]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        bail!("GPU worker packs require supported parent driver metadata")
     }
 
     #[cfg(any(feature = "inference-worker", test))]
     fn identity_for(&self, _stable_device_identity: &str) -> Result<String> {
-        bail!("Stage 4 GPU worker packs require Windows driver metadata")
+        bail!("GPU worker packs require supported parent driver metadata")
     }
 
     fn fingerprint(&self) -> String {
