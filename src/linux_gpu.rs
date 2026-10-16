@@ -1,8 +1,9 @@
-//! Worker-local Linux GPU identity and provider-index routing.
+//! Provider-free parent witnesses and worker-local Linux GPU routing.
 //!
-//! Stable identity is always a canonical PCI function. Provider indexes are
-//! deliberately process-local and are returned only after the current worker
-//! reconciles its provider enumeration with two identical kernel fact samples.
+//! The parent samples only bounded kernel PCI, vendor, driver, and release facts.
+//! Stable identity is always a canonical PCI function. Provider indexes and
+//! private physical UUID proof stay process-local to the worker and are returned
+//! only after it reconciles provider enumeration with two kernel fact samples.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,6 +13,8 @@ const MAX_DRIVER_IDENTITY_BYTES: usize = 192;
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 const MAX_SYSFS_VALUE_BYTES: u64 = 4096;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+const MAX_PCI_SYSFS_ENTRIES: usize = 4096;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 const MAX_NVIDIA_INFORMATION_BYTES: u64 = 16 * 1024;
 
@@ -29,6 +32,17 @@ pub(crate) enum LinuxGpuVendor {
     Other,
 }
 
+impl LinuxGpuVendor {
+    pub(crate) const fn witness_name(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Amd => "amd",
+            Self::Intel => "intel",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PciAddress {
     domain: u16,
@@ -39,12 +53,19 @@ struct PciAddress {
 
 impl PciAddress {
     fn parse(value: &str) -> Option<Self> {
-        if value.len() != 12 || value != value.to_ascii_lowercase() {
+        if !value.is_ascii() || value.len() != 12 || value != value.to_ascii_lowercase() {
             return None;
         }
         let bytes = value.as_bytes();
-        if bytes[4] != b':' || bytes[7] != b':' || bytes[10] != b'.' {
-            return None;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            let valid = match index {
+                4 | 7 => byte == b':',
+                10 => byte == b'.',
+                _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            };
+            if !valid {
+                return None;
+            }
         }
         let domain = u16::from_str_radix(&value[0..4], 16).ok()?;
         let bus = u8::from_str_radix(&value[5..7], 16).ok()?;
@@ -80,6 +101,113 @@ impl PciAddress {
             self.domain, self.bus, self.device, self.function
         )
     }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct LinuxGpuKernelFact {
+    address: PciAddress,
+    vendor: LinuxGpuVendor,
+    driver_identity: String,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct LinuxGpuKernelFactSnapshot {
+    kernel_release: String,
+    devices: Vec<LinuxGpuKernelFact>,
+}
+
+trait LinuxGpuKernelFactSource {
+    fn snapshot(&self) -> Result<LinuxGpuKernelFactSnapshot, String>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LinuxGpuParentDeviceWitness {
+    stable_device_identity: String,
+    vendor: LinuxGpuVendor,
+    driver_identity: String,
+}
+
+impl LinuxGpuParentDeviceWitness {
+    pub(crate) fn stable_device_identity(&self) -> &str {
+        &self.stable_device_identity
+    }
+
+    pub(crate) fn vendor(&self) -> LinuxGpuVendor {
+        self.vendor
+    }
+
+    pub(crate) fn driver_identity(&self) -> &str {
+        &self.driver_identity
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LinuxGpuParentCatalog {
+    kernel_release: String,
+    devices: Vec<LinuxGpuParentDeviceWitness>,
+}
+
+impl LinuxGpuParentCatalog {
+    pub(crate) fn kernel_release(&self) -> &str {
+        &self.kernel_release
+    }
+
+    pub(crate) fn devices(&self) -> &[LinuxGpuParentDeviceWitness] {
+        &self.devices
+    }
+
+    pub(crate) fn identity_for(&self, stable_device_identity: &str) -> Result<String, String> {
+        let address = stable_device_identity
+            .strip_prefix("native:pci:")
+            .and_then(PciAddress::parse)
+            .ok_or_else(|| "Linux GPU stable identity is not canonical PCI".to_owned())?;
+        let canonical = address.canonical();
+        self.devices
+            .binary_search_by(|device| device.stable_device_identity.cmp(&canonical))
+            .ok()
+            .map(|index| self.devices[index].driver_identity.clone())
+            .ok_or_else(|| "Linux GPU PCI identity has no parent driver witness".to_owned())
+    }
+}
+
+fn parent_device_driver_catalog(
+    source: &impl LinuxGpuKernelFactSource,
+) -> Result<LinuxGpuParentCatalog, String> {
+    let first = canonical_parent_catalog(source.snapshot()?)?;
+    let second = canonical_parent_catalog(source.snapshot()?)?;
+    if first != second {
+        return Err("Linux GPU parent device or driver facts changed during sampling".to_owned());
+    }
+    Ok(first)
+}
+
+fn canonical_parent_catalog(
+    snapshot: LinuxGpuKernelFactSnapshot,
+) -> Result<LinuxGpuParentCatalog, String> {
+    if snapshot.kernel_release.len() > 96
+        || bounded_token(&snapshot.kernel_release).as_deref() != Some(&snapshot.kernel_release)
+    {
+        return Err("Linux kernel release witness is malformed".to_owned());
+    }
+    if snapshot.devices.is_empty() || snapshot.devices.len() > MAX_GPU_FACTS {
+        return Err("Linux GPU parent fact set is empty or oversized".to_owned());
+    }
+    let mut devices = BTreeMap::new();
+    for fact in snapshot.devices {
+        validate_driver_identity(&fact.driver_identity)?;
+        let witness = LinuxGpuParentDeviceWitness {
+            stable_device_identity: fact.address.canonical(),
+            vendor: fact.vendor,
+            driver_identity: fact.driver_identity,
+        };
+        if devices.insert(fact.address, witness).is_some() {
+            return Err("Linux GPU parent facts contain a duplicate PCI function".to_owned());
+        }
+    }
+    Ok(LinuxGpuParentCatalog {
+        kernel_release: snapshot.kernel_release,
+        devices: devices.into_values().collect(),
+    })
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -316,22 +444,39 @@ pub(crate) struct KernelLinuxGpuFactSource;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 impl LinuxGpuFactSource for KernelLinuxGpuFactSource {
     fn snapshot(&self, backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, String> {
-        kernel_snapshot(backend)
+        worker_snapshot(backend)
     }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
-fn kernel_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, String> {
+struct KernelLinuxGpuKernelFactSource;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+impl LinuxGpuKernelFactSource for KernelLinuxGpuKernelFactSource {
+    fn snapshot(&self) -> Result<LinuxGpuKernelFactSnapshot, String> {
+        kernel_pci_snapshot()
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+pub(crate) fn discover_parent_device_driver_catalog() -> Result<LinuxGpuParentCatalog, String> {
+    parent_device_driver_catalog(&KernelLinuxGpuKernelFactSource)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn kernel_pci_snapshot() -> Result<LinuxGpuKernelFactSnapshot, String> {
     use std::fs;
     use std::path::Path;
 
     const PCI_ROOT: &str = "/sys/bus/pci/devices";
-    let mut entries = fs::read_dir(PCI_ROOT)
-        .map_err(|_| "Linux PCI sysfs root is unavailable".to_owned())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "Linux PCI sysfs enumeration failed".to_owned())?;
-    if entries.len() > 4096 {
-        return Err("Linux PCI sysfs enumeration is oversized".to_owned());
+    let directory =
+        fs::read_dir(PCI_ROOT).map_err(|_| "Linux PCI sysfs root is unavailable".to_owned())?;
+    let mut entries = Vec::new();
+    for entry in directory {
+        if entries.len() == MAX_PCI_SYSFS_ENTRIES {
+            return Err("Linux PCI sysfs enumeration is oversized".to_owned());
+        }
+        entries.push(entry.map_err(|_| "Linux PCI sysfs enumeration failed".to_owned())?);
     }
     entries.sort_by_key(|entry| entry.file_name());
     let kernel_release = bounded_fixed_file(
@@ -340,12 +485,6 @@ fn kernel_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, Str
     )?;
     let kernel_release = bounded_token(&kernel_release)
         .ok_or_else(|| "Linux kernel release witness is malformed".to_owned())?;
-    let vulkan_driver_identities = (backend == LinuxGpuBackend::Vulkan)
-        .then(vulkan_pci_driver_identities)
-        .transpose()?;
-    let cuda_runtime_identities = (backend == LinuxGpuBackend::Cuda)
-        .then(cuda_pci_uuid_identities)
-        .transpose()?;
     let mut devices = Vec::new();
     for entry in entries {
         let name = entry
@@ -386,7 +525,8 @@ fn kernel_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, Str
             .and_then(bounded_token)
             .ok_or_else(|| "Linux PCI driver name is malformed".to_owned())?;
         let module_version_path = Path::new("/sys/module").join(&driver).join("version");
-        let version = if module_version_path.exists() {
+        let version = if module_version_is_present(fs::metadata(&module_version_path).map(|_| ()))?
+        {
             bounded_token(&bounded_fixed_file(
                 &module_version_path,
                 MAX_SYSFS_VALUE_BYTES,
@@ -396,27 +536,50 @@ fn kernel_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, Str
             format!("kernel-{kernel_release}")
         };
         let driver_identity = format!("linux:{driver}:{version}");
-        let nvidia_physical_uuid_alias = if vendor == LinuxGpuVendor::Nvidia {
-            nvidia_uuid_for(address)?
-        } else {
-            None
-        };
         validate_driver_identity(&driver_identity)?;
-        devices.push(LinuxGpuFact {
+        devices.push(LinuxGpuKernelFact {
             address,
             vendor,
             driver_identity,
-            nvidia_physical_uuid_alias,
-            cuda_runtime_uuid_witness: cuda_runtime_identities
-                .as_ref()
-                .and_then(|identities| identities.get(&address).cloned()),
-            vulkan_pci_witness: vulkan_driver_identities
-                .as_ref()
-                .and_then(|identities| identities.get(&address).cloned()),
         });
     }
     if devices.is_empty() {
         return Err("Linux reported no driver-bound display PCI function".to_owned());
+    }
+    Ok(LinuxGpuKernelFactSnapshot {
+        kernel_release,
+        devices,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn worker_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, String> {
+    let kernel = kernel_pci_snapshot()?;
+    let vulkan_driver_identities = (backend == LinuxGpuBackend::Vulkan)
+        .then(vulkan_pci_driver_identities)
+        .transpose()?;
+    let cuda_runtime_identities = (backend == LinuxGpuBackend::Cuda)
+        .then(cuda_pci_uuid_identities)
+        .transpose()?;
+    let mut devices = Vec::with_capacity(kernel.devices.len());
+    for fact in kernel.devices {
+        let nvidia_physical_uuid_alias = if fact.vendor == LinuxGpuVendor::Nvidia {
+            nvidia_uuid_for(fact.address)?
+        } else {
+            None
+        };
+        devices.push(LinuxGpuFact {
+            address: fact.address,
+            vendor: fact.vendor,
+            driver_identity: fact.driver_identity,
+            nvidia_physical_uuid_alias,
+            cuda_runtime_uuid_witness: cuda_runtime_identities
+                .as_ref()
+                .and_then(|identities| identities.get(&fact.address).cloned()),
+            vulkan_pci_witness: vulkan_driver_identities
+                .as_ref()
+                .and_then(|identities| identities.get(&fact.address).cloned()),
+        });
     }
     Ok(LinuxGpuFactSnapshot { devices })
 }
@@ -443,7 +606,14 @@ fn bounded_fixed_file(path: &std::path::Path, limit: u64) -> Result<String, Stri
     String::from_utf8(bytes).map_err(|_| "required Linux GPU kernel fact is not UTF-8".to_owned())
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn module_version_is_present(metadata: std::io::Result<()>) -> Result<bool, String> {
+    match metadata {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("Linux GPU module version cannot be inspected".to_owned()),
+    }
+}
+
 fn bounded_token(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
     (!value.is_empty()
@@ -858,6 +1028,65 @@ mod tests {
         }
     }
 
+    struct FakeKernelSource {
+        snapshots: Vec<LinuxGpuKernelFactSnapshot>,
+        calls: Cell<usize>,
+    }
+
+    impl FakeKernelSource {
+        fn stable(snapshot: LinuxGpuKernelFactSnapshot) -> Self {
+            Self {
+                snapshots: vec![snapshot],
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LinuxGpuKernelFactSource for FakeKernelSource {
+        fn snapshot(&self) -> Result<LinuxGpuKernelFactSnapshot, String> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            Ok(self.snapshots[call.min(self.snapshots.len() - 1)].clone())
+        }
+    }
+
+    struct FailingKernelSource {
+        snapshot: LinuxGpuKernelFactSnapshot,
+        fail_on_call: usize,
+        calls: Cell<usize>,
+    }
+
+    impl LinuxGpuKernelFactSource for FailingKernelSource {
+        fn snapshot(&self) -> Result<LinuxGpuKernelFactSnapshot, String> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call == self.fail_on_call {
+                Err("required Linux GPU kernel fact is unavailable".to_owned())
+            } else {
+                Ok(self.snapshot.clone())
+            }
+        }
+    }
+
+    fn kernel_fact(
+        value: &str,
+        vendor: LinuxGpuVendor,
+        driver_identity: &str,
+    ) -> LinuxGpuKernelFact {
+        LinuxGpuKernelFact {
+            address: address(value),
+            vendor,
+            driver_identity: driver_identity.to_owned(),
+        }
+    }
+
+    fn kernel_snapshot(devices: Vec<LinuxGpuKernelFact>) -> LinuxGpuKernelFactSnapshot {
+        LinuxGpuKernelFactSnapshot {
+            kernel_release: "6.8.0-52-generic".to_owned(),
+            devices,
+        }
+    }
+
     #[test]
     fn canonical_pci_identity_is_fixed_width_and_preserves_nonzero_domain() {
         let parsed = PciAddress::from_provider_id("000a:0b:1f.7").unwrap();
@@ -866,6 +1095,191 @@ mod tests {
         assert!(PciAddress::from_provider_id("0000:01:20.0").is_none());
         assert!(PciAddress::from_provider_id("0000:01:00.8").is_none());
         assert!(PciAddress::from_provider_id("000A:01:00.0").is_none());
+        assert!(PciAddress::from_provider_id("+000:01:00.0").is_none());
+        assert!(PciAddress::from_provider_id("0000:+1:00.0").is_none());
+        assert!(PciAddress::from_provider_id("éééééé").is_none());
+    }
+
+    #[test]
+    fn parent_catalog_is_two_sample_canonical_sorted_and_vendor_bound() {
+        let nvidia = kernel_fact(
+            "0001:02:00.0",
+            LinuxGpuVendor::Nvidia,
+            "linux:nvidia:570.26",
+        );
+        let amd = kernel_fact(
+            "0000:0a:00.0",
+            LinuxGpuVendor::Amd,
+            "linux:amdgpu:kernel-6.8.0-52-generic",
+        );
+        let source = FakeKernelSource {
+            snapshots: vec![
+                kernel_snapshot(vec![nvidia.clone(), amd.clone()]),
+                kernel_snapshot(vec![amd, nvidia]),
+            ],
+            calls: Cell::new(0),
+        };
+
+        let catalog = parent_device_driver_catalog(&source).unwrap();
+        assert_eq!(catalog.kernel_release(), "6.8.0-52-generic");
+        assert_eq!(catalog.devices().len(), 2);
+        assert_eq!(
+            catalog.devices()[0].stable_device_identity(),
+            "native:pci:0000:0a:00.0"
+        );
+        assert_eq!(catalog.devices()[0].vendor(), LinuxGpuVendor::Amd);
+        assert_eq!(catalog.devices()[1].vendor(), LinuxGpuVendor::Nvidia);
+        assert_eq!(
+            catalog.identity_for("native:pci:0001:02:00.0").unwrap(),
+            "linux:nvidia:570.26"
+        );
+        assert!(catalog.identity_for("native:pci:0000:ff:00.0").is_err());
+        assert!(catalog.identity_for("GPU-opaque").is_err());
+    }
+
+    #[test]
+    fn parent_catalog_rejects_device_driver_vendor_and_kernel_changes() {
+        let first = kernel_snapshot(vec![
+            kernel_fact(
+                "0000:01:00.0",
+                LinuxGpuVendor::Nvidia,
+                "linux:nvidia:570.26",
+            ),
+            kernel_fact(
+                "0000:02:00.0",
+                LinuxGpuVendor::Amd,
+                "linux:amdgpu:kernel-6.8.0-52-generic",
+            ),
+        ]);
+        let mut added = first.clone();
+        added.devices.push(kernel_fact(
+            "0000:03:00.0",
+            LinuxGpuVendor::Intel,
+            "linux:i915:kernel-6.8.0-52-generic",
+        ));
+        let mut removed = first.clone();
+        removed.devices.pop();
+        let mut driver = first.clone();
+        driver.devices[0].driver_identity = "linux:nvidia:570.27".to_owned();
+        let mut vendor = first.clone();
+        vendor.devices[0].vendor = LinuxGpuVendor::Other;
+        let mut kernel = first.clone();
+        kernel.kernel_release = "6.8.0-53-generic".to_owned();
+
+        for changed in [added, removed, driver, vendor, kernel] {
+            let source = FakeKernelSource {
+                snapshots: vec![first.clone(), changed],
+                calls: Cell::new(0),
+            };
+            assert!(parent_device_driver_catalog(&source).is_err());
+        }
+    }
+
+    #[test]
+    fn parent_catalog_rejects_duplicate_empty_malformed_and_oversized_facts() {
+        let valid = kernel_fact(
+            "0000:01:00.0",
+            LinuxGpuVendor::Nvidia,
+            "linux:nvidia:570.26",
+        );
+        let duplicate = kernel_snapshot(vec![valid.clone(), valid.clone()]);
+        let empty = kernel_snapshot(Vec::new());
+        let mut malformed_driver = kernel_snapshot(vec![valid.clone()]);
+        malformed_driver.devices[0].driver_identity = "Linux NVIDIA 570".to_owned();
+        let mut oversized_driver = kernel_snapshot(vec![valid.clone()]);
+        oversized_driver.devices[0].driver_identity = format!("linux:nvidia:{}", "x".repeat(193));
+        let mut malformed_kernel = kernel_snapshot(vec![valid.clone()]);
+        malformed_kernel.kernel_release = " Kernel Release ".to_owned();
+        let mut oversized_kernel = kernel_snapshot(vec![valid]);
+        oversized_kernel.kernel_release = "k".repeat(97);
+        let oversized = kernel_snapshot(
+            (0..=MAX_GPU_FACTS)
+                .map(|index| {
+                    kernel_fact(
+                        &format!("0000:{index:02x}:00.0"),
+                        LinuxGpuVendor::Other,
+                        "linux:other:kernel-6.8.0-52-generic",
+                    )
+                })
+                .collect(),
+        );
+
+        for snapshot in [
+            duplicate,
+            empty,
+            malformed_driver,
+            oversized_driver,
+            malformed_kernel,
+            oversized_kernel,
+            oversized,
+        ] {
+            assert!(parent_device_driver_catalog(&FakeKernelSource::stable(snapshot)).is_err());
+        }
+    }
+
+    #[test]
+    fn parent_catalog_propagates_first_and_second_sample_errors() {
+        let snapshot = kernel_snapshot(vec![kernel_fact(
+            "0000:01:00.0",
+            LinuxGpuVendor::Nvidia,
+            "linux:nvidia:570.26",
+        )]);
+        for (fail_on_call, expected_calls) in [(0, 1), (1, 2)] {
+            let source = FailingKernelSource {
+                snapshot: snapshot.clone(),
+                fail_on_call,
+                calls: Cell::new(0),
+            };
+            assert_eq!(
+                parent_device_driver_catalog(&source).unwrap_err(),
+                "required Linux GPU kernel fact is unavailable"
+            );
+            assert_eq!(source.calls.get(), expected_calls);
+        }
+    }
+
+    #[test]
+    fn parent_catalog_accepts_exact_device_bound_and_rejects_one_more() {
+        let facts = |count| {
+            (0..count)
+                .map(|index| {
+                    kernel_fact(
+                        &format!("0000:{index:02x}:00.0"),
+                        LinuxGpuVendor::Other,
+                        "linux:other:kernel-6.8.0-52-generic",
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let exact = parent_device_driver_catalog(&FakeKernelSource::stable(kernel_snapshot(
+            facts(MAX_GPU_FACTS),
+        )))
+        .unwrap();
+        assert_eq!(exact.devices().len(), MAX_GPU_FACTS);
+        assert!(
+            parent_device_driver_catalog(&FakeKernelSource::stable(kernel_snapshot(facts(
+                MAX_GPU_FACTS + 1
+            ),)))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn module_version_absence_is_distinct_from_inspection_failure() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(module_version_is_present(Ok(())).unwrap());
+        assert!(!module_version_is_present(Err(Error::from(ErrorKind::NotFound))).unwrap());
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotADirectory,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                module_version_is_present(Err(Error::from(kind))).unwrap_err(),
+                "Linux GPU module version cannot be inspected"
+            );
+        }
     }
 
     #[test]
