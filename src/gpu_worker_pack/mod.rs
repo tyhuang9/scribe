@@ -13,6 +13,11 @@ pub(crate) mod health;
     all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
     test
 ))]
+mod linux_release_authority;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    test
+))]
 mod linux_release_epoch;
 pub(crate) mod manifest;
 pub(crate) mod store;
@@ -1719,20 +1724,39 @@ mod tests {
     #[test]
     fn embedded_empty_release_authority_is_canonical_exact_and_default_deny() {
         let empty_catalog = br#"{"schema_version":1,"packs":[]}"#;
-        assert_eq!(
-            serde_json::to_vec(
-                &serde_json::from_slice::<super::PackReleaseAuthority>(
-                    super::EMBEDDED_PACK_RELEASE_AUTHORITY
-                )
-                .unwrap()
+        #[cfg(target_os = "linux")]
+        {
+            let binding = super::linux_release_authority::validate_catalog_release_binding(
+                empty_catalog,
+                super::EMBEDDED_PACK_RELEASE_AUTHORITY,
+                super::linux_release_authority::ExpectedBuild {
+                    app_version: env!("CARGO_PKG_VERSION"),
+                    build_revision: env!("SCRIBE_BUILD_REVISION"),
+                    app_protocol_version: super::manifest::APP_PROTOCOL_VERSION,
+                    runtime_abi_version: super::manifest::RUNTIME_ABI_VERSION,
+                },
             )
-            .unwrap(),
-            super::EMBEDDED_PACK_RELEASE_AUTHORITY
-        );
-        assert!(super::catalog_matches_release_authority(
-            empty_catalog,
-            super::EMBEDDED_PACK_RELEASE_AUTHORITY
-        ));
+            .expect("embedded Linux authority must bind the canonical empty catalog");
+            assert_eq!(binding.release_security_epoch, 0);
+            assert_eq!(binding.entry_count, 0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                serde_json::to_vec(
+                    &serde_json::from_slice::<super::PackReleaseAuthority>(
+                        super::EMBEDDED_PACK_RELEASE_AUTHORITY
+                    )
+                    .unwrap()
+                )
+                .unwrap(),
+                super::EMBEDDED_PACK_RELEASE_AUTHORITY
+            );
+            assert!(super::catalog_matches_release_authority(
+                empty_catalog,
+                super::EMBEDDED_PACK_RELEASE_AUTHORITY
+            ));
+        }
 
         let state = super::manifest::test_support::temp_root("empty-authority-no-state")
             .join("discovery-state");

@@ -7,15 +7,19 @@ on:
       - '.gitattributes'
       - 'build.rs'
       - 'build_support/build_revision.rs'
+      - 'build_support/linux_release_authority.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'runtime-manifests/gpu-pack-release-authority-linux-empty.json'
       - 'docs/LINUX_GPU_ROUTING.md'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
       - 'src/**'
+      - 'tools/worker-pack-author/Cargo.toml'
+      - 'tools/worker-pack-author/src/main.rs'
       - 'vendor/sherpa-onnx-sys/**'
   pull_request:
     paths:
@@ -23,15 +27,19 @@ on:
       - '.gitattributes'
       - 'build.rs'
       - 'build_support/build_revision.rs'
+      - 'build_support/linux_release_authority.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'runtime-manifests/gpu-pack-release-authority-linux-empty.json'
       - 'docs/LINUX_GPU_ROUTING.md'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
       - 'src/**'
+      - 'tools/worker-pack-author/Cargo.toml'
+      - 'tools/worker-pack-author/src/main.rs'
       - 'vendor/sherpa-onnx-sys/**'
 
 permissions:
@@ -60,6 +68,8 @@ jobs:
         run: |
           cargo check --locked --bin local-transcriber --features ui-harness
           cargo check --locked --bin scribe-inference-worker --features inference-worker
+      - name: Fetch worker-pack authority test dependencies
+        run: cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
       - name: Test descriptor-bound Linux worker launch
         run: ./scripts/test-linux-worker-launch.sh
       - name: Type-check the feature-enabled Linux Vulkan identity branch

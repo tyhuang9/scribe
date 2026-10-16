@@ -53,9 +53,11 @@ unit deliberately adds no runtime call-site wiring.
 This is an inspected admission snapshot, not a linearizable updater lock or a
 hard kernel-I/O deadline. Privileged monotonic advancement, writer/reader
 coordination, initial provisioning, retention across uninstall/reinstallation,
-and a Linux-specific authenticated release-authority schema remain separate
-prerequisites. An ordinary user-owned cache cannot substitute for them. A
-privileged administrator and a compromised kernel remain outside the reader's
+and authenticated positive release integration remain separate prerequisites.
+The Linux-specific metadata boundary in `LINUX_GPU_RELEASE_AUTHORITY.md` keeps
+production embedding empty-only; its positive fixtures are not activation
+authority. An ordinary user-owned cache cannot substitute for these protections.
+A privileged administrator and a compromised kernel remain outside the reader's
 protection boundary.
 
 Only after those prerequisites, pack/launcher integration and native

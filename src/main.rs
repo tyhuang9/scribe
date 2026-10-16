@@ -79,6 +79,8 @@ mod linux_gpu_runtime;
 )]
 mod linux_power;
 #[cfg(test)]
+mod linux_release_authority_architecture_guard;
+#[cfg(test)]
 mod linux_release_epoch_architecture_guard;
 #[cfg(test)]
 mod linux_worker_architecture_guard;
