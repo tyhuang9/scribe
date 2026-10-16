@@ -73,6 +73,14 @@ jobs:
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
           cargo test --manifest-path tools/worker-pack-author/Cargo.toml --locked -- --test-threads=1
+      - name: Check Metal worker feature and compile native Metal shim
+        env:
+          SCRIBE_BUILD_REVISION: stage6-macos-ci
+        run: |
+          env -u SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP \
+            DOCS_RS=1 SCRIBE_BUILDING_WORKER=1 MACOSX_DEPLOYMENT_TARGET=13.0 \
+            CARGO_TARGET_DIR="$RUNNER_TEMP/scribe-metal-source-check" \
+            cargo check --locked --bin scribe-inference-worker --features metal-acceleration
       - name: Build ad hoc signed universal structural package
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc

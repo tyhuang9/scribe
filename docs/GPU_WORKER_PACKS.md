@@ -909,9 +909,64 @@ Metal framework linkage is confined to the per-architecture Metal worker. The
 desktop and universal CPU worker use only an IOKit power-source shim plus the
 `kern.osversion` witness and must have no Metal load command. Stable
 `MTLDevice.registryID` discovery/remapping occurs inside the verified Metal
-worker and reaches the parent only through the challenge-bound capability
-Hello. Release verification checks these Mach-O linkage boundaries with both
-`otool -L` and `otool -l`.
+worker. The challenge-bound capability Hello carries its initial device facts;
+the negotiated worker-only metadata refresh described below revalidates them
+before successful catalog reuse. Release verification checks these Mach-O
+linkage boundaries with both `otool -L` and `otool -l`.
+
+### Successful Metal catalog freshness
+
+The OS build is not a complete Metal device-set witness: an external GPU can
+change without an OS update. A successful explicit-GPU catalog and Auto's
+positive live admission therefore require fresh topology from their exact
+already-running Metal worker before reuse. The initial optional, versioned
+Ready capability carries the complete Metal enumeration used by that same
+Hello's provider remapping, before filtering to a selected device. Its canonical
+topology contains bounded, unique registry identities and vendor/device-class
+facts. Device order, names, default-device flags, process indexes and volatile
+memory values are not topology identity.
+
+The authenticated complete snapshot also supplies the macOS health device-set
+witness, including native devices not exposed as a selected provider route.
+Provider discovery publishes it only after confirmed probe cleanup and rejects
+conflicting complete snapshots from different Metal pack probes. Windows keeps
+its existing parent-observed physical adapter witness.
+
+Refresh is a generation-, challenge- and correlation-bound metadata request,
+not another Hello, model load or provider initialization. It uses only the
+worker's native Metal metadata enumerator and cannot launch a worker implicitly
+or rewrite its current provider mappings. An unchanged topology retains the
+existing warm model and idle lifetime. Changed or unavailable topology rejects
+cached admission; fresh canonical discovery requires confirmed previous-worker
+retirement. A positive cache without its exact live owner also requires fresh
+discovery. The request remains serialized with inference, so active
+transcriptions are never migrated.
+
+Refresh, retirement and any replacement capability probe share one absolute
+discovery allowance; intervening execution preparation consumes this same
+allowance. Cancellation is terminal. Unconfirmed cleanup blocks all
+replacement workers, including CPU; explicit GPU never silently falls back to
+CPU. A topology change is not a pack-health failure and creates no quarantine
+record. The optional advertisement is omitted for CPU/CUDA/Vulkan workers,
+preserving their existing Ready bytes and commands. Unsupported workers are
+never sent the extension. Metal Hello without the supported capability is
+explicitly rejected as incompatible, not admitted through legacy fallback;
+Metal retains the existing same-build macOS binding.
+
+This is a successful-cache fix, not complete all-state hot-plug detection.
+The initial probe-to-cold-load window is not atomic: a device-set change in
+that interval invalidates the next successful cached admission, rather than
+adding a new first-cold-load rejection or migrating work already underway.
+Existing negative provider-probe and Auto-admission backoff without a live
+worker remains unchanged and can delay rediscovery. Native Metal hot-plug,
+power, suspend/resume and device-loss qualification is still required. This
+extension neither provisions Metal packs nor changes release trust or the
+default-deny Auto qualification policy.
+
+The credential-free macOS structural lanes compile the Metal worker feature
+and native Metal/shim code in an isolated target directory in addition to
+running the portable contract tests. This check does not execute a Metal
+worker, author a GPU pack or establish native hardware qualification.
 
 On Windows, before a bundled verified lease can become a route, discovery loads
 the private per-platform/backend/pack security-epoch high-water ledger under the

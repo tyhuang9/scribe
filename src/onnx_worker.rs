@@ -103,6 +103,10 @@ const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const RUNTIME_OBSERVATION_VERSION_V1: u8 = 1;
 const RUNTIME_OBSERVATION_VERSION_V2: u8 = 2;
+// This is intentionally an optional, worker-local capability extension rather
+// than a global protocol or worker ABI revision. Only an authenticated Metal
+// worker that advertised it during Hello may receive the matching refresh.
+const METAL_TOPOLOGY_REFRESH_VERSION_V1: u8 = 1;
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 const RUNTIME_OBSERVATION_COLLECTOR_VERSION: u8 = RUNTIME_OBSERVATION_VERSION_V2;
 const MAX_PCM_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -860,6 +864,11 @@ enum Control {
     NegotiateRuntimeObservation {
         version: u8,
     },
+    RefreshMetalTopology {
+        version: u8,
+        challenge: String,
+        nonce: String,
+    },
     BeginRuntimeObservation {
         version: u8,
         model_sha256: String,
@@ -910,6 +919,12 @@ enum Control {
     },
     RuntimeObservationV2Supported {
         version: u8,
+    },
+    MetalTopology {
+        version: u8,
+        challenge: String,
+        nonce: String,
+        topology: MetalTopologyV1,
     },
     RuntimeObservationStarted {
         version: u8,
@@ -969,6 +984,7 @@ impl Control {
             Self::Hello { .. }
                 | Self::CompatibilityHello { .. }
                 | Self::NegotiateRuntimeObservation { .. }
+                | Self::RefreshMetalTopology { .. }
                 | Self::BeginRuntimeObservation { .. }
                 | Self::FinishRuntimeObservation { .. }
                 | Self::LoadRuntime { .. }
@@ -995,6 +1011,7 @@ impl Control {
             Self::Ready { .. }
                 | Self::RuntimeObservationSupported { .. }
                 | Self::RuntimeObservationV2Supported { .. }
+                | Self::MetalTopology { .. }
                 | Self::RuntimeObservationStarted { .. }
                 | Self::RuntimeObservationV2Started { .. }
                 | Self::RuntimeObservationCompleted { .. }
@@ -1319,6 +1336,12 @@ struct Correlation {
     request_id: u64,
 }
 
+enum MetalDispatchWriteError {
+    Cancelled,
+    Deadline(anyhow::Error),
+    Write(anyhow::Error),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CancelOutcome {
     NoActiveRequest,
@@ -1466,6 +1489,111 @@ struct WorkerPackDeviceCapability {
     memory_available_bytes: u64,
 }
 
+/// The complete, bounded physical Metal witness exchanged only by an
+/// authenticated Metal worker. It purposely contains neither provider order
+/// nor display/default/memory facts: those are not stable topology identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetalTopologyV1 {
+    devices: Vec<MetalTopologyDeviceV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetalTopologyDeviceV1 {
+    stable_registry_identity: String,
+    vendor: GpuVendor,
+    device_class: DeviceClass,
+}
+
+impl MetalTopologyV1 {
+    fn canonicalize(mut devices: Vec<MetalTopologyDeviceV1>) -> Result<Self> {
+        if devices.is_empty() || devices.len() > MAX_PACK_DEVICES {
+            bail!("Metal topology witness is empty or exceeds the device bound");
+        }
+        for device in &mut devices {
+            device.stable_registry_identity =
+                canonical_metal_registry_identity(&device.stable_registry_identity)?;
+            if !matches!(
+                device.device_class,
+                DeviceClass::DiscreteGpu | DeviceClass::IntegratedGpu | DeviceClass::UnifiedGpu
+            ) {
+                bail!("Metal topology witness has a non-GPU device class");
+            }
+            if matches!(device.vendor, GpuVendor::Unknown) {
+                bail!("Metal topology witness has an unknown vendor");
+            }
+        }
+        devices.sort_by(|left, right| {
+            left.stable_registry_identity
+                .cmp(&right.stable_registry_identity)
+        });
+        if devices
+            .windows(2)
+            .any(|pair| pair[0].stable_registry_identity == pair[1].stable_registry_identity)
+        {
+            bail!("Metal topology witness contains duplicate registry identities");
+        }
+        Ok(Self { devices })
+    }
+
+    fn covers_target(&self, target: &BackendTarget) -> bool {
+        target.backend == BackendKind::Metal
+            && self.devices.iter().any(|device| {
+                device.stable_registry_identity == target.device_id.as_str()
+                    && device.vendor == target.vendor
+                    && device.device_class == target.device_class
+            })
+    }
+}
+
+fn canonical_metal_registry_identity(identity: &str) -> Result<String> {
+    let value = identity
+        .strip_prefix("metal-registry:")
+        .ok_or_else(|| anyhow!("Metal topology identity has no registry prefix"))?;
+    if value.len() != 16
+        || value != value.to_ascii_lowercase()
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("Metal topology identity is not fixed-width lowercase hexadecimal");
+    }
+    let registry_id = u64::from_str_radix(value, 16)
+        .map_err(|_| anyhow!("Metal topology identity is not hexadecimal"))?;
+    if registry_id == 0 {
+        bail!("Metal topology identity must not name registry ID zero");
+    }
+    Ok(format!("metal-registry:{registry_id:016x}"))
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "metal-acceleration")))]
+fn metal_topology_from_raw_devices(
+    devices: &[crate::macos_gpu::MetalDevice],
+) -> Result<MetalTopologyV1> {
+    MetalTopologyV1::canonicalize(
+        devices
+            .iter()
+            .map(|device| MetalTopologyDeviceV1 {
+                stable_registry_identity: device.stable_identity.clone(),
+                vendor: device.vendor,
+                device_class: device.device_class,
+            })
+            .collect(),
+    )
+}
+
+fn discover_worker_metal_topology() -> Result<MetalTopologyV1> {
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    {
+        let devices = crate::macos_gpu::discover_devices()
+            .context("could not refresh MTLDevice registry identities")?;
+        return metal_topology_from_raw_devices(&devices);
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal-acceleration")))]
+    {
+        bail!("Metal topology refresh requires the dedicated macOS Metal worker")
+    }
+}
+
 #[derive(Clone, Debug)]
 #[cfg(any(feature = "inference-worker", test))]
 struct CurrentPackRuntimeDeviceCatalog {
@@ -1584,6 +1712,10 @@ struct WorkerCapability {
     compatibility: Option<FrozenWorkerCompatibilityContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pack: Option<WorkerPackCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metal_topology_refresh_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metal_topology: Option<MetalTopologyV1>,
 }
 
 fn expected_worker_for_provider(role: WorkerRole, provider: WorkerProvider) -> WorkerExpectation {
@@ -1611,11 +1743,13 @@ fn expected_worker(role: WorkerRole) -> WorkerExpectation {
 }
 
 fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapability> {
-    worker_capability_for_provider(
+    let facts = worker_pack_capability(role)?;
+    worker_capability_for_provider_with_metal_topology(
         role,
         challenge,
         compiled_worker_provider(role),
-        worker_pack_capability(role)?,
+        facts.pack,
+        facts.metal_topology,
     )
 }
 
@@ -1624,6 +1758,16 @@ fn worker_capability_for_provider(
     challenge: String,
     provider: WorkerProvider,
     pack: Option<WorkerPackCapability>,
+) -> Result<WorkerCapability> {
+    worker_capability_for_provider_with_metal_topology(role, challenge, provider, pack, None)
+}
+
+fn worker_capability_for_provider_with_metal_topology(
+    role: WorkerRole,
+    challenge: String,
+    provider: WorkerProvider,
+    pack: Option<WorkerPackCapability>,
+    metal_topology: Option<MetalTopologyV1>,
 ) -> Result<WorkerCapability> {
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let artifacts = match role {
@@ -1665,11 +1809,21 @@ fn worker_capability_for_provider(
         artifacts,
         compatibility: None,
         pack,
+        metal_topology_refresh_version: metal_topology
+            .as_ref()
+            .map(|_| METAL_TOPOLOGY_REFRESH_VERSION_V1),
+        metal_topology,
     };
     // On Linux this closes inherited FD 3 only after the one Hello capability
     // has been completely formed from its sealed image digest.
     drop(inference_fingerprint);
     Ok(capability)
+}
+
+#[derive(Default)]
+struct WorkerPackCapabilityFacts {
+    pack: Option<WorkerPackCapability>,
+    metal_topology: Option<MetalTopologyV1>,
 }
 
 struct InferenceWorkerFingerprint {
@@ -2649,12 +2803,12 @@ pub(crate) fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32
 }
 
 #[cfg(feature = "inference-worker")]
-fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+fn worker_pack_capability(role: WorkerRole) -> Result<WorkerPackCapabilityFacts> {
     use transcribe_cpp::DeviceType;
 
     clear_current_pack_runtime_devices();
     let Some(expectation) = worker_pack_expectation_from_private_env()? else {
-        return Ok(None);
+        return Ok(WorkerPackCapabilityFacts::default());
     };
     if role != WorkerRole::Inference {
         bail!("only the inference role may advertise a GPU worker pack");
@@ -2822,6 +2976,7 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
             .collect::<Result<Vec<_>>>()?;
         let metal = crate::macos_gpu::discover_devices()
             .context("could not obtain MTLDevice registry identities")?;
+        let topology = metal_topology_from_raw_devices(&metal)?;
         let devices = crate::macos_gpu::remap_provider_devices(&provider, &metal)?
             .into_iter()
             .map(|device| {
@@ -2839,7 +2994,9 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        return finish_worker_pack_capability(expectation, expected_device_id, devices);
+        let mut facts = finish_worker_pack_capability(expectation, expected_device_id, devices)?;
+        facts.metal_topology = Some(topology);
+        return Ok(facts);
     }
     if expectation.backend == WorkerProvider::Metal {
         bail!("Metal GPU worker pack requires macOS Metal acceleration");
@@ -2943,7 +3100,7 @@ fn finish_worker_pack_capability(
     expectation: WorkerPackExpectation,
     expected_device_id: Option<String>,
     devices: Vec<WorkerPackDeviceCapability>,
-) -> Result<Option<WorkerPackCapability>> {
+) -> Result<WorkerPackCapabilityFacts> {
     // Validate before the parent-selected stable ID narrows the list. A
     // duplicate index in another provider device must not be hidden by that
     // filter and later make an index-only remap ambiguous.
@@ -2984,17 +3141,20 @@ fn finish_worker_pack_capability(
         )
         .is_some_and(|current| current.process_index == device.process_index)
     }));
-    Ok(Some(capability))
+    Ok(WorkerPackCapabilityFacts {
+        pack: Some(capability),
+        metal_topology: None,
+    })
 }
 
 #[cfg(not(feature = "inference-worker"))]
-fn worker_pack_capability(_role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+fn worker_pack_capability(_role: WorkerRole) -> Result<WorkerPackCapabilityFacts> {
     clear_current_pack_runtime_devices();
     worker_pack_expectation_from_private_env().and_then(|pack| {
         if pack.is_some() {
             bail!("desktop process cannot advertise a GPU worker pack")
         }
-        Ok(None)
+        Ok(WorkerPackCapabilityFacts::default())
     })
 }
 
@@ -3069,6 +3229,24 @@ fn validate_worker_capability_for_hello(
         })
     {
         bail!("worker capability does not advertise the required artifact targets");
+    }
+    match (
+        expected.provider,
+        capability.metal_topology_refresh_version,
+        capability.metal_topology.as_ref(),
+    ) {
+        (WorkerProvider::Metal, Some(METAL_TOPOLOGY_REFRESH_VERSION_V1), Some(topology)) => {
+            if MetalTopologyV1::canonicalize(topology.devices.clone())? != *topology {
+                bail!("Metal worker topology witness is not canonical");
+            }
+        }
+        (WorkerProvider::Metal, _, _) => {
+            bail!("Metal worker capability omitted topology-refresh-v1");
+        }
+        (_, Some(_), _) | (_, _, Some(_)) => {
+            bail!("non-Metal worker capability advertised a Metal topology witness");
+        }
+        (_, None, None) => {}
     }
     Ok(())
 }
@@ -3630,6 +3808,7 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
             Control::Hello { .. }
                 | Control::CompatibilityHello { .. }
                 | Control::NegotiateRuntimeObservation { .. }
+                | Control::RefreshMetalTopology { .. }
                 | Control::BeginRuntimeObservation { .. }
                 | Control::FinishRuntimeObservation { .. }
                 | Control::LoadRuntime { .. }
@@ -5419,6 +5598,9 @@ struct CurrentGeneration {
     frozen_worker_approval: Option<FrozenWorkerApproval>,
     pack_launch: Option<PackLaunchContext>,
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
+    metal_topology_refresh_version: Option<u8>,
+    metal_topology: Option<MetalTopologyV1>,
+    hello_challenge: Option<String>,
     #[cfg(feature = "windows-gpu-capture-observation")]
     validated_handshake: Option<ValidatedWorkerHandshake>,
 }
@@ -5433,6 +5615,20 @@ struct ValidatedWorkerHandshake {
 struct WorkerGenerationContext {
     generation: u64,
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
+}
+
+struct MetalTopologyRefreshContext {
+    generation: u64,
+    hello_challenge: String,
+    topology: MetalTopologyV1,
+}
+
+/// An authenticated, exact-generation probe observation. This stays inside the
+/// supervisor/discovery pipeline: launch bindings remain the only data that
+/// can leave the probe as executable authority.
+struct VerifiedPackProbeOutcome {
+    bindings: Vec<VerifiedPackLaunchBinding>,
+    metal_topology: Option<MetalTopologyV1>,
 }
 
 /// A read-only observation lease for one validated worker generation.
@@ -5765,6 +5961,8 @@ struct SupervisorInner {
     writer: Mutex<Option<WriterSlot>>,
     pending: Mutex<HashMap<Correlation, SyncSender<PendingResult>>>,
     #[cfg(test)]
+    writer_contention_observer: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    #[cfg(test)]
     retirement_snapshot_gate: Mutex<Option<RetirementSnapshotGate>>,
     #[cfg(test)]
     retirement_wait_observer: Mutex<Option<std::sync::mpsc::Sender<MonotonicDeadline>>>,
@@ -5824,6 +6022,8 @@ impl ProcessWorkerSupervisor {
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 #[cfg(test)]
+                writer_contention_observer: Mutex::new(None),
+                #[cfg(test)]
                 retirement_snapshot_gate: Mutex::new(None),
                 #[cfg(test)]
                 retirement_wait_observer: Mutex::new(None),
@@ -5849,6 +6049,8 @@ impl ProcessWorkerSupervisor {
                 state: Mutex::new(SupervisorState::default()),
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                writer_contention_observer: Mutex::new(None),
                 #[cfg(test)]
                 retirement_snapshot_gate: Mutex::new(None),
                 #[cfg(test)]
@@ -6560,6 +6762,9 @@ impl ProcessWorkerSupervisor {
                 frozen_worker_approval: frozen_worker_approval.clone(),
                 pack_launch,
                 pack_bindings: Vec::new(),
+                metal_topology_refresh_version: None,
+                metal_topology: None,
+                hello_challenge: None,
                 #[cfg(feature = "windows-gpu-capture-observation")]
                 validated_handshake: None,
             });
@@ -7159,6 +7364,88 @@ impl ProcessWorkerSupervisor {
         result.map(|response| response.control)
     }
 
+    /// Runs an already-authorized metadata request under one caller-owned
+    /// absolute deadline. The deadline is never reconstructed after framing,
+    /// registration, or dispatch.
+    fn active_round_trip_before_with_request_cancellation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        frames: &[Frame],
+        deadline: MonotonicDeadline,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Control> {
+        let correlation = Correlation {
+            generation,
+            session_id,
+            request_id,
+        };
+        let response = self.register(correlation)?;
+        let active_error = match self.inner.state.lock() {
+            Ok(mut state)
+                if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation)
+                    && !state.retiring_generations.contains_key(&generation) =>
+            {
+                if state.active_request.is_some() {
+                    Some(anyhow!("a process worker request is already active"))
+                } else {
+                    state.active_request = Some(correlation);
+                    None
+                }
+            }
+            Ok(_) => Some(anyhow!(
+                "process worker generation {generation} is unavailable"
+            )),
+            Err(_) => Some(anyhow!("process worker supervisor state lock was poisoned")),
+        };
+        if let Some(error) = active_error {
+            self.unregister(correlation);
+            return Err(error);
+        }
+        if cancelled() || deadline.remaining().is_err() {
+            self.unregister(correlation);
+            self.clear_active(correlation);
+            if cancelled() {
+                bail!("Metal topology refresh was cancelled before dispatch");
+            }
+            bail!("Metal topology refresh deadline expired before dispatch");
+        }
+        match self.write_metal_frames_before_with_request_cancellation(
+            generation, frames, deadline, &cancelled,
+        ) {
+            Ok(()) => {}
+            Err(MetalDispatchWriteError::Cancelled) => {
+                self.unregister(correlation);
+                self.clear_active(correlation);
+                bail!("Metal topology refresh was cancelled before dispatch");
+            }
+            Err(MetalDispatchWriteError::Deadline(error)) => {
+                self.unregister(correlation);
+                self.clear_active(correlation);
+                return Err(
+                    error.context("Metal topology refresh deadline expired before dispatch")
+                );
+            }
+            Err(MetalDispatchWriteError::Write(error)) => {
+                self.unregister(correlation);
+                self.invalidate_generation(generation, &error.to_string(), true)?;
+                return Err(error);
+            }
+        }
+        let result = self.await_response_with_request_cancellation_before(
+            correlation,
+            response,
+            deadline,
+            cancelled,
+        );
+        self.clear_active(correlation);
+        result.map(|response| response.control)
+    }
+
     fn require_stream(&self, session_id: u64) -> Result<SupervisorStream> {
         self.inner
             .state
@@ -7318,14 +7605,36 @@ impl ProcessWorkerSupervisor {
         if capability.compatibility != launch_compatibility {
             bail!("process worker compatibility context changed during Hello");
         }
-        match (&current.pack_launch, &capability.pack) {
-            (None, None) => Ok(()),
-            (Some(context), Some(pack)) => {
-                current.pack_bindings = bind_pack_hello(context, pack)?;
-                Ok(())
-            }
+        let bindings = match (&current.pack_launch, &capability.pack) {
+            (None, None) => Vec::new(),
+            (Some(context), Some(pack)) => bind_pack_hello(context, pack)?,
             _ => bail!("process worker pack capability did not match launch authority"),
+        };
+        match (expected.provider, capability.metal_topology.as_ref()) {
+            (WorkerProvider::Metal, Some(topology)) => {
+                if bindings
+                    .iter()
+                    .any(|binding| !topology.covers_target(&binding.backend_target()))
+                {
+                    bail!("Metal worker topology witness does not cover the routed stable device");
+                }
+                current.metal_topology = Some(topology.clone());
+                current.metal_topology_refresh_version = Some(METAL_TOPOLOGY_REFRESH_VERSION_V1);
+            }
+            (WorkerProvider::Metal, None) => {
+                bail!("Metal worker omitted its topology-refresh-v1 witness");
+            }
+            (_, Some(_)) => {
+                bail!("non-Metal worker attempted to bind a Metal topology witness");
+            }
+            (_, None) => {
+                current.metal_topology = None;
+                current.metal_topology_refresh_version = None;
+            }
         }
+        current.pack_bindings = bindings;
+        current.hello_challenge = Some(capability.challenge.clone());
+        Ok(())
     }
 
     #[cfg(feature = "windows-gpu-capture-observation")]
@@ -7579,6 +7888,94 @@ impl ProcessWorkerSupervisor {
         })
     }
 
+    /// Takes a read-only lease on the exact warm Metal generation. This is
+    /// deliberately stricter than `has_loaded_artifact`: a stale/retiring,
+    /// unloaded, busy, or pre-extension worker is never asked to refresh.
+    /// It does not call `ensure_generation`, load a model, or alter a stream.
+    fn metal_topology_refresh_context(
+        &self,
+        expected_model_identity: &str,
+    ) -> Result<MetalTopologyRefreshContext> {
+        let (generation, process, hello_challenge, topology) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let current = state.current.as_ref().ok_or_else(|| {
+                anyhow!("no current worker generation is available for Metal topology refresh")
+            })?;
+            if current.expectation.provider != WorkerProvider::Metal
+                || state.retiring_generations.contains_key(&current.generation)
+                || state.active_request.is_some()
+                || state
+                    .active_stream
+                    .is_some_and(|stream| stream.generation == current.generation)
+            {
+                bail!("current worker generation is not an idle Metal refresh owner");
+            }
+            if state.active_model.as_ref()
+                != Some(&(current.generation, expected_model_identity.to_owned()))
+            {
+                bail!("current Metal worker model does not match the cached admission");
+            }
+            let topology = current.metal_topology.clone().ok_or_else(|| {
+                anyhow!("current Metal worker did not negotiate topology-refresh-v1")
+            })?;
+            if current.metal_topology_refresh_version != Some(METAL_TOPOLOGY_REFRESH_VERSION_V1) {
+                bail!(
+                    "current Metal worker did not negotiate the supported topology refresh version"
+                );
+            }
+            let challenge = current
+                .hello_challenge
+                .as_deref()
+                .ok_or_else(|| anyhow!("current Metal worker has no validated Hello challenge"))?;
+            if challenge.len() != 64 || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("current Metal worker has an invalid validated Hello challenge");
+            }
+            (
+                current.generation,
+                Arc::clone(&current.process),
+                challenge.to_owned(),
+                topology,
+            )
+        };
+        if !process.is_running()? {
+            bail!("current Metal worker generation is no longer running");
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_ref()
+            .filter(|current| {
+                current.generation == generation && Arc::ptr_eq(&current.process, &process)
+            })
+            .ok_or_else(|| anyhow!("current Metal worker generation changed during refresh"))?;
+        if current.expectation.provider != WorkerProvider::Metal
+            || current.metal_topology.as_ref() != Some(&topology)
+            || current.metal_topology_refresh_version != Some(METAL_TOPOLOGY_REFRESH_VERSION_V1)
+            || state.retiring_generations.contains_key(&generation)
+            || state.active_request.is_some()
+            || state
+                .active_stream
+                .is_some_and(|stream| stream.generation == generation)
+            || state.active_model.as_ref()
+                != Some(&(generation, expected_model_identity.to_owned()))
+        {
+            bail!("current Metal worker generation is no longer an idle refresh owner");
+        }
+        Ok(MetalTopologyRefreshContext {
+            generation,
+            hello_challenge,
+            topology,
+        })
+    }
+
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn observation_generation_context(
         &self,
@@ -7622,6 +8019,141 @@ impl ProcessWorkerSupervisor {
             .filter(|current| current.generation == generation)
             .map(|current| current.pack_bindings.clone())
             .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))
+    }
+
+    fn verified_pack_probe_outcome_for_generation(
+        &self,
+        generation: u64,
+    ) -> Result<VerifiedPackProbeOutcome> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_ref()
+            .filter(|current| current.generation == generation)
+            .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))?;
+        if state.retiring_generations.contains_key(&generation) {
+            bail!("process worker generation {generation} is being retired")
+        }
+        if current.pack_bindings.is_empty() {
+            bail!("inference worker did not produce a verified pack binding");
+        }
+        let metal_topology = match current.expectation.provider {
+            WorkerProvider::Metal => {
+                if current.metal_topology_refresh_version != Some(METAL_TOPOLOGY_REFRESH_VERSION_V1)
+                {
+                    bail!("Metal probe did not negotiate topology-refresh-v1");
+                }
+                let topology = current.metal_topology.clone().ok_or_else(|| {
+                    anyhow!("Metal probe did not retain its authenticated topology witness")
+                })?;
+                if MetalTopologyV1::canonicalize(topology.devices.clone())? != topology {
+                    bail!("Metal probe retained a noncanonical topology witness");
+                }
+                if current
+                    .pack_bindings
+                    .iter()
+                    .any(|binding| !topology.covers_target(&binding.backend_target()))
+                {
+                    bail!("Metal probe topology witness does not cover every routed device");
+                }
+                Some(topology)
+            }
+            _ => {
+                if current.metal_topology_refresh_version.is_some()
+                    || current.metal_topology.is_some()
+                {
+                    bail!("non-Metal probe retained a Metal topology witness");
+                }
+                None
+            }
+        };
+        Ok(VerifiedPackProbeOutcome {
+            bindings: current.pack_bindings.clone(),
+            metal_topology,
+        })
+    }
+
+    #[cfg(test)]
+    fn observe_writer_contention_for_test(&self, observer: std::sync::mpsc::SyncSender<()>) {
+        *self.inner.writer_contention_observer.lock().unwrap() = Some(observer);
+    }
+
+    /// Metadata refresh dispatch must remain cancellation- and deadline-aware
+    /// while waiting for the shared writer. Ordinary worker commands keep the
+    /// established blocking writer path below.
+    fn write_metal_frames_before_with_request_cancellation(
+        &self,
+        generation: u64,
+        frames: &[Frame],
+        deadline: MonotonicDeadline,
+        cancelled: &impl Fn() -> bool,
+    ) -> std::result::Result<(), MetalDispatchWriteError> {
+        let check_dispatch = || {
+            if cancelled() {
+                return Err(MetalDispatchWriteError::Cancelled);
+            }
+            deadline
+                .remaining()
+                .map(|_| ())
+                .map_err(MetalDispatchWriteError::Deadline)
+        };
+        let mut writer = loop {
+            check_dispatch()?;
+            match self.inner.writer.try_lock() {
+                Ok(writer) => break writer,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    if let Some(observer) = self
+                        .inner
+                        .writer_contention_observer
+                        .lock()
+                        .map_err(|_| {
+                            MetalDispatchWriteError::Write(anyhow!(
+                                "process worker writer contention observer lock was poisoned"
+                            ))
+                        })?
+                        .take()
+                    {
+                        let _ = observer.send(());
+                    }
+                    // Do not spin while another request owns the writer. The
+                    // bounded pause is charged to this request's original
+                    // deadline; the next iteration repeats both fences.
+                    check_dispatch()?;
+                    let pause = deadline
+                        .remaining()
+                        .map_err(MetalDispatchWriteError::Deadline)?
+                        .min(Duration::from_millis(2));
+                    std::thread::park_timeout(pause);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(MetalDispatchWriteError::Write(anyhow!(
+                        "process worker writer lock was poisoned"
+                    )));
+                }
+            }
+        };
+        let slot = writer
+            .as_mut()
+            .filter(|slot| slot.generation == generation)
+            .ok_or_else(|| {
+                MetalDispatchWriteError::Write(anyhow!(
+                    "process worker generation {generation} is unavailable"
+                ))
+            })?;
+        for frame in frames {
+            // This is deliberately inside the acquired writer lease and
+            // immediately precedes the write: a request that waited behind a
+            // prior command cannot dispatch after its own cancellation or
+            // absolute deadline has elapsed.
+            check_dispatch()?;
+            write_frame(&mut slot.stdin, frame).map_err(MetalDispatchWriteError::Write)?;
+        }
+        Ok(())
     }
 
     fn write_frames(&self, generation: u64, frames: &[Frame]) -> Result<()> {
@@ -7688,6 +8220,44 @@ impl ProcessWorkerSupervisor {
         }
     }
 
+    fn await_response_with_request_cancellation_before(
+        &self,
+        correlation: Correlation,
+        response: Receiver<PendingResult>,
+        deadline: MonotonicDeadline,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<WorkerResponse> {
+        loop {
+            if cancelled() {
+                self.unregister(correlation);
+                self.invalidate_generation(
+                    correlation.generation,
+                    "Metal topology refresh was cancelled",
+                    true,
+                )?;
+                bail!("Metal topology refresh was cancelled");
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_err() {
+                self.unregister(correlation);
+                self.invalidate_generation(
+                    correlation.generation,
+                    "process worker response deadline exceeded",
+                    true,
+                )?;
+                bail!("Metal topology refresh deadline exceeded");
+            }
+            let remaining = remaining.expect("checked above");
+            match response.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(result) => return result.map_err(anyhow::Error::msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("process worker response channel disconnected")
+                }
+            }
+        }
+    }
+
     fn clear_active(&self, correlation: Correlation) {
         if let Ok(mut state) = self.inner.state.lock()
             && state.active_request == Some(correlation)
@@ -7721,7 +8291,15 @@ impl ProcessWorkerSupervisor {
             return wait_deadline.remaining();
         }
         match join_deadline {
-            Some(deadline) => deadline.remaining(),
+            Some(deadline) => {
+                #[cfg(test)]
+                if let Ok(observer) = self.inner.retirement_wait_observer.lock()
+                    && let Some(observer) = observer.as_ref()
+                {
+                    let _ = observer.send(deadline);
+                }
+                deadline.remaining()
+            }
             None => Ok(self.inner.deadlines.cancel),
         }
     }
@@ -8888,6 +9466,11 @@ struct CorrelatedRuntimeExecution {
     end_request_id: u64,
 }
 
+struct MetalTopologyRefresh {
+    initial: MetalTopologyV1,
+    current: MetalTopologyV1,
+}
+
 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
 #[derive(Debug)]
 pub(crate) struct ObservedRuntimeExecution {
@@ -8961,6 +9544,7 @@ impl InferenceWorkerSupervisor {
         Ok(bindings)
     }
 
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     fn verified_pack_bindings_before(
         &self,
         deadline: MonotonicDeadline,
@@ -8973,6 +9557,20 @@ impl InferenceWorkerSupervisor {
             bail!("inference worker did not produce a verified pack binding");
         }
         Ok(bindings)
+    }
+
+    fn verified_pack_probe_outcome_before(
+        &self,
+        deadline: MonotonicDeadline,
+        cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+    ) -> Result<VerifiedPackProbeOutcome> {
+        let generation =
+            self.transport
+                .ensure_generation_before_admitted(Some(deadline), None, || {
+                    !provider_discovery_was_cancelled(cancellation)
+                })?;
+        self.transport
+            .verified_pack_probe_outcome_for_generation(generation)
     }
 
     fn reconcile_verified_pack_diagnostics(
@@ -9147,6 +9745,127 @@ impl InferenceWorkerSupervisor {
         self.transport
             .current_generation_has_active_model(&identity)
             .unwrap_or(false)
+    }
+
+    /// Refreshes metadata on the exact already-loaded Metal generation. This
+    /// is intentionally not a health check: it cannot create, load, replace,
+    /// or globally initialize a provider runtime.
+    fn refresh_metal_topology(
+        &self,
+        artifact: &RuntimeArtifact,
+        deadline: MonotonicDeadline,
+        cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+    ) -> Result<MetalTopologyRefresh, RuntimeError> {
+        let cancelled = || {
+            cancellation.is_some_and(|(generation, snapshot)| {
+                generation.load(Ordering::Acquire) != snapshot
+            })
+        };
+        if cancelled() {
+            return Err(RuntimeError::Cancelled(
+                "Metal topology refresh was cancelled before dispatch".to_owned(),
+            ));
+        }
+        let identity = Self::artifact_identity(artifact, AccelerationPreference::Gpu)?;
+        let context = self
+            .transport
+            .metal_topology_refresh_context(&identity)
+            .map_err(|error| {
+                if cancelled() {
+                    RuntimeError::Cancelled("Metal topology refresh was cancelled".to_owned())
+                } else {
+                    worker_unavailable(error)
+                }
+            })?;
+        let session_id = self.next_id();
+        let request_id = self.next_id();
+        let nonce = random_challenge().map_err(worker_unavailable)?;
+        let frame = control_frame(
+            session_id,
+            request_id,
+            &Control::RefreshMetalTopology {
+                version: METAL_TOPOLOGY_REFRESH_VERSION_V1,
+                challenge: context.hello_challenge.clone(),
+                nonce: nonce.clone(),
+            },
+        )
+        .map_err(worker_unavailable)?;
+        let response = self
+            .transport
+            .active_round_trip_before_with_request_cancellation(
+                context.generation,
+                session_id,
+                request_id,
+                &[frame],
+                deadline,
+                cancelled,
+            )
+            .map_err(|error| {
+                if cancelled() {
+                    RuntimeError::Cancelled("Metal topology refresh was cancelled".to_owned())
+                } else {
+                    worker_unavailable(error)
+                }
+            })?;
+        let current = match response {
+            Control::MetalTopology {
+                version,
+                challenge,
+                nonce: response_nonce,
+                topology,
+            } if version == METAL_TOPOLOGY_REFRESH_VERSION_V1
+                && challenge == context.hello_challenge
+                && response_nonce == nonce =>
+            {
+                let canonical = MetalTopologyV1::canonicalize(topology.devices.clone())
+                    .map_err(worker_unavailable)?;
+                if canonical != topology {
+                    let _ = self.transport.invalidate_generation(
+                        context.generation,
+                        "noncanonical Metal topology refresh response",
+                        true,
+                    );
+                    return Err(RuntimeError::WorkerUnavailable(
+                        "worker returned a noncanonical Metal topology refresh response".to_owned(),
+                    ));
+                }
+                topology
+            }
+            Control::Error { message } => {
+                return Err(RuntimeError::WorkerUnavailable(message));
+            }
+            _ => {
+                let _ = self.transport.invalidate_generation(
+                    context.generation,
+                    "unexpected Metal topology refresh response",
+                    true,
+                );
+                return Err(RuntimeError::WorkerUnavailable(
+                    "worker does not support Metal topology-refresh-v1".to_owned(),
+                ));
+            }
+        };
+        let still_current = self
+            .transport
+            .metal_topology_refresh_context(&identity)
+            .map_err(|error| {
+                if cancelled() {
+                    RuntimeError::Cancelled("Metal topology refresh was cancelled".to_owned())
+                } else {
+                    worker_unavailable(error)
+                }
+            })?;
+        if still_current.generation != context.generation
+            || still_current.topology != context.topology
+        {
+            return Err(RuntimeError::WorkerUnavailable(
+                "Metal worker generation changed during topology refresh".to_owned(),
+            ));
+        }
+        Ok(MetalTopologyRefresh {
+            initial: context.topology,
+            current,
+        })
     }
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
@@ -10048,6 +10767,7 @@ impl CaptureObservationWorkerFactory {
                 &mut allowance,
                 &provider_probe_cleanup,
             )?
+            .registry
         } else {
             let mut discovery = discovery;
             discovery.leases.retain(|lease| {
@@ -10443,6 +11163,7 @@ struct VerifiedGpuRouteCatalog {
     routes: Arc<Vec<InferenceWorkerRoute>>,
     diagnostic: Option<String>,
     device_set_digest: String,
+    metal_topology: Option<MetalTopologyV1>,
     discovery_fingerprint: String,
     model_digest: Option<String>,
     provider_probe_incomplete: bool,
@@ -10455,6 +11176,7 @@ struct DeferredGpuRouteDiscovery {
     packs: DeferredPackDiscovery,
     discovery_fingerprint: String,
     device_set_digest: String,
+    metal_topology: Option<MetalTopologyV1>,
     model_digest: Option<String>,
     #[cfg(test)]
     route_stages_for_testing: VecDeque<DeferredRouteStageForTesting>,
@@ -10558,6 +11280,19 @@ fn gpu_catalog_lookup_for_model(
 }
 
 impl GpuRouteCatalogCache {
+    /// Forget only a positive reuse authority. Failed-probe and Auto
+    /// admission backoff remain intact: topology change is neither a runtime
+    /// health failure nor evidence that a denied probe became eligible.
+    fn clear_successful_for(&mut self, discovery_fingerprint: &str) {
+        if self
+            .successful
+            .as_ref()
+            .is_some_and(|catalog| catalog.discovery_fingerprint == discovery_fingerprint)
+        {
+            self.successful = None;
+        }
+    }
+
     fn lookup(&self, discovery_fingerprint: &str, now: Instant) -> GpuRouteCatalogLookup {
         let successful = self
             .successful
@@ -11035,10 +11770,18 @@ struct ProviderProbeCleanupFence {
     supervisors: Mutex<Vec<InferenceWorkerSupervisor>>,
     #[cfg(test)]
     confirmed_cleanup_gate: Mutex<Option<ConfirmedProviderCleanupGate>>,
+    #[cfg(test)]
+    before_probe_gate: Mutex<Option<BeforeProviderProbeGate>>,
 }
 
 #[cfg(test)]
 struct ConfirmedProviderCleanupGate {
+    reached: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+#[cfg(test)]
+struct BeforeProviderProbeGate {
     reached: SyncSender<()>,
     release: Receiver<()>,
 }
@@ -11065,6 +11808,22 @@ impl ProviderProbeCleanupFence {
     #[cfg(test)]
     fn gate_confirmed_cleanup_for_test(&self, gate: ConfirmedProviderCleanupGate) {
         *self.confirmed_cleanup_gate.lock().unwrap() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn gate_before_probe_for_test(&self, gate: BeforeProviderProbeGate) {
+        *self.before_probe_gate.lock().unwrap() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn wait_before_probe_for_test(&self) {
+        let gate = self.before_probe_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.send(()).unwrap();
+            gate.release
+                .recv_timeout(Duration::from_secs(1))
+                .expect("before-provider-probe test gate timed out");
+        }
     }
 
     fn acquire_before(
@@ -11325,7 +12084,38 @@ struct DeferredPackDiscovery {
 
 struct StagedProductionPackRegistry {
     registry: crate::gpu_worker_pack::ProductionPackRegistry,
+    // Captured from authenticated CurrentGeneration state before its probe is
+    // retired. It is never a resolver binding or a caller-provided digest.
+    metal_topology: Option<MetalTopologyV1>,
     deferred: Option<DeferredPackDiscovery>,
+}
+
+struct ObservedPackProbeRegistry {
+    registry: crate::gpu_worker_pack::ProductionPackRegistry,
+    metal_topology: Option<MetalTopologyV1>,
+}
+
+impl ObservedPackProbeRegistry {
+    fn empty(diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>) -> Self {
+        Self {
+            registry: crate::gpu_worker_pack::ProductionPackRegistry::empty()
+                .with_diagnostics(diagnostics),
+            metal_topology: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.registry.is_empty()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<VerifiedPackLaunchBinding>,
+        Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
+    ) {
+        self.registry.into_parts()
+    }
 }
 
 fn pack_backend_priority(backend: PackBackend) -> u8 {
@@ -11386,12 +12176,148 @@ fn diagnose_exhausted_pack_stages(
     }
 }
 
+/// The refresh-recovery caller supplies the request's original cancellation
+/// snapshot. Ordinary load/health discovery passes `None` and retains its
+/// established non-cancellable contract.
+fn check_provider_discovery_cancellation(
+    cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> Result<(), RuntimeError> {
+    if provider_discovery_was_cancelled(cancellation) {
+        return Err(RuntimeError::Cancelled(
+            "Metal topology refresh was cancelled before provider discovery".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The refresh-recovery caller owns this exact cancellation snapshot from the
+/// route-execution boundary through retirement and any replacement probe. It
+/// is intentionally a predicate (rather than a new cancellation primitive)
+/// so the process supervisor can fence its final launch admission without
+/// widening ordinary load or health cancellation contracts.
+fn provider_discovery_was_cancelled(
+    cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> bool {
+    cancellation
+        .is_some_and(|(generation, snapshot)| generation.load(Ordering::Acquire) != snapshot)
+}
+
+fn collect_verified_pack_probe_outcomes(
+    probes: Vec<PendingPackProbe>,
+    mut diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
+    allowance: &mut ProviderDiscoveryAllowance,
+    cleanup: &ProviderProbeCleanupFence,
+    deadline: MonotonicDeadline,
+    cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> Result<ObservedPackProbeRegistry, RuntimeError> {
+    use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+    let mut bindings = Vec::new();
+    let mut metal_bindings = Vec::new();
+    let mut metal_topology = None;
+    let mut reject_metal_stage = false;
+    for probe in probes {
+        check_provider_discovery_cancellation(cancellation)?;
+        if allowance.remaining_probes == 0 || deadline.remaining().is_err() {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            ));
+            continue;
+        }
+        allowance.remaining_probes -= 1;
+        #[cfg(test)]
+        cleanup.wait_before_probe_for_test();
+        check_provider_discovery_cancellation(cancellation)?;
+        let probe_result = cleanup.run_probe(&probe.supervisor, deadline, || {
+            probe
+                .supervisor
+                .verified_pack_probe_outcome_before(deadline, cancellation)
+        });
+        // If cancellation races an already-running probe, its cleanup fence
+        // has completed before this check; cancellation still wins before any
+        // binding or catalog authority can be published.
+        check_provider_discovery_cancellation(cancellation)?;
+        match probe_result? {
+            Ok(observed) => {
+                let mut accepted = Vec::new();
+                for binding in observed.bindings {
+                    if binding.backend_target().driver_version.is_none() {
+                        diagnostics.push(PackDiscoveryDiagnostic::pack(
+                            PackDiscoveryIssue::DriverVersionUnavailable,
+                            &probe.pack_id,
+                            probe.backend,
+                        ));
+                    } else {
+                        accepted.push(binding);
+                    }
+                }
+                if probe.backend != PackBackend::Metal {
+                    if observed.metal_topology.is_some() {
+                        diagnostics.push(PackDiscoveryDiagnostic::pack(
+                            PackDiscoveryIssue::ProviderProbeRejected,
+                            &probe.pack_id,
+                            probe.backend,
+                        ));
+                    } else {
+                        bindings.extend(accepted);
+                    }
+                    continue;
+                }
+                if accepted.is_empty() {
+                    continue;
+                }
+                let Some(topology) = observed.metal_topology else {
+                    diagnostics.push(PackDiscoveryDiagnostic::pack(
+                        PackDiscoveryIssue::ProviderProbeRejected,
+                        &probe.pack_id,
+                        probe.backend,
+                    ));
+                    reject_metal_stage = true;
+                    continue;
+                };
+                if metal_topology
+                    .as_ref()
+                    .is_some_and(|accepted_topology| accepted_topology != &topology)
+                {
+                    diagnostics.push(PackDiscoveryDiagnostic::pack(
+                        PackDiscoveryIssue::ProviderProbeRejected,
+                        &probe.pack_id,
+                        probe.backend,
+                    ));
+                    reject_metal_stage = true;
+                    continue;
+                }
+                metal_topology.get_or_insert(topology);
+                metal_bindings.extend(accepted);
+            }
+            Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            )),
+        }
+    }
+    if reject_metal_stage {
+        metal_topology = None;
+    } else {
+        bindings.extend(metal_bindings);
+    }
+    check_provider_discovery_cancellation(cancellation)?;
+    Ok(ObservedPackProbeRegistry {
+        registry: crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
+            .with_diagnostics(diagnostics),
+        metal_topology,
+    })
+}
+
 fn discover_pack_launch_bindings_with_budget(
     probes: Vec<PendingPackProbe>,
     mut diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
     allowance: &mut ProviderDiscoveryAllowance,
     cleanup: &ProviderProbeCleanupFence,
-) -> Result<crate::gpu_worker_pack::ProductionPackRegistry, RuntimeError> {
+) -> Result<ObservedPackProbeRegistry, RuntimeError> {
     use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
 
     if !allowance.can_probe() {
@@ -11402,9 +12328,7 @@ fn discover_pack_launch_bindings_with_budget(
                 probe.backend,
             )
         }));
-        return Ok(
-            crate::gpu_worker_pack::ProductionPackRegistry::empty().with_diagnostics(diagnostics)
-        );
+        return Ok(ObservedPackProbeRegistry::empty(diagnostics));
     }
     let started = Instant::now();
     let deadline =
@@ -11414,58 +12338,17 @@ fn discover_pack_launch_bindings_with_budget(
                 diagnostics.push(PackDiscoveryDiagnostic::catalog(
                     PackDiscoveryIssue::ProviderProbeRejected,
                 ));
-                return Ok(crate::gpu_worker_pack::ProductionPackRegistry::empty()
-                    .with_diagnostics(diagnostics));
+                return Ok(ObservedPackProbeRegistry::empty(diagnostics));
             }
         };
-    let result = (|| {
-        let mut bindings = Vec::new();
-        for probe in probes {
-            if allowance.remaining_probes == 0 {
-                diagnostics.push(PackDiscoveryDiagnostic::pack(
-                    PackDiscoveryIssue::ProviderProbeRejected,
-                    &probe.pack_id,
-                    probe.backend,
-                ));
-                continue;
-            }
-            allowance.remaining_probes -= 1;
-            if deadline.remaining().is_err() {
-                diagnostics.push(PackDiscoveryDiagnostic::pack(
-                    PackDiscoveryIssue::ProviderProbeRejected,
-                    &probe.pack_id,
-                    probe.backend,
-                ));
-                continue;
-            }
-            match cleanup.run_probe(&probe.supervisor, deadline, || {
-                probe.supervisor.verified_pack_bindings_before(deadline)
-            })? {
-                Ok(observed) => {
-                    for binding in observed {
-                        if binding.backend_target().driver_version.is_none() {
-                            diagnostics.push(PackDiscoveryDiagnostic::pack(
-                                PackDiscoveryIssue::DriverVersionUnavailable,
-                                &probe.pack_id,
-                                probe.backend,
-                            ));
-                        } else {
-                            bindings.push(binding);
-                        }
-                    }
-                }
-                Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
-                    PackDiscoveryIssue::ProviderProbeRejected,
-                    &probe.pack_id,
-                    probe.backend,
-                )),
-            }
-        }
-        Ok(
-            crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
-                .with_diagnostics(diagnostics),
-        )
-    })();
+    let result = collect_verified_pack_probe_outcomes(
+        probes,
+        diagnostics,
+        allowance,
+        cleanup,
+        deadline,
+        None,
+    );
     allowance.charge(started.elapsed());
     result
 }
@@ -11490,34 +12373,127 @@ fn discover_production_pack_launch_bindings(
             InferenceWorkerSupervisor::for_pack_probe,
         );
         diagnostics.extend(stage_diagnostics);
-        let registry = discover_pack_launch_bindings_with_budget(
+        let observed = discover_pack_launch_bindings_with_budget(
             probes,
             diagnostics,
             &mut allowance,
             cleanup,
         )?;
-        if !registry.is_empty() {
+        if !observed.is_empty() {
             return Ok(StagedProductionPackRegistry {
-                registry,
+                registry: observed.registry,
+                metal_topology: observed.metal_topology,
                 deferred: (!stages.is_empty())
                     .then_some(DeferredPackDiscovery { stages, allowance }),
             });
         }
-        let (bindings, observed_diagnostics) = registry.into_parts();
+        let (bindings, observed_diagnostics) = observed.into_parts();
         debug_assert!(bindings.is_empty());
         diagnostics = observed_diagnostics;
     }
     Ok(StagedProductionPackRegistry {
         registry: crate::gpu_worker_pack::ProductionPackRegistry::empty()
             .with_diagnostics(diagnostics),
+        metal_topology: None,
         deferred: (!stages.is_empty()).then_some(DeferredPackDiscovery { stages, allowance }),
     })
+}
+
+/// The topology-refresh recovery path owns one absolute budget across refresh,
+/// retirement, and probe. Unlike the ordinary duration-based path, this never
+/// creates a replacement deadline after retiring a warm owner.
+fn discover_production_pack_launch_bindings_before(
+    discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+    deadline: MonotonicDeadline,
+    cleanup: &ProviderProbeCleanupFence,
+    cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> Result<StagedProductionPackRegistry, RuntimeError> {
+    let (mut diagnostics, mut stages) = priority_pack_discovery_stages(discovery);
+    let mut allowance = ProviderDiscoveryAllowance::production();
+    allowance.remaining_active = deadline.remaining().unwrap_or(Duration::ZERO);
+    while let Some(stage) = stages.pop_front() {
+        check_provider_discovery_cancellation(cancellation)?;
+        if !allowance.can_probe() || deadline.remaining().is_err() {
+            stages.push_front(stage);
+            diagnose_exhausted_pack_stages(&mut stages, &mut diagnostics);
+            break;
+        }
+        let (probes, stage_diagnostics) = prepare_pack_probes(
+            stage,
+            crate::gpu_worker_pack::prepare_pack_execution,
+            InferenceWorkerSupervisor::for_pack_probe,
+        );
+        check_provider_discovery_cancellation(cancellation)?;
+        diagnostics.extend(stage_diagnostics);
+        let observed = discover_pack_launch_bindings_with_deadline(
+            probes,
+            diagnostics,
+            &mut allowance,
+            cleanup,
+            deadline,
+            cancellation,
+        )?;
+        check_provider_discovery_cancellation(cancellation)?;
+        if !observed.is_empty() {
+            return Ok(StagedProductionPackRegistry {
+                registry: observed.registry,
+                metal_topology: observed.metal_topology,
+                deferred: (!stages.is_empty())
+                    .then_some(DeferredPackDiscovery { stages, allowance }),
+            });
+        }
+        let (bindings, observed_diagnostics) = observed.into_parts();
+        debug_assert!(bindings.is_empty());
+        diagnostics = observed_diagnostics;
+    }
+    check_provider_discovery_cancellation(cancellation)?;
+    Ok(StagedProductionPackRegistry {
+        registry: crate::gpu_worker_pack::ProductionPackRegistry::empty()
+            .with_diagnostics(diagnostics),
+        metal_topology: None,
+        deferred: (!stages.is_empty()).then_some(DeferredPackDiscovery { stages, allowance }),
+    })
+}
+
+fn discover_pack_launch_bindings_with_deadline(
+    probes: Vec<PendingPackProbe>,
+    mut diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
+    allowance: &mut ProviderDiscoveryAllowance,
+    cleanup: &ProviderProbeCleanupFence,
+    deadline: MonotonicDeadline,
+    cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> Result<ObservedPackProbeRegistry, RuntimeError> {
+    use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+    check_provider_discovery_cancellation(cancellation)?;
+    if !allowance.can_probe() || deadline.remaining().is_err() {
+        diagnostics.extend(probes.into_iter().map(|probe| {
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            )
+        }));
+        return Ok(ObservedPackProbeRegistry::empty(diagnostics));
+    }
+    let started = Instant::now();
+    let result = collect_verified_pack_probe_outcomes(
+        probes,
+        diagnostics,
+        allowance,
+        cleanup,
+        deadline,
+        cancellation,
+    );
+    allowance.charge(started.elapsed());
+    check_provider_discovery_cancellation(cancellation)?;
+    result
 }
 
 fn discover_next_deferred_pack_launch_bindings(
     deferred: &mut DeferredPackDiscovery,
     cleanup: &ProviderProbeCleanupFence,
-) -> Result<crate::gpu_worker_pack::ProductionPackRegistry, RuntimeError> {
+) -> Result<ObservedPackProbeRegistry, RuntimeError> {
     let mut diagnostics = Vec::new();
     while let Some(stage) = deferred.stages.pop_front() {
         if !deferred.allowance.can_probe() {
@@ -11531,20 +12507,20 @@ fn discover_next_deferred_pack_launch_bindings(
             InferenceWorkerSupervisor::for_pack_probe,
         );
         diagnostics.extend(stage_diagnostics);
-        let registry = discover_pack_launch_bindings_with_budget(
+        let observed = discover_pack_launch_bindings_with_budget(
             probes,
             diagnostics,
             &mut deferred.allowance,
             cleanup,
         )?;
-        if !registry.is_empty() {
-            return Ok(registry);
+        if !observed.is_empty() {
+            return Ok(observed);
         }
-        let (bindings, observed_diagnostics) = registry.into_parts();
+        let (bindings, observed_diagnostics) = observed.into_parts();
         debug_assert!(bindings.is_empty());
         diagnostics = observed_diagnostics;
     }
-    Ok(crate::gpu_worker_pack::ProductionPackRegistry::empty().with_diagnostics(diagnostics))
+    Ok(ObservedPackProbeRegistry::empty(diagnostics))
 }
 
 fn prepare_pack_probes(
@@ -12122,6 +13098,29 @@ fn verified_gpu_device_set_digest(routes: &[InferenceWorkerRoute]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// The macOS health witness is the complete authenticated Metal Hello
+/// snapshot, including devices the selected route did not use. It excludes
+/// display names, ordering, default flags, and all memory measurements.
+#[cfg(target_os = "macos")]
+fn macos_metal_topology_device_set_digest(topology: &MetalTopologyV1) -> String {
+    debug_assert_eq!(
+        MetalTopologyV1::canonicalize(topology.devices.clone())
+            .ok()
+            .as_ref(),
+        Some(topology),
+        "only canonical authenticated Metal topology witnesses reach the catalog"
+    );
+    let mut digest = Sha256::new();
+    update_health_digest(&mut digest, "macos-metal-topology-health-v1");
+    digest.update((topology.devices.len() as u64).to_le_bytes());
+    for device in &topology.devices {
+        update_health_digest(&mut digest, &device.stable_registry_identity);
+        update_health_digest(&mut digest, &format!("{:?}", device.vendor));
+        update_health_digest(&mut digest, &format!("{:?}", device.device_class));
+    }
+    format!("{:x}", digest.finalize())
+}
+
 /// Health invalidation follows the physical adapter/driver set, not the
 /// current preference, qualification subset, or power-policy subset. Sharing
 /// this witness between explicit GPU and Auto prevents a normal mode or AC /
@@ -12281,7 +13280,11 @@ fn verified_gpu_route_catalog(
     staged: StagedProductionPackRegistry,
     discovery_fingerprint: String,
 ) -> VerifiedGpuRouteCatalog {
-    let StagedProductionPackRegistry { registry, deferred } = staged;
+    let StagedProductionPackRegistry {
+        registry,
+        metal_topology,
+        deferred,
+    } = staged;
     let (bindings, diagnostics) = registry.into_parts();
     let provider_probe_incomplete = diagnostics.iter().any(|diagnostic| {
         matches!(
@@ -12329,7 +13332,12 @@ fn verified_gpu_route_catalog(
         key(left).cmp(&key(right))
     });
     #[cfg(target_os = "macos")]
-    let device_set_digest = verified_gpu_device_set_digest(&routes);
+    let device_set_digest = metal_topology.as_ref().map_or_else(
+        || verified_gpu_device_set_digest(&routes),
+        macos_metal_topology_device_set_digest,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let _ = &metal_topology;
     #[cfg(not(target_os = "macos"))]
     let device_set_digest = physical_gpu_device_set_digest();
     let mut diagnostic = crate::gpu_worker_pack::diagnostic_summary(&diagnostics);
@@ -12346,6 +13354,7 @@ fn verified_gpu_route_catalog(
         packs,
         discovery_fingerprint: discovery_fingerprint.clone(),
         device_set_digest: device_set_digest.clone(),
+        metal_topology: metal_topology.clone(),
         model_digest: None,
         #[cfg(test)]
         route_stages_for_testing: VecDeque::new(),
@@ -12354,11 +13363,43 @@ fn verified_gpu_route_catalog(
         routes: Arc::new(routes),
         diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
         device_set_digest,
+        metal_topology,
         discovery_fingerprint,
         model_digest: None,
         provider_probe_incomplete,
         skipped_targets: Vec::new(),
         deferred_discovery,
+    }
+}
+
+/// Deferred provider stages may add routes only when their authenticated Metal
+/// snapshot agrees with the snapshot already carried by the catalog. A later
+/// stage never unions, replaces, or silently forgets the accepted full witness.
+fn reconcile_deferred_metal_topology(
+    registry: crate::gpu_worker_pack::ProductionPackRegistry,
+    prior_metal_topology: Option<MetalTopologyV1>,
+    observed_metal_topology: Option<MetalTopologyV1>,
+) -> (
+    crate::gpu_worker_pack::ProductionPackRegistry,
+    Option<MetalTopologyV1>,
+    bool,
+) {
+    match (prior_metal_topology.as_ref(), observed_metal_topology) {
+        (Some(prior), Some(observed)) if prior != &observed => {
+            let (_, mut diagnostics) = registry.into_parts();
+            diagnostics.push(crate::gpu_worker_pack::PackDiscoveryDiagnostic::catalog(
+                crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected,
+            ));
+            (
+                crate::gpu_worker_pack::ProductionPackRegistry::empty()
+                    .with_diagnostics(diagnostics),
+                Some(prior.clone()),
+                false,
+            )
+        }
+        (Some(prior), Some(_)) | (Some(prior), None) => (registry, Some(prior.clone()), false),
+        (None, Some(observed)) => (registry, Some(observed), true),
+        (None, None) => (registry, None, false),
     }
 }
 
@@ -12374,6 +13415,7 @@ fn materialize_next_gpu_route_catalog(
         let staged = StagedProductionPackRegistry {
             registry: crate::gpu_worker_pack::ProductionPackRegistry::empty()
                 .with_diagnostics(diagnostics),
+            metal_topology: None,
             deferred: None,
         };
         let mut catalog =
@@ -12383,6 +13425,7 @@ fn materialize_next_gpu_route_catalog(
             "deferred GPU provider discovery was skipped because the shared active probe allowance was exhausted",
         );
         catalog.device_set_digest = deferred.device_set_digest;
+        catalog.metal_topology = deferred.metal_topology;
         catalog.model_digest = deferred.model_digest;
         return Ok(catalog);
     }
@@ -12397,6 +13440,7 @@ fn materialize_next_gpu_route_catalog(
             routes: Arc::new(routes),
             diagnostic: None,
             device_set_digest: deferred.device_set_digest,
+            metal_topology: deferred.metal_topology,
             discovery_fingerprint: deferred.discovery_fingerprint,
             model_digest: deferred.model_digest,
             provider_probe_incomplete: false,
@@ -12405,19 +13449,32 @@ fn materialize_next_gpu_route_catalog(
         });
     }
     let model_digest = deferred.model_digest.clone();
-    let registry = discover_next_deferred_pack_launch_bindings(&mut deferred.packs, cleanup)?;
+    let prior_metal_topology = deferred.metal_topology.clone();
+    let observed = discover_next_deferred_pack_launch_bindings(&mut deferred.packs, cleanup)?;
+    let ObservedPackProbeRegistry {
+        registry,
+        metal_topology: observed_metal_topology,
+    } = observed;
+    let (registry, metal_topology, topology_changed) =
+        reconcile_deferred_metal_topology(registry, prior_metal_topology, observed_metal_topology);
     let staged = StagedProductionPackRegistry {
         registry,
+        metal_topology,
         deferred: (!deferred.packs.stages.is_empty()).then_some(deferred.packs),
     };
     let mut catalog = verified_gpu_route_catalog(staged, deferred.discovery_fingerprint);
     // Deferred additions belong to the same completely verified physical
     // generation. Never let a lower-priority provider change the health
     // witness and accidentally erase a higher-priority quarantine.
-    catalog.device_set_digest = deferred.device_set_digest.clone();
+    if !topology_changed {
+        catalog.device_set_digest = deferred.device_set_digest.clone();
+    }
     catalog.model_digest = model_digest.clone();
+    let catalog_device_set_digest = catalog.device_set_digest.clone();
+    let catalog_metal_topology = catalog.metal_topology.clone();
     if let Some(next) = catalog.deferred_discovery.as_mut() {
-        next.device_set_digest = deferred.device_set_digest;
+        next.device_set_digest = catalog_device_set_digest;
+        next.metal_topology = catalog_metal_topology;
         next.model_digest = model_digest;
     }
     Ok(catalog)
@@ -12440,6 +13497,7 @@ fn deferred_only_gpu_route_catalog(
         // "disk-only" text after promotion.
         diagnostic: None,
         device_set_digest: deferred_discovery.device_set_digest.clone(),
+        metal_topology: deferred_discovery.metal_topology.clone(),
         discovery_fingerprint: deferred_discovery.discovery_fingerprint.clone(),
         model_digest: deferred_discovery.model_digest.clone(),
         provider_probe_incomplete: false,
@@ -13064,6 +14122,125 @@ impl InferenceWorkerRegistry {
             .cloned()
     }
 
+    /// Returns true only when a positive cache contains Metal and therefore
+    /// must be discarded before selection. The refresh touches the exact
+    /// warm owner only; it never creates a replacement or performs discovery.
+    fn cached_metal_admission_requires_fresh_discovery(
+        &self,
+        catalog: &VerifiedGpuRouteCatalog,
+        artifact: &RuntimeArtifact,
+        deadline: MonotonicDeadline,
+        cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+    ) -> Result<bool, RuntimeError> {
+        if !catalog
+            .routes
+            .iter()
+            .any(|route| Self::route_identity(route).backend == BackendKind::Metal)
+        {
+            return Ok(false);
+        }
+        // A legacy or otherwise incomplete positive catalog must never admit
+        // a Metal warm owner: the complete canonical snapshot is part of the
+        // cache authority, not merely an optimization for the refresh reply.
+        let Some(catalog_topology) = catalog.metal_topology.as_ref() else {
+            return Ok(true);
+        };
+        let active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .clone();
+        let Some(active) = active.filter(|active| {
+            active.identity.backend == BackendKind::Metal
+                && catalog.routes.iter().any(|route| {
+                    Self::route_identity(route) == active.identity
+                        && Self::same_supervisor(&route.supervisor, &active.supervisor)
+                })
+        }) else {
+            return Ok(true);
+        };
+        let refresh =
+            match active
+                .supervisor
+                .refresh_metal_topology(artifact, deadline, cancellation)
+            {
+                Ok(refresh) => refresh,
+                Err(RuntimeError::Cancelled(message)) => {
+                    return Err(RuntimeError::Cancelled(message));
+                }
+                Err(_) => return Ok(true),
+            };
+        let still_active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .as_ref()
+            .is_some_and(|current| {
+                current.identity == active.identity
+                    && Self::same_supervisor(&current.supervisor, &active.supervisor)
+            });
+        Ok(!still_active
+            || refresh.initial != refresh.current
+            || refresh.initial != *catalog_topology)
+    }
+
+    fn discard_cached_metal_admission(
+        &self,
+        cache: &Arc<Mutex<GpuRouteCatalogCache>>,
+        catalog: &VerifiedGpuRouteCatalog,
+    ) -> Result<(), RuntimeError> {
+        cache
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+            })?
+            .clear_successful_for(&catalog.discovery_fingerprint);
+        Ok(())
+    }
+
+    /// The only successful-cache consumer shared by explicit GPU and Auto.
+    /// A rejected Metal witness is retired before either caller discovers a
+    /// replacement, so this helper never creates a second owner itself.
+    fn retain_cached_catalog_after_metal_refresh(
+        &self,
+        cache: &Arc<Mutex<GpuRouteCatalogCache>>,
+        catalog: &VerifiedGpuRouteCatalog,
+        artifact: &RuntimeArtifact,
+        deadline: MonotonicDeadline,
+        cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
+    ) -> Result<bool, RuntimeError> {
+        if !self.cached_metal_admission_requires_fresh_discovery(
+            catalog,
+            artifact,
+            deadline,
+            cancellation,
+        )? {
+            return Ok(true);
+        }
+        if cancellation
+            .is_some_and(|(generation, snapshot)| generation.load(Ordering::Acquire) != snapshot)
+        {
+            return Err(RuntimeError::Cancelled(
+                "Metal topology refresh was cancelled before retirement".to_owned(),
+            ));
+        }
+        self.discard_cached_metal_admission(cache, catalog)?;
+        let retirement = self.retire_active_worker_before_provider_discovery_deadline(deadline);
+        if cancellation
+            .is_some_and(|(generation, snapshot)| generation.load(Ordering::Acquire) != snapshot)
+        {
+            return Err(RuntimeError::Cancelled(
+                "Metal topology refresh was cancelled after retirement".to_owned(),
+            ));
+        }
+        retirement?;
+        Ok(false)
+    }
+
     fn clear_auto_live_admission(&self) {
         if let Ok(mut cache) = self.auto_gpu_routes.lock() {
             cache.successful = None;
@@ -13127,6 +14304,13 @@ impl InferenceWorkerRegistry {
     ) -> Result<(), RuntimeError> {
         let deadline = MonotonicDeadline::after_for(budget, "provider discovery worker retirement")
             .map_err(worker_unavailable)?;
+        self.retire_active_worker_before_provider_discovery_deadline(deadline)
+    }
+
+    fn retire_active_worker_before_provider_discovery_deadline(
+        &self,
+        deadline: MonotonicDeadline,
+    ) -> Result<(), RuntimeError> {
         self.provider_probe_cleanup.settle_before(deadline)?;
         let active = self
             .active_route
@@ -13138,7 +14322,7 @@ impl InferenceWorkerRegistry {
         self.clear_auto_live_admission();
         if let Some(active) = active {
             self.track_retiring_worker(&active.supervisor)?;
-            active.supervisor.retire()?;
+            active.supervisor.retire_before(deadline)?;
         }
         if self
             .retiring_workers
@@ -13595,7 +14779,9 @@ impl InferenceWorkerRegistry {
         preference: AccelerationPreference,
         artifact: &RuntimeArtifact,
     ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
-        self.routes_for_preference_with_idle_health(preference, artifact, false)
+        self.routes_for_preference_with_idle_health_and_metal_refresh(
+            preference, artifact, false, None,
+        )
     }
 
     fn routes_for_preference_with_idle_health(
@@ -13603,6 +14789,21 @@ impl InferenceWorkerRegistry {
         preference: AccelerationPreference,
         artifact: &RuntimeArtifact,
         allow_unprobed_idle_health: bool,
+    ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
+        self.routes_for_preference_with_idle_health_and_metal_refresh(
+            preference,
+            artifact,
+            allow_unprobed_idle_health,
+            None,
+        )
+    }
+
+    fn routes_for_preference_with_idle_health_and_metal_refresh(
+        &self,
+        preference: AccelerationPreference,
+        artifact: &RuntimeArtifact,
+        allow_unprobed_idle_health: bool,
+        cancellation: Option<(&std::sync::atomic::AtomicU64, u64)>,
     ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
         if preference == AccelerationPreference::Cpu {
             return Ok(InferenceWorkerRoutePlan {
@@ -13706,7 +14907,45 @@ impl InferenceWorkerRegistry {
                 )
             };
             let catalog = match cached_catalog {
-                GpuRouteCatalogLookup::Successful(cached) => cached,
+                GpuRouteCatalogLookup::Successful(cached) => {
+                    let deadline = MonotonicDeadline::after_for(
+                        GPU_PROVIDER_DISCOVERY_BUDGET,
+                        "Metal cached-admission freshness",
+                    )
+                    .map_err(worker_unavailable)?;
+                    if self.retain_cached_catalog_after_metal_refresh(
+                        &self.auto_gpu_routes,
+                        &cached,
+                        artifact,
+                        deadline,
+                        cancellation,
+                    )? {
+                        cached
+                    } else {
+                        let mut discovered = verified_gpu_route_catalog(
+                            discover_production_pack_launch_bindings_before(
+                                discovery,
+                                deadline,
+                                &self.provider_probe_cleanup,
+                                cancellation,
+                            )?,
+                            discovery_fingerprint.clone(),
+                        );
+                        bind_deferred_model(&mut discovered, &model.expected_sha256);
+                        append_route_plan_diagnostic(
+                            &mut discovered.diagnostic,
+                            "Metal cached topology could not be revalidated; fresh discovery required",
+                        );
+                        let mut cache = self.auto_gpu_routes.lock().map_err(|_| {
+                            RuntimeError::WorkerUnavailable(
+                                "Auto GPU worker registry lock poisoned".to_owned(),
+                            )
+                        })?;
+                        check_provider_discovery_cancellation(cancellation)?;
+                        cache.record_auto_live_admission_probe(&discovered, Instant::now());
+                        discovered
+                    }
+                }
                 GpuRouteCatalogLookup::Deferred(deferred) => {
                     deferred_only_gpu_route_catalog(deferred)
                 }
@@ -13714,6 +14953,7 @@ impl InferenceWorkerRegistry {
                     routes: Arc::new(Vec::new()),
                     diagnostic,
                     device_set_digest: verified_gpu_device_set_digest(&[]),
+                    metal_topology: None,
                     discovery_fingerprint: discovery_fingerprint.clone(),
                     model_digest: Some(model.expected_sha256.clone()),
                     provider_probe_incomplete: true,
@@ -13833,12 +15073,51 @@ impl InferenceWorkerRegistry {
         };
         let cached_catalog = gpu_catalog_lookup_for_model(cached_catalog, &model.expected_sha256);
         let catalog = match cached_catalog {
-            GpuRouteCatalogLookup::Successful(cached) => cached,
+            GpuRouteCatalogLookup::Successful(cached) => {
+                let deadline = MonotonicDeadline::after_for(
+                    GPU_PROVIDER_DISCOVERY_BUDGET,
+                    "Metal cached-admission freshness",
+                )
+                .map_err(worker_unavailable)?;
+                if self.retain_cached_catalog_after_metal_refresh(
+                    &self.gpu_routes,
+                    &cached,
+                    artifact,
+                    deadline,
+                    cancellation,
+                )? {
+                    cached
+                } else {
+                    let mut discovered = verified_gpu_route_catalog(
+                        discover_production_pack_launch_bindings_before(
+                            lease_discovery,
+                            deadline,
+                            &self.provider_probe_cleanup,
+                            cancellation,
+                        )?,
+                        discovery_fingerprint,
+                    );
+                    bind_deferred_model(&mut discovered, &model.expected_sha256);
+                    append_route_plan_diagnostic(
+                        &mut discovered.diagnostic,
+                        "Metal cached topology could not be revalidated; fresh discovery required",
+                    );
+                    let mut cache = self.gpu_routes.lock().map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "GPU worker registry lock poisoned".to_owned(),
+                        )
+                    })?;
+                    check_provider_discovery_cancellation(cancellation)?;
+                    cache.record_probe(discovered.clone(), Instant::now());
+                    discovered
+                }
+            }
             GpuRouteCatalogLookup::Deferred(deferred) => deferred_only_gpu_route_catalog(deferred),
             GpuRouteCatalogLookup::Backoff(diagnostic) => VerifiedGpuRouteCatalog {
                 routes: Arc::new(Vec::new()),
                 diagnostic,
                 device_set_digest: verified_gpu_device_set_digest(&[]),
+                metal_topology: None,
                 discovery_fingerprint,
                 model_digest: Some(model.expected_sha256.clone()),
                 provider_probe_incomplete: true,
@@ -14580,7 +15859,12 @@ impl InferenceWorkerRegistry {
         let mut fallback_history = Vec::new();
         let mut attempted = false;
         let mut authority_rejected = false;
-        let mut plan = self.routes_for_preference(preference, &artifact)?;
+        let mut plan = self.routes_for_preference_with_idle_health_and_metal_refresh(
+            preference,
+            &artifact,
+            false,
+            Some((cancellation_generation, cancellation_snapshot)),
+        )?;
         let mut execution_skipped_targets = plan.skipped_targets.clone();
         let mut execution_power_source = plan.selection_power_source;
         if plan.routes.is_empty() {
@@ -15470,12 +16754,12 @@ impl WorkerLoopIdentityPolicy {
         session: &ValidatedCompatibleWorkerSession,
         challenge: String,
     ) -> Result<WorkerCapability> {
-        let pack = match self {
+        let facts = match self {
             Self::Compiled => worker_pack_capability(session.role)?,
             #[cfg(test)]
-            Self::FixtureCpu => None,
+            Self::FixtureCpu => WorkerPackCapabilityFacts::default(),
         };
-        compatible_worker_capability(session, challenge, pack)
+        compatible_worker_capability(session, challenge, facts.pack)
     }
 }
 
@@ -15549,6 +16833,7 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
     let mut runtime_observation_version = None;
     let mut runtime_observation: Option<RuntimeObservationSlot> = None;
     let mut worker_provider: Option<WorkerProvider> = None;
+    let mut worker_hello_challenge: Option<String> = None;
     let mut handshake_complete = false;
     loop {
         let frame = match read_frame(&mut input) {
@@ -15621,8 +16906,9 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
             } => {
                 let provider = expected.provider;
                 let actual_role = identity_policy.validate_hello(role, &challenge, &expected)?;
-                let capability = identity_policy.capability(actual_role, challenge)?;
+                let capability = identity_policy.capability(actual_role, challenge.clone())?;
                 worker_provider = Some(provider);
+                worker_hello_challenge = Some(challenge);
                 handshake_complete = true;
                 write_worker_response(
                     &mut output,
@@ -15642,8 +16928,10 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                     &expected,
                     &compatibility,
                 )?;
-                let capability = identity_policy.compatibility_capability(&session, challenge)?;
+                let capability =
+                    identity_policy.compatibility_capability(&session, challenge.clone())?;
                 worker_provider = Some(session.provider);
+                worker_hello_challenge = Some(challenge);
                 handshake_complete = true;
                 write_worker_response(
                     &mut output,
@@ -15651,6 +16939,45 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
                     request_id,
                     Control::Ready { capability },
                 )?;
+            }
+            Control::RefreshMetalTopology {
+                version,
+                challenge,
+                nonce,
+            } => {
+                let result = (|| {
+                    if version != METAL_TOPOLOGY_REFRESH_VERSION_V1 {
+                        bail!("unsupported Metal topology refresh version {version}");
+                    }
+                    if worker_provider != Some(WorkerProvider::Metal) {
+                        bail!("Metal topology refresh requires an authenticated Metal worker");
+                    }
+                    if worker_hello_challenge.as_deref() != Some(challenge.as_str()) {
+                        bail!(
+                            "Metal topology refresh challenge does not bind this worker generation"
+                        );
+                    }
+                    if nonce.len() != 64 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        bail!("Metal topology refresh nonce is malformed");
+                    }
+                    if loaded_runtime.is_none()
+                        || pending_batch.is_some()
+                        || active_stream.is_some()
+                        || loaded_vad.is_some()
+                        || active_vad.is_some()
+                        || runtime_observation.is_some()
+                    {
+                        bail!("Metal topology refresh requires an idle loaded worker");
+                    }
+                    let topology = discover_worker_metal_topology()?;
+                    Ok(Control::MetalTopology {
+                        version,
+                        challenge,
+                        nonce,
+                        topology,
+                    })
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::NegotiateRuntimeObservation { version } => {
                 let result = (|| {
@@ -16176,6 +17503,7 @@ fn worker_loop_with_factories_and_identity<F: WorkerRecognizerFactory, V: Worker
             Control::Ready { .. }
             | Control::RuntimeObservationSupported { .. }
             | Control::RuntimeObservationV2Supported { .. }
+            | Control::MetalTopology { .. }
             | Control::RuntimeObservationStarted { .. }
             | Control::RuntimeObservationV2Started { .. }
             | Control::RuntimeObservationCompleted { .. }
@@ -16526,6 +17854,23 @@ fn validate_worker_response(response: &Control) -> Result<()> {
         Control::RuntimeObservationV2Supported { version } => {
             if *version != RUNTIME_OBSERVATION_VERSION_V2 {
                 bail!("worker returned an unsupported runtime observation version");
+            }
+            Ok(())
+        }
+        Control::MetalTopology {
+            version,
+            challenge,
+            nonce,
+            topology,
+        } => {
+            if *version != METAL_TOPOLOGY_REFRESH_VERSION_V1
+                || challenge.len() != 64
+                || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || nonce.len() != 64
+                || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || MetalTopologyV1::canonicalize(topology.devices.clone())? != *topology
+            {
+                bail!("worker returned a noncanonical Metal topology witness");
             }
             Ok(())
         }
@@ -17168,6 +18513,38 @@ mod tests {
         cleanup_probe: Option<Arc<DiagnosticProbeState>>,
     }
 
+    struct GatedMetalRefreshProcess {
+        entered: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    struct GatedMetalRetirementFailureProcess {
+        entered: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    /// Test process swaps must be recoverable even when an assertion panics:
+    /// the fixture worker otherwise retains its pipe sender and thread.
+    struct SwappedMetalTestProcessCleanup {
+        supervisor: InferenceWorkerSupervisor,
+        original: Option<Arc<dyn WorkerProcess>>,
+    }
+
+    impl Drop for SwappedMetalTestProcessCleanup {
+        fn drop(&mut self) {
+            let Some(original) = self.original.take() else {
+                return;
+            };
+            if let Ok(mut state) = self.supervisor.transport.inner.state.lock()
+                && let Some(current) = state.current.as_mut()
+            {
+                current.process = Arc::clone(&original);
+            }
+            let _ = original.terminate();
+            let _ = original.wait();
+        }
+    }
+
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     struct DiagnosticCleanupFailureProcess;
 
@@ -17244,6 +18621,9 @@ mod tests {
                 frozen_worker_approval: None,
                 pack_launch: None,
                 pack_bindings: Vec::new(),
+                metal_topology_refresh_version: None,
+                metal_topology: None,
+                hello_challenge: None,
                 validated_handshake: None,
             });
             let (pending_tx, pending) = sync_channel(1);
@@ -17415,6 +18795,50 @@ mod tests {
                     .context("could not create the test observation handle");
             }
             Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+        }
+    }
+
+    impl WorkerProcess for GatedMetalRefreshProcess {
+        fn is_running(&self) -> Result<bool> {
+            self.entered
+                .send(())
+                .map_err(|_| anyhow!("Metal refresh test gate receiver dropped"))?;
+            self.release
+                .lock()
+                .map_err(|_| anyhow!("Metal refresh test gate lock poisoned"))?
+                .recv()
+                .map_err(|_| anyhow!("Metal refresh test gate release dropped"))?;
+            Ok(true)
+        }
+
+        fn terminate(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl WorkerProcess for GatedMetalRetirementFailureProcess {
+        fn is_running(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn terminate(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait(&self) -> Result<()> {
+            self.entered
+                .send(())
+                .map_err(|_| anyhow!("Metal retirement test gate receiver dropped"))?;
+            self.release
+                .lock()
+                .map_err(|_| anyhow!("Metal retirement test gate lock poisoned"))?
+                .recv()
+                .map_err(|_| anyhow!("Metal retirement test gate release dropped"))?;
+            bail!("fixture Metal retirement reaping failed")
         }
     }
 
@@ -17602,6 +19026,11 @@ mod tests {
             started: TestSender<()>,
             release: TestReceiver<()>,
         },
+        MetalTopologyResponder {
+            topology: Arc<Mutex<MetalTopologyV1>>,
+            commands: Arc<Mutex<Vec<&'static str>>>,
+            reply: MetalTopologyResponderReply,
+        },
         RuntimeLoad,
         RuntimeDiagnostics(Box<WireRuntimeDiagnostics>),
         RuntimeRetryHealth {
@@ -17645,6 +19074,14 @@ mod tests {
         Failure,
     }
 
+    #[derive(Clone, Copy)]
+    enum MetalTopologyResponderReply {
+        Echo,
+        StaleChallenge,
+        StaleNonce,
+        NoncanonicalTopology,
+    }
+
     struct ReleaseOnDrop(Option<TestSender<()>>);
 
     impl ReleaseOnDrop {
@@ -17658,6 +19095,14 @@ mod tests {
     impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
             self.release();
+        }
+    }
+
+    struct CancellationGenerationOnDrop(Arc<AtomicU64>);
+
+    impl Drop for CancellationGenerationOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -17879,7 +19324,7 @@ mod tests {
                 compatible_worker_capability(
                     &session,
                     challenge,
-                    worker_pack_capability(session.role).unwrap(),
+                    worker_pack_capability(session.role).unwrap().pack,
                 )
                 .unwrap()
             }
@@ -17936,6 +19381,14 @@ mod tests {
                         message: "runtime observation unavailable in legacy fake".to_owned(),
                     },
                 ),
+                Control::RefreshMetalTopology { .. } => respond(
+                    output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "Metal topology refresh unavailable in legacy fake".to_owned(),
+                    },
+                ),
                 Control::StartStream | Control::AudioChunk | Control::EndStream => respond(
                     output,
                     session_id,
@@ -17971,6 +19424,7 @@ mod tests {
                 Control::Ready { .. }
                 | Control::RuntimeObservationSupported { .. }
                 | Control::RuntimeObservationV2Supported { .. }
+                | Control::MetalTopology { .. }
                 | Control::RuntimeObservationStarted { .. }
                 | Control::RuntimeObservationV2Started { .. }
                 | Control::RuntimeObservationCompleted { .. }
@@ -18387,6 +19841,94 @@ mod tests {
                 );
                 run_normal_worker(&mut input, &mut output);
             }
+            TestMode::MetalTopologyResponder {
+                topology,
+                commands,
+                reply,
+            } => loop {
+                let Ok(frame) = read_frame(&mut input) else {
+                    return;
+                };
+                let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
+                match control {
+                    Control::LoadRuntime { preference, .. } => {
+                        commands.lock().unwrap().push("load");
+                        respond(
+                            &mut output,
+                            session_id,
+                            request_id,
+                            Control::RuntimeLoaded {
+                                execution: WireRuntimeLoadExecution {
+                                    diagnostics: WireRuntimeDiagnostics {
+                                        resolved_acceleration: ResolvedAcceleration {
+                                            requested: preference,
+                                            resolved: ComputeDevice::Cpu,
+                                            diagnostic: None,
+                                            selection: None,
+                                        },
+                                        runtime_location: PathBuf::from("test-metal-topology"),
+                                        warm_reused: false,
+                                        model_load_duration_ms: 1,
+                                    },
+                                    detected_architecture: "test-metal-topology".to_owned(),
+                                    capabilities: RuntimeCapabilities::default(),
+                                },
+                            },
+                        );
+                    }
+                    Control::RefreshMetalTopology {
+                        version,
+                        challenge,
+                        nonce,
+                    } => {
+                        commands.lock().unwrap().push("refresh");
+                        let mut response_topology = topology.lock().unwrap().clone();
+                        let mut response_challenge = challenge.clone();
+                        let mut response_nonce = nonce.clone();
+                        match reply {
+                            MetalTopologyResponderReply::Echo => {}
+                            MetalTopologyResponderReply::StaleChallenge => {
+                                let replacement = if response_challenge.starts_with('0') {
+                                    "1"
+                                } else {
+                                    "0"
+                                };
+                                response_challenge.replace_range(0..1, replacement);
+                            }
+                            MetalTopologyResponderReply::StaleNonce => {
+                                let replacement = if response_nonce.starts_with('0') {
+                                    "1"
+                                } else {
+                                    "0"
+                                };
+                                response_nonce.replace_range(0..1, replacement);
+                            }
+                            MetalTopologyResponderReply::NoncanonicalTopology => {
+                                response_topology.devices.reverse();
+                            }
+                        }
+                        respond(
+                            &mut output,
+                            session_id,
+                            request_id,
+                            Control::MetalTopology {
+                                version,
+                                challenge: response_challenge,
+                                nonce: response_nonce,
+                                topology: response_topology,
+                            },
+                        );
+                    }
+                    Control::Unload | Control::Health | Control::Cancel { .. } => {
+                        respond(&mut output, session_id, request_id, Control::Ok);
+                    }
+                    Control::Shutdown => {
+                        respond(&mut output, session_id, request_id, Control::Ok);
+                        return;
+                    }
+                    other => panic!("unexpected Metal topology test command: {other:?}"),
+                }
+            },
             TestMode::RuntimeDiagnostics(diagnostics) => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 match control {
@@ -22183,6 +23725,7 @@ mod tests {
     fn verified_gpu_catalog(routes: Vec<InferenceWorkerRoute>) -> VerifiedGpuRouteCatalog {
         VerifiedGpuRouteCatalog {
             device_set_digest: verified_gpu_device_set_digest(&routes),
+            metal_topology: None,
             routes: Arc::new(routes),
             diagnostic: None,
             discovery_fingerprint: "test-catalog".to_owned(),
@@ -22215,6 +23758,7 @@ mod tests {
                 },
                 discovery_fingerprint: discovery_fingerprint.to_owned(),
                 device_set_digest: "d".repeat(64),
+                metal_topology: None,
                 model_digest: Some("a".repeat(64)),
                 route_stages_for_testing: VecDeque::new(),
             },
@@ -22237,6 +23781,7 @@ mod tests {
             },
             discovery_fingerprint: "test-catalog".to_owned(),
             device_set_digest: "d".repeat(64),
+            metal_topology: None,
             model_digest: None,
             route_stages_for_testing: VecDeque::from([DeferredRouteStageForTesting {
                 backend,
@@ -23216,6 +24761,7 @@ mod tests {
         let catalog = verified_gpu_route_catalog(
             StagedProductionPackRegistry {
                 registry: crate::gpu_worker_pack::ProductionPackRegistry::empty(),
+                metal_topology: None,
                 deferred: Some(deferred.packs.clone()),
             },
             deferred.discovery_fingerprint.clone(),
@@ -25933,6 +27479,7 @@ mod tests {
                 route_execution: Arc::new(Mutex::new(())),
                 gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                     device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                    metal_topology: None,
                     routes: gpu_routes,
                     diagnostic: Some("fixture-only hardware smoke".to_owned()),
                     discovery_fingerprint: "fixture-hardware-smoke".to_owned(),
@@ -26081,6 +27628,7 @@ mod tests {
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                 device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                metal_topology: None,
                 routes: gpu_routes,
                 diagnostic: Some("fixture-only Vulkan evidence capture".to_owned()),
                 discovery_fingerprint: "fixture-vulkan-evidence".to_owned(),
@@ -28127,6 +29675,96 @@ mod tests {
     }
 
     #[test]
+    fn macos_metal_topology_retained_retirement_rejoins_the_supplied_discovery_deadline() {
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::WithProcessTerminationFailure {
+                mode: Box::new(TestMode::Normal),
+            },
+        ]));
+        let supervisor = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(
+            supervisor.clone(),
+        ));
+        let route = registry.routes[0].clone();
+        registry.prepare_route(&route).unwrap();
+        let generation = supervisor.transport.ensure_generation().unwrap();
+
+        // The first termination fails after reserving this exact-generation
+        // receipt, deliberately retaining both the live owner and marker.
+        // The next provider retirement must join that receipt with the
+        // supplied deadline instead of using the ordinary cancel allowance.
+        assert!(
+            supervisor
+                .transport
+                .invalidate_generation(generation, "fixture retained failed generation", true)
+                .is_err()
+        );
+        let (retained_process, retained_progress) = {
+            let state = supervisor.transport.inner.state.lock().unwrap();
+            assert!(
+                state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation)
+            );
+            let progress = Arc::clone(
+                state
+                    .retiring_generations
+                    .get(&generation)
+                    .expect("failed termination retains its generation receipt"),
+            );
+            let process = Arc::clone(
+                &state
+                    .current
+                    .as_ref()
+                    .expect("failed termination retains its current owner")
+                    .process,
+            );
+            (process, progress)
+        };
+        let (retirement_wait_tx, retirement_wait_rx) = channel();
+        supervisor
+            .transport
+            .observe_retirement_waits_for_test(retirement_wait_tx);
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "fixture retained Metal topology retirement",
+        )
+        .unwrap();
+        let retiring_registry = Arc::clone(&registry);
+        let retiring = std::thread::spawn(move || {
+            retiring_registry.retire_active_worker_before_provider_discovery_deadline(deadline)
+        });
+
+        // Record the positive observation before cleanup, but defer its
+        // assertion until after the real receipt teardown and thread join so
+        // a regressed fixture cannot leave a process behind on panic.
+        let observed = retirement_wait_rx.recv_timeout(Duration::from_secs(1));
+        supervisor
+            .transport
+            .finish_generation_invalidation(
+                generation,
+                "fixture retained generation cleanup",
+                true,
+                retained_process,
+                retained_progress,
+            )
+            .unwrap();
+        let result = retiring.join().unwrap();
+        let observed = observed.expect("retained retirement did not join the supplied deadline");
+        assert_eq!(observed.expires_at, deadline.expires_at);
+        assert_eq!(observed.budget, deadline.budget);
+        result.unwrap();
+        assert!(registry.retiring_workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn route_transition_reuses_one_absolute_retirement_deadline() {
         let (first_wait_started_tx, first_wait_started_rx) = channel();
         let (first_wait_release_tx, first_wait_release_rx) = channel();
@@ -28528,6 +30166,7 @@ mod tests {
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                 device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                metal_topology: None,
                 routes: gpu_routes,
                 diagnostic: None,
                 discovery_fingerprint: "test-catalog".to_owned(),
@@ -30430,6 +32069,9 @@ mod tests {
             frozen_worker_approval: None,
             pack_launch: None,
             pack_bindings: Vec::new(),
+            metal_topology_refresh_version: None,
+            metal_topology: None,
+            hello_challenge: None,
             #[cfg(feature = "windows-gpu-capture-observation")]
             validated_handshake: None,
         });
@@ -34189,5 +35831,1031 @@ mod tests {
         let gpu = resolve_cpu_only_acceleration(AccelerationPreference::Gpu).unwrap_err();
         assert!(gpu.to_string().contains("CPU-only"));
         assert!(gpu.to_string().contains("Auto or CPU"));
+    }
+
+    fn macos_metal_topology_device(
+        registry_id: u64,
+        vendor: GpuVendor,
+        device_class: DeviceClass,
+        display_name: &str,
+        memory_total_bytes: u64,
+        is_default: bool,
+    ) -> crate::macos_gpu::MetalDevice {
+        crate::macos_gpu::MetalDevice {
+            registry_id,
+            stable_identity: crate::macos_gpu::stable_registry_identity(registry_id),
+            display_name: display_name.to_owned(),
+            vendor,
+            device_class,
+            memory_total_bytes,
+            memory_available_bytes: memory_total_bytes / 2,
+            is_default,
+        }
+    }
+
+    fn macos_metal_topology_fixture() -> MetalTopologyV1 {
+        MetalTopologyV1::canonicalize(vec![
+            MetalTopologyDeviceV1 {
+                stable_registry_identity: "metal-registry:0000000000000002".to_owned(),
+                vendor: GpuVendor::Amd,
+                device_class: DeviceClass::DiscreteGpu,
+            },
+            MetalTopologyDeviceV1 {
+                stable_registry_identity: "metal-registry:0000000000000001".to_owned(),
+                vendor: GpuVendor::Apple,
+                device_class: DeviceClass::UnifiedGpu,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn macos_metal_topology_initial_witness_uses_full_raw_snapshot_and_ignores_volatile_facts() {
+        let original = vec![
+            macos_metal_topology_device(
+                2,
+                GpuVendor::Amd,
+                DeviceClass::DiscreteGpu,
+                "AMD Radeon",
+                8 << 30,
+                false,
+            ),
+            macos_metal_topology_device(
+                1,
+                GpuVendor::Apple,
+                DeviceClass::UnifiedGpu,
+                "Apple M4",
+                16 << 30,
+                true,
+            ),
+        ];
+        let mut reordered = original.clone();
+        reordered.reverse();
+        reordered[0].display_name = "renamed device".to_owned();
+        reordered[0].memory_total_bytes = 1;
+        reordered[0].memory_available_bytes = 1;
+        reordered[0].is_default = !reordered[0].is_default;
+
+        let initial = metal_topology_from_raw_devices(&original).unwrap();
+        let refreshed = metal_topology_from_raw_devices(&reordered).unwrap();
+        assert_eq!(initial, refreshed);
+        assert_eq!(initial.devices.len(), 2);
+        assert_eq!(
+            initial.devices[0].stable_registry_identity,
+            "metal-registry:0000000000000001"
+        );
+        assert_eq!(
+            initial.devices[1].stable_registry_identity,
+            "metal-registry:0000000000000002"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_metal_topology_catalog_digest_propagates_complete_snapshot_and_deferred_witness() {
+        let original = vec![
+            macos_metal_topology_device(
+                2,
+                GpuVendor::Amd,
+                DeviceClass::DiscreteGpu,
+                "unselected AMD",
+                8 << 30,
+                false,
+            ),
+            macos_metal_topology_device(
+                1,
+                GpuVendor::Apple,
+                DeviceClass::UnifiedGpu,
+                "selected Apple",
+                16 << 30,
+                true,
+            ),
+        ];
+        let mut reordered_volatile = original.clone();
+        reordered_volatile.reverse();
+        reordered_volatile[0].display_name = "renamed".to_owned();
+        reordered_volatile[0].memory_total_bytes = 1;
+        reordered_volatile[0].memory_available_bytes = 1;
+        reordered_volatile[0].is_default = !reordered_volatile[0].is_default;
+        let complete = metal_topology_from_raw_devices(&original).unwrap();
+        let reordered = metal_topology_from_raw_devices(&reordered_volatile).unwrap();
+        let catalog_for = |topology: MetalTopologyV1, deferred: bool| {
+            verified_gpu_route_catalog(
+                StagedProductionPackRegistry {
+                    registry: crate::gpu_worker_pack::ProductionPackRegistry::empty(),
+                    metal_topology: Some(topology),
+                    deferred: deferred.then_some(DeferredPackDiscovery {
+                        stages: VecDeque::new(),
+                        allowance: ProviderDiscoveryAllowance::production(),
+                    }),
+                },
+                "macos-metal-topology-catalog-test".to_owned(),
+            )
+        };
+        let catalog = catalog_for(complete.clone(), true);
+        let reordered_catalog = catalog_for(reordered, false);
+        assert_eq!(
+            catalog.device_set_digest,
+            reordered_catalog.device_set_digest
+        );
+
+        let mut added = original.clone();
+        added.push(macos_metal_topology_device(
+            3,
+            GpuVendor::Intel,
+            DeviceClass::IntegratedGpu,
+            "unselected Intel",
+            4 << 30,
+            false,
+        ));
+        let mut removed = original.clone();
+        removed.retain(|device| device.registry_id != 2);
+        let mut changed_class = original.clone();
+        changed_class[0].device_class = DeviceClass::IntegratedGpu;
+        for changed in [
+            metal_topology_from_raw_devices(&added).unwrap(),
+            metal_topology_from_raw_devices(&removed).unwrap(),
+            metal_topology_from_raw_devices(&changed_class).unwrap(),
+        ] {
+            assert_ne!(
+                catalog.device_set_digest,
+                catalog_for(changed, false).device_set_digest
+            );
+        }
+        let deferred = catalog.deferred_discovery.clone().unwrap();
+        assert_eq!(
+            deferred_only_gpu_route_catalog(deferred).device_set_digest,
+            catalog.device_set_digest
+        );
+    }
+
+    #[test]
+    fn macos_metal_topology_deferred_observation_propagates_or_fails_closed() {
+        let prior = macos_metal_topology_fixture();
+        let mut changed_devices = prior.devices.clone();
+        changed_devices.push(MetalTopologyDeviceV1 {
+            stable_registry_identity: "metal-registry:0000000000000003".to_owned(),
+            vendor: GpuVendor::Intel,
+            device_class: DeviceClass::IntegratedGpu,
+        });
+        let observed = MetalTopologyV1::canonicalize(changed_devices).unwrap();
+
+        let (rejected, retained, changed) = reconcile_deferred_metal_topology(
+            crate::gpu_worker_pack::ProductionPackRegistry::empty(),
+            Some(prior.clone()),
+            Some(observed.clone()),
+        );
+        assert!(rejected.is_empty());
+        assert_eq!(retained, Some(prior));
+        assert!(!changed);
+        let (_, diagnostics) = rejected.into_parts();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.issue,
+                crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
+            )
+        }));
+
+        let (accepted, propagated, changed) = reconcile_deferred_metal_topology(
+            crate::gpu_worker_pack::ProductionPackRegistry::empty(),
+            None,
+            Some(observed.clone()),
+        );
+        assert!(accepted.is_empty());
+        assert_eq!(propagated, Some(observed));
+        assert!(changed);
+    }
+
+    #[test]
+    fn macos_metal_topology_ready_extension_preserves_legacy_bytes_and_rejects_non_metal() {
+        #[derive(Serialize)]
+        struct LegacyReady<'a> {
+            challenge: &'a String,
+            app_build: &'a String,
+            worker_build: &'a String,
+            bundled_worker_sha256: &'a String,
+            abi: u16,
+            role: WorkerRole,
+            provider: WorkerProvider,
+            artifacts: &'a Vec<WorkerArtifactTarget>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            compatibility: Option<&'a FrozenWorkerCompatibilityContext>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pack: Option<&'a WorkerPackCapability>,
+        }
+
+        let challenge = "ab".repeat(32);
+        let mut cpu_legacy = None;
+        for provider in [
+            WorkerProvider::Cpu,
+            WorkerProvider::Cuda,
+            WorkerProvider::Vulkan,
+        ] {
+            let capability = worker_capability_for_provider(
+                WorkerRole::Inference,
+                challenge.clone(),
+                provider,
+                None,
+            )
+            .unwrap();
+            let expected_legacy_bytes = serde_json::to_vec(&LegacyReady {
+                challenge: &capability.challenge,
+                app_build: &capability.app_build,
+                worker_build: &capability.worker_build,
+                bundled_worker_sha256: &capability.bundled_worker_sha256,
+                abi: capability.abi,
+                role: capability.role,
+                provider: capability.provider,
+                artifacts: &capability.artifacts,
+                compatibility: capability.compatibility.as_ref(),
+                pack: capability.pack.as_ref(),
+            })
+            .unwrap();
+            let ready_bytes = serde_json::to_vec(&capability).unwrap();
+            assert_eq!(
+                ready_bytes, expected_legacy_bytes,
+                "{:?} Ready bytes changed",
+                provider
+            );
+            assert!(
+                !String::from_utf8(ready_bytes)
+                    .unwrap()
+                    .contains("metal_topology")
+            );
+            if provider == WorkerProvider::Cpu {
+                cpu_legacy = Some(capability);
+            }
+        }
+
+        let mut non_metal = cpu_legacy.expect("CPU legacy capability retained for rejection test");
+        non_metal.metal_topology = Some(macos_metal_topology_fixture());
+        assert!(
+            validate_worker_capability(
+                &non_metal,
+                &challenge,
+                &expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn macos_metal_topology_metal_ready_requires_complete_canonical_witness() {
+        let challenge = "ab".repeat(32);
+        let expected = expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Metal);
+        let mut capability = worker_capability_for_provider_with_metal_topology(
+            WorkerRole::Inference,
+            challenge.clone(),
+            WorkerProvider::Metal,
+            None,
+            Some(macos_metal_topology_fixture()),
+        )
+        .unwrap();
+        validate_worker_capability(&capability, &challenge, &expected).unwrap();
+
+        capability.metal_topology = None;
+        assert!(validate_worker_capability(&capability, &challenge, &expected).is_err());
+
+        capability.metal_topology = Some(MetalTopologyV1 {
+            devices: vec![
+                MetalTopologyDeviceV1 {
+                    stable_registry_identity: "metal-registry:0000000000000002".to_owned(),
+                    vendor: GpuVendor::Amd,
+                    device_class: DeviceClass::DiscreteGpu,
+                },
+                MetalTopologyDeviceV1 {
+                    stable_registry_identity: "metal-registry:0000000000000002".to_owned(),
+                    vendor: GpuVendor::Amd,
+                    device_class: DeviceClass::DiscreteGpu,
+                },
+            ],
+        });
+        assert!(validate_worker_capability(&capability, &challenge, &expected).is_err());
+    }
+
+    #[test]
+    fn macos_metal_topology_rejects_canonical_hello_vendor_or_class_contradictions() {
+        let topology = macos_metal_topology_fixture();
+        let mut target =
+            backend_target(BackendKind::Metal, "metal-registry:0000000000000001", None);
+        target.vendor = GpuVendor::Apple;
+        target.device_class = DeviceClass::UnifiedGpu;
+        assert!(topology.covers_target(&target));
+
+        target.vendor = GpuVendor::Amd;
+        assert!(!topology.covers_target(&target));
+        target.vendor = GpuVendor::Apple;
+        target.device_class = DeviceClass::IntegratedGpu;
+        assert!(!topology.covers_target(&target));
+    }
+
+    fn macos_metal_topology_warm_supervisor(
+        topology: MetalTopologyV1,
+        commands: Arc<Mutex<Vec<&'static str>>>,
+    ) -> (
+        InferenceWorkerSupervisor,
+        GgufArtifactFixture,
+        Arc<Mutex<MetalTopologyV1>>,
+    ) {
+        macos_metal_topology_warm_supervisor_with_reply(
+            topology,
+            commands,
+            MetalTopologyResponderReply::Echo,
+        )
+    }
+
+    fn macos_metal_topology_warm_supervisor_with_reply(
+        topology: MetalTopologyV1,
+        commands: Arc<Mutex<Vec<&'static str>>>,
+        reply: MetalTopologyResponderReply,
+    ) -> (
+        InferenceWorkerSupervisor,
+        GgufArtifactFixture,
+        Arc<Mutex<MetalTopologyV1>>,
+    ) {
+        let responder_topology = Arc::new(Mutex::new(topology.clone()));
+        let launcher = Arc::new(TestLauncher::new([TestMode::MetalTopologyResponder {
+            topology: Arc::clone(&responder_topology),
+            commands,
+            reply,
+        }]));
+        let supervisor = inference_supervisor_with_launcher(launcher);
+        let artifact = gguf_artifact_fixture("macos-metal-topology-warm");
+        supervisor
+            .load(artifact.artifact.clone(), AccelerationPreference::Gpu)
+            .unwrap();
+        let mut state = supervisor.transport.inner.state.lock().unwrap();
+        let current = state.current.as_mut().unwrap();
+        current.expectation.provider = WorkerProvider::Metal;
+        current.metal_topology_refresh_version = Some(METAL_TOPOLOGY_REFRESH_VERSION_V1);
+        current.metal_topology = Some(topology);
+        assert!(current.hello_challenge.is_some());
+        drop(state);
+        (supervisor, artifact, responder_topology)
+    }
+
+    #[test]
+    fn macos_metal_topology_refreshes_exact_loaded_warm_owner_without_load_or_ttl_mutation() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology.clone(), Arc::clone(&commands));
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "macOS Metal topology refresh test",
+        )
+        .unwrap();
+        let refresh = supervisor
+            .refresh_metal_topology(&artifact.artifact, deadline, None)
+            .unwrap();
+        assert_eq!(refresh.initial, topology);
+        assert_eq!(refresh.current, topology);
+        assert_eq!(*commands.lock().unwrap(), ["load", "refresh"]);
+        assert!(supervisor.has_loaded_artifact(&artifact.artifact, AccelerationPreference::Gpu));
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_rejects_stale_and_malformed_refresh_replies() {
+        for reply in [
+            MetalTopologyResponderReply::StaleChallenge,
+            MetalTopologyResponderReply::StaleNonce,
+            MetalTopologyResponderReply::NoncanonicalTopology,
+        ] {
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let topology = macos_metal_topology_fixture();
+            let (supervisor, artifact, _) = macos_metal_topology_warm_supervisor_with_reply(
+                topology,
+                Arc::clone(&commands),
+                reply,
+            );
+            let result = supervisor.refresh_metal_topology(
+                &artifact.artifact,
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "macOS Metal stale or malformed refresh reply test",
+                )
+                .unwrap(),
+                None,
+            );
+            assert!(matches!(result, Err(RuntimeError::WorkerUnavailable(_))));
+            assert_eq!(*commands.lock().unwrap(), ["load", "refresh"]);
+            supervisor.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn macos_metal_topology_cancelled_before_dispatch_sends_no_refresh_command() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology, Arc::clone(&commands));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = channel();
+        let gated_process: Arc<dyn WorkerProcess> = Arc::new(GatedMetalRefreshProcess {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let original_process = {
+            let mut state = supervisor.transport.inner.state.lock().unwrap();
+            let current = state.current.as_mut().unwrap();
+            std::mem::replace(&mut current.process, Arc::clone(&gated_process))
+        };
+        let _original_process_cleanup = SwappedMetalTestProcessCleanup {
+            supervisor: supervisor.clone(),
+            original: Some(original_process),
+        };
+        let mut gate_release = ReleaseOnDrop(Some(release_tx));
+        let cancellation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let refresh_supervisor = supervisor.clone();
+        let refresh_artifact = artifact.artifact.clone();
+        let refresh_cancellation = Arc::clone(&cancellation);
+        let refresh = std::thread::spawn(move || {
+            refresh_supervisor.refresh_metal_topology(
+                &refresh_artifact,
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "macOS Metal cancellation-before-dispatch test",
+                )
+                .unwrap(),
+                Some((&*refresh_cancellation, 0)),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(1, Ordering::Release);
+        gate_release.release();
+        assert!(matches!(
+            refresh.join().unwrap(),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert_eq!(*commands.lock().unwrap(), ["load"]);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_cancelled_while_writer_lease_is_contended_sends_no_refresh_command() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology, Arc::clone(&commands));
+        let writer_lease = supervisor.transport.inner.writer.lock().unwrap();
+        let (contended_tx, contended_rx) = sync_channel(1);
+        supervisor
+            .transport
+            .observe_writer_contention_for_test(contended_tx);
+        let cancellation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // If a gated assertion unwinds, cancel before releasing the writer so
+        // the detached request still cannot emit the refresh frame.
+        let _cancel_on_drop = CancellationGenerationOnDrop(Arc::clone(&cancellation));
+        let refresh_supervisor = supervisor.clone();
+        let refresh_artifact = artifact.artifact.clone();
+        let refresh_cancellation = Arc::clone(&cancellation);
+        let (completion_tx, completion_rx) = sync_channel(1);
+        let refresh = std::thread::spawn(move || {
+            let result = refresh_supervisor.refresh_metal_topology(
+                &refresh_artifact,
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "macOS Metal writer-lease cancellation test",
+                )
+                .unwrap(),
+                Some((&*refresh_cancellation, 0)),
+            );
+            let _ = completion_tx.send(result);
+        });
+        contended_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(1, Ordering::Release);
+        // Keep the lease held only while the child proves that its own
+        // cancellation fence completed. A blocking-lock mutant must time out
+        // here rather than leave this test permanently joined on the lease.
+        let completion = completion_rx.recv_timeout(Duration::from_secs(1));
+        // Always release the lease before joining, including when the
+        // watchdog failed. The RAII cancellation guard protects unwinding.
+        drop(writer_lease);
+        refresh.join().unwrap();
+        assert!(matches!(
+            completion.expect("Metal refresh cancellation watchdog expired"),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert_eq!(*commands.lock().unwrap(), ["load"]);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_expired_while_writer_lease_is_contended_sends_no_refresh_command() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology, Arc::clone(&commands));
+        let writer_lease = supervisor.transport.inner.writer.lock().unwrap();
+        let (contended_tx, contended_rx) = sync_channel(1);
+        supervisor
+            .transport
+            .observe_writer_contention_for_test(contended_tx);
+        let cancellation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // If an assertion unwinds, cancellation precedes release of the
+        // writer lease so the detached request cannot dispatch afterward.
+        let _cancel_on_drop = CancellationGenerationOnDrop(Arc::clone(&cancellation));
+        let refresh_supervisor = supervisor.clone();
+        let refresh_artifact = artifact.artifact.clone();
+        let refresh_cancellation = Arc::clone(&cancellation);
+        let (completion_tx, completion_rx) = sync_channel(1);
+        let refresh = std::thread::spawn(move || {
+            let result = refresh_supervisor.refresh_metal_topology(
+                &refresh_artifact,
+                MonotonicDeadline::after_for(
+                    Duration::from_millis(500),
+                    "macOS Metal writer-lease expiry test",
+                )
+                .unwrap(),
+                Some((&*refresh_cancellation, 0)),
+            );
+            let _ = completion_tx.send(result);
+        });
+        contended_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A timeout is failure evidence, but cancel first so releasing the
+        // lease for teardown cannot permit a late refresh dispatch.
+        let completion = completion_rx.recv_timeout(Duration::from_secs(1));
+        if completion.is_err() {
+            cancellation.store(1, Ordering::Release);
+        }
+        // Never join a child while this test owns the contested writer lease.
+        drop(writer_lease);
+        refresh.join().unwrap();
+        assert!(matches!(
+            completion.expect("Metal refresh expiry watchdog expired"),
+            Err(RuntimeError::RetryableWorkerFailure(_))
+        ));
+        assert_eq!(*commands.lock().unwrap(), ["load"]);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_expired_before_dispatch_sends_no_refresh_command() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology, Arc::clone(&commands));
+        let expired = MonotonicDeadline {
+            expires_at: Instant::now(),
+            budget: Duration::from_millis(1),
+            label: "macOS Metal expired-before-dispatch test",
+        };
+        assert!(matches!(
+            supervisor.refresh_metal_topology(&artifact.artifact, expired, None),
+            Err(RuntimeError::RetryableWorkerFailure(_))
+        ));
+        assert_eq!(*commands.lock().unwrap(), ["load"]);
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_cancelled_at_preprobe_boundary_does_not_launch_replacement() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let supervisor = inference_supervisor_with_launcher(Arc::clone(&launcher));
+        let probe = PendingPackProbe {
+            pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new("metal-refresh-test")
+                .unwrap(),
+            backend: PackBackend::Metal,
+            supervisor,
+        };
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        cleanup.gate_before_probe_for_test(BeforeProviderProbeGate {
+            reached: entered_tx,
+            release: release_rx,
+        });
+        let cancellation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_cleanup = Arc::clone(&cleanup);
+        let probe_cancellation = Arc::clone(&cancellation);
+        let result = std::thread::spawn(move || {
+            let mut allowance = ProviderDiscoveryAllowance::production();
+            collect_verified_pack_probe_outcomes(
+                vec![probe],
+                Vec::new(),
+                &mut allowance,
+                &probe_cleanup,
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "macOS Metal cancelled provider-discovery test",
+                )
+                .unwrap(),
+                Some((&*probe_cancellation, 0)),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(1, Ordering::Release);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            result.join().unwrap(),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn macos_metal_topology_cancelled_inside_probe_generation_admission_does_not_launch() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let supervisor = inference_supervisor_with_launcher(Arc::clone(&launcher));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (receipt_observed_tx, _receipt_observed_rx) = sync_channel(1);
+        supervisor.transport.gate_retirement_snapshot_for_test(
+            entered_tx,
+            release_rx,
+            receipt_observed_tx,
+        );
+        let probe = PendingPackProbe {
+            pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                "metal-inner-admission-test",
+            )
+            .unwrap(),
+            backend: PackBackend::Metal,
+            supervisor,
+        };
+        let cleanup = Arc::new(ProviderProbeCleanupFence::default());
+        let cancellation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_cleanup = Arc::clone(&cleanup);
+        let probe_cancellation = Arc::clone(&cancellation);
+        let result = std::thread::spawn(move || {
+            let mut allowance = ProviderDiscoveryAllowance::production();
+            collect_verified_pack_probe_outcomes(
+                vec![probe],
+                Vec::new(),
+                &mut allowance,
+                &probe_cleanup,
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "macOS Metal cancelled inner generation-admission test",
+                )
+                .unwrap(),
+                Some((&*probe_cancellation, 0)),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(1, Ordering::Release);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            result.join().unwrap(),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert!(cleanup.supervisors.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn macos_metal_topology_cancellation_wins_over_retirement_failure() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, responder_topology) =
+            macos_metal_topology_warm_supervisor(topology.clone(), Arc::clone(&commands));
+        let mut changed_devices = topology.devices.clone();
+        changed_devices.push(MetalTopologyDeviceV1 {
+            stable_registry_identity: "metal-registry:0000000000000003".to_owned(),
+            vendor: GpuVendor::Intel,
+            device_class: DeviceClass::IntegratedGpu,
+        });
+        *responder_topology.lock().unwrap() =
+            MetalTopologyV1::canonicalize(changed_devices).unwrap();
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = channel();
+        let retirement_process: Arc<dyn WorkerProcess> =
+            Arc::new(GatedMetalRetirementFailureProcess {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            });
+        let original_process = {
+            let mut state = supervisor.transport.inner.state.lock().unwrap();
+            let current = state.current.as_mut().unwrap();
+            std::mem::replace(&mut current.process, Arc::clone(&retirement_process))
+        };
+        let _original_process_cleanup = SwappedMetalTestProcessCleanup {
+            supervisor: supervisor.clone(),
+            original: Some(original_process),
+        };
+        let mut gate_release = ReleaseOnDrop(Some(release_tx));
+        let mut route = verified_gpu_route(
+            BackendKind::Metal,
+            "metal-registry:0000000000000001",
+            "test-driver-1",
+            'm',
+        );
+        route.supervisor = supervisor.clone();
+        let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        catalog.metal_topology = Some(topology);
+        let registry = Arc::new(InferenceWorkerRegistry::with_cpu_supervisor(
+            InferenceWorkerSupervisor::unstarted(),
+        ));
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap(),
+            supervisor: supervisor.clone(),
+        });
+        registry
+            .gpu_routes
+            .lock()
+            .unwrap()
+            .record_probe(catalog.clone(), Instant::now());
+        let cancellation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let racing_registry = Arc::clone(&registry);
+        let racing_artifact = artifact.artifact.clone();
+        let racing_catalog = catalog.clone();
+        let racing_cancellation = Arc::clone(&cancellation);
+        let result = std::thread::spawn(move || {
+            racing_registry.retain_cached_catalog_after_metal_refresh(
+                &racing_registry.gpu_routes,
+                &racing_catalog,
+                &racing_artifact,
+                MonotonicDeadline::after_for(
+                    Duration::from_secs(1),
+                    "macOS Metal cancellation-during-retirement test",
+                )
+                .unwrap(),
+                Some((&*racing_cancellation, 0)),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(1, Ordering::Release);
+        gate_release.release();
+        assert!(matches!(
+            result.join().unwrap(),
+            Err(RuntimeError::Cancelled(_))
+        ));
+        assert_eq!(*commands.lock().unwrap(), ["load", "refresh"]);
+        assert!(!registry.retiring_workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn macos_metal_topology_cached_consumer_keeps_matching_warm_admission() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology.clone(), Arc::clone(&commands));
+        let mut route = verified_gpu_route(
+            BackendKind::Metal,
+            "metal-registry:0000000000000001",
+            "test-driver-1",
+            'm',
+        );
+        route.supervisor = supervisor.clone();
+        let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        catalog.metal_topology = Some(topology);
+        let registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor::unstarted());
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap(),
+            supervisor: supervisor.clone(),
+        });
+        registry
+            .gpu_routes
+            .lock()
+            .unwrap()
+            .record_probe(catalog.clone(), Instant::now());
+        assert!(
+            registry
+                .retain_cached_catalog_after_metal_refresh(
+                    &registry.gpu_routes,
+                    &catalog,
+                    &artifact.artifact,
+                    MonotonicDeadline::after_for(
+                        Duration::from_secs(1),
+                        "macOS Metal matching cached-admission test",
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(*commands.lock().unwrap(), ["load", "refresh"]);
+        assert!(supervisor.has_loaded_artifact(&artifact.artifact, AccelerationPreference::Gpu));
+        assert!(registry.gpu_routes.lock().unwrap().successful.is_some());
+        registry.retire_active_worker().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_cached_consumer_rejects_probe_to_cold_snapshot_drift() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let probe_topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, responder_topology) =
+            macos_metal_topology_warm_supervisor(probe_topology.clone(), Arc::clone(&commands));
+        let mut cold_topology = probe_topology.devices.clone();
+        cold_topology.push(MetalTopologyDeviceV1 {
+            stable_registry_identity: "metal-registry:0000000000000003".to_owned(),
+            vendor: GpuVendor::Intel,
+            device_class: DeviceClass::IntegratedGpu,
+        });
+        let cold_topology = MetalTopologyV1::canonicalize(cold_topology).unwrap();
+        *responder_topology.lock().unwrap() = cold_topology.clone();
+        supervisor
+            .transport
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap()
+            .metal_topology = Some(cold_topology);
+        let mut route = verified_gpu_route(
+            BackendKind::Metal,
+            "metal-registry:0000000000000001",
+            "test-driver-1",
+            'm',
+        );
+        route.supervisor = supervisor.clone();
+        let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        catalog.metal_topology = Some(probe_topology);
+        let registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor::unstarted());
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap(),
+            supervisor: supervisor.clone(),
+        });
+        registry
+            .auto_gpu_routes
+            .lock()
+            .unwrap()
+            .record_auto_live_admission_probe(&catalog, Instant::now());
+        assert!(
+            !registry
+                .retain_cached_catalog_after_metal_refresh(
+                    &registry.auto_gpu_routes,
+                    &catalog,
+                    &artifact.artifact,
+                    MonotonicDeadline::after_for(
+                        Duration::from_secs(1),
+                        "macOS Metal probe-to-cold drift test",
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(*commands.lock().unwrap(), ["load", "refresh"]);
+        assert!(registry.active_route.lock().unwrap().is_none());
+        assert!(
+            registry
+                .auto_gpu_routes
+                .lock()
+                .unwrap()
+                .successful
+                .is_none()
+        );
+        registry.retire_active_worker().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_cached_consumer_rejects_unselected_add_remove_and_class_changes() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, responder_topology) =
+            macos_metal_topology_warm_supervisor(topology.clone(), Arc::clone(&commands));
+        let mut route = verified_gpu_route(
+            BackendKind::Metal,
+            "metal-registry:0000000000000001",
+            "test-driver-1",
+            'm',
+        );
+        route.supervisor = supervisor.clone();
+        let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        catalog.metal_topology = Some(topology.clone());
+        let registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor::unstarted());
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap(),
+            supervisor: supervisor.clone(),
+        });
+
+        let mut with_added_unselected = topology.devices.clone();
+        with_added_unselected.push(MetalTopologyDeviceV1 {
+            stable_registry_identity: "metal-registry:0000000000000003".to_owned(),
+            vendor: GpuVendor::Intel,
+            device_class: DeviceClass::IntegratedGpu,
+        });
+        *responder_topology.lock().unwrap() =
+            MetalTopologyV1::canonicalize(with_added_unselected).unwrap();
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "macOS Metal added-device freshness test",
+        )
+        .unwrap();
+        assert!(
+            registry
+                .cached_metal_admission_requires_fresh_discovery(
+                    &catalog,
+                    &artifact.artifact,
+                    deadline,
+                    None,
+                )
+                .unwrap()
+        );
+
+        let selected_only =
+            MetalTopologyV1::canonicalize(vec![topology.devices[0].clone()]).unwrap();
+        *responder_topology.lock().unwrap() = selected_only;
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "macOS Metal removed-device freshness test",
+        )
+        .unwrap();
+        assert!(
+            registry
+                .cached_metal_admission_requires_fresh_discovery(
+                    &catalog,
+                    &artifact.artifact,
+                    deadline,
+                    None,
+                )
+                .unwrap()
+        );
+
+        let mut with_changed_unselected_class = topology.devices.clone();
+        with_changed_unselected_class[1].device_class = DeviceClass::IntegratedGpu;
+        *responder_topology.lock().unwrap() =
+            MetalTopologyV1::canonicalize(with_changed_unselected_class).unwrap();
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "macOS Metal class-change freshness test",
+        )
+        .unwrap();
+        assert!(
+            registry
+                .cached_metal_admission_requires_fresh_discovery(
+                    &catalog,
+                    &artifact.artifact,
+                    deadline,
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            *commands.lock().unwrap(),
+            ["load", "refresh", "refresh", "refresh"]
+        );
+        registry.retire_active_worker().unwrap();
+    }
+
+    #[test]
+    fn macos_metal_topology_cached_consumer_rejects_missing_feature_without_sending_refresh() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let topology = macos_metal_topology_fixture();
+        let (supervisor, artifact, _) =
+            macos_metal_topology_warm_supervisor(topology, Arc::clone(&commands));
+        supervisor
+            .transport
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap()
+            .metal_topology = None;
+        let mut route = verified_gpu_route(
+            BackendKind::Metal,
+            "metal-registry:0000000000000001",
+            "test-driver-1",
+            'm',
+        );
+        route.supervisor = supervisor.clone();
+        let catalog = verified_gpu_catalog(vec![route.clone()]);
+        let registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor::unstarted());
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+            target: route.target.clone().unwrap(),
+            supervisor: supervisor.clone(),
+        });
+        let deadline = MonotonicDeadline::after_for(
+            Duration::from_secs(1),
+            "macOS Metal cached consumer test",
+        )
+        .unwrap();
+        assert!(
+            registry
+                .cached_metal_admission_requires_fresh_discovery(
+                    &catalog,
+                    &artifact.artifact,
+                    deadline,
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(*commands.lock().unwrap(), ["load"]);
+        registry.retire_active_worker().unwrap();
     }
 }
