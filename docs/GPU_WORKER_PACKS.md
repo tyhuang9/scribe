@@ -1125,9 +1125,13 @@ Unsupported distributions, architectures, ABI,
 glibc, or kernels deny Linux GPU eligibility only; the CPU path remains
 available. `gpu-auto-qualification-linux-x86_64.json` is canonical
 `default_deny` with no entries, so this contract does not enable Auto GPU use or
-introduce production trust. A Linux release-authority document is intentionally
-deferred until the root-owned epoch authority is implemented; the current
-schema is macOS Keychain-specific and is not reused as a Linux trust contract.
+introduce production trust. The Linux-specific embedded metadata boundary is
+specified in `docs/LINUX_GPU_RELEASE_AUTHORITY.md`. Linux builds select their
+own canonical epoch-zero/empty document, while positive/nonempty production
+overrides remain rejected before publication. Positive schema/catalog fixtures
+do not authenticate packs or activate GPU support; the macOS Keychain schema is
+not reused as a Linux trust contract. Shared project pack-signature keys are
+unchanged, and existing nonempty Linux package rejection remains independent.
 
 The read-only admission-snapshot prerequisite is specified in
 `docs/LINUX_GPU_RELEASE_EPOCH.md`. It accepts only an already committed,

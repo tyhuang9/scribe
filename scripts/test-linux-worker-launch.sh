@@ -30,6 +30,20 @@ require_exact_test_set() {
   fi
 }
 
+require_exact_named_tests() {
+  local listing="$1"
+  shift
+  local expected
+  local discovered
+  expected="$(printf '%s\n' "$@" | LC_ALL=C sort)"
+  discovered="$(sed -n 's/: test$//p' <<<"$listing" | LC_ALL=C sort)"
+  if [[ "$discovered" != "$expected" ]]; then
+    echo "Discovered Cargo test set did not match the canonical inventory" >&2
+    diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$discovered") >&2 || true
+    exit 1
+  fi
+}
+
 if [[ -r /proc/sys/vm/memfd_noexec ]]; then
   memfd_noexec="$(< /proc/sys/vm/memfd_noexec)"
   if [[ "$memfd_noexec" != "0" ]]; then
@@ -149,4 +163,56 @@ require_exact_test_set \
 (
   cd "$repo_root"
   "$test_root/linux-release-epoch-architecture-tests"
+)
+
+linux_release_authority_tests=(
+  "tests::linux_release_authority_default_emission_validates_empty_runtime_binding"
+  "tests::linux_release_authority_positive_cuda_and_vulkan_fixture_binds_exactly"
+  "tests::linux_release_authority_rejects_malformed_noncanonical_and_unbounded_documents"
+  "tests::linux_release_authority_rejects_nonempty_linux_build_inputs"
+  "tests::linux_release_authority_rejects_tampered_build_catalog_target_abi_provider_epoch_and_inventory"
+  "tests::linux_release_authority_target_selection_preserves_non_linux_defaults"
+)
+if (( ${#linux_release_authority_tests[@]} != 6 )); then
+  echo "Canonical Linux release authority test inventory has the wrong count" >&2
+  exit 1
+fi
+(
+  cd "$repo_root"
+  export CARGO_TARGET_DIR="$test_root/linux-release-authority-cargo-target"
+  export SCRIBE_BUILD_REVISION="linux-release-authority-tests"
+  linux_release_authority_listing="$(
+    timeout 120s cargo test --locked --offline \
+      --manifest-path tools/worker-pack-author/Cargo.toml \
+      linux_release_authority_ -- --list
+  )"
+  require_exact_named_tests \
+    "$linux_release_authority_listing" \
+    "${linux_release_authority_tests[@]}"
+  timeout 120s cargo test --locked --offline \
+    --manifest-path tools/worker-pack-author/Cargo.toml \
+    linux_release_authority_ -- --test-threads=1
+)
+
+rustc --edition=2024 --test \
+  "$repo_root/src/linux_release_authority_architecture_guard.rs" \
+  -D warnings \
+  -o "$test_root/linux-release-authority-architecture-tests"
+
+linux_release_authority_architecture_tests=(
+  "build_policy_selects_and_reviews_the_linux_empty_authority_before_publication"
+  "linux_authority_is_private_semantic_binding_not_pack_or_epoch_admission"
+  "platform_dispatch_preserves_existing_non_linux_release_authority_behavior"
+  "portable_authority_suites_are_exactly_discovered_on_both_ubuntu_lanes"
+)
+if (( ${#linux_release_authority_architecture_tests[@]} != 4 )); then
+  echo "Canonical Linux release authority architecture test inventory has the wrong count" >&2
+  exit 1
+fi
+require_exact_test_set \
+  "$test_root/linux-release-authority-architecture-tests" \
+  "${linux_release_authority_architecture_tests[@]}"
+(
+  cd "$repo_root"
+  "$test_root/linux-release-authority-architecture-tests"
 )

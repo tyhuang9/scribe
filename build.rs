@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 #[path = "build_support/build_revision.rs"]
 mod build_revision;
 
+#[path = "build_support/linux_release_authority.rs"]
+mod linux_release_authority;
+
 #[path = "build_support/windows_application_manifest.rs"]
 mod windows_application_manifest;
 
@@ -242,40 +245,36 @@ fn validated_macos_keychain_access_group(reviewed_group: &str) -> Option<String>
 }
 
 fn embed_gpu_pack_release_authority() {
-    const DEFAULT_AUTHORITY: &str = "runtime-manifests/gpu-pack-release-authority-macos-empty.json";
-    const MAX_AUTHORITY_BYTES: usize = 512 * 1024;
-
     println!("cargo:rerun-if-env-changed=SCRIBE_GPU_PACK_RELEASE_AUTHORITY");
-    println!("cargo:rerun-if-changed={DEFAULT_AUTHORITY}");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let selection =
+        linux_release_authority::select_release_authority(&target_os, &target_arch, &target_env);
+    let _ = selection.linux_gpu_eligible;
+    println!("cargo:rerun-if-changed={}", selection.default_path);
     let source = std::env::var_os("SCRIBE_GPU_PACK_RELEASE_AUTHORITY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTHORITY));
-    if source.as_path() != Path::new(DEFAULT_AUTHORITY) {
+        .unwrap_or_else(|| PathBuf::from(selection.default_path));
+    if source.as_path() != Path::new(selection.default_path) {
         println!("cargo:rerun-if-changed={}", source.display());
     }
-    let mut bytes = fs::read(&source).unwrap_or_else(|error| {
+    let source_bytes = fs::read(&source).unwrap_or_else(|error| {
         panic!(
             "could not read the GPU pack release authority {}: {error}",
             source.display()
         )
     });
-    assert!(
-        !bytes.is_empty() && bytes.len() <= MAX_AUTHORITY_BYTES,
-        "GPU pack release authority is empty or exceeds its build-time bound"
-    );
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    assert!(
-        !bytes.is_empty() && bytes.last() != Some(&b'\r') && std::str::from_utf8(&bytes).is_ok(),
-        "GPU pack release authority must be canonical UTF-8 JSON with at most one trailing LF"
-    );
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
-    fs::write(
-        out_dir.join("scribe_gpu_pack_release_authority.json"),
-        bytes,
-    )
-    .expect("could not embed the GPU pack release authority");
+    linux_release_authority::emit_selected_authority(selection, &source_bytes, |bytes| {
+        // The emitter invokes this closure only after all target policy has passed.
+        let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
+        fs::write(
+            out_dir.join("scribe_gpu_pack_release_authority.json"),
+            bytes,
+        )
+        .expect("could not embed the GPU pack release authority");
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 fn reject_multiple_gpu_features() {
