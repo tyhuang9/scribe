@@ -169,15 +169,19 @@ fn portable_authority_suites_are_exactly_discovered_on_both_ubuntu_lanes() {
         "require_exact_named_tests",
         "tools/worker-pack-author/Cargo.toml",
         "SCRIBE_BUILD_REVISION=\"linux-release-authority-tests\"",
-        "${#linux_release_authority_tests[@]} != 6",
+        "${#linux_release_authority_tests[@]} != 9",
         "linux_release_authority_default_emission_validates_empty_runtime_binding",
         "linux_release_authority_positive_cuda_and_vulkan_fixture_binds_exactly",
+        "linux_release_authority_reviewed_empty_metadata_disables_gpu_support",
+        "linux_release_authority_rejects_malformed_and_digest_mismatched_release_metadata",
+        "linux_release_authority_rejects_structurally_valid_positive_and_nonempty_release_metadata",
         "linux_release_authority_rejects_tampered_build_catalog_target_abi_provider_epoch_and_inventory",
         "timeout 120s cargo test --locked",
         "cargo test --locked --offline",
         "src/linux_release_authority_architecture_guard.rs",
-        "${#linux_release_authority_architecture_tests[@]} != 4",
+        "${#linux_release_authority_architecture_tests[@]} != 5",
         "linux_authority_is_private_semantic_binding_not_pack_or_epoch_admission",
+        "linux_release_package_consumer_is_data_only_default_deny_and_exactly_tested",
     ] {
         assert!(
             script.contains(required),
@@ -188,4 +192,89 @@ fn portable_authority_suites_are_exactly_discovered_on_both_ubuntu_lanes() {
         workflow
             .contains("cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml")
     );
+}
+
+#[test]
+fn linux_release_package_consumer_is_data_only_default_deny_and_exactly_tested() {
+    let module = normalized(include_str!("gpu_worker_pack/mod.rs"));
+    let authority = normalized(include_str!("gpu_worker_pack/linux_release_authority.rs"));
+    let portable_tests = normalized(include_str!("../tools/worker-pack-author/src/main.rs"));
+    let worker = normalized(include_str!("onnx_worker.rs"));
+    let script = normalized(include_str!("../scripts/test-linux-worker-launch.sh"));
+    let compact_module = module.split_whitespace().collect::<String>();
+    for required in [
+        "linux_release_authority::linux_release_policy_decision(",
+        "linux_release_authority::LinuxReleasePolicyDecision::SupportDisabled",
+        "linux_release_authority::LinuxReleasePolicyDecision::MetadataRejected",
+        "PackDiscoveryIssue::LinuxReleaseSupportDisabled",
+        "PackDiscoveryIssue::LinuxReleaseMetadataRejected",
+        "catalog_generation: None",
+        "linux_release_package_policy_projects_to_zero_lease_categorical_discovery",
+    ] {
+        assert!(
+            module.contains(required),
+            "missing Linux consumer invariant: {required}"
+        );
+    }
+    assert!(compact_module.contains(
+        "#[cfg(all(target_os=\"linux\",target_arch=\"x86_64\",target_env=\"gnu\"))]pub(crate)fndiscover_production_pack_leases()"
+    ));
+    for required in [
+        "pub(crate) enum LinuxReleasePolicyDecision",
+        "pub(crate) fn linux_release_policy_decision(",
+        "binding.release_security_epoch == 0 && binding.entry_count == 0",
+    ] {
+        assert!(
+            authority.contains(required),
+            "missing Linux policy invariant: {required}"
+        );
+    }
+    assert!(!authority.contains("pub enum LinuxReleasePolicyDecision"));
+    let helper_start = authority
+        .find("pub(crate) fn linux_release_policy_decision(")
+        .unwrap();
+    let helper_tail = &authority[helper_start..];
+    let helper_end = helper_tail.find("\n}\n").unwrap() + 3;
+    let helper = &helper_tail[..helper_end];
+    for forbidden in [
+        "std::fs",
+        "LinuxReleaseEpochLease",
+        "ProductionTrustRoot",
+        "verify_catalog_entries",
+        "provider",
+        "health",
+        "launch",
+    ] {
+        assert!(
+            !helper.contains(forbidden),
+            "Linux data-only consumer acquired forbidden behavior: {forbidden}"
+        );
+    }
+    for required in [
+        "LinuxReleaseSupportDisabled",
+        "LinuxReleaseMetadataRejected",
+    ] {
+        assert!(
+            worker.contains(required),
+            "missing stable probe mapping: {required}"
+        );
+    }
+    for required in [
+        "linux_release_authority_reviewed_empty_metadata_disables_gpu_support",
+        "linux_release_authority_rejects_malformed_and_digest_mismatched_release_metadata",
+        "linux_release_authority_rejects_structurally_valid_positive_and_nonempty_release_metadata",
+    ] {
+        assert!(
+            portable_tests.contains(required),
+            "missing portable consumer test: {required}"
+        );
+        assert!(
+            script.contains(required),
+            "missing canonical consumer test hook: {required}"
+        );
+    }
+    assert!(portable_tests.contains("linux_vulkan_fixture("));
+    assert!(script.contains("${#linux_release_authority_tests[@]} != 9"));
+    assert!(!script.contains("linux_release_package_consumer_tests"));
+    assert!(!script.contains("--bin local-transcriber --features ui-harness"));
 }

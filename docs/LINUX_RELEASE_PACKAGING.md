@@ -7,6 +7,13 @@ inference dependencies. The package installs the desktop at
 `/usr/lib/scribe/scribe-inference-worker`, and reserves immutable GPU packs
 under `/usr/lib/scribe/workers/packs/<id>/<version>/<digest>/`.
 
+The CPU-only payload also includes
+`/usr/lib/scribe/gpu-pack-release-authority.json`: the exact reviewed Linux
+epoch-zero, empty authority, with its source transport newline removed. The
+assembler and independent verifier compare it with fixed reviewed bytes and
+the exact empty catalog. Recomputing an unsigned inventory cannot authorize
+different authority bytes, a positive epoch or GPU entries.
+
 The checked-in release contract and package catalog are canonical JSON. The
 catalog is exactly `{"schema_version":1,"packs":[]}`. The shared project public
 key can authenticate compatible CUDA/Vulkan packs with `ProductionTrustRoot`,
@@ -35,7 +42,7 @@ production Rust verification and labels the trust mode.
 `verify-linux-release-package.sh` independently parses the outer `ar` archive,
 requires exactly the three ordered Debian members, and bounds both compressed
 members and their XZ expansion before any tar processing. It requires the exact
-control field set and the independently authorized five-file CPU payload, then
+control field set and the independently authorized six-file CPU payload, then
 rejects unsafe names, duplicates, case collisions, links, nonregular entries,
 non-root ownership, and unsafe archive modes without normalizing them during
 extraction. It also checks ELF identity, the exact inventory, deterministic
@@ -46,7 +53,29 @@ the unsigned inventory cannot authorize additional files. This makes the
 installed CPU worker compatible with the descriptor-bound `openat2` plus
 sealed-`memfd` launcher while leaving no mutable path fallback.
 
+On supported Linux x86_64 GNU, desktop GPU discovery consumes its embedded
+authority through the typed validator against the canonical empty catalog.
+Reviewed epoch-zero metadata reports that production Linux GPU support is
+disabled; invalid or positive metadata reports a separate rejection. Both
+paths return zero packs and no catalog generation. This data-only check does
+not read installed metadata, access a security floor or health cache, or start
+a provider. Unsupported targets retain their unsupported-platform result.
+
+Build-time Linux policy and packaging independently require the same reviewed
+empty document. This is artifact-integrity checking, not publisher
+authentication: the package verifier does not execute the desktop and cannot
+prove the provenance or embedded authority of an arbitrary supplied ELF. No
+synthetic linker marker or new digest-grep proof substitutes for that missing
+provenance. Positive authenticated release inclusion remains separate work.
+
 Run the native package and attack suite on Ubuntu 22.04 or 24.04:
+
+Prerequisites are the system C/Debian/Python packaging tools and, for the Rust
+pack-verifier cases, the pinned Rust toolchain with locked dependencies fetched
+separately using
+`cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml`.
+Verification uses the cached dependencies offline; it does not provision tools
+or start services.
 
 ```sh
 ./scripts/test-linux-release-packaging.sh
@@ -59,6 +88,10 @@ compression across different `dpkg-deb` or compression-tool versions. It
 rejects unsafe directory modes, invalid ELF inputs, worker tampering, unexpected
 files, stale size reports, catalog and contract mutation, symlink arguments,
 overwrite attempts, fixture trust in production, and partial publication. The
+authority-specific cases also reject missing, changed, linked or duplicated
+authority files, positive metadata and self-consistently rehashed tampering.
+Compiler-generated fixture executables test packaging, not the actual desktop
+binary or its native inference behavior. The
 standalone Rust tool tests additionally cover
 exact manifest/signature/inventory validation, immutable staging, no-replace
 publication, interruption recovery, previous-pack retention, rollback, epoch

@@ -34,6 +34,16 @@ pub(crate) struct LinuxCatalogReleaseBinding {
     pub(crate) entry_count: usize,
 }
 
+/// The only Linux release outcomes available at the embedded-catalog boundary.
+///
+/// This is crate-private so platform dispatch can map the result to its stable
+/// diagnostic without exposing a pack-admission API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxReleasePolicyDecision {
+    SupportDisabled,
+    MetadataRejected,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LinuxReleaseAuthority {
@@ -136,6 +146,24 @@ pub(crate) fn validate_catalog_release_binding(
         release_security_epoch: authority.release_security_epoch,
         entry_count: authority.entries.len(),
     })
+}
+
+/// Applies the Linux release's deliberately narrow default-deny policy.
+///
+/// Structural validation deliberately accepts future positive epochs and
+/// populated catalogs. The current Linux package, however, has authority only
+/// for the reviewed empty epoch-zero catalog; every other input is rejected.
+pub(crate) fn linux_release_policy_decision(
+    catalog_bytes: &[u8],
+    authority_bytes: &[u8],
+    expected: ExpectedBuild<'_>,
+) -> LinuxReleasePolicyDecision {
+    match validate_catalog_release_binding(catalog_bytes, authority_bytes, expected) {
+        Some(binding) if binding.release_security_epoch == 0 && binding.entry_count == 0 => {
+            LinuxReleasePolicyDecision::SupportDisabled
+        }
+        _ => LinuxReleasePolicyDecision::MetadataRejected,
+    }
 }
 
 fn catalog_roots_are_unique(entries: &[PackCatalogEntry]) -> bool {

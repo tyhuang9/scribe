@@ -1140,3 +1140,11 @@ advances authority. Privileged monotonic advancement, updater coordination,
 uninstall persistence and authenticated Linux release-authority wiring remain
 separate prerequisites; this reader does not enable production Linux discovery,
 pack launch, nonempty packaging or Auto.
+
+The Linux CPU-only package now includes the exact normalized empty release
+authority in its independently checked six-file payload. Supported Linux
+desktop discovery validates its embedded empty authority for categorical
+disabled/rejected diagnostics only, returning no leases or catalog generation.
+This does not authenticate a positive release or read privileged state. See
+`docs/LINUX_GPU_RELEASE_AUTHORITY.md` and `docs/LINUX_RELEASE_PACKAGING.md` for
+the integrity checks and their artifact-provenance limitations.

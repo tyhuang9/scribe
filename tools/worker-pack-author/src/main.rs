@@ -556,6 +556,17 @@ mod tests {
         .is_some()
     }
 
+    fn linux_policy_decision(
+        catalog: &[u8],
+        authority: &[u8],
+    ) -> linux_release_authority::LinuxReleasePolicyDecision {
+        linux_release_authority::linux_release_policy_decision(
+            catalog,
+            authority,
+            linux_expected_build(),
+        )
+    }
+
     fn linux_rebind_catalog_sha(authority: &[u8], catalog: &[u8]) -> Vec<u8> {
         use sha2::{Digest, Sha256};
 
@@ -627,6 +638,63 @@ mod tests {
         .unwrap();
         assert_eq!(binding.release_security_epoch, 0);
         assert_eq!(binding.entry_count, 0);
+    }
+
+    #[test]
+    fn linux_release_authority_reviewed_empty_metadata_disables_gpu_support() {
+        use linux_release_authority::LinuxReleasePolicyDecision;
+
+        let source = include_bytes!(
+            "../../../runtime-manifests/gpu-pack-release-authority-linux-empty.json"
+        );
+        let authority = &source[..source.len() - 1];
+        assert_eq!(
+            linux_policy_decision(br#"{"schema_version":1,"packs":[]}"#, authority),
+            LinuxReleasePolicyDecision::SupportDisabled
+        );
+    }
+
+    #[test]
+    fn linux_release_authority_rejects_malformed_and_digest_mismatched_release_metadata() {
+        use linux_release_authority::LinuxReleasePolicyDecision;
+
+        const DIGEST_MISMATCH: &[u8] = br#"{"schema_version":1,"target":"x86_64-unknown-linux-gnu","catalog_sha256":"0000000000000000000000000000000000000000000000000000000000000000","release_security_epoch":0,"entries":[]}"#;
+        for authority in [b"{}".as_slice(), DIGEST_MISMATCH] {
+            assert_eq!(
+                linux_policy_decision(br#"{"schema_version":1,"packs":[]}"#, authority),
+                LinuxReleasePolicyDecision::MetadataRejected
+            );
+        }
+    }
+
+    #[test]
+    fn linux_release_authority_rejects_structurally_valid_positive_and_nonempty_release_metadata() {
+        use linux_release_authority::LinuxReleasePolicyDecision;
+
+        let empty_catalog = br#"{"schema_version":1,"packs":[]}"#;
+        let positive_empty = format!(
+            r#"{{"schema_version":1,"target":"x86_64-unknown-linux-gnu","catalog_sha256":"c3f19154f1b2265dac92206eae3a35c130a078be46705e1be6032bc442c3b9dc","release_security_epoch":{LINUX_TEST_EPOCH},"entries":[]}}"#
+        );
+        assert!(linux_binding(empty_catalog, positive_empty.as_bytes()));
+        assert_eq!(
+            linux_policy_decision(empty_catalog, positive_empty.as_bytes()),
+            LinuxReleasePolicyDecision::MetadataRejected
+        );
+
+        let (catalog, authority) = linux_vulkan_fixture(
+            LINUX_TEST_EPOCH,
+            LINUX_TEST_RUNTIME_ABI,
+            "linux",
+            "x86_64",
+            "transcribe-cpp-ggml-vulkan",
+            "bin/worker",
+            &["bin/worker", "pack-manifest.json", "pack-manifest.sig"],
+        );
+        assert!(linux_binding(&catalog, &authority));
+        assert_eq!(
+            linux_policy_decision(&catalog, &authority),
+            LinuxReleasePolicyDecision::MetadataRejected
+        );
     }
 
     #[test]
