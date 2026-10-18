@@ -69,6 +69,9 @@ jobs:
         env:
           SCRIBE_BUILD_REVISION: stage6-macos-ci
         run: |
+          metadata_tests="$(cargo test --locked --bin local-transcriber macos_metal_metadata_ -- --list)"
+          metadata_count="$(printf '%s\n' "$metadata_tests" | awk '/^onnx_worker::tests::macos_metal_metadata_.*: test$/ { count++ } END { print count+0 }')"
+          test "$metadata_count" -eq 11
           cargo test --locked --test build_revision_invalidation -- --test-threads=1
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture

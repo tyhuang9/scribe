@@ -43,6 +43,8 @@ packs for publication.
 - One registry-wide route owns the sole inference worker/model. CPU/GPU and
   GPU-device switches retire the previous worker; failed fallback workers are
   retired; only the winner retains the existing five-minute warm model.
+  The macOS metadata-only helper described below is a brief exception to
+  process exclusivity, not to the one-model or serialized-inference rule.
 - Repeated explicit-GPU requests reuse the verified catalog while a cheap
   signed-catalog generation plus SetupAPI device/driver fingerprint is
   unchanged. A changed fingerprint retires the warm worker before re-probing.
@@ -914,7 +916,7 @@ the negotiated worker-only metadata refresh described below revalidates them
 before successful catalog reuse. Release verification checks these Mach-O
 linkage boundaries with both `otool -L` and `otool -l`.
 
-### Successful Metal catalog freshness
+### Metal catalog freshness
 
 The OS build is not a complete Metal device-set witness: an external GPU can
 change without an OS update. A successful explicit-GPU catalog and Auto's
@@ -953,15 +955,57 @@ never sent the extension. Metal Hello without the supported capability is
 explicitly rejected as incompatible, not admitted through legacy fallback;
 Metal retains the existing same-build macOS binding.
 
-This is a successful-cache fix, not complete all-state hot-plug detection.
+#### Negative-cache metadata helper
+
+When a macOS request would reuse a negative GPU discovery decision while the
+exact CPU model is idle and warm, a brief helper may enumerate native Metal
+metadata without unloading that CPU model. The helper uses the existing
+verified Metal worker executable and private process supervision, not an
+additional executable, a permanent service or parent-side Metal linkage.
+Only verified packs eligible for the request may be inspected; no eligible
+pack means no helper launch and leaves the CPU path available.
+If there is no exact idle CPU owner, normal serialized retirement and provider
+discovery apply instead; a helper never overlaps a busy or different model.
+
+This is a distinct, authenticated metadata session, dispatched before normal
+runtime construction or provider initialization. It cannot load a model,
+transcribe, report inference health, create a device launch binding or become
+an inference worker. It authenticates the exact expected app/worker build,
+protocol, ABI, pack identity, executable digest and session challenge. Its
+snapshot contains bounded stable device identities and vendor/class facts,
+not reusable provider enumeration indexes.
+The wire format distinguishes an empty snapshot from an enumeration error;
+the current native enumerator conservatively treats zero devices as
+unavailable, rather than manufacturing a successful empty witness.
+
+The helper must be confirmed retired and reaped before its result can affect
+selection. The existing persistent cleanup fence retains abandoned launches
+or unreaped helpers; unconfirmed cleanup blocks subsequent inference,
+including CPU. Cancellation is terminal, and helper launch, cleanup and any
+replacement discovery consume one absolute allowance. Selection and inference
+remain serialized, so the helper never accompanies an active transcription.
+
+An unchanged negative-cache witness preserves the exact CPU generation,
+loaded artifact and original idle timestamp. Changed or unavailable evidence
+cannot authorize reuse of that negative decision. A valid changed snapshot
+requires canonical rediscovery after confirmed CPU retirement; it may seed a
+new failed-probe witness even when that probe fails before Ready. Missing old
+evidence is never made valid merely by attaching a new snapshot to it.
+If fresh metadata itself is unavailable but cleanup succeeded, Auto can keep
+the warm CPU for this request without accepting the stale negative cache;
+explicit GPU still returns a GPU-only error. Metadata activity never renews the
+five-minute model lifetime or the existing fifteen-second failed-probe and
+five-second volatile-admission timers. Topology equality is not evidence of
+available memory, a successful idle-health probe or permission to enable Auto.
+
+#### Remaining qualification limits
+
 The initial probe-to-cold-load window is not atomic: a device-set change in
 that interval invalidates the next successful cached admission, rather than
 adding a new first-cold-load rejection or migrating work already underway.
-Existing negative provider-probe and Auto-admission backoff without a live
-worker remains unchanged and can delay rediscovery. Native Metal hot-plug,
-power, suspend/resume and device-loss qualification is still required. This
-extension neither provisions Metal packs nor changes release trust or the
-default-deny Auto qualification policy.
+Native Metal hot-plug, power, suspend/resume and device-loss qualification is
+still required. This extension neither provisions Metal packs nor changes
+release trust or the default-deny Auto qualification policy.
 
 The credential-free macOS structural lanes compile the Metal worker feature
 and native Metal/shim code in an isolated target directory in addition to
