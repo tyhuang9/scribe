@@ -50,16 +50,49 @@ Future GPU packs retain their reserved FHS location under
 not enable Linux GPU discovery, add release trust keys, or make GPU `Auto`
 nonempty.
 
-Run the isolated verification suite on Linux without Cargo:
+Run the isolated launcher and authority verification suite on Linux:
 
 ```sh
 ./scripts/test-linux-worker-launch.sh
 ```
 
-The suite intentionally uses `rustc` directly because the reviewed Linux
-Sherpa archive is not yet present. CI runs it on Ubuntu 22.04 and 24.04.
+That suite uses direct `rustc` kernel fixtures and locked, offline Cargo tests
+for the portable authority tool. It remains separate from actual application
+linking. CI runs both kinds of checks on Ubuntu 22.04 and 24.04.
 
-Full Linux application Cargo builds and real inference smoke remain activation
-work until the reviewed Sherpa archive exists. Stage 7D verifies deterministic
-package assembly with synthetic executables; it does not claim a production
-transcription run.
+For the actual CPU-worker contract, fetch the main crate's locked dependencies
+and prepare the already-reviewed Linux x64 Sherpa archive, then run:
+
+```sh
+cargo fetch --locked
+bash scripts/prepare-linux-release-inputs.sh --output-directory "$RUNNER_TEMP/scribe-reviewed-linux-native"
+SHERPA_ONNX_ARCHIVE_DIR="$RUNNER_TEMP/scribe-reviewed-linux-native" bash scripts/test-linux-native-cpu-worker.sh
+```
+
+The input preparer downloads only the fixed build-time archive, caps its size,
+and checks its reviewed length and SHA-256 before atomic publication. The
+vendor build independently verifies the same pins before extraction. This is
+CI/developer build preparation, not an application runtime download.
+`scripts/test-linux-release-inputs.sh` checks short/oversized downloads, wrong
+digests, transport failure and existing/linked output rejection offline using a
+mock transport; it never substitutes synthetic bytes for successful admission.
+
+The bounded native script links the actual release CPU worker, embeds that
+worker's digest in the actual release desktop and test parent, requires exactly
+one ignored native test to be discovered, and runs it through the ordinary
+descriptor-bound launcher. Its temporary test-only authority relaxes ownership
+for the fixture; it does not change production `/usr/lib/scribe` authority.
+The test rejects the wrong digest before launch, authenticates SCIF v5 Ready
+and exact CPU/build/ABI identity, sends model-free Health and Shutdown, and
+confirms exit and reap before removing the fixture. The script then assembles,
+independently verifies and size-reports the actual pair's CPU-only Debian
+package without installing it. Owned temporary build/test outputs are removed
+on exit.
+
+Use the bounded script rather than invoking the ignored Rust test directly:
+its outer deadline also bounds blocking protocol reads. Reaping confirms that
+the worker is no longer running; the process API does not expose its exit code.
+
+No model or audio is loaded. This verifies native linking, startup, IPC,
+shutdown and package assembly, not transcription correctness, clean-machine
+installation, Linux GPU activation or hardware/performance qualification.

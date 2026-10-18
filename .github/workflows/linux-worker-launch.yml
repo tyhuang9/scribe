@@ -14,6 +14,11 @@ on:
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
       - 'runtime-manifests/gpu-pack-release-authority-linux-empty.json'
       - 'docs/LINUX_GPU_ROUTING.md'
+      - 'docs/LINUX_WORKER_LAUNCH.md'
+      - 'docs/LINUX_RELEASE_PACKAGING.md'
+      - 'scripts/*linux*release*'
+      - 'scripts/*linux*worker*'
+      - 'scripts/inspect-linux-deb.py'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
@@ -34,6 +39,11 @@ on:
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
       - 'runtime-manifests/gpu-pack-release-authority-linux-empty.json'
       - 'docs/LINUX_GPU_ROUTING.md'
+      - 'docs/LINUX_WORKER_LAUNCH.md'
+      - 'docs/LINUX_RELEASE_PACKAGING.md'
+      - 'scripts/*linux*release*'
+      - 'scripts/*linux*worker*'
+      - 'scripts/inspect-linux-deb.py'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
@@ -51,6 +61,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -72,6 +83,16 @@ jobs:
         run: cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
       - name: Test descriptor-bound Linux worker launch
         run: ./scripts/test-linux-worker-launch.sh
+      - name: Test reviewed Linux CPU input rejection without network access
+        run: bash scripts/test-linux-release-inputs.sh
+      - name: Prepare reviewed Linux CPU native input
+        run: bash scripts/prepare-linux-release-inputs.sh --output-directory "$RUNNER_TEMP/scribe-reviewed-linux-native"
+      - name: Fetch locked application dependencies for offline native builds
+        run: cargo fetch --locked
+      - name: Build and test actual CPU worker and desktop, then verify their Debian package
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/scribe-reviewed-linux-native
+        run: bash scripts/test-linux-native-cpu-worker.sh
       - name: Type-check the feature-enabled Linux Vulkan identity branch
         env:
           CARGO_TARGET_DIR: target/linux-gpu-typecheck

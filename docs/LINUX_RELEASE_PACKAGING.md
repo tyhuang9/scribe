@@ -97,8 +97,20 @@ exact manifest/signature/inventory validation, immutable staging, no-replace
 publication, interruption recovery, previous-pack retention, rollback, epoch
 floors, ancestor swaps, and hostile filesystem entries.
 
+The separate Linux worker-launch workflow now also runs
+`scripts/test-linux-native-cpu-worker.sh` on Ubuntu 22.04 and 24.04. It builds
+the actual release CPU worker and desktop offline from the locked dependencies
+and reviewed native archive, embeds the actual worker digest in the desktop,
+and exercises authenticated model-free worker startup, Health, Shutdown and
+reaping. It then feeds those linked executables into the same six-file,
+CPU-only assembler, independent package verifier and package-size reporter.
+Copies of Cargo outputs avoid hardlinked aliases. No package is installed or
+uploaded, and the private temporary outputs are removed on exit. This adds
+actual binary integration evidence; it does not replace the synthetic
+adversarial suite or establish publisher provenance for arbitrary inputs.
+
 This stage is suitable for reviewing and publishing the packaging pull request,
 but it is not approval to ship Linux GPU packs. Production GPU delivery still
-requires reviewed Linux Sherpa/transcribe-cpp artifacts, a separately reviewed
+requires reviewed Linux GPU transcribe-cpp artifacts, a separately reviewed
 public key and protected signer, clean-machine installation evidence, and the
 hardware/performance qualification stage.
