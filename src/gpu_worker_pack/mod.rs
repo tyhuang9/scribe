@@ -80,7 +80,12 @@ mod launch_binding {
     #[derive(Debug)]
     pub(crate) struct UnixPackExecAuthority {
         verified_pack_lease: Arc<VerifiedPackLease>,
+        // Linux executes this readable authority directly. macOS retains it
+        // only for position-independent hashing and launches through the
+        // separately admitted O_EXEC handle below.
         executable_fd: File,
+        #[cfg(target_os = "macos")]
+        launch_executable_fd: File,
         dependency_root_fd: File,
     }
 
@@ -89,7 +94,6 @@ mod launch_binding {
         pub(crate) fn from_verified_pack_lease(
             verified_pack_lease: Arc<VerifiedPackLease>,
         ) -> Result<Arc<Self>, super::manifest::PackVerificationError> {
-            use std::io::{Seek, SeekFrom};
             use std::os::unix::fs::PermissionsExt;
 
             verified_pack_lease.recheck()?;
@@ -99,29 +103,54 @@ mod launch_binding {
                 .iter()
                 .find(|entry| entry.path == *worker_path)
                 .ok_or(super::manifest::PackVerificationError::WorkerMissing)?;
+            #[cfg(target_os = "macos")]
+            let executable_fd = verified_pack_lease.open_copy_file(entry)?;
+            #[cfg(not(target_os = "macos"))]
             let mut executable_fd = verified_pack_lease.open_copy_file(entry)?;
             if executable_fd.metadata()?.permissions().mode() & 0o111 == 0 {
                 return Err(super::manifest::PackVerificationError::WorkerNotExecutable);
             }
+            #[cfg(target_os = "macos")]
+            let launch_executable_fd = verified_pack_lease.open_copy_executable(entry)?;
+            #[cfg(target_os = "macos")]
+            verify_macos_executable_pair(&executable_fd, &launch_executable_fd, entry)?;
+            #[cfg(not(target_os = "macos"))]
+            use std::io::Seek;
+            #[cfg(not(target_os = "macos"))]
             let digest = super::manifest::hash_exact_length(
                 &mut executable_fd,
                 entry.size_bytes,
                 &entry.path,
             )?;
+            #[cfg(not(target_os = "macos"))]
             if digest != entry.sha256 {
                 return Err(super::manifest::PackVerificationError::DigestMismatch);
             }
-            executable_fd.seek(SeekFrom::Start(0))?;
+            #[cfg(not(target_os = "macos"))]
+            executable_fd.rewind()?;
             let dependency_root_fd = verified_pack_lease.open_dependency_root()?;
             verified_pack_lease.recheck()?;
             Ok(Arc::new(Self {
                 verified_pack_lease,
                 executable_fd,
+                #[cfg(target_os = "macos")]
+                launch_executable_fd,
                 dependency_root_fd,
             }))
         }
 
+        #[cfg(not(target_os = "macos"))]
         pub(crate) fn executable_fd(&self) -> &File {
+            &self.executable_fd
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(crate) fn executable_fd(&self) -> &File {
+            &self.launch_executable_fd
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(crate) fn readable_executable_fd(&self) -> &File {
             &self.executable_fd
         }
 
@@ -134,7 +163,6 @@ mod launch_binding {
         }
 
         pub(crate) fn recheck(&self) -> Result<(), super::manifest::PackVerificationError> {
-            use std::io::Seek;
             let lease = self.verified_pack_lease();
             lease.recheck()?;
             let worker_path = &lease.verified_pack().worker_relative_path;
@@ -143,10 +171,18 @@ mod launch_binding {
                 .iter()
                 .find(|entry| entry.path == *worker_path)
                 .ok_or(super::manifest::PackVerificationError::WorkerMissing)?;
+            #[cfg(target_os = "macos")]
+            verify_macos_executable_pair(&self.executable_fd, &self.launch_executable_fd, entry)?;
+            #[cfg(not(target_os = "macos"))]
+            use std::io::Seek;
+            #[cfg(not(target_os = "macos"))]
             let mut executable = self.executable_fd.try_clone()?;
+            #[cfg(not(target_os = "macos"))]
             executable.rewind()?;
+            #[cfg(not(target_os = "macos"))]
             let digest =
                 super::manifest::hash_exact_length(&mut executable, entry.size_bytes, &entry.path)?;
+            #[cfg(not(target_os = "macos"))]
             if digest != entry.sha256 {
                 return Err(super::manifest::PackVerificationError::DigestMismatch);
             }
@@ -159,11 +195,102 @@ mod launch_binding {
             executable_fd: File,
             dependency_root_fd: File,
         ) -> Self {
+            #[cfg(target_os = "macos")]
+            let launch_executable_fd = {
+                let worker_path = &verified_pack_lease.verified_pack().worker_relative_path;
+                let entry = verified_pack_lease
+                    .copy_entries()
+                    .iter()
+                    .find(|entry| entry.path == *worker_path)
+                    .expect("fixture worker is present in its signed inventory");
+                verified_pack_lease
+                    .open_copy_executable(entry)
+                    .expect("fixture worker opens with O_EXEC authority")
+            };
             Self {
                 verified_pack_lease,
                 executable_fd,
+                #[cfg(target_os = "macos")]
+                launch_executable_fd,
                 dependency_root_fd,
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_macos_executable_pair(
+        readable: &File,
+        executable: &File,
+        entry: &super::manifest::VerifiedCopyEntry,
+    ) -> Result<(), super::manifest::PackVerificationError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let readable_flags = unsafe { libc::fcntl(readable.as_raw_fd(), libc::F_GETFL) };
+        let executable_flags = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFL) };
+        if readable_flags < 0 || executable_flags < 0 {
+            return Err(super::manifest::PackVerificationError::Io(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if readable_flags & libc::O_EXEC != 0
+            || readable_flags & libc::O_ACCMODE != libc::O_RDONLY
+            || executable_flags & libc::O_EXEC != libc::O_EXEC
+        {
+            return Err(super::manifest::PackVerificationError::DescriptorChanged);
+        }
+        let readable_metadata = readable.metadata()?;
+        let executable_metadata = executable.metadata()?;
+        if !readable_metadata.is_file()
+            || !executable_metadata.is_file()
+            || readable_metadata.dev() != executable_metadata.dev()
+            || readable_metadata.ino() != executable_metadata.ino()
+            || readable_metadata.len() != entry.size_bytes
+            || executable_metadata.len() != entry.size_bytes
+            || readable_metadata.nlink() != 1
+            || executable_metadata.nlink() != 1
+            || readable_metadata.permissions().mode() & 0o111 == 0
+        {
+            return Err(super::manifest::PackVerificationError::DescriptorChanged);
+        }
+        let digest = super::manifest::hash_exact_file_at(readable, entry.size_bytes, &entry.path)?;
+        if digest != entry.sha256 {
+            return Err(super::manifest::PackVerificationError::DigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod macos_exec_authority_tests {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        #[test]
+        fn macos_exec_authority_descriptor_relative_leaf_swap_is_rejected_before_launch() {
+            let root = super::super::manifest::test_support::temp_root("macos-exec-leaf-swap");
+            let (_verifier, lease) = super::super::manifest::test_support::leased_fixture(&root);
+            let worker_path = lease.verified_pack().worker_relative_path.clone();
+            let entry = lease
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == worker_path)
+                .unwrap();
+            let readable = lease.open_copy_file(entry).unwrap();
+            let worker = lease.worker_path();
+            let retained = worker.with_extension("retained");
+            std::fs::rename(&worker, &retained).unwrap();
+            std::fs::write(&worker, b"signed worker").unwrap();
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = lease.open_copy_executable(entry).unwrap();
+            assert!(matches!(
+                verify_macos_executable_pair(&readable, &executable, entry),
+                Err(super::super::manifest::PackVerificationError::DescriptorChanged)
+            ));
+            drop(executable);
+            drop(readable);
+            drop(lease);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

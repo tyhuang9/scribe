@@ -75,6 +75,9 @@ jobs:
           directory_tests="$(cargo test --locked --bin local-transcriber macos_worker_launch::platform::tests::descriptor_directory_spawn_ -- --list)"
           directory_count="$(printf '%s\n' "$directory_tests" | awk '/^macos_worker_launch::platform::tests::descriptor_directory_spawn_.*: test$/ { count++ } END { print count+0 }')"
           test "$directory_count" -eq 2
+          executable_tests="$(cargo test --locked --bin local-transcriber macos_exec_authority_ -- --list)"
+          executable_count="$(printf '%s\n' "$executable_tests" | awk '/^(macos_worker_launch::platform::tests|gpu_worker_pack::launch_binding::macos_exec_authority_tests|onnx_worker::tests)::macos_exec_authority_.*: test$/ { count++ } END { print count+0 }')"
+          test "$executable_count" -eq 4
           cargo test --locked --test build_revision_invalidation -- --test-threads=1
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture

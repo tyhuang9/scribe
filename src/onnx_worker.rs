@@ -1948,6 +1948,10 @@ struct InferenceWorkerFingerprint {
         target_env = "gnu"
     ))]
     _inherited_image: std::fs::File,
+    #[cfg(all(not(test), target_os = "macos"))]
+    _inherited_readable_image: Option<std::fs::File>,
+    #[cfg(all(not(test), target_os = "macos"))]
+    _inherited_executable_image: Option<std::fs::File>,
 }
 
 #[cfg(test)]
@@ -2026,9 +2030,41 @@ fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprin
     })
 }
 
+#[cfg(all(not(test), target_os = "macos"))]
+fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprint> {
+    match take_macos_pack_worker_image_pair()? {
+        Some((readable, executable)) => {
+            let length = readable
+                .metadata()
+                .context("could not inspect readable macOS worker image")?
+                .len();
+            let sha256 = sha256_file_at(&readable, length)
+                .context("could not fingerprint descriptor-bound macOS worker image")?;
+            Ok(InferenceWorkerFingerprint {
+                sha256,
+                _inherited_readable_image: Some(readable),
+                _inherited_executable_image: Some(executable),
+            })
+        }
+        None => {
+            let executable = std::env::current_exe()
+                .context("could not locate inference worker for capability fingerprint")?;
+            Ok(InferenceWorkerFingerprint {
+                sha256: sha256_file(&executable)
+                    .context("could not fingerprint inference worker for capability handshake")?,
+                _inherited_readable_image: None,
+                _inherited_executable_image: None,
+            })
+        }
+    }
+}
+
 #[cfg(all(
     not(test),
-    not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")
+    ))
 ))]
 fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprint> {
     let executable = std::env::current_exe()
@@ -2037,6 +2073,184 @@ fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprin
         sha256: sha256_file(&executable)
             .context("could not fingerprint inference worker for capability handshake")?,
     })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacosPackWorkerImageDescriptors {
+    executable: std::os::fd::RawFd,
+    readable: std::os::fd::RawFd,
+}
+
+#[cfg(target_os = "macos")]
+fn parse_canonical_private_descriptor(raw: &std::ffi::OsStr) -> Result<std::os::fd::RawFd> {
+    let value = raw
+        .to_str()
+        .ok_or_else(|| anyhow!("private macOS worker descriptor is not valid UTF-8"))?;
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        bail!("private macOS worker descriptor is not canonical decimal");
+    }
+    let descriptor = value
+        .parse::<i64>()
+        .context("private macOS worker descriptor is outside its integer bound")?;
+    if descriptor < 3 || descriptor > i64::from(i32::MAX) {
+        bail!("private macOS worker descriptor is outside its safe range");
+    }
+    let descriptor = descriptor as std::os::fd::RawFd;
+    if descriptor.to_string() != value {
+        bail!("private macOS worker descriptor is not canonical decimal");
+    }
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_pack_worker_image_descriptors(
+    executable: Option<&std::ffi::OsStr>,
+    readable: Option<&std::ffi::OsStr>,
+    private_pack_present: bool,
+    forbidden: Option<std::os::fd::RawFd>,
+) -> Result<Option<MacosPackWorkerImageDescriptors>> {
+    let (Some(executable), Some(readable)) = (executable, readable) else {
+        if executable.is_some() || readable.is_some() || private_pack_present {
+            bail!("private macOS pack worker image descriptor binding is incomplete");
+        }
+        return Ok(None);
+    };
+    if !private_pack_present {
+        bail!("private macOS worker image descriptors require a verified pack binding");
+    }
+    let descriptors = MacosPackWorkerImageDescriptors {
+        executable: parse_canonical_private_descriptor(executable)?,
+        readable: parse_canonical_private_descriptor(readable)?,
+    };
+    if descriptors.executable == descriptors.readable
+        || forbidden.is_some_and(|descriptor| {
+            descriptor == descriptors.executable || descriptor == descriptors.readable
+        })
+    {
+        bail!("private macOS worker descriptors must be distinct authorities");
+    }
+    Ok(Some(descriptors))
+}
+
+#[cfg(target_os = "macos")]
+fn private_worker_pack_environment_present() -> bool {
+    [
+        PACK_ID_ENV,
+        PACK_VERSION_ENV,
+        PACK_DIGEST_ENV,
+        PACK_SECURITY_EPOCH_ENV,
+        PACK_RUNTIME_ABI_ENV,
+        PACK_BACKEND_ENV,
+        PACK_PROVIDER_ENV,
+    ]
+    .iter()
+    .any(|name| std::env::var_os(*name).is_some())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pack_worker_image_descriptors_from_env(
+    forbidden: Option<std::os::fd::RawFd>,
+) -> Result<Option<MacosPackWorkerImageDescriptors>> {
+    let executable = std::env::var_os(crate::macos_worker_launch::EXECUTABLE_FD_ENV);
+    let readable = std::env::var_os(crate::macos_worker_launch::EXECUTABLE_READ_FD_ENV);
+    parse_macos_pack_worker_image_descriptors(
+        executable.as_deref(),
+        readable.as_deref(),
+        private_worker_pack_environment_present(),
+        forbidden,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_pack_worker_image_pair(
+    descriptors: MacosPackWorkerImageDescriptors,
+) -> Result<()> {
+    use std::mem::MaybeUninit;
+
+    let readable_flags = unsafe { libc::fcntl(descriptors.readable, libc::F_GETFL) };
+    let executable_flags = unsafe { libc::fcntl(descriptors.executable, libc::F_GETFL) };
+    if readable_flags < 0 || executable_flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("private macOS worker image descriptor is not live");
+    }
+    if readable_flags & libc::O_EXEC != 0
+        || readable_flags & libc::O_ACCMODE != libc::O_RDONLY
+        || executable_flags & libc::O_EXEC != libc::O_EXEC
+    {
+        bail!("private macOS worker image descriptor flags are invalid");
+    }
+    let mut readable_stat = MaybeUninit::<libc::stat>::uninit();
+    let mut executable_stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(descriptors.readable, readable_stat.as_mut_ptr()) } != 0
+        || unsafe { libc::fstat(descriptors.executable, executable_stat.as_mut_ptr()) } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("could not inspect private macOS worker image descriptors");
+    }
+    let readable_stat = unsafe { readable_stat.assume_init() };
+    let executable_stat = unsafe { executable_stat.assume_init() };
+    if readable_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || executable_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || readable_stat.st_dev != executable_stat.st_dev
+        || readable_stat.st_ino != executable_stat.st_ino
+        || readable_stat.st_size < 0
+        || readable_stat.st_size != executable_stat.st_size
+        || readable_stat.st_nlink != 1
+        || executable_stat.st_nlink != 1
+        || readable_stat.st_mode & 0o111 == 0
+    {
+        bail!("private macOS worker image descriptor identity is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn take_macos_pack_worker_image_pair() -> Result<Option<(std::fs::File, std::fs::File)>> {
+    use std::os::fd::FromRawFd;
+
+    let descriptors = macos_pack_worker_image_descriptors_from_env(None)?;
+    // The parent-control watchdog may already be running. Keep these sanitized
+    // decimal bindings until exit rather than mutate the Unix environment
+    // after startup; this single-use fingerprint path owns the handles below.
+    let Some(descriptors) = descriptors else {
+        return Ok(None);
+    };
+    // Validate both raw descriptors before assuming ownership. Parsing excludes
+    // stdio and duplicates; the earlier liveness parse excludes its control FD.
+    validate_macos_pack_worker_image_pair(descriptors)?;
+    let readable = unsafe { std::fs::File::from_raw_fd(descriptors.readable) };
+    let executable = unsafe { std::fs::File::from_raw_fd(descriptors.executable) };
+    Ok(Some((readable, executable)))
+}
+
+#[cfg(target_os = "macos")]
+fn sha256_file_at(file: &std::fs::File, expected_bytes: u64) -> Result<String> {
+    use std::os::unix::fs::FileExt;
+
+    let mut digest = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < expected_bytes {
+        let remaining = expected_bytes - offset;
+        let maximum = usize::try_from(remaining.min(buffer.len() as u64))
+            .context("macOS worker image length exceeds the address-space bound")?;
+        let read = file.read_at(&mut buffer[..maximum], offset)?;
+        if read == 0 {
+            bail!("macOS worker image ended before its descriptor length");
+        }
+        digest.update(&buffer[..read]);
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow!("macOS worker image offset overflow"))?;
+    }
+    if file.read_at(&mut buffer[..1], expected_bytes)? != 0 {
+        bail!("macOS worker image exceeds its descriptor length");
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn worker_pack_expectation_from_private_env() -> Result<Option<WorkerPackExpectation>> {
@@ -5496,6 +5710,14 @@ fn take_parent_control_reader_from_env() -> Result<Option<std::fs::File>> {
         }
         bail!("private worker did not receive its parent-liveness descriptor");
     };
+    #[cfg(target_os = "macos")]
+    {
+        let parent_descriptor = raw.to_str().and_then(|value| value.parse::<i32>().ok());
+        // Check the launcher-authored image bindings while the parent-control
+        // descriptor is still known. The later ownership transfer can never
+        // alias liveness or double-close it.
+        macos_pack_worker_image_descriptors_from_env(parent_descriptor)?;
+    }
     unsafe {
         std::env::remove_var(PARENT_LIVENESS_ENV);
     }
@@ -17933,13 +18155,16 @@ fn metal_metadata_worker_loop_with_discovery_and_identity(
         protocol: PROTOCOL_VERSION,
         app_build: expected.app_build,
         worker_build: expected.worker_build,
-        worker_sha256: fingerprint.sha256,
+        worker_sha256: fingerprint.sha256.clone(),
         abi: expected.abi,
         role,
         provider: expected.provider,
         pack,
         topology: discover()?,
     };
+    // On macOS this releases both inherited image descriptors only after the
+    // authenticated Hello capability has been completely formed.
+    drop(fingerprint);
     write_worker_response(
         &mut output,
         session_id,
@@ -37436,6 +37661,152 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_exec_authority_binding_parser_rejects_partial_malformed_and_aliased_values() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            parse_macos_pack_worker_image_descriptors(None, None, false, None).unwrap(),
+            None
+        );
+        let non_utf8 = OsStr::from_bytes(&[0xff]);
+        for (executable, readable, pack_present, forbidden) in [
+            (None, None, true, None),
+            (Some(OsStr::new("3")), None, true, None),
+            (None, Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new("3")), Some(OsStr::new("4")), false, None),
+            (Some(OsStr::new("")), Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new("-1")), Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new(" 3")), Some(OsStr::new("4")), true, None),
+            (Some(non_utf8), Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new("2")), Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new("03")), Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new("+3")), Some(OsStr::new("4")), true, None),
+            (Some(OsStr::new("3")), Some(OsStr::new("3")), true, None),
+            (Some(OsStr::new("3")), Some(OsStr::new("4")), true, Some(3)),
+            (Some(OsStr::new("3")), Some(OsStr::new("4")), true, Some(4)),
+            (
+                Some(OsStr::new("2147483648")),
+                Some(OsStr::new("4")),
+                true,
+                None,
+            ),
+        ] {
+            assert!(
+                parse_macos_pack_worker_image_descriptors(
+                    executable,
+                    readable,
+                    pack_present,
+                    forbidden,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            parse_macos_pack_worker_image_descriptors(
+                Some(OsStr::new("7")),
+                Some(OsStr::new("8")),
+                true,
+                Some(9),
+            )
+            .unwrap(),
+            Some(MacosPackWorkerImageDescriptors {
+                executable: 7,
+                readable: 8,
+            })
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_exec_authority_child_pair_hashes_by_position_and_rejects_wrong_authority() {
+        use std::ffi::CString;
+        use std::io::{Seek, SeekFrom};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn open_exec(path: &Path) -> std::fs::File {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let raw = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_EXEC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(raw >= 0, "open O_EXEC fixture");
+            unsafe { std::fs::File::from_raw_fd(raw) }
+        }
+
+        let root = test_root("macos-child-image-pair");
+        let image = root.join("worker");
+        let other = root.join("other-worker");
+        let bytes = b"known descriptor-bound worker bytes";
+        std::fs::write(&image, bytes).unwrap();
+        std::fs::write(&other, bytes).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut readable = std::fs::File::open(&image).unwrap();
+        let executable = open_exec(&image);
+        let other_executable = open_exec(&other);
+        let descriptors = MacosPackWorkerImageDescriptors {
+            executable: executable.as_raw_fd(),
+            readable: readable.as_raw_fd(),
+        };
+        validate_macos_pack_worker_image_pair(descriptors).unwrap();
+        readable.seek(SeekFrom::Start(7)).unwrap();
+        assert_eq!(
+            sha256_file_at(&readable, bytes.len() as u64).unwrap(),
+            sha256_reader(Cursor::new(bytes)).unwrap()
+        );
+        assert_eq!(readable.stream_position().unwrap(), 7);
+        assert!(sha256_file_at(&readable, bytes.len() as u64 - 1).is_err());
+        assert_eq!(readable.stream_position().unwrap(), 7);
+        assert!(sha256_file_at(&readable, bytes.len() as u64 + 1).is_err());
+        assert_eq!(readable.stream_position().unwrap(), 7);
+
+        assert!(
+            validate_macos_pack_worker_image_pair(MacosPackWorkerImageDescriptors {
+                executable: other_executable.as_raw_fd(),
+                readable: readable.as_raw_fd(),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_macos_pack_worker_image_pair(MacosPackWorkerImageDescriptors {
+                executable: readable.as_raw_fd(),
+                readable: executable.as_raw_fd(),
+            })
+            .is_err()
+        );
+        let second_readable = std::fs::File::open(&image).unwrap();
+        assert!(
+            validate_macos_pack_worker_image_pair(MacosPackWorkerImageDescriptors {
+                executable: second_readable.as_raw_fd(),
+                readable: readable.as_raw_fd(),
+            })
+            .is_err()
+        );
+        let closed = unsafe { libc::dup(readable.as_raw_fd()) };
+        assert!(closed >= 0);
+        assert_eq!(unsafe { libc::close(closed) }, 0);
+        assert!(
+            validate_macos_pack_worker_image_pair(MacosPackWorkerImageDescriptors {
+                executable: executable.as_raw_fd(),
+                readable: closed,
+            })
+            .is_err()
+        );
+
+        drop(second_readable);
+        drop(other_executable);
+        drop(executable);
+        drop(readable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn macos_metal_metadata_capability_binds_every_identity_and_distinguishes_empty() {
         let expected = macos_metal_metadata_expectation();
@@ -37492,6 +37863,11 @@ mod tests {
     #[test]
     #[ignore = "requires an explicitly built, ad-hoc codesigned, fixture-signed native Metal worker pack"]
     fn macos_native_metal_metadata_helper_launches_authenticated_worker_and_reaps() {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
         const FIXTURE_ENV: &str = "SCRIBE_MACOS_NATIVE_METAL_METADATA_FIXTURE_PACK";
         let fixture_path = std::env::var_os(FIXTURE_ENV)
             .map(PathBuf::from)
@@ -37508,6 +37884,44 @@ mod tests {
             .iter()
             .find(|entry| entry.path == pack.worker_relative_path)
             .expect("verified native Metal pack must retain its worker inventory entry");
+        assert_eq!(
+            option_env!("SCRIBE_BUNDLED_WORKER_SHA256"),
+            Some(worker_entry.sha256.as_str()),
+            "native test parent must embed the final signed fixture worker anchor"
+        );
+        let readable_worker = lease
+            .open_copy_file(worker_entry)
+            .expect("native worker must retain readable hash authority");
+        let executable_worker = lease
+            .open_copy_executable(worker_entry)
+            .expect("native worker must retain O_EXEC launch authority");
+        let readable_metadata = readable_worker.metadata().unwrap();
+        let executable_metadata = executable_worker.metadata().unwrap();
+        assert_eq!(readable_metadata.uid(), unsafe { libc::geteuid() });
+        assert_ne!(readable_metadata.mode() & libc::S_IXUSR as u32, 0);
+        assert_eq!(readable_metadata.dev(), executable_metadata.dev());
+        assert_eq!(readable_metadata.ino(), executable_metadata.ino());
+        assert_eq!(readable_metadata.len(), worker_entry.size_bytes);
+        let readable_flags = unsafe { libc::fcntl(readable_worker.as_raw_fd(), libc::F_GETFL) };
+        let executable_flags = unsafe { libc::fcntl(executable_worker.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(readable_flags & libc::O_EXEC, 0);
+        assert_eq!(readable_flags & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_eq!(executable_flags & libc::O_EXEC, libc::O_EXEC);
+        let worker_path = CString::new(lease.worker_path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    worker_path.as_ptr(),
+                    libc::X_OK,
+                    libc::AT_EACCESS,
+                )
+            },
+            0,
+            "native worker is not executable by the effective test identity"
+        );
+        drop(executable_worker);
+        drop(readable_worker);
         assert_eq!(pack.backend, PackBackend::Metal);
         assert_eq!(pack.target_os, "macos");
         assert_eq!(pack.target_arch, std::env::consts::ARCH);

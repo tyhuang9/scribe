@@ -913,6 +913,20 @@ It does not resolve that directory through a `/dev/fd` pathname or fall back to
 the catalog path. The explicit descriptor-inheritance actions and the separate
 retained-executable `/dev/fd` bridge remain required.
 
+The readable verification handle is separate from the `O_EXEC` launch handle.
+Both are opened without following links beneath the retained pack-root
+descriptor and must identify the same regular, single-link file with the signed
+size and executable permissions. The same execute handle supplies the spawn
+path and its private descriptor binding. The child validates both inherited
+handles and measures its Hello fingerprint from the readable one. Missing or
+inconsistent handles reject launch; there is no digest echo or pathname reopen.
+
+Descriptor retention pins identity through renames and path replacement, not
+immutable contents against a hostile file owner. These descriptor/hash checks
+alone do not defend against a same-user write/execute/restore race; worker
+self-hashing is not independent code attestation. A process already able to
+rewrite pack contents is outside this worker-isolation boundary.
+
 Metal framework linkage is confined to the per-architecture Metal worker. The
 desktop and universal CPU worker use only an IOKit power-source shim plus the
 `kern.osversion` witness and must have no Metal load command. Stable
@@ -1021,7 +1035,10 @@ enumerator's empty/error/overflow boundary, builds the real per-architecture
 Metal worker with the reviewed inputs, applies ad hoc code signing, and only
 then authors and verifies a fixture-signed pack under the runner's private
 temporary directory. One explicitly ignored, exact-name test launches that
-verified worker through the production descriptor/private-IPC path, requires
+verified worker from a release-profile parent through the production
+descriptor/private-IPC path. The test parent embeds and checks the final signed
+fixture worker's exact digest; it never bypasses the release build's anchor
+requirement. The contract requires
 an authenticated metadata snapshot, and confirms that the child was retired
 and reaped. The fixture test key does not grant production trust, and this
 contract creates no release pack, Auto eligibility, health credit or native
