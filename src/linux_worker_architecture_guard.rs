@@ -4,6 +4,24 @@ fn normalized(source: &str) -> String {
     source.replace("\r\n", "\n")
 }
 
+fn linux_image_capability_body(supervisor: &str) -> &str {
+    supervisor
+        .split_once("const REQUIRED_SEALS: i32")
+        .expect("Linux capability must define its exact seals")
+        .1
+        .split_once("\n#[cfg(")
+        .expect("Linux capability must end before the next platform-gated item")
+        .0
+}
+
+#[test]
+fn linux_image_guard_does_not_inspect_the_next_platforms_capability() {
+    let source = "const REQUIRED_SEALS: i32 = 1;\nlinux_body\n}\n\n#[cfg(other_platform)]\nstd::env::current_exe()";
+    assert!(!linux_image_capability_body(source).contains("std::env::current_exe()"));
+    let bad_linux = source.replace("linux_body", "std::env::current_exe()");
+    assert!(linux_image_capability_body(&bad_linux).contains("std::env::current_exe()"));
+}
+
 #[test]
 fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
     let launcher = normalized(include_str!("linux_worker_launch.rs"));
@@ -159,13 +177,7 @@ fn linux_worker_hashes_and_closes_the_exact_sealed_image_fd_for_hello() {
     assert!(launcher.contains("child_dup(self.executable.raw(), EXEC_FD, false, 2)"));
     assert!(launcher.contains("SYS_CLOSE_RANGE, 7_u32"));
 
-    let capability = supervisor
-        .split("const REQUIRED_SEALS: i32")
-        .nth(1)
-        .unwrap()
-        .split("#[cfg(all(\n    not(test),\n    not(all(target_os")
-        .next()
-        .unwrap();
+    let capability = linux_image_capability_body(&supervisor);
     for required in [
         "std::fs::File::from_raw_fd(LINUX_EXECUTABLE_FD)",
         "metadata.file_type().is_file()",

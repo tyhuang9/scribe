@@ -10,6 +10,11 @@ use anyhow::{Result, bail};
 
 const SAFE_PARENT_ENVIRONMENT: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL"];
 
+#[cfg(target_os = "macos")]
+pub(crate) const EXECUTABLE_FD_ENV: &str = "SCRIBE_PRIVATE_MACOS_EXECUTABLE_FD";
+#[cfg(target_os = "macos")]
+pub(crate) const EXECUTABLE_READ_FD_ENV: &str = "SCRIBE_PRIVATE_MACOS_EXECUTABLE_READ_FD";
+
 pub(crate) fn sanitized_environment(
     bindings: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
@@ -240,6 +245,8 @@ mod platform {
             .recheck()
             .context("verified macOS worker authority changed before spawn")?;
         let executable = InheritableFd::duplicate(authority.executable_fd().as_raw_fd())?;
+        let readable_executable =
+            InheritableFd::duplicate(authority.readable_executable_fd().as_raw_fd())?;
         let dependency_root = InheritableFd::duplicate(authority.dependency_root_fd().as_raw_fd())?;
         let stdin_pipe = Pipe::new()?;
         let stdout_pipe = Pipe::new()?;
@@ -259,6 +266,13 @@ mod platform {
             PARENT_LIVENESS_ENV.to_owned(),
             liveness_pipe.read.raw().to_string(),
         ));
+        // These launcher-authored bindings intentionally follow caller
+        // bindings. A caller cannot redirect either retained image authority.
+        bindings.push((
+            EXECUTABLE_READ_FD_ENV.to_owned(),
+            readable_executable.raw().to_string(),
+        ));
+        bindings.push((EXECUTABLE_FD_ENV.to_owned(), executable.raw().to_string()));
         let environment = sanitized_environment(&bindings)?;
         let environment_storage = environment
             .into_iter()
@@ -272,6 +286,7 @@ mod platform {
 
         let mut actions = SpawnFileActions::new()?;
         actions.dup2(executable.raw(), executable.raw())?;
+        actions.dup2(readable_executable.raw(), readable_executable.raw())?;
         actions.dup2(dependency_root.raw(), dependency_root.raw())?;
         actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())?;
         actions.dup2(stdin_pipe.read.raw(), libc::STDIN_FILENO)?;
@@ -638,6 +653,94 @@ mod platform {
                 result == libc::EBADF || result == libc::ENOTDIR,
                 "unexpected invalid working-directory descriptor error: {result}"
             );
+        }
+
+        fn spawn_descriptor_image(descriptor: RawFd) -> (c_int, libc::pid_t) {
+            let retained = InheritableFd::duplicate(descriptor).unwrap();
+            let executable = CString::new(format!("/dev/fd/{}", retained.raw())).unwrap();
+            let argument = CString::new("true").unwrap();
+            let mut argv = [argument.as_ptr().cast_mut(), std::ptr::null_mut()];
+            let mut environment: [*mut c_char; 1] = [std::ptr::null_mut()];
+            let mut actions = SpawnFileActions::new().unwrap();
+            actions.dup2(retained.raw(), retained.raw()).unwrap();
+            let mut attributes = SpawnAttributes::new().unwrap();
+            attributes.process_group().unwrap();
+            let mut pid = 0;
+            let result = unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    executable.as_ptr(),
+                    actions.as_ptr(),
+                    attributes.as_ptr(),
+                    argv.as_mut_ptr(),
+                    environment.as_mut_ptr(),
+                )
+            };
+            (result, pid)
+        }
+
+        #[test]
+        fn macos_exec_authority_o_exec_descriptor_spawns_and_read_only_control_is_reaped() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = CString::new("/usr/bin/true").unwrap();
+            let metadata = fs::metadata("/usr/bin/true").unwrap();
+            assert_ne!(metadata.permissions().mode() & 0o111, 0);
+            assert_eq!(
+                unsafe {
+                    libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS)
+                },
+                0,
+                "fixture is not executable by the effective test identity"
+            );
+            let readable_raw = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(readable_raw >= 0, "open readable executable fixture");
+            let readable = unsafe { std::fs::File::from_raw_fd(readable_raw) };
+            let executable_raw = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_EXEC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(executable_raw >= 0, "open O_EXEC executable fixture");
+            let executable = unsafe { std::fs::File::from_raw_fd(executable_raw) };
+            let readable_flags = unsafe { libc::fcntl(readable.as_raw_fd(), libc::F_GETFL) };
+            let executable_flags = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(readable_flags & libc::O_EXEC, 0);
+            assert_eq!(readable_flags & libc::O_ACCMODE, libc::O_RDONLY);
+            assert_eq!(executable_flags & libc::O_EXEC, libc::O_EXEC);
+
+            let (read_result, read_pid) = spawn_descriptor_image(readable.as_raw_fd());
+            if read_result == 0 {
+                let mut child = TestChild {
+                    pid: read_pid,
+                    reaped: false,
+                };
+                let status = child
+                    .wait_before(Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+            } else {
+                assert_eq!(read_result, libc::EACCES);
+            }
+
+            let (exec_result, exec_pid) = spawn_descriptor_image(executable.as_raw_fd());
+            assert_eq!(exec_result, 0, "O_EXEC /dev/fd posix_spawn failed");
+            let mut child = TestChild {
+                pid: exec_pid,
+                reaped: false,
+            };
+            let status = child
+                .wait_before(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
         }
 
         #[test]

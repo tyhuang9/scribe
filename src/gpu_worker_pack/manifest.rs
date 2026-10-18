@@ -282,6 +282,34 @@ impl VerifiedPackLease {
         Ok(file)
     }
 
+    /// Opens the signed worker through the retained pack root with execute-only
+    /// authority. macOS may strip executable use from an ordinary `O_RDONLY`
+    /// descriptor; use explicit `O_EXEC` authority across supported releases.
+    /// The readable handle returned by [`Self::open_copy_file`] remains the
+    /// sole source for hashing.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_copy_executable(
+        &self,
+        entry: &VerifiedCopyEntry,
+    ) -> Result<File, PackVerificationError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path = Path::new(&entry.path);
+        let file = self.root.open_executable(path)?;
+        let metadata = file.metadata().map_err(PackVerificationError::Io)?;
+        let display_path = self.root.path.join(path);
+        if !metadata.is_file() || metadata.len() != entry.size_bytes {
+            return Err(PackVerificationError::DescriptorChanged);
+        }
+        if metadata.nlink() != 1 {
+            return Err(PackVerificationError::Hardlink(display_path));
+        }
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(PackVerificationError::WorkerNotExecutable);
+        }
+        Ok(file)
+    }
+
     #[cfg(unix)]
     pub(crate) fn open_dependency_root(&self) -> Result<File, PackVerificationError> {
         self.recheck()?;
@@ -392,6 +420,14 @@ impl PinnedPackRoot {
             let _ = relative;
             Err(PackVerificationError::UnsupportedLeasePlatform)
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_executable(&self, relative: &Path) -> Result<File, PackVerificationError> {
+        open_executable_at(
+            self.handles.last().expect("digest handle").as_raw_fd(),
+            relative,
+        )
     }
 
     fn recheck(&self) -> Result<(), PackVerificationError> {
@@ -1372,6 +1408,42 @@ pub(crate) fn hash_exact_length(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn hash_exact_file_at(
+    file: &File,
+    expected_bytes: u64,
+    path: &str,
+) -> Result<String, PackVerificationError> {
+    use std::os::unix::fs::FileExt;
+
+    let mut hasher = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < expected_bytes {
+        let remaining = expected_bytes - offset;
+        let maximum = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| PackVerificationError::SizeMismatch(path.to_owned()))?;
+        let read = file
+            .read_at(&mut buffer[..maximum], offset)
+            .map_err(PackVerificationError::Io)?;
+        if read == 0 {
+            return Err(PackVerificationError::SizeMismatch(path.to_owned()));
+        }
+        hasher.update(&buffer[..read]);
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| PackVerificationError::SizeMismatch(path.to_owned()))?;
+    }
+    if file
+        .read_at(&mut buffer[..1], expected_bytes)
+        .map_err(PackVerificationError::Io)?
+        != 0
+    {
+        return Err(PackVerificationError::SizeMismatch(path.to_owned()));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 pub(super) fn read_capped(
     reader: &mut impl Read,
     maximum_bytes: u64,
@@ -1475,6 +1547,68 @@ fn open_regular_at(directory_fd: i32, relative: &Path) -> Result<File, PackVerif
     let file = unsafe { File::from_raw_fd(fd) };
     let metadata = file.metadata().map_err(PackVerificationError::Io)?;
     if !metadata.is_file() {
+        return Err(PackVerificationError::NonRegularEntry(
+            relative.to_path_buf(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn open_executable_at(
+    directory_fd: libc::c_int,
+    relative: &Path,
+) -> Result<File, PackVerificationError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(PackVerificationError::UnsafePath(
+            relative.display().to_string(),
+        ));
+    }
+    let duplicated = unsafe { libc::dup(directory_fd) };
+    if duplicated < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let mut current = unsafe { File::from_raw_fd(duplicated) };
+    for component in &components[..components.len() - 1] {
+        let name = CString::new(component.as_os_str().as_bytes())
+            .map_err(|_| PackVerificationError::UnsafePath(relative.display().to_string()))?;
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(PackVerificationError::Io(io::Error::last_os_error()));
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    let name = CString::new(components.last().expect("non-empty").as_os_str().as_bytes())
+        .map_err(|_| PackVerificationError::UnsafePath(relative.display().to_string()))?;
+    let fd = unsafe {
+        libc::openat(
+            current.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_EXEC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file
+        .metadata()
+        .map_err(PackVerificationError::Io)?
+        .is_file()
+    {
         return Err(PackVerificationError::NonRegularEntry(
             relative.to_path_buf(),
         ));
@@ -2133,7 +2267,13 @@ pub(crate) mod test_support {
         mut manifest: PackManifest,
     ) -> &'static FixtureTrustRoot {
         fs::create_dir_all(root.join("bin")).unwrap();
-        fs::write(root.join("bin/worker.exe"), b"signed worker").unwrap();
+        let worker = root.join("bin/worker.exe");
+        fs::write(&worker, b"signed worker").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         manifest.pack_digest = compute_pack_digest(&manifest).unwrap();
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         fs::write(root.join(MANIFEST_NAME), &manifest_bytes).unwrap();

@@ -98,6 +98,8 @@ mkdir -p "$pack_root/worker"
 cp -p "$worker" "$pack_root/worker/scribe-inference-worker"
 run_bounded 60 codesign --force --sign - "$pack_root/worker/scribe-inference-worker"
 run_bounded 60 codesign --verify --strict --verbose=2 "$pack_root/worker/scribe-inference-worker"
+worker_digest="$(shasum -a 256 "$pack_root/worker/scribe-inference-worker" | awk '{print $1}')"
+[[ "$worker_digest" =~ ^[0-9a-f]{64}$ ]] || { echo 'signed fixture worker digest is invalid.' >&2; exit 1; }
 
 # Fixture authoring happens only after the final ad-hoc signature has changed
 # the Mach-O bytes. No project signing key or Keychain identity is involved.
@@ -113,18 +115,26 @@ run_bounded 300 cargo run --locked --quiet \
 
 mkdir -p "$test_root/tmp"
 test_name='onnx_worker::tests::macos_native_metal_metadata_helper_launches_authenticated_worker_and_reaps'
+# Measure startup with the shipped optimization profile. The exact native
+# contract, ten-second provider budget, and cleanup requirements are unchanged.
 test_listing="$(
   run_bounded 1200 env \
+    -u DOCS_RS -u SCRIBE_BUILDING_WORKER \
+    -u SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP \
+    SCRIBE_BUNDLED_WORKER_SHA256="$worker_digest" \
     TMPDIR="$test_root/tmp" \
     SCRIBE_MACOS_NATIVE_METAL_METADATA_FIXTURE_PACK="$pack_root" \
-    cargo test --locked --bin local-transcriber "$test_name" -- \
+    cargo test --locked --release --bin local-transcriber "$test_name" -- \
       --ignored --exact --list
 )"
 test_count="$(printf '%s\n' "$test_listing" | awk -v expected="$test_name" '$0 == expected ": test" { count++ } END { print count+0 }')"
 [[ "$test_count" == 1 ]] || { echo 'exact native Metal metadata helper test was not discovered once.' >&2; exit 1; }
 
 run_bounded 1200 env \
+  -u DOCS_RS -u SCRIBE_BUILDING_WORKER \
+  -u SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP \
+  SCRIBE_BUNDLED_WORKER_SHA256="$worker_digest" \
   TMPDIR="$test_root/tmp" \
   SCRIBE_MACOS_NATIVE_METAL_METADATA_FIXTURE_PACK="$pack_root" \
-  cargo test --locked --bin local-transcriber "$test_name" -- \
+  cargo test --locked --release --bin local-transcriber "$test_name" -- \
     --ignored --exact --nocapture --test-threads=1

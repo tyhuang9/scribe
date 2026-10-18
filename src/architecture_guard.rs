@@ -414,6 +414,88 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
 }
 
 #[test]
+fn macos_exec_authority_is_descriptor_paired_and_child_measured() {
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
+    let manifest = production_source(include_str!("gpu_worker_pack/manifest.rs"));
+
+    let executable_open = named_function_bodies(&manifest, "open_executable_at").join("\n");
+    for required in [
+        "libc::openat(",
+        "libc::O_EXEC | libc::O_NOFOLLOW | libc::O_CLOEXEC",
+    ] {
+        assert!(
+            executable_open.contains(required),
+            "executable open lost {required:?}"
+        );
+    }
+    let pair = named_function_bodies(&pack, "verify_macos_executable_pair").join("\n");
+    for required in [
+        "libc::F_GETFL",
+        "libc::O_EXEC",
+        "libc::O_RDONLY",
+        "readable_metadata.dev() != executable_metadata.dev()",
+        "readable_metadata.ino() != executable_metadata.ino()",
+        "entry.size_bytes",
+        "readable_metadata.nlink() != 1",
+        "hash_exact_file_at(readable, entry.size_bytes, &entry.path)",
+        "digest != entry.sha256",
+    ] {
+        assert!(
+            pair.contains(required),
+            "macOS pair validation lost {required:?}"
+        );
+    }
+    for required in [
+        "authority.readable_executable_fd().as_raw_fd()",
+        "CString::new(format!(\"/dev/fd/{}\", executable.raw()))",
+        "actions.dup2(executable.raw(), executable.raw())?",
+        "actions.dup2(readable_executable.raw(), readable_executable.raw())?",
+    ] {
+        assert!(
+            launcher.contains(required),
+            "macOS inherited authority lost {required:?}"
+        );
+    }
+    let compact_launcher = launcher.split_whitespace().collect::<String>();
+    for required in [
+        "EXECUTABLE_FD_ENV.to_owned(),executable.raw().to_string()",
+        "EXECUTABLE_READ_FD_ENV.to_owned(),readable_executable.raw().to_string()",
+    ] {
+        assert!(
+            compact_launcher.contains(required),
+            "macOS binding lost {required:?}"
+        );
+    }
+    let take_pair = named_function_bodies(&worker, "take_macos_pack_worker_image_pair").join("\n");
+    let validate = take_pair
+        .find("validate_macos_pack_worker_image_pair(descriptors)?")
+        .expect("child validates descriptors before ownership");
+    let own = take_pair
+        .find("std::fs::File::from_raw_fd(descriptors.readable)")
+        .expect("child owns the validated readable descriptor");
+    assert!(validate < own);
+    assert!(!take_pair.contains("current_exe"));
+    assert!(!take_pair.contains("remove_var"));
+    let parse_pair =
+        named_function_bodies(&worker, "parse_macos_pack_worker_image_descriptors").join("\n");
+    assert!(
+        parse_pair.contains("executable.is_some() || readable.is_some() || private_pack_present")
+    );
+    assert!(parse_pair.contains("descriptors.executable == descriptors.readable"));
+    assert!(parse_pair.contains("forbidden.is_some_and"));
+    let hash = named_function_bodies(&worker, "sha256_file_at").join("\n");
+    assert!(hash.contains("file.read_at("));
+    assert!(!hash.contains("File::open"));
+    assert!(!hash.contains("seek("));
+    let fingerprint =
+        named_function_bodies(&worker, "inference_worker_capability_fingerprint").join("\n");
+    assert!(fingerprint.contains("match take_macos_pack_worker_image_pair()?"));
+    assert!(fingerprint.contains("sha256_file_at(&readable, length)"));
+}
+
+#[test]
 fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     let launcher = production_source(include_str!("macos_worker_launch.rs"));
     let worker = production_source(include_str!("onnx_worker.rs"));
