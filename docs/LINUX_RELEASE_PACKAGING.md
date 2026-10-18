@@ -108,6 +108,10 @@ Copies of Cargo outputs avoid hardlinked aliases. No package is installed or
 uploaded, and the private temporary outputs are removed on exit. This adds
 actual binary integration evidence; it does not replace the synthetic
 adversarial suite or establish publisher provenance for arbitrary inputs.
+Its fixed CPU build profile excludes unowned system BLAS; the harness checks
+the actual native cache/link manifest and ELF requirements. This is a portable
+dependency choice, not a CPU performance qualification or a claim that every
+system dependency has been validated on a clean installation.
 
 This stage is suitable for reviewing and publishing the packaging pull request,
 but it is not approval to ship Linux GPU packs. Production GPU delivery still

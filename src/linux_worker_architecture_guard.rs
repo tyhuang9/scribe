@@ -314,6 +314,12 @@ fn linux_native_cpu_contract_requires_real_release_pair_and_exact_test_discovery
     assert!(prepare.contains("mv --no-clobber --no-target-directory"));
     for required in [
         "-u DOCS_RS -u SCRIBE_BUILDING_WORKER -u SCRIBE_BUNDLED_WORKER_SHA256",
+        "-u CMAKE_ARGS -u TRANSCRIBE_CMAKE_ARGS",
+        "TRANSCRIBE_CMAKE_ARGS=-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF",
+        "TRANSCRIBE_USE_SYSTEM_BLAS:BOOL=OFF",
+        "check_native_cpu_profile",
+        "reject_blas_runtime \"$worker\"",
+        "reject_blas_runtime \"$desktop\"",
         "timeout --signal=TERM --kill-after=5s",
         "--bin scribe-inference-worker --features inference-worker",
         "--bin local-transcriber",

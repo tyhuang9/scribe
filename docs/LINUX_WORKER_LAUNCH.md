@@ -89,6 +89,20 @@ independently verifies and size-reports the actual pair's CPU-only Debian
 package without installing it. Owned temporary build/test outputs are removed
 on exit.
 
+The packaged CPU recipe explicitly sets the upstream-supported
+`TRANSCRIBE_USE_SYSTEM_BLAS=OFF` for the worker, desktop and test parent, after
+clearing both ambient CMake argument overrides. The current package owns no
+BLAS payload or dependency contract. Automatic host BLAS discovery previously
+enabled CBLAS calls whose absolute link dependency was not propagated by the
+native Rust wrapper, producing an actual release-worker link failure. This
+profile avoids inheriting an unowned build-host runtime; it is not a dummy
+worker or a skipped link check. The harness checks the regenerated CMake cache
+and link manifest, then both deliverable ELFs for unexpected BLAS requirements.
+The native ggml CPU backend/threadpool is unchanged. The optional host-decoder
+CBLAS fast path is disabled and may be slower; CPU transcription/performance
+remains unqualified. Adding optimized BLAS later requires an explicitly owned
+link/runtime inventory and separate qualification, not an ambient `-lblas` fix.
+
 Use the bounded script rather than invoking the ignored Rust test directly:
 its outer deadline also bounds blocking protocol reads. Reaping confirms that
 the worker is no longer running; the process API does not expose its exit code.
