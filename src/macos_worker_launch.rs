@@ -59,7 +59,7 @@ fn validate_environment_field(name: &str, value: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::ffi::{CString, c_char, c_int};
+    use std::ffi::{CString, c_int};
     use std::io::Write;
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -75,9 +75,9 @@ mod platform {
     const DROP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
     unsafe extern "C" {
-        fn posix_spawn_file_actions_addchdir_np(
+        fn posix_spawn_file_actions_addfchdir_np(
             actions: *mut libc::posix_spawn_file_actions_t,
-            path: *const c_char,
+            descriptor: c_int,
         ) -> c_int;
     }
 
@@ -246,7 +246,6 @@ mod platform {
         let liveness_pipe = Pipe::new()?;
 
         let executable_path = CString::new(format!("/dev/fd/{}", executable.raw()))?;
-        let dependency_root_path = CString::new(format!("/dev/fd/{}", dependency_root.raw()))?;
         let worker_flag = CString::new(worker_flag)?;
         let argv_storage = [executable_path.clone(), worker_flag];
         let mut argv = argv_storage
@@ -280,7 +279,7 @@ mod platform {
         actions.close(stdin_pipe.write.raw())?;
         actions.close(stdout_pipe.read.raw())?;
         actions.close(liveness_pipe.write.raw())?;
-        actions.chdir(&dependency_root_path)?;
+        actions.fchdir(dependency_root.raw())?;
 
         let mut attributes = SpawnAttributes::new()?;
         attributes.process_group()?;
@@ -349,7 +348,8 @@ mod platform {
     impl InheritableFd {
         fn duplicate(source: RawFd) -> Result<Self> {
             // F_DUPFD creates a private duplicate; only that duplicate has its
-            // close-on-exec bit cleared for the /dev/fd spawn bridge.
+            // close-on-exec bit cleared for the executable /dev/fd bridge or
+            // descriptor-bound working-directory spawn action.
             let raw = unsafe { libc::fcntl(source, libc::F_DUPFD, 3) };
             if raw < 0 || unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } < 0 {
                 if raw >= 0 {
@@ -428,9 +428,9 @@ mod platform {
             )
         }
 
-        fn chdir(&mut self, path: &CString) -> Result<()> {
+        fn fchdir(&mut self, descriptor: RawFd) -> Result<()> {
             spawn_result(
-                unsafe { posix_spawn_file_actions_addchdir_np(&mut self.0, path.as_ptr()) },
+                unsafe { posix_spawn_file_actions_addfchdir_np(&mut self.0, descriptor) },
                 "could not bind macOS worker dependency root",
             )
         }
@@ -489,11 +489,209 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
+        use std::ffi::c_char;
+        use std::fs;
+        use std::io::Read;
         use std::os::unix::process::CommandExt;
         use std::panic::AssertUnwindSafe;
+        use std::path::PathBuf;
         use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
 
         use super::*;
+
+        static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
+
+        struct TestRoot(PathBuf);
+
+        impl TestRoot {
+            fn new(label: &str) -> Self {
+                let sequence = NEXT_TEMP_ROOT.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir()
+                    .join(format!("scribe-{label}-{}-{sequence}", std::process::id()));
+                fs::create_dir(&root).expect("create private macOS spawn fixture root");
+                Self(root)
+            }
+        }
+
+        impl Drop for TestRoot {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct TestChild {
+            pid: libc::pid_t,
+            reaped: bool,
+        }
+
+        impl TestChild {
+            fn wait_before(&mut self, deadline: Instant) -> Result<c_int> {
+                loop {
+                    let mut status = 0;
+                    let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+                    if result == self.pid {
+                        self.reaped = true;
+                        return Ok(status);
+                    }
+                    if result == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            if Instant::now() >= deadline {
+                                bail!(
+                                    "macOS spawn-action fixture did not exit before its deadline"
+                                );
+                            }
+                            continue;
+                        }
+                        if error.raw_os_error() == Some(libc::ECHILD) {
+                            self.reaped = true;
+                        }
+                        return Err(error).context("could not reap macOS spawn-action fixture");
+                    }
+                    if Instant::now() >= deadline {
+                        bail!("macOS spawn-action fixture did not exit before its deadline");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                if self.reaped {
+                    return;
+                }
+                unsafe {
+                    libc::killpg(self.pid, libc::SIGKILL);
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+                let deadline = Instant::now() + Duration::from_millis(500);
+                loop {
+                    let mut status = 0;
+                    let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+                    if result == self.pid {
+                        self.reaped = true;
+                        return;
+                    }
+                    if result == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ECHILD) {
+                            self.reaped = true;
+                            return;
+                        }
+                        if error.kind() == std::io::ErrorKind::Interrupted
+                            && Instant::now() < deadline
+                        {
+                            continue;
+                        }
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        fn spawn_pwd(
+            actions: &SpawnFileActions,
+            attributes: &SpawnAttributes,
+        ) -> (c_int, libc::pid_t) {
+            let executable = CString::new("/bin/pwd").unwrap();
+            let argument = CString::new("pwd").unwrap();
+            let mut argv = [argument.as_ptr().cast_mut(), std::ptr::null_mut()];
+            let mut environment: [*mut c_char; 1] = [std::ptr::null_mut()];
+            let mut pid = 0;
+            let result = unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    executable.as_ptr(),
+                    actions.as_ptr(),
+                    attributes.as_ptr(),
+                    argv.as_mut_ptr(),
+                    environment.as_mut_ptr(),
+                )
+            };
+            (result, pid)
+        }
+
+        fn assert_cwd_descriptor_rejected(descriptor: RawFd, retain: bool) {
+            let mut actions = SpawnFileActions::new().unwrap();
+            if retain {
+                actions.dup2(descriptor, descriptor).unwrap();
+            }
+            if actions.fchdir(descriptor).is_err() {
+                return;
+            }
+            let mut attributes = SpawnAttributes::new().unwrap();
+            attributes.process_group().unwrap();
+            let (result, pid) = spawn_pwd(&actions, &attributes);
+            if result == 0 {
+                let mut child = TestChild { pid, reaped: false };
+                let _ = child.wait_before(Instant::now() + Duration::from_secs(2));
+                panic!("invalid working-directory descriptor launched a child");
+            }
+            assert!(
+                result == libc::EBADF || result == libc::ENOTDIR,
+                "unexpected invalid working-directory descriptor error: {result}"
+            );
+        }
+
+        #[test]
+        fn descriptor_directory_spawn_retained_fd_survives_path_rename() {
+            let root = TestRoot::new("retained-worker-directory");
+            let original = root.0.join("original");
+            let renamed = root.0.join("renamed");
+            fs::create_dir(&original).unwrap();
+            let directory = std::fs::File::open(&original).unwrap();
+            let retained = InheritableFd::duplicate(directory.as_raw_fd()).unwrap();
+            fs::rename(&original, &renamed).unwrap();
+            fs::create_dir(&original).unwrap();
+
+            let output = Pipe::new().unwrap();
+            let mut actions = SpawnFileActions::new().unwrap();
+            actions.dup2(retained.raw(), retained.raw()).unwrap();
+            actions
+                .dup2(output.write.raw(), libc::STDOUT_FILENO)
+                .unwrap();
+            actions.close(output.read.raw()).unwrap();
+            actions.fchdir(retained.raw()).unwrap();
+            let mut attributes = SpawnAttributes::new().unwrap();
+            attributes.process_group().unwrap();
+            let (result, pid) = spawn_pwd(&actions, &attributes);
+            assert_eq!(result, 0, "retained-directory posix_spawn failed");
+            let mut child = TestChild { pid, reaped: false };
+            drop(output.write);
+            let status = child
+                .wait_before(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(status, 0);
+
+            let mut observed = String::new();
+            let mut reader = unsafe { std::fs::File::from_raw_fd(output.read.into_raw()) };
+            reader.read_to_string(&mut observed).unwrap();
+            assert_eq!(
+                PathBuf::from(observed.trim()),
+                fs::canonicalize(&renamed).unwrap()
+            );
+            assert_ne!(
+                PathBuf::from(observed.trim()),
+                fs::canonicalize(&original).unwrap(),
+                "spawn followed the replacement pathname instead of the retained directory"
+            );
+        }
+
+        #[test]
+        fn descriptor_directory_spawn_rejects_non_directory_and_invalid_descriptors_without_child()
+        {
+            let non_directory = std::fs::File::open("/dev/null").unwrap();
+            let retained = InheritableFd::duplicate(non_directory.as_raw_fd()).unwrap();
+            assert_cwd_descriptor_rejected(retained.raw(), true);
+            assert_cwd_descriptor_rejected(-1, false);
+        }
 
         #[test]
         fn drop_terminates_and_reaps_worker_even_after_state_lock_poisoning() {

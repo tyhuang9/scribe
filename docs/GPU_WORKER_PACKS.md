@@ -907,6 +907,12 @@ the pack before launch authority or a GPU route is constructed. Multi-file
 macOS packs are deferred until descriptor-bound dependency loading or
 ownership-enforced filesystem immutability is separately designed and reviewed.
 
+The macOS launcher binds the worker's working directory with a descriptor-native
+`posix_spawn_file_actions_addfchdir_np` action on the retained verified directory.
+It does not resolve that directory through a `/dev/fd` pathname or fall back to
+the catalog path. The explicit descriptor-inheritance actions and the separate
+retained-executable `/dev/fd` bridge remain required.
+
 Metal framework linkage is confined to the per-architecture Metal worker. The
 desktop and universal CPU worker use only an IOKit power-source shim plus the
 `kern.osversion` witness and must have no Metal load command. Stable

@@ -431,7 +431,9 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     for required in [
         "posix_spawn(",
         "/dev/fd/",
-        "posix_spawn_file_actions_addchdir_np",
+        "posix_spawn_file_actions_addfchdir_np",
+        "actions.fchdir(dependency_root.raw())?",
+        "actions.dup2(dependency_root.raw(), dependency_root.raw())?",
         "POSIX_SPAWN_CLOEXEC_DEFAULT",
         "POSIX_SPAWN_SETPGROUP",
         "killpg",
@@ -447,6 +449,8 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     assert!(!launcher.contains("Command::new"));
     assert!(!launcher.contains("std::process::Command"));
     assert!(!launcher.contains("executable.path"));
+    assert!(!launcher.contains("posix_spawn_file_actions_addchdir_np"));
+    assert!(!launcher.contains("dependency_root_path"));
     assert!(launcher.contains("SAFE_PARENT_ENVIRONMENT"));
     assert!(launcher.contains("SCRIBE_PRIVATE_"));
     for required in [
