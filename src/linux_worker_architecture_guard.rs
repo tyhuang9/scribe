@@ -296,6 +296,8 @@ fn linux_native_cpu_contract_requires_real_release_pair_and_exact_test_discovery
         "bash scripts/test-linux-native-cpu-worker.sh",
         "'scripts/*linux*worker*'",
         "'scripts/*linux*release*'",
+        "'scripts/*linux*cpu*'",
+        "python3 -B scripts/test-linux-cpu-native-baseline.py",
     ] {
         assert!(
             workflow.contains(required),
@@ -315,7 +317,20 @@ fn linux_native_cpu_contract_requires_real_release_pair_and_exact_test_discovery
     for required in [
         "-u DOCS_RS -u SCRIBE_BUILDING_WORKER -u SCRIBE_BUNDLED_WORKER_SHA256",
         "-u CMAKE_ARGS -u TRANSCRIBE_CMAKE_ARGS",
-        "TRANSCRIBE_CMAKE_ARGS=-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF",
+        "-DTRANSCRIBE_USE_SYSTEM_BLAS:BOOL=OFF",
+        "-DTRANSCRIBE_X86_CONSERVATIVE:BOOL=ON",
+        "-DGGML_NATIVE:BOOL=OFF",
+        "-DTRANSCRIBE_BUILD_SHARED:BOOL=OFF",
+        "-DTRANSCRIBE_GGML_BACKEND_DL:BOOL=OFF",
+        "-DGGML_BACKEND_DL:BOOL=OFF",
+        "-DGGML_CPU_ALL_VARIANTS:BOOL=OFF",
+        "-DTRANSCRIBE_USE_OPENMP:BOOL=OFF",
+        "-DGGML_OPENMP:BOOL=OFF",
+        "-DGGML_CCACHE:BOOL=OFF",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
+        "CARGO_ENCODED_RUSTFLAGS=$'-C\\x1ftarget-cpu=x86-64'",
+        "linux-cpu-native-baseline.py\" check-environment",
+        "linux-cpu-native-baseline.py\" verify --build-root",
         "TRANSCRIBE_USE_SYSTEM_BLAS:BOOL=OFF",
         "check_native_cpu_profile",
         "reject_blas_runtime \"$worker\"",
@@ -338,6 +353,7 @@ fn linux_native_cpu_contract_requires_real_release_pair_and_exact_test_discovery
             "missing native pair invariant: {required}"
         );
     }
+    assert!(native.find("check-environment").unwrap() < native.find("cpu_cmake_args=").unwrap());
     for forbidden in [
         "DOCS_RS=1",
         "--features ui-harness",
