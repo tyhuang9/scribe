@@ -31367,6 +31367,107 @@ mod tests {
         }))
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    struct LinuxNativeCpuFixtureResolver {
+        parent: PathBuf,
+        root_name: &'static str,
+        expected_sha256: String,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    impl WorkerExecutableResolver for LinuxNativeCpuFixtureResolver {
+        fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+            if role != WorkerRole::Inference {
+                bail!("Linux native CPU fixture only permits the inference worker role");
+            }
+            let authority =
+                crate::linux_worker_launch::InstalledWorkerAuthority::open_test_fixture(
+                    &self.parent,
+                    self.root_name,
+                    &self.expected_sha256,
+                )
+                .context("could not admit the Linux native CPU worker fixture")?;
+            let identity = authority.identity();
+            let open_file = authority
+                .duplicate_executable()
+                .context("could not retain the Linux native CPU worker fixture descriptor")?;
+            let linux_exec_authority: Arc<dyn crate::linux_worker_launch::LinuxExecAuthority> =
+                authority;
+            let root = self.parent.join(self.root_name);
+            Ok(VerifiedWorkerExecutable {
+                path: root.join(crate::linux_worker_launch::WORKER_NAME),
+                root,
+                expected_name: crate::linux_worker_launch::WORKER_NAME.into(),
+                expected_sha256: identity.sha256.clone(),
+                identity: WorkerExecutableIdentity {
+                    length: identity.length,
+                    sha256: identity.sha256,
+                    device: identity.device,
+                    inode: identity.inode,
+                },
+                frozen_worker_approval: None,
+                pack_launch: None,
+                linux_exec_authority: Some(linux_exec_authority),
+                _open_file: open_file,
+            })
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    fn linux_native_cpu_fixture_launcher(parent: &Path, expected_sha256: &str) -> OsWorkerLauncher {
+        OsWorkerLauncher {
+            role: WorkerRole::Inference,
+            resolver: Arc::new(LinuxNativeCpuFixtureResolver {
+                parent: parent.to_owned(),
+                root_name: "scribe",
+                expected_sha256: expected_sha256.to_owned(),
+            }),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    struct LinuxNativeCpuFixture {
+        parent: Option<PathBuf>,
+        executable: PathBuf,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    impl LinuxNativeCpuFixture {
+        fn install(source: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let parent = test_root("linux-native-cpu-worker");
+            let root = parent.join("scribe");
+            std::fs::create_dir(&root).expect("create Linux native CPU worker fixture root");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+                .expect("restrict Linux native CPU worker fixture root");
+            let executable = root.join(crate::linux_worker_launch::WORKER_NAME);
+            std::fs::copy(source, &executable)
+                .expect("copy reviewed Linux native CPU worker fixture");
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o555))
+                .expect("make Linux native CPU worker fixture executable and read-only");
+            Self {
+                parent: Some(parent),
+                executable,
+            }
+        }
+
+        fn cleanup(mut self) {
+            let parent = self.parent.take().expect("fixture parent remains owned");
+            std::fs::remove_dir_all(parent)
+                .expect("remove Linux native CPU worker fixture after confirmed reap");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    impl Drop for LinuxNativeCpuFixture {
+        fn drop(&mut self) {
+            if let Some(parent) = self.parent.take() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
     fn run_native_worker(input: Vec<u8>) -> Vec<(u64, u64, Control)> {
         let mut output = Vec::new();
         worker_loop(Cursor::new(input), &mut output).unwrap();
@@ -31487,6 +31588,151 @@ mod tests {
         );
         assert!(first.is_finite() && second.is_finite());
         assert_eq!(after_reset, first);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    #[test]
+    #[ignore = "requires SCRIBE_LINUX_NATIVE_CPU_WORKER_EXE to name the reviewed release CPU worker built with the parent's exact compiled SHA"]
+    fn linux_native_cpu_worker_authenticated_ready_health_shutdown_and_reap() {
+        let source = required_fixture_path("SCRIBE_LINUX_NATIVE_CPU_WORKER_EXE");
+        let fixture = LinuxNativeCpuFixture::install(&source);
+        let actual_sha256 =
+            sha256_file(&fixture.executable).expect("hash copied Linux native CPU worker fixture");
+        let compiled_sha256 = option_env!("SCRIBE_BUNDLED_WORKER_SHA256")
+            .filter(|sha256| !sha256.is_empty())
+            .expect("native CPU contract parent must embed the reviewed worker SHA-256");
+        assert_eq!(
+            actual_sha256, compiled_sha256,
+            "native CPU fixture must be the worker sealed by the parent build"
+        );
+
+        let mut wrong_sha256 = actual_sha256.clone();
+        let replacement = if wrong_sha256.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        wrong_sha256.replace_range(..1, replacement);
+        let wrong_launcher = linux_native_cpu_fixture_launcher(
+            fixture
+                .parent
+                .as_deref()
+                .expect("fixture parent remains owned"),
+            &wrong_sha256,
+        );
+        let mismatch = match wrong_launcher.launch() {
+            Ok(_) => panic!("wrong worker SHA-256 must be rejected before process launch"),
+            Err(error) => error,
+        };
+        let mismatch_text = format!("{mismatch:#}");
+        assert!(
+            mismatch_text.contains("SHA-256 mismatch"),
+            "unexpected wrong-SHA admission error: {mismatch:#}"
+        );
+        drop(wrong_launcher);
+
+        let launcher = linux_native_cpu_fixture_launcher(
+            fixture
+                .parent
+                .as_deref()
+                .expect("fixture parent remains owned"),
+            &actual_sha256,
+        );
+        let SpawnedWorker {
+            mut stdin,
+            mut stdout,
+            process,
+            expectation,
+            frozen_worker_approval,
+            pack_launch,
+        } = launcher
+            .launch()
+            .expect("launch descriptor-bound Linux native CPU worker fixture");
+        assert_eq!(expectation.role, WorkerRole::Inference);
+        assert_eq!(expectation.provider, WorkerProvider::Cpu);
+        assert_eq!(expectation.bundled_worker_sha256, actual_sha256);
+        assert!(expectation.pack.is_none());
+        assert!(frozen_worker_approval.is_none());
+        assert!(pack_launch.is_none());
+
+        let challenge = random_challenge().expect("create native CPU worker challenge");
+        write_frame(
+            &mut stdin,
+            &control_frame(
+                0,
+                1,
+                &Control::Hello {
+                    challenge: challenge.clone(),
+                    expected: expectation.clone(),
+                },
+            )
+            .unwrap(),
+        )
+        .expect("send authenticated Hello to Linux native CPU worker");
+        let (session_id, request_id, response) =
+            parse_worker_control(read_frame(&mut stdout).expect("read native CPU Ready"))
+                .expect("parse native CPU Ready");
+        assert_eq!((session_id, request_id), (0, 1));
+        let capability = match response {
+            Control::Ready { capability } => capability,
+            other => panic!("expected authenticated native CPU Ready, got {other:?}"),
+        };
+        validate_worker_capability(&capability, &challenge, &expectation)
+            .expect("authenticate Linux native CPU worker capability");
+        assert_eq!(capability.app_build, DESKTOP_BUILD_ID);
+        assert_eq!(capability.worker_build, INFERENCE_WORKER_BUILD_ID);
+        assert_eq!(capability.bundled_worker_sha256, actual_sha256);
+        assert_eq!(capability.abi, WORKER_ABI_VERSION);
+        assert_eq!(capability.role, WorkerRole::Inference);
+        assert_eq!(capability.provider, WorkerProvider::Cpu);
+        assert!(capability.compatibility.is_none());
+        assert!(capability.pack.is_none());
+
+        write_frame(&mut stdin, &control_frame(0, 2, &Control::Health).unwrap())
+            .expect("send model-free Health to Linux native CPU worker");
+        let health = parse_worker_control(
+            read_frame(&mut stdout).expect("read model-free native CPU Health response"),
+        )
+        .expect("parse model-free native CPU Health response");
+        assert_eq!((health.0, health.1), (0, 2));
+        assert!(matches!(health.2, Control::Ok));
+
+        write_frame(
+            &mut stdin,
+            &control_frame(0, 3, &Control::Shutdown).unwrap(),
+        )
+        .expect("send Shutdown to Linux native CPU worker");
+        let shutdown = parse_worker_control(
+            read_frame(&mut stdout).expect("read native CPU Shutdown response"),
+        )
+        .expect("parse native CPU Shutdown response");
+        assert_eq!((shutdown.0, shutdown.1), (0, 3));
+        assert!(matches!(shutdown.2, Control::Ok));
+        drop(stdin);
+        drop(stdout);
+
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        while process
+            .is_running()
+            .expect("query Linux native CPU worker exit")
+        {
+            assert!(
+                Instant::now() < reap_deadline,
+                "Linux native CPU worker did not exit before the bounded reap deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        process
+            .wait()
+            .expect("confirm already-terminal Linux native CPU worker was reaped");
+        assert!(
+            !process
+                .is_running()
+                .expect("confirm native CPU worker reap")
+        );
+        drop(process);
+        drop(launcher);
+        fixture.cleanup();
     }
 
     #[test]
