@@ -2244,6 +2244,92 @@ pub(crate) mod test_support {
         lease.test_reverification_trust = Some(trust);
         Ok((owner_root, lease))
     }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ExistingMetalFixtureIdentity {
+        pub(crate) app_protocol_version: u16,
+        pub(crate) worker_protocol_version: u16,
+        pub(crate) runtime_abi_version: u16,
+        pub(crate) app_build: String,
+        pub(crate) worker_build: String,
+        pub(crate) worker_sha256: String,
+        pub(crate) pack_digest: String,
+        pub(crate) target_arch: String,
+    }
+
+    /// Imports only a fixture-signed, exact-build native Metal pack into a
+    /// fresh pinned test store. Production trust and the existing CUDA/Vulkan
+    /// fixture importer remain unchanged.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn lease_existing_metal_fixture(
+        source: &Path,
+    ) -> Result<(PathBuf, VerifiedPackLease, ExistingMetalFixtureIdentity), PackVerificationError>
+    {
+        static ALLOWED_BACKENDS: [PackBackend; 1] = [PackBackend::Metal];
+        let key_pair =
+            Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("fixture Ed25519 seed is valid");
+        let trust = Box::leak(Box::new(FixtureTrustRoot {
+            public_key: key_pair.public_key().as_ref().to_vec(),
+        }));
+        let verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: crate::onnx_worker::DESKTOP_BUILD_ID,
+                worker_build: crate::onnx_worker::INFERENCE_WORKER_BUILD_ID,
+                target_os: "macos",
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &ALLOWED_BACKENDS,
+            },
+        );
+        let descriptor = verifier.verify(source)?;
+        let manifest_bytes =
+            fs::read(source.join(MANIFEST_NAME)).map_err(PackVerificationError::Io)?;
+        let manifest: PackManifest = parse_canonical_json(&manifest_bytes, "manifest")?;
+        let worker_sha256 = manifest
+            .payload
+            .iter()
+            .find(|entry| entry.path == manifest.worker_path)
+            .ok_or(PackVerificationError::WorkerMissing)?
+            .sha256
+            .clone();
+        let identity = ExistingMetalFixtureIdentity {
+            app_protocol_version: manifest.app_protocol_version,
+            worker_protocol_version: manifest.worker_protocol_version,
+            runtime_abi_version: manifest.runtime_abi_version,
+            app_build: manifest.app_build.clone(),
+            worker_build: manifest.worker_build.clone(),
+            worker_sha256,
+            pack_digest: manifest.pack_digest.clone(),
+            target_arch: manifest.target_arch.clone(),
+        };
+        let owner_root = temp_root("existing-metal-fixture-lease");
+        let store_root = owner_root.join("workers").join("packs");
+        let destination = store_root
+            .join(descriptor.pack_id.as_str())
+            .join(descriptor.pack_version.as_str())
+            .join(&descriptor.pack_digest);
+        fs::create_dir_all(&destination).map_err(PackVerificationError::Io)?;
+        for relative in std::iter::once(MANIFEST_NAME)
+            .chain(std::iter::once(SIGNATURE_NAME))
+            .chain(manifest.payload.iter().map(|entry| entry.path.as_str()))
+        {
+            let destination_file = destination.join(relative);
+            if let Some(parent) = destination_file.parent() {
+                fs::create_dir_all(parent).map_err(PackVerificationError::Io)?;
+            }
+            fs::copy(source.join(relative), destination_file).map_err(PackVerificationError::Io)?;
+        }
+        let canonical_store = fs::canonicalize(&store_root).map_err(PackVerificationError::Io)?;
+        let pinned = PinnedPackRoot::open(
+            &canonical_store,
+            [&descriptor.pack_id, &descriptor.pack_version],
+            &descriptor.pack_digest,
+        )?;
+        let mut lease = verifier.verify_pinned(pinned)?;
+        lease.test_reverification_trust = Some(trust);
+        Ok((owner_root, lease, identity))
+    }
 }
 
 #[cfg(test)]

@@ -975,8 +975,10 @@ protocol, ABI, pack identity, executable digest and session challenge. Its
 snapshot contains bounded stable device identities and vendor/class facts,
 not reusable provider enumeration indexes.
 The wire format distinguishes an empty snapshot from an enumeration error;
-the current native enumerator conservatively treats zero devices as
-unavailable, rather than manufacturing a successful empty witness.
+the native metadata enumerator treats a non-nil empty `MTLCopyAllDevices`
+array as a genuine empty snapshot. A nil result, invalid arguments, overflow
+or insufficient output capacity is unavailable/error evidence, never an empty witness.
+This path does not use the ordinary default-device fallback.
 
 The helper must be confirmed retired and reaped before its result can affect
 selection. The existing persistent cleanup fence retains abandoned launches
@@ -1007,10 +1009,17 @@ Native Metal hot-plug, power, suspend/resume and device-loss qualification is
 still required. This extension neither provisions Metal packs nor changes
 release trust or the default-deny Auto qualification policy.
 
-The credential-free macOS structural lanes compile the Metal worker feature
-and native Metal/shim code in an isolated target directory in addition to
-running the portable contract tests. This check does not execute a Metal
-worker, author a GPU pack or establish native hardware qualification.
+The credential-free macOS structural lanes also run
+`scripts/test-macos-metal-metadata-helper.sh`. The script checks the native
+enumerator's empty/error/overflow boundary, builds the real per-architecture
+Metal worker with the reviewed inputs, applies ad hoc code signing, and only
+then authors and verifies a fixture-signed pack under the runner's private
+temporary directory. One explicitly ignored, exact-name test launches that
+verified worker through the production descriptor/private-IPC path, requires
+an authenticated metadata snapshot, and confirms that the child was retired
+and reaped. The fixture test key does not grant production trust, and this
+contract creates no release pack, Auto eligibility, health credit or native
+hardware-inference qualification.
 
 On Windows, before a bundled verified lease can become a route, discovery loads
 the private per-platform/backend/pack security-epoch high-water ledger under the

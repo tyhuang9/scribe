@@ -5,6 +5,8 @@
 
 #include <string.h>
 
+enum { SCRIBE_MACOS_MAX_METAL_DEVICES = 16 };
+
 static void scribe_copy_device(id<MTLDevice> device,
                                id<MTLDevice> default_device,
                                scribe_macos_metal_device *output) {
@@ -50,5 +52,53 @@ size_t scribe_macos_copy_metal_devices(scribe_macos_metal_device *devices,
             scribe_copy_device(all_devices[index], default_device, &devices[index]);
         }
         return count;
+    }
+}
+
+// Metadata-only enumeration deliberately has no default-device fallback.
+// MTLCopyAllDevices is the complete snapshot authority for this short-lived
+// helper. A non-nil empty array is a valid empty snapshot; nil is unavailable.
+static scribe_macos_metal_metadata_status
+scribe_macos_copy_metal_metadata_devices_from_array(
+    NSArray<id<MTLDevice>> *all_devices,
+    id<MTLDevice> default_device,
+    scribe_macos_metal_device *devices,
+    size_t capacity,
+    size_t *count) {
+    if (count == NULL || (devices == NULL && capacity != 0) ||
+        (devices != NULL && capacity == 0)) {
+        return SCRIBE_MACOS_METAL_METADATA_INVALID_ARGUMENT;
+    }
+    *count = 0;
+    if (all_devices == nil) {
+        return SCRIBE_MACOS_METAL_METADATA_UNAVAILABLE;
+    }
+    size_t observed = (size_t)all_devices.count;
+    if (observed > SCRIBE_MACOS_MAX_METAL_DEVICES) {
+        return SCRIBE_MACOS_METAL_METADATA_OVERFLOW;
+    }
+    if (devices == NULL) {
+        *count = observed;
+        return SCRIBE_MACOS_METAL_METADATA_OK;
+    }
+    if (capacity < observed) {
+        *count = observed;
+        return SCRIBE_MACOS_METAL_METADATA_INSUFFICIENT_CAPACITY;
+    }
+    for (size_t index = 0; index < observed; ++index) {
+        scribe_copy_device(all_devices[index], default_device, &devices[index]);
+    }
+    *count = observed;
+    return SCRIBE_MACOS_METAL_METADATA_OK;
+}
+
+scribe_macos_metal_metadata_status
+scribe_macos_copy_metal_metadata_devices(scribe_macos_metal_device *devices,
+                                         size_t capacity,
+                                         size_t *count) {
+    @autoreleasepool {
+        NSArray<id<MTLDevice>> *all_devices = MTLCopyAllDevices();
+        return scribe_macos_copy_metal_metadata_devices_from_array(
+            all_devices, nil, devices, capacity, count);
     }
 }
