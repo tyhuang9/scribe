@@ -278,6 +278,106 @@ fn linux_launcher_workflow_uses_reviewed_immutable_actions() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn linux_native_cpu_contract_requires_real_release_pair_and_exact_test_discovery() {
+    let workflow = normalized(include_str!("../.github/workflows/linux-worker-launch.yml"));
+    let prepare = normalized(include_str!("../scripts/prepare-linux-release-inputs.sh"));
+    let native = normalized(include_str!("../scripts/test-linux-native-cpu-worker.sh"));
+    let pins = normalized(include_str!(
+        "../vendor/sherpa-onnx-sys/src/archive_verifier.rs"
+    ));
+    let supervisor = normalized(include_str!("onnx_worker.rs"));
+    for required in [
+        "ubuntu-22.04, ubuntu-24.04",
+        "bash scripts/prepare-linux-release-inputs.sh",
+        "bash scripts/test-linux-release-inputs.sh",
+        "cargo fetch --locked",
+        "bash scripts/test-linux-native-cpu-worker.sh",
+        "'scripts/*linux*worker*'",
+        "'scripts/*linux*release*'",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing native CI contract: {required}"
+        );
+    }
+    for pin in [
+        "sherpa-onnx-v1.13.5-linux-x64-static-lib.tar.bz2",
+        "2ade8b7c62de66b9cf2e32bd7dbe077addaa4b18f422b49dc1bf3a1a0b1f762e",
+    ] {
+        assert!(prepare.contains(pin) && pins.contains(pin));
+    }
+    assert!(prepare.contains("expected_size=22394054"));
+    assert!(pins.contains("size: 22_394_054"));
+    assert!(prepare.contains("head -c \"$((expected_size + 1))\""));
+    assert!(prepare.contains("mv --no-clobber --no-target-directory"));
+    for required in [
+        "-u DOCS_RS -u SCRIBE_BUILDING_WORKER -u SCRIBE_BUNDLED_WORKER_SHA256",
+        "-u CMAKE_ARGS -u TRANSCRIBE_CMAKE_ARGS",
+        "TRANSCRIBE_CMAKE_ARGS=-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF",
+        "TRANSCRIBE_USE_SYSTEM_BLAS:BOOL=OFF",
+        "check_native_cpu_profile",
+        "reject_blas_runtime \"$worker\"",
+        "reject_blas_runtime \"$desktop\"",
+        "timeout --signal=TERM --kill-after=5s",
+        "--bin scribe-inference-worker --features inference-worker",
+        "--bin local-transcriber",
+        "cargo build --locked --offline --release",
+        "SCRIBE_BUNDLED_WORKER_SHA256=$worker_digest",
+        "SCRIBE_LINUX_NATIVE_CPU_WORKER_EXE=$worker",
+        "--ignored --exact --list",
+        "[[ \"$test_count\" == 1 ]]",
+        "--ignored --exact --nocapture --test-threads=1",
+        "build-linux-release-package.sh",
+        "verify-linux-release-package.sh",
+        "report-linux-worker-pack-sizes.sh",
+    ] {
+        assert!(
+            native.contains(required),
+            "missing native pair invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "DOCS_RS=1",
+        "--features ui-harness",
+        "dpkg --install",
+        "sudo",
+        "--features cuda",
+        "--features vulkan",
+    ] {
+        assert!(
+            !native.contains(forbidden),
+            "unexpected native test behavior: {forbidden}"
+        );
+    }
+    let test_name = "linux_native_cpu_worker_authenticated_ready_health_shutdown_and_reap";
+    assert!(native.contains(test_name));
+    let signature = format!("fn {test_name}()");
+    let test = supervisor
+        .split(signature.as_str())
+        .nth(1)
+        .unwrap()
+        .split("fn hidden_inference_worker_manual_protocol_smoke")
+        .next()
+        .unwrap();
+    for required in [
+        "compiled_sha256",
+        "wrong_launcher.launch()",
+        "validate_worker_capability",
+        "WorkerProvider::Cpu",
+        "Control::Health",
+        "Control::Shutdown",
+        "process\n            .wait()",
+        "fixture.cleanup()",
+    ] {
+        assert!(
+            test.contains(required),
+            "missing native lifecycle assertion: {required}"
+        );
+    }
+}
+
 #[test]
 fn manifest_preserves_fhs_paths_and_excludes_desktop_from_authority() {
     let manifest = normalized(include_str!(

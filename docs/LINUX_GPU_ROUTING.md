@@ -76,5 +76,7 @@ fake fact sources and runs source guards on Ubuntu 22.04 and 24.04. A separate
 locked, source-only type-check crate compiles both real Linux feature branches,
 including the pinned `ash` Vulkan API, without linking or downloading Sherpa or
 other native payloads. Real CUDA/Vulkan worker and package smoke evidence
-remains PR 7D scope because the reviewed Linux Sherpa archive and signed pack
-payloads are not present yet.
+remains separate qualification work. The reviewed Linux Sherpa pin is present,
+and the native CPU contract now prepares it for actual release linking,
+authenticated startup and CPU-only package verification. That CPU evidence
+does not supply signed Linux GPU packs or GPU hardware/performance results.
