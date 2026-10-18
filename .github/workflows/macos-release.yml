@@ -84,6 +84,11 @@ jobs:
             DOCS_RS=1 SCRIBE_BUILDING_WORKER=1 MACOSX_DEPLOYMENT_TARGET=13.0 \
             CARGO_TARGET_DIR="$RUNNER_TEMP/scribe-metal-source-check" \
             cargo check --locked --bin scribe-inference-worker --features metal-acceleration
+      - name: Run native Metal metadata helper contract
+        timeout-minutes: 45
+        env:
+          SCRIBE_BUILD_REVISION: stage6-macos-ci
+        run: bash scripts/test-macos-metal-metadata-helper.sh
       - name: Build ad hoc signed universal structural package
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc
