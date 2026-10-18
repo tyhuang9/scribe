@@ -17,7 +17,7 @@ from typing import Any
 
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 TOOL_PATH = SCRIPT_ROOT / "linux-cpu-native-baseline.py"
-EXPECTED_TEST_COUNT = 22
+EXPECTED_TEST_COUNT = 24
 
 spec = importlib.util.spec_from_file_location("linux_cpu_native_baseline", TOOL_PATH)
 assert spec is not None and spec.loader is not None
@@ -33,8 +33,16 @@ class BaselineFixture:
         self.build_root = self.root / "build"
         self.source_root.mkdir()
         self.build_root.mkdir()
-        self.c_compiler = "/usr/bin/cc"
-        self.cxx_compiler = "/usr/bin/c++"
+        # Evidence validation never executes compilers. Distinct, inert fixture
+        # files exercise retained inode identity without requiring a toolchain.
+        compilers = self.root / "compilers"
+        compilers.mkdir()
+        for name in ("cc", "c++"):
+            compiler = compilers / name
+            compiler.write_bytes(b"inert compiler-identity fixture\n")
+            compiler.chmod(0o755)
+        self.c_compiler = str(compilers / "cc")
+        self.cxx_compiler = str(compilers / "c++")
         self.cache: dict[str, tuple[str, str]] = {
             name: (baseline.EXPECTED_CACHE_KINDS[name], value)
             for name, value in baseline.EXPECTED_CACHE_VALUES.items()
@@ -58,8 +66,9 @@ class BaselineFixture:
             source = self.source_root / pathlib.PurePosixPath(relative_source)
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text("/* portable fixture */\n", encoding="utf-8")
+            directory = self.build_root / "nested" / target
             output = (
-                self.build_root
+                directory
                 / "CMakeFiles"
                 / f"{target}.dir"
                 / f"fixture-{sequence}.o"
@@ -77,17 +86,17 @@ class BaselineFixture:
                 "-c",
                 str(source),
                 "-o",
-                str(output),
+                output.relative_to(directory).as_posix(),
             ]
             record: dict[str, Any] = {
-                "directory": str(self.build_root),
+                "directory": str(directory),
                 "file": str(source),
+                "output": output.relative_to(self.build_root).as_posix(),
             }
             if sequence == 0:
                 record["command"] = shlex.join(arguments)
             else:
                 record["arguments"] = arguments
-                record["output"] = str(output)
             self.records.append(record)
             self.records_by_key[(target, relative_source)] = record
         self.write()
@@ -134,6 +143,34 @@ class LinuxCpuNativeBaselineTests(unittest.TestCase):
         fixture = self.fixture()
 
         fixture.verify()
+        for record in fixture.records:
+            record.pop("output")
+        fixture.verify()
+
+    def test_cmake_nested_outputs_accept_relative_and_absolute_evidence(self) -> None:
+        fixture = self.fixture()
+        fixture.verify()
+        for record in fixture.records:
+            record["output"] = str(fixture.build_root / record["output"])
+            if "arguments" in record:
+                index = record["arguments"].index("-o") + 1
+                record["arguments"][index] = record["output"]
+        fixture.verify()
+
+    def test_cmake_nested_outputs_reject_wrong_bases_and_escapes(self) -> None:
+        for corruption in ("directory-relative-json", "root-relative-command", "escape-json"):
+            with self.subTest(corruption=corruption):
+                fixture = BaselineFixture()
+                self.addCleanup(fixture.close)
+                record = next(item for item in fixture.records if "arguments" in item)
+                index = record["arguments"].index("-o") + 1
+                if corruption == "directory-relative-json":
+                    record["output"] = record["arguments"][index]
+                elif corruption == "root-relative-command":
+                    record["arguments"][index] = record["output"]
+                else:
+                    record["output"] = "../outside.o"
+                self.assert_rejected(fixture, "output disagrees with -o|output resolves outside")
 
     def test_environment_rejects_present_empty_override_aliases(self) -> None:
         baseline.validate_environment({"PATH": "/usr/bin", "HOME": "/tmp/home"})
@@ -228,7 +265,7 @@ class LinuxCpuNativeBaselineTests(unittest.TestCase):
         record["arguments"][output_index] = record["arguments"][output_index].replace(
             "ggml-base.dir", "ggml-cpu.dir"
         )
-        record["output"] = record["arguments"][output_index]
+        record["output"] = record["output"].replace("ggml-base.dir", "ggml-cpu.dir")
 
         self.assert_rejected(fixture, "missing required native target/source coverage")
 
@@ -378,7 +415,7 @@ class LinuxCpuNativeBaselineTests(unittest.TestCase):
 
         shared = self.fixture()
         records = [item for item in shared.records if "arguments" in item]
-        first_output = records[0]["arguments"][records[0]["arguments"].index("-o") + 1]
+        first_output = str(shared.build_root / records[0]["output"])
         second_output_index = records[1]["arguments"].index("-o") + 1
         records[1]["arguments"][second_output_index] = first_output
         records[1]["output"] = first_output

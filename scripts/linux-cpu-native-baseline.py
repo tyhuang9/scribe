@@ -522,7 +522,10 @@ def _validate_compile_database(
             output_field = record["output"]
             if type(output_field) is not str:
                 fail(f"compile database entry {index} output must be a string")
-            if _resolve_output(output_field, directory, build_root) != output:
+            # CMake exports JSON output relative to the top-level build tree
+            # (relativeObj/GetHomeRelativeOutputPath), unlike command -o,
+            # which is relative to the record's nested working directory.
+            if _resolve_output(output_field, build_root, build_root) != output:
                 fail(f"compile database entry {index} output disagrees with -o")
         target = _target_from_output(output, build_root)
         relative_source = source.relative_to(source_root).as_posix()
