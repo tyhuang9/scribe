@@ -72,20 +72,20 @@ mod launch_binding {
         fn hello_memory_available_bytes(&self) -> u64;
     }
 
-    /// Stage 4's Unix resolver must produce both authorities from no-follow,
-    /// descriptor-relative opens. A path plus a lease is deliberately not a
-    /// substitute: the executable handle must reach `execveat`/`fexecve` and
-    /// the dependency-root handle must remain live through Hello validation.
+    /// Unix resolvers retain no-follow executable and dependency-root handles.
+    /// Linux executes the descriptor; Darwin additionally requires a root-owned
+    /// installer capability because `/dev/fd` is not executable there.
     #[cfg(unix)]
     #[derive(Debug)]
     pub(crate) struct UnixPackExecAuthority {
         verified_pack_lease: Arc<VerifiedPackLease>,
-        // Linux executes this readable authority directly. macOS retains it
-        // only for position-independent hashing and launches through the
-        // separately admitted O_EXEC handle below.
+        // Linux executes this readable authority directly. macOS uses the
+        // descriptor pair as image evidence, never as a spawn pathname.
         executable_fd: File,
         #[cfg(target_os = "macos")]
         launch_executable_fd: File,
+        #[cfg(target_os = "macos")]
+        protected_path: crate::macos_worker_authority::ProtectedPackAuthority,
         dependency_root_fd: File,
     }
 
@@ -114,6 +114,8 @@ mod launch_binding {
             let launch_executable_fd = verified_pack_lease.open_copy_executable(entry)?;
             #[cfg(target_os = "macos")]
             verify_macos_executable_pair(&executable_fd, &launch_executable_fd, entry)?;
+            #[cfg(target_os = "macos")]
+            let protected_path = macos_protected_authority(&verified_pack_lease)?;
             #[cfg(not(target_os = "macos"))]
             use std::io::Seek;
             #[cfg(not(target_os = "macos"))]
@@ -135,6 +137,8 @@ mod launch_binding {
                 executable_fd,
                 #[cfg(target_os = "macos")]
                 launch_executable_fd,
+                #[cfg(target_os = "macos")]
+                protected_path,
                 dependency_root_fd,
             }))
         }
@@ -154,6 +158,11 @@ mod launch_binding {
             &self.executable_fd
         }
 
+        #[cfg(target_os = "macos")]
+        pub(crate) fn protected_executable_path(&self) -> &std::ffi::CStr {
+            self.protected_path.worker_path()
+        }
+
         pub(crate) fn dependency_root_fd(&self) -> &File {
             &self.dependency_root_fd
         }
@@ -165,6 +174,10 @@ mod launch_binding {
         pub(crate) fn recheck(&self) -> Result<(), super::manifest::PackVerificationError> {
             let lease = self.verified_pack_lease();
             lease.recheck()?;
+            #[cfg(target_os = "macos")]
+            self.protected_path.recheck().map_err(|error| {
+                super::manifest::PackVerificationError::Io(std::io::Error::other(error))
+            })?;
             let worker_path = &lease.verified_pack().worker_relative_path;
             let entry = lease
                 .copy_entries()
@@ -207,14 +220,45 @@ mod launch_binding {
                     .open_copy_executable(entry)
                     .expect("fixture worker opens with O_EXEC authority")
             };
+            #[cfg(target_os = "macos")]
+            let protected_path = macos_protected_authority(&verified_pack_lease)
+                .expect("fixture retains explicit protected-path test authority");
             Self {
                 verified_pack_lease,
                 executable_fd,
                 #[cfg(target_os = "macos")]
                 launch_executable_fd,
+                #[cfg(target_os = "macos")]
+                protected_path,
                 dependency_root_fd,
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_protected_authority(
+        lease: &VerifiedPackLease,
+    ) -> Result<
+        crate::macos_worker_authority::ProtectedPackAuthority,
+        super::manifest::PackVerificationError,
+    > {
+        use crate::macos_worker_authority::ProtectedPackAuthority;
+
+        // This is private, in-process fixture trust, not manifest data or an
+        // environment setting. No relaxed constructor exists in production.
+        #[cfg(test)]
+        if lease.test_reverification_trust().is_some() {
+            return ProtectedPackAuthority::open_fixture(lease).map_err(|error| {
+                super::manifest::PackVerificationError::Io(std::io::Error::other(error))
+            });
+        }
+        let authority = ProtectedPackAuthority::open(lease).map_err(|error| {
+            super::manifest::PackVerificationError::Io(std::io::Error::other(error))
+        })?;
+        if authority.pack_root() != lease.verified_pack().root {
+            return Err(super::manifest::PackVerificationError::DescriptorChanged);
+        }
+        Ok(authority)
     }
 
     #[cfg(target_os = "macos")]
@@ -684,6 +728,142 @@ pub(crate) fn prepare_pack_execution_with_permission(
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     let _ = allow_execution_copy;
     discovery
+}
+
+/// Read-only projection of a release-authorized bundled Mac pack to its exact
+/// installer-owned counterpart. This never creates, repairs, or copies files.
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_macos_protected_pack(
+    source: Arc<manifest::VerifiedPackLease>,
+) -> anyhow::Result<Arc<manifest::VerifiedPackLease>> {
+    use crate::macos_worker_authority::ProtectedPackAuthority;
+    use anyhow::{Context, bail};
+
+    // Native process fixtures are explicitly trusted by the test verifier in
+    // memory. The production binary cannot select a user-owned fixture root.
+    #[cfg(test)]
+    if source.test_reverification_trust().is_some() {
+        return Ok(source);
+    }
+    if !single_executable_signed_payload(&source) {
+        bail!("protected Mac packs require the single-executable payload contract");
+    }
+    let authority = ProtectedPackAuthority::open(&source)
+        .context("installer-managed Mac worker is missing or unsafe")?;
+    // A launch binding may already retain this exact protected projection.
+    // Never create cache-to-cache provenance or reinterpret a different root.
+    if source.has_execution_source() {
+        if source.verified_pack().root != authority.pack_root() {
+            bail!("protected Mac execution projection changed its root");
+        }
+        authority.recheck()?;
+        return Ok(source);
+    }
+    let verifier = manifest::PackVerifier::new(
+        &manifest::ProductionTrustRoot,
+        manifest::Compatibility::current(&[manifest::PackBackend::Metal]),
+    );
+    project_macos_protected_pack(source, &authority, &verifier)
+}
+
+#[cfg(target_os = "macos")]
+fn project_macos_protected_pack(
+    source: Arc<manifest::VerifiedPackLease>,
+    authority: &crate::macos_worker_authority::ProtectedPackAuthority,
+    verifier: &manifest::PackVerifier<'_>,
+) -> anyhow::Result<Arc<manifest::VerifiedPackLease>> {
+    use anyhow::Context;
+
+    let mut protected = verifier
+        .verify_pinned(authority.pinned_root()?)
+        .context("installed Mac worker signature or complete inventory was rejected")?;
+    // This compares every descriptor field, file digest/size, and compatibility
+    // approval, changing only the exact verified root. Source remains pinned.
+    protected
+        .retain_execution_source(source)
+        .context("installed Mac worker does not exactly match its bundled source")?;
+    authority.recheck()?;
+    Ok(Arc::new(protected))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod protected_macos_projection_tests {
+    use super::*;
+    use crate::macos_worker_authority::ProtectedPackAuthority;
+    use manifest::test_support::{
+        base_manifest, lease_existing_fixture, leased_fixture, temp_root, write_signed,
+    };
+
+    #[derive(Default)]
+    struct FixtureRoots(Vec<PathBuf>);
+
+    impl FixtureRoots {
+        fn root(&mut self, label: &str) -> PathBuf {
+            let path = temp_root(label);
+            self.0.push(path.clone());
+            path
+        }
+    }
+
+    impl Drop for FixtureRoots {
+        fn drop(&mut self) {
+            for root in &self.0 {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn macos_protected_projection_reverifies_both_trees_and_retains_exact_source() {
+        let mut roots = FixtureRoots::default();
+        let (verifier, source) = leased_fixture(&roots.root("mac-projection-source"));
+        let (_, installed) = leased_fixture(&roots.root("mac-projection-installed"));
+        let authority = ProtectedPackAuthority::open_fixture(&installed).unwrap();
+        let source = Arc::new(source);
+        let projected =
+            project_macos_protected_pack(source.clone(), &authority, &verifier).unwrap();
+        assert_eq!(
+            projected.verified_pack().root,
+            installed.verified_pack().root
+        );
+        assert_eq!(projected.copy_entries(), source.copy_entries());
+        assert!(projected.has_execution_source());
+        verifier.launchable_worker(&projected).unwrap();
+        // A valid installed copy must not erase the bundled provenance check.
+        std::fs::write(source.worker_path(), b"forged worker").unwrap();
+        assert!(verifier.launchable_worker(&projected).is_err());
+    }
+
+    #[test]
+    fn macos_protected_projection_rejects_tampering_and_unexpected_inventory() {
+        for extra_file in [false, true] {
+            let mut roots = FixtureRoots::default();
+            let (verifier, source) = leased_fixture(&roots.root("mac-projection-reject-source"));
+            let (_, installed) = leased_fixture(&roots.root("mac-projection-reject-installed"));
+            let authority = ProtectedPackAuthority::open_fixture(&installed).unwrap();
+            if extra_file {
+                std::fs::write(installed.verified_pack().root.join("unexpected"), b"extra")
+                    .unwrap();
+            } else {
+                std::fs::write(installed.worker_path(), b"forged worker").unwrap();
+            }
+            assert!(project_macos_protected_pack(Arc::new(source), &authority, &verifier).is_err());
+        }
+    }
+
+    #[test]
+    fn macos_protected_projection_rejects_a_different_validly_signed_pack() {
+        let mut roots = FixtureRoots::default();
+        let (verifier, source) = leased_fixture(&roots.root("mac-projection-identity-source"));
+        let signed_root = roots.root("mac-projection-different-signed");
+        let mut other = base_manifest();
+        other.pack_version = manifest::StoreComponent::new("different-version").unwrap();
+        write_signed(&signed_root, other);
+        let (owner_root, installed) = lease_existing_fixture(&signed_root).unwrap();
+        roots.0.push(owner_root);
+        let authority = ProtectedPackAuthority::open_fixture(&installed).unwrap();
+        assert!(project_macos_protected_pack(Arc::new(source), &authority, &verifier).is_err());
+    }
 }
 
 impl PackLeaseDiscovery {

@@ -4722,6 +4722,8 @@ fn resolve_verified_pack_executable(
     lease: Arc<VerifiedPackLease>,
     expected_device: Option<BackendTarget>,
 ) -> Result<VerifiedWorkerExecutable> {
+    #[cfg(target_os = "macos")]
+    let lease = crate::gpu_worker_pack::prepare_macos_protected_pack(lease)?;
     let frozen_worker_approval = lease.frozen_worker_approval().cloned();
     let pack = lease.verified_pack();
     let allowed = match pack.backend {

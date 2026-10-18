@@ -866,11 +866,13 @@ obtains those bindings from the concrete
 
 Windows and macOS are implemented Stage 4 targets. Their resolvers retain the
 verified directory/file lease through exact-image launch and the
-challenge-bound Hello check. macOS uses the opaque descriptor-bound
-`UnixPackExecAuthority` and `posix_spawn` `/dev/fd` bridge; catalog paths are
-not process-creation authority. Production macOS nevertheless remains
-fail-closed today because its trust root and Auto qualification manifests are
-empty/default-deny. Linux remains fail-closed until an equivalent descriptor
+challenge-bound Hello check. macOS retains image descriptors but executes only
+an opaque installer-protected absolute-path capability. Native Intel and ARM
+tests rejected the earlier `/dev/fd` executable bridge. Catalog paths are
+not process-creation authority. The reviewed shared project public key already
+authenticates compatible packs; production Mac deployment still requires the
+protected installer lifecycle and hardware qualification, and Auto manifests
+remain default-deny. Linux remains fail-closed until an equivalent descriptor
 relative execution primitive is implemented and tested. `PathBuf`,
 `Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix pack-execution
 authority and cannot satisfy that provisioning guard. The architecture guard
@@ -904,28 +906,64 @@ exactly one regular executable, the declared worker path. The manifest and
 detached signature remain the only two control files outside that signed
 payload. Any dylib, framework, resource, helper, or second executable rejects
 the pack before launch authority or a GPU route is constructed. Multi-file
-macOS packs are deferred until descriptor-bound dependency loading or
-ownership-enforced filesystem immutability is separately designed and reviewed.
+macOS packs remain deferred; the protected-path contract below does not widen
+the signed single-executable inventory.
 
-The macOS launcher binds the worker's working directory with a descriptor-native
-`posix_spawn_file_actions_addfchdir_np` action on the retained verified directory.
-It does not resolve that directory through a `/dev/fd` pathname or fall back to
-the catalog path. The explicit descriptor-inheritance actions and the separate
-retained-executable `/dev/fd` bridge remain required.
+### Installer-protected Mac execution authority
+
+The bundled catalog and embedded release authority remain the discovery source.
+Before resolution, an eligible Metal pack must also exist, byte-for-byte, at:
+
+```text
+/Library/Application Support/Scribe/WorkerPacks/<pack-id>/<version>/<digest>/
+```
+
+Runtime preparation is read-only: it never installs, copies, creates, repairs,
+changes ownership, or requests elevation. It walks from `/` with no-follow,
+descriptor-relative opens, checks root ownership and non-writable ancestry,
+and inspects ACLs on every ancestor, signed file, and intermediate directory.
+Mutation-granting allow entries are rejected even behind deny entries or when
+inherited; unknown permissions, inspection errors, links, hardlinks, set-id
+files and unsupported filesystems are rejected. The initial filesystem contract
+is local, ownership-enforcing APFS. Darwin's native `ENOENT` result for an
+absent extended ACL is distinct from every other ACL query error; only that
+specific absence or a successfully inspected safe ACL is accepted. The tree is
+independently signature/inventory verified and must match every bundled descriptor and file
+digest, retaining exactly one hop of source provenance. No user cache, bundle
+path, environment-selected root or `/dev/fd` fallback is executable authority.
+
+The opaque authority retains the checked descriptors and reopens/rechecks their
+relative edges at launch. `posix_spawn` consumes only its exact absolute worker
+path; retained readable/O_EXEC descriptors remain measurement evidence, not a
+claim of atomic descriptor execution. The working directory still uses
+`posix_spawn_file_actions_addfchdir_np`, with the existing private pipes,
+sanitized environment, process group, cancellation, and bounded cleanup.
 
 The readable verification handle is separate from the `O_EXEC` launch handle.
 Both are opened without following links beneath the retained pack-root
 descriptor and must identify the same regular, single-link file with the signed
-size and executable permissions. The same execute handle supplies the spawn
-path and its private descriptor binding. The child validates both inherited
+size and executable permissions. Both handles are inherited as private image
+evidence. The child validates both inherited
 handles and measures its Hello fingerprint from the readable one. Missing or
 inconsistent handles reject launch; there is no digest echo or pathname reopen.
 
-Descriptor retention pins identity through renames and path replacement, not
-immutable contents against a hostile file owner. These descriptor/hash checks
-alone do not defend against a same-user write/execute/restore race; worker
-self-hashing is not independent code attestation. A process already able to
-rewrite pack contents is outside this worker-isolation boundary.
+Root, the privileged installer, and filesystem backing remain trusted. The
+future installer must create new complete version/digest directories and never
+overwrite, replace or reuse an admitted directory in place. Updates and garbage
+collection must coordinate with live launch/use or retain old immutable
+versions. Privileged tampering is outside this boundary; worker self-hashing is
+not independent code attestation. Installation/update requires administrator
+permission, while ordinary inference/helper requests do not.
+The installer must create fresh files privately under protected ancestry; it
+must not move, adopt or merely chown/chmod user-owned source inodes. Previously
+opened writable descriptors survive ownership/permission changes.
+
+This source unit implements admission and launch only. Installer payload,
+atomic activation, rollback/retention and clean-machine installation tests are
+still required; no privileged writer or installation is introduced here.
+The release CPU resolver remains fail-closed pending its separate protected
+CPU payload/admission unit. Missing protected Metal copies reject GPU admission
+without changing existing CPU preference/fallback policy, trust or Auto gates.
 
 Metal framework linkage is confined to the per-architecture Metal worker. The
 desktop and universal CPU worker use only an IOKit power-source shim plus the
@@ -1036,7 +1074,11 @@ Metal worker with the reviewed inputs, applies ad hoc code signing, and only
 then authors and verifies a fixture-signed pack under the runner's private
 temporary directory. One explicitly ignored, exact-name test launches that
 verified worker from a release-profile parent through the production
-descriptor/private-IPC path. The test parent embeds and checks the final signed
+absolute-path/private-IPC path. An explicit, private `cfg(test)` constructor
+admits a current-user-owned fixture anchor only when the lease retains
+in-process fixture-verifier trust; production has no such constructor, flag or
+environment override. This exercises process/session behavior, not production
+installer ownership or privileged lifecycle. The test parent checks the signed
 fixture worker's exact digest; it never bypasses the release build's anchor
 requirement. The contract requires
 an authenticated metadata snapshot, and confirms that the child was retired

@@ -1,7 +1,7 @@
-//! Descriptor-bound macOS worker launch.
+//! Installer-protected macOS worker launch.
 //!
-//! Production Metal packs are executed only through the retained verified
-//! executable descriptor. Catalog paths are never process-creation authority.
+//! Production Metal packs execute only through a retained root-protected path
+//! capability. Catalog paths and `/dev/fd` are never spawn authority.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -252,7 +252,7 @@ mod platform {
         let stdout_pipe = Pipe::new()?;
         let liveness_pipe = Pipe::new()?;
 
-        let executable_path = CString::new(format!("/dev/fd/{}", executable.raw()))?;
+        let executable_path = authority.protected_executable_path().to_owned();
         let worker_flag = CString::new(worker_flag)?;
         let argv_storage = [executable_path.clone(), worker_flag];
         let mut argv = argv_storage
@@ -316,7 +316,7 @@ mod platform {
         };
         if result != 0 {
             return Err(std::io::Error::from_raw_os_error(result))
-                .context("descriptor-bound macOS worker posix_spawn failed");
+                .context("installer-protected macOS worker posix_spawn failed");
         }
 
         drop(stdin_pipe.read);
@@ -363,7 +363,7 @@ mod platform {
     impl InheritableFd {
         fn duplicate(source: RawFd) -> Result<Self> {
             // F_DUPFD creates a private duplicate; only that duplicate has its
-            // close-on-exec bit cleared for the executable /dev/fd bridge or
+            // close-on-exec bit cleared for inherited image evidence or the
             // descriptor-bound working-directory spawn action.
             let raw = unsafe { libc::fcntl(source, libc::F_DUPFD, 3) };
             if raw < 0 || unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } < 0 {
@@ -655,32 +655,8 @@ mod platform {
             );
         }
 
-        fn spawn_descriptor_image(descriptor: RawFd) -> (c_int, libc::pid_t) {
-            let retained = InheritableFd::duplicate(descriptor).unwrap();
-            let executable = CString::new(format!("/dev/fd/{}", retained.raw())).unwrap();
-            let argument = CString::new("true").unwrap();
-            let mut argv = [argument.as_ptr().cast_mut(), std::ptr::null_mut()];
-            let mut environment: [*mut c_char; 1] = [std::ptr::null_mut()];
-            let mut actions = SpawnFileActions::new().unwrap();
-            actions.dup2(retained.raw(), retained.raw()).unwrap();
-            let mut attributes = SpawnAttributes::new().unwrap();
-            attributes.process_group().unwrap();
-            let mut pid = 0;
-            let result = unsafe {
-                libc::posix_spawn(
-                    &mut pid,
-                    executable.as_ptr(),
-                    actions.as_ptr(),
-                    attributes.as_ptr(),
-                    argv.as_mut_ptr(),
-                    environment.as_mut_ptr(),
-                )
-            };
-            (result, pid)
-        }
-
         #[test]
-        fn macos_exec_authority_o_exec_descriptor_spawns_and_read_only_control_is_reaped() {
+        fn macos_exec_authority_retains_image_evidence_without_descriptor_spawn() {
             use std::os::unix::fs::PermissionsExt;
 
             let path = CString::new("/usr/bin/true").unwrap();
@@ -715,32 +691,14 @@ mod platform {
             assert_eq!(readable_flags & libc::O_ACCMODE, libc::O_RDONLY);
             assert_eq!(executable_flags & libc::O_EXEC, libc::O_EXEC);
 
-            let (read_result, read_pid) = spawn_descriptor_image(readable.as_raw_fd());
-            if read_result == 0 {
-                let mut child = TestChild {
-                    pid: read_pid,
-                    reaped: false,
-                };
-                let status = child
-                    .wait_before(Instant::now() + Duration::from_secs(2))
-                    .unwrap();
-                assert!(libc::WIFEXITED(status));
-                assert_eq!(libc::WEXITSTATUS(status), 0);
-            } else {
-                assert_eq!(read_result, libc::EACCES);
-            }
-
-            let (exec_result, exec_pid) = spawn_descriptor_image(executable.as_raw_fd());
-            assert_eq!(exec_result, 0, "O_EXEC /dev/fd posix_spawn failed");
-            let mut child = TestChild {
-                pid: exec_pid,
-                reaped: false,
-            };
-            let status = child
-                .wait_before(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            assert!(libc::WIFEXITED(status));
-            assert_eq!(libc::WEXITSTATUS(status), 0);
+            // These are measurement evidence only. The separate native Metal
+            // helper contract exercises actual protected-path spawn and IPC;
+            // Darwin's /dev/fd vnode is not an executable image authority.
+            let readable_metadata = readable.metadata().unwrap();
+            let executable_metadata = executable.metadata().unwrap();
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(readable_metadata.dev(), executable_metadata.dev());
+            assert_eq!(readable_metadata.ino(), executable_metadata.ino());
         }
 
         #[test]
