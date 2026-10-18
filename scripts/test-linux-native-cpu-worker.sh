@@ -16,6 +16,9 @@ if [[ -r /proc/sys/vm/memfd_noexec && "$(< /proc/sys/vm/memfd_noexec)" != 0 ]]; 
 fi
 for command in cargo timeout sha256sum dpkg-deb python3 xz readelf; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Check before supplying our own fixed settings; even empty ambient overrides
+# must not turn a supposedly portable build into build-host-specific evidence.
+python3 "$repo_root/scripts/linux-cpu-native-baseline.py" check-environment
 runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"
 archive_root="$(cd "$SHERPA_ONNX_ARCHIVE_DIR" && pwd -P)"
 revision="${SCRIBE_BUILD_REVISION:-$(git -C "$repo_root" rev-parse --verify HEAD)}"
@@ -41,13 +44,18 @@ run_bounded() {
 
 native_target="$test_root/cargo-target"
 mkdir -p "$test_root/inputs" "$test_root/tmp"
+cpu_cmake_args='-DTRANSCRIBE_USE_SYSTEM_BLAS:BOOL=OFF -DTRANSCRIBE_X86_CONSERVATIVE:BOOL=ON -DGGML_NATIVE:BOOL=OFF'
+cpu_cmake_args+=' -DTRANSCRIBE_BUILD_SHARED:BOOL=OFF -DTRANSCRIBE_GGML_BACKEND_DL:BOOL=OFF -DGGML_BACKEND_DL:BOOL=OFF -DGGML_CPU_ALL_VARIANTS:BOOL=OFF'
+cpu_cmake_args+=' -DTRANSCRIBE_USE_OPENMP:BOOL=OFF -DGGML_OPENMP:BOOL=OFF -DGGML_CCACHE:BOOL=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON'
 native_env=(env
   -u DOCS_RS -u SCRIBE_BUILDING_WORKER -u SCRIBE_BUNDLED_WORKER_SHA256
   -u CARGO_BUILD_TARGET -u SHERPA_ONNX_LIB_DIR -u SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD
   -u CMAKE_ARGS -u TRANSCRIBE_CMAKE_ARGS
-  # The current CPU-only package owns no BLAS runtime. Do not let build-host
-  # discovery add one implicitly; this is the upstream-supported static profile.
-  TRANSCRIBE_CMAKE_ARGS=-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF
+  # This static, conservative profile owns no BLAS runtime. The upstream
+  # conservative switch must accompany native=OFF (native=OFF alone can still
+  # enable AVX tiers). Generated commands, not just requested flags, are checked.
+  "TRANSCRIBE_CMAKE_ARGS=$cpu_cmake_args"
+  CARGO_ENCODED_RUSTFLAGS=$'-C\x1ftarget-cpu=x86-64'
   "SHERPA_ONNX_ARCHIVE_DIR=$archive_root"
   "SCRIBE_BUILD_REVISION=$revision"
   "CARGO_TARGET_DIR=$native_target"
@@ -59,6 +67,7 @@ check_native_cpu_profile() {
   local manifests=("$native_target"/release/build/transcribe-cpp-sys-*/out/lib/transcribe-link.json
     "$native_target"/release/build/transcribe-cpp-sys-*/out/lib64/transcribe-link.json)
   [[ ${#caches[@]} == 1 && ${#manifests[@]} == 1 ]] || { echo 'expected exactly one actual native CPU build profile.' >&2; exit 1; }
+  python3 "$repo_root/scripts/linux-cpu-native-baseline.py" verify --build-root "${caches[0]%/CMakeCache.txt}"
   grep -Fxq 'TRANSCRIBE_USE_SYSTEM_BLAS:BOOL=OFF' "${caches[0]}" || { echo 'actual native CPU build did not disable unowned system BLAS.' >&2; exit 1; }
   python3 - "${manifests[0]}" <<'PY'
 import json

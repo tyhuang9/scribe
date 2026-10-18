@@ -18,6 +18,7 @@ on:
       - 'docs/LINUX_RELEASE_PACKAGING.md'
       - 'scripts/*linux*release*'
       - 'scripts/*linux*worker*'
+      - 'scripts/*linux*cpu*'
       - 'scripts/inspect-linux-deb.py'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/linux-gpu-typecheck/**'
@@ -43,6 +44,7 @@ on:
       - 'docs/LINUX_RELEASE_PACKAGING.md'
       - 'scripts/*linux*release*'
       - 'scripts/*linux*worker*'
+      - 'scripts/*linux*cpu*'
       - 'scripts/inspect-linux-deb.py'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/linux-gpu-typecheck/**'
@@ -85,6 +87,8 @@ jobs:
         run: ./scripts/test-linux-worker-launch.sh
       - name: Test reviewed Linux CPU input rejection without network access
         run: bash scripts/test-linux-release-inputs.sh
+      - name: Test Linux CPU baseline evidence rejection without network access
+        run: python3 -B scripts/test-linux-cpu-native-baseline.py
       - name: Prepare reviewed Linux CPU native input
         run: bash scripts/prepare-linux-release-inputs.sh --output-directory "$RUNNER_TEMP/scribe-reviewed-linux-native"
       - name: Fetch locked application dependencies for offline native builds

@@ -90,11 +90,11 @@ package without installing it. Owned temporary build/test outputs are removed
 on exit.
 
 The packaged CPU recipe explicitly sets the upstream-supported
-`TRANSCRIBE_USE_SYSTEM_BLAS=OFF` for the worker, desktop and test parent, after
-clearing both ambient CMake argument overrides. The current package owns no
-BLAS payload or dependency contract. Automatic host BLAS discovery previously
-enabled CBLAS calls whose absolute link dependency was not propagated by the
-native Rust wrapper, producing an actual release-worker link failure. This
+`TRANSCRIBE_USE_SYSTEM_BLAS=OFF` for the worker, desktop and test parent. The
+current package owns no BLAS payload or dependency contract. Automatic host
+BLAS discovery previously enabled CBLAS calls whose absolute link dependency
+was not propagated by the native Rust wrapper, producing an actual
+release-worker link failure. This
 profile avoids inheriting an unowned build-host runtime; it is not a dummy
 worker or a skipped link check. The harness checks the regenerated CMake cache
 and link manifest, then both deliverable ELFs for unexpected BLAS requirements.
@@ -102,6 +102,31 @@ The native ggml CPU backend/threadpool is unchanged. The optional host-decoder
 CBLAS fast path is disabled and may be slower; CPU transcription/performance
 remains unqualified. Adding optimized BLAS later requires an explicitly owned
 link/runtime inventory and separate qualification, not an ambient `-lblas` fix.
+
+The same fresh-target recipe fixes Rust code generation at `target-cpu=x86-64`
+and uses `TRANSCRIBE_X86_CONSERVATIVE=ON` together with `GGML_NATIVE=OFF` for
+the vendored C/C++ backend. Turning native tuning off alone is insufficient:
+upstream defaults can still enable AVX-family instructions. Dynamic backends,
+all CPU variants, shared native libraries, OpenMP and ccache remain off.
+Before supplying this policy, `linux-cpu-native-baseline.py check-environment`
+rejects ambient compiler, toolchain, flag and wrapper overrides, including
+present-empty values. After native compilation, its `verify --build-root`
+checks the actual bounded CMake cache and every generated compilation command,
+including required C/C++ target/source coverage, for higher ISA settings,
+wrappers and hidden overrides. It never executes compile-database records.
+
+Run the offline evidence validator tests independently with:
+
+```sh
+python3 -B scripts/test-linux-cpu-native-baseline.py
+```
+
+These checks constrain this recipe's Rust and transcribe/ggml compilation;
+they do not prove the ISA of precompiled Sherpa archives or system libraries,
+disassemble the final executable, or replace low-ISA hardware and real-model
+qualification. Conservative kernels may be slower. Ubuntu CI still links and
+starts the actual worker/desktop pair, rather than accepting fixture-only
+compile evidence as native integration success.
 
 Use the bounded script rather than invoking the ignored Rust test directly:
 its outer deadline also bounds blocking protocol reads. Reaping confirms that
