@@ -67,6 +67,9 @@ mod macos_gpu;
 #[path = "../macos_power.rs"]
 mod macos_power;
 #[cfg(any(target_os = "macos", test))]
+#[path = "../macos_worker_authority.rs"]
+mod macos_worker_authority;
+#[cfg(any(target_os = "macos", test))]
 #[path = "../macos_worker_launch.rs"]
 mod macos_worker_launch;
 #[allow(

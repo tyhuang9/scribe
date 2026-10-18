@@ -97,6 +97,12 @@ mod macos_power;
 #[cfg(any(target_os = "macos", test))]
 #[allow(
     dead_code,
+    reason = "host tests exercise the protected Mac admission policy"
+)]
+mod macos_worker_authority;
+#[cfg(any(target_os = "macos", test))]
+#[allow(
+    dead_code,
     reason = "host-side tests compile the macOS launcher without invoking posix_spawn"
 )]
 mod macos_worker_launch;
