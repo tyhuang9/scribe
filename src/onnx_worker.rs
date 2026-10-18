@@ -1688,7 +1688,7 @@ fn discover_worker_metal_topology() -> Result<MetalTopologyV1> {
 fn discover_worker_metal_metadata_topology() -> Result<MetalMetadataTopologyV1> {
     #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
     {
-        let devices = crate::macos_gpu::discover_devices()
+        let devices = crate::macos_gpu::discover_metadata_devices()
             .context("could not enumerate MTLDevice metadata")?;
         return MetalMetadataTopologyV1::canonicalize(
             devices
@@ -8493,6 +8493,30 @@ impl ProcessWorkerSupervisor {
             .ok_or_else(|| anyhow!("Metal metadata generation produced no authenticated witness"))
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    fn metal_metadata_session_fully_reaped_for_test(&self) -> Result<bool> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let state_is_empty = self.inner.purpose == WorkerSessionPurpose::MetalMetadata
+            && state.current.is_none()
+            && state.retiring_generations.is_empty()
+            && state.pending_launches.is_empty()
+            && state.active_request.is_none()
+            && state.active_stream.is_none()
+            && state.active_model.is_none();
+        drop(state);
+        let writer_is_empty = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("process worker writer lock was poisoned"))?
+            .is_none();
+        Ok(state_is_empty && writer_is_empty)
+    }
+
     #[cfg(test)]
     fn observe_writer_contention_for_test(&self, observer: std::sync::mpsc::SyncSender<()>) {
         *self.inner.writer_contention_observer.lock().unwrap() = Some(observer);
@@ -10032,6 +10056,12 @@ impl InferenceWorkerSupervisor {
         }
         self.transport
             .metal_metadata_witness_for_generation(generation)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn metal_metadata_session_fully_reaped_for_test(&self) -> Result<bool> {
+        self.transport
+            .metal_metadata_session_fully_reaped_for_test()
     }
 
     fn reconcile_verified_pack_diagnostics(
@@ -19736,6 +19766,21 @@ mod tests {
         reaped: Option<TestSender<()>>,
         #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
         cleanup_probe: Option<Arc<DiagnosticProbeState>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct RetainingNativeWorkerLauncher {
+        actual: Arc<dyn WorkerLauncher>,
+        launched_process: Arc<Mutex<Option<Arc<dyn WorkerProcess>>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl WorkerLauncher for RetainingNativeWorkerLauncher {
+        fn launch(&self) -> Result<SpawnedWorker> {
+            let spawned = self.actual.launch()?;
+            *self.launched_process.lock().unwrap() = Some(Arc::clone(&spawned.process));
+            Ok(spawned)
+        }
     }
 
     struct GatedMetalRefreshProcess {
@@ -37300,6 +37345,89 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an explicitly built, ad-hoc codesigned, fixture-signed native Metal worker pack"]
+    fn macos_native_metal_metadata_helper_launches_authenticated_worker_and_reaps() {
+        const FIXTURE_ENV: &str = "SCRIBE_MACOS_NATIVE_METAL_METADATA_FIXTURE_PACK";
+        let fixture_path = std::env::var_os(FIXTURE_ENV)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .expect("exact native Metal metadata fixture pack path is required");
+        let (owner_root, lease, identity) =
+            crate::gpu_worker_pack::manifest::test_support::lease_existing_metal_fixture(
+                &fixture_path,
+            )
+            .expect("fixture-signed native Metal pack must verify and lease");
+        let pack = lease.verified_pack().clone();
+        let worker_entry = lease
+            .copy_entries()
+            .iter()
+            .find(|entry| entry.path == pack.worker_relative_path)
+            .expect("verified native Metal pack must retain its worker inventory entry");
+        assert_eq!(pack.backend, PackBackend::Metal);
+        assert_eq!(pack.target_os, "macos");
+        assert_eq!(pack.target_arch, std::env::consts::ARCH);
+        assert_eq!(identity.target_arch, std::env::consts::ARCH);
+        assert_eq!(identity.app_build, DESKTOP_BUILD_ID);
+        assert_eq!(identity.worker_build, INFERENCE_WORKER_BUILD_ID);
+        assert_eq!(identity.app_protocol_version, u16::from(PROTOCOL_VERSION));
+        assert_eq!(
+            identity.worker_protocol_version,
+            u16::from(PROTOCOL_VERSION)
+        );
+        assert_eq!(identity.runtime_abi_version, WORKER_ABI_VERSION);
+        assert_eq!(identity.pack_digest, pack.pack_digest);
+        assert_eq!(identity.worker_sha256, worker_entry.sha256);
+
+        let mut supervisor = InferenceWorkerSupervisor::for_metal_metadata(Arc::new(lease));
+        let launched_process = Arc::new(Mutex::new(None));
+        let inner = Arc::get_mut(&mut supervisor.transport.inner)
+            .expect("unstarted native metadata supervisor must own its launcher");
+        let actual = Arc::clone(&inner.launcher);
+        inner.launcher = Arc::new(RetainingNativeWorkerLauncher {
+            actual,
+            launched_process: Arc::clone(&launched_process),
+        });
+        let cleanup = ProviderProbeCleanupFence::default();
+        let witness = collect_metal_metadata_witness_before(
+            &supervisor,
+            &cleanup,
+            MonotonicDeadline::after_for(
+                GPU_PROVIDER_DISCOVERY_BUDGET,
+                "native Metal metadata helper",
+            )
+            .unwrap(),
+            None,
+        )
+        .expect("native Metal metadata helper cleanup must be confirmed")
+        .expect("native Metal metadata helper must return authenticated metadata");
+
+        assert_eq!(witness.pack.pack_id, pack.pack_id.as_str());
+        assert_eq!(witness.pack.pack_version, pack.pack_version.as_str());
+        assert_eq!(witness.pack.pack_digest, pack.pack_digest);
+        assert_eq!(witness.pack.runtime_abi, WORKER_ABI_VERSION);
+        assert_eq!(witness.pack.backend, WorkerProvider::Metal);
+        assert_eq!(witness.pack.provider, pack.provider);
+        assert!(ProviderProbeCleanupFence::cleanup_confirmed(&supervisor).unwrap());
+        assert!(
+            supervisor
+                .metal_metadata_session_fully_reaped_for_test()
+                .unwrap()
+        );
+        assert!(!supervisor.has_live_generation());
+        let process = launched_process
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("native metadata helper must launch one real child process");
+        assert!(!process.is_running().unwrap());
+
+        drop(cleanup);
+        drop(supervisor);
+        std::fs::remove_dir_all(owner_root).unwrap();
     }
 
     #[test]

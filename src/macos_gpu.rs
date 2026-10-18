@@ -6,8 +6,20 @@
 
 use crate::backend_policy::{DeviceClass, GpuVendor};
 use anyhow::{Result, bail};
+#[cfg(any(target_os = "macos", test))]
+use std::ffi::c_char;
 
 const MAX_METAL_DEVICES: usize = 16;
+#[cfg(any(target_os = "macos", test))]
+const METAL_METADATA_OK: u32 = 0;
+#[cfg(any(target_os = "macos", test))]
+const METAL_METADATA_UNAVAILABLE: u32 = 1;
+#[cfg(any(target_os = "macos", test))]
+const METAL_METADATA_OVERFLOW: u32 = 2;
+#[cfg(any(target_os = "macos", test))]
+const METAL_METADATA_INVALID_ARGUMENT: u32 = 3;
+#[cfg(any(target_os = "macos", test))]
+const METAL_METADATA_INSUFFICIENT_CAPACITY: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MetalDevice {
@@ -39,6 +51,53 @@ pub(crate) fn stable_registry_identity(registry_id: u64) -> String {
 
 pub(crate) fn discover_devices() -> Result<Vec<MetalDevice>> {
     platform::discover_devices()
+}
+
+/// Returns the complete native Metal snapshot used only by the short-lived
+/// metadata worker. Unlike provider discovery, an observed empty snapshot is
+/// valid and no default-device fallback is synthesized.
+#[cfg(target_os = "macos")]
+pub(crate) fn discover_metadata_devices() -> Result<Vec<MetalDevice>> {
+    platform::discover_metadata_devices()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_metadata_status(status: u32, count: usize) -> Result<usize> {
+    match status {
+        METAL_METADATA_OK => {}
+        METAL_METADATA_UNAVAILABLE => bail!("Metal metadata enumeration is unavailable"),
+        METAL_METADATA_OVERFLOW => bail!("Metal metadata enumeration exceeded the device bound"),
+        METAL_METADATA_INVALID_ARGUMENT => {
+            bail!("Metal metadata enumeration rejected its output arguments")
+        }
+        METAL_METADATA_INSUFFICIENT_CAPACITY => {
+            bail!("Metal metadata enumeration exceeded its prepared capacity")
+        }
+        _ => bail!("Metal metadata enumeration returned an unknown status"),
+    }
+    if count > MAX_METAL_DEVICES {
+        bail!("Metal metadata enumeration returned an oversized count");
+    }
+    Ok(count)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_native_device_name(name: &[c_char; 256]) -> Result<String> {
+    let name_end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| anyhow::anyhow!("Metal device name is not NUL-terminated"))?;
+    let name_bytes = name[..name_end]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    let name = std::str::from_utf8(&name_bytes)
+        .map_err(|_| anyhow::anyhow!("Metal device name is not UTF-8"))?
+        .trim();
+    if name.is_empty() || name.len() > 255 || !name.is_ascii() {
+        bail!("Metal device has no bounded ASCII display name");
+    }
+    Ok(name.to_owned())
 }
 
 pub(crate) fn remap_provider_devices(
@@ -132,10 +191,6 @@ fn device_class(low_power: bool, _removable: bool, unified: bool) -> DeviceClass
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::ffi::{CStr, c_char};
-
-    use anyhow::anyhow;
-
     use super::*;
 
     #[repr(C)]
@@ -171,6 +226,11 @@ mod platform {
             devices: *mut NativeMetalDevice,
             capacity: usize,
         ) -> usize;
+        fn scribe_macos_copy_metal_metadata_devices(
+            devices: *mut NativeMetalDevice,
+            capacity: usize,
+            count: *mut usize,
+        ) -> u32;
     }
 
     pub(super) fn discover_devices() -> Result<Vec<MetalDevice>> {
@@ -185,25 +245,37 @@ mod platform {
         if observed != count {
             bail!("Metal device enumeration changed during discovery");
         }
+        parse_native_devices(native)
+    }
+
+    pub(super) fn discover_metadata_devices() -> Result<Vec<MetalDevice>> {
+        let mut native = vec![NativeMetalDevice::default(); MAX_METAL_DEVICES];
+        let mut count = 0;
+        // SAFETY: native owns the metadata contract's complete bounded output
+        // capacity and count points to one writable usize. One call captures
+        // one snapshot, avoiding a query/copy topology race.
+        let status = unsafe {
+            scribe_macos_copy_metal_metadata_devices(native.as_mut_ptr(), native.len(), &mut count)
+        };
+        let count = validate_metadata_status(status, count)?;
+        native.truncate(count);
+        parse_native_devices(native)
+    }
+
+    fn parse_native_devices(native: Vec<NativeMetalDevice>) -> Result<Vec<MetalDevice>> {
         native
             .into_iter()
             .map(|device| {
                 if device.registry_id == 0 {
                     bail!("Metal device has no registry identity");
                 }
-                // SAFETY: the shim always zero-fills and NUL-terminates name.
-                let name = unsafe { CStr::from_ptr(device.name.as_ptr()) }
-                    .to_str()
-                    .map_err(|_| anyhow!("Metal device name is not UTF-8"))?
-                    .trim();
-                if name.is_empty() || name.len() > 255 || !name.is_ascii() {
-                    bail!("Metal device has no bounded ASCII display name");
-                }
+                let name = parse_native_device_name(&device.name)?;
+                let vendor = vendor_from_name(&name);
                 Ok(MetalDevice {
                     registry_id: device.registry_id,
                     stable_identity: stable_registry_identity(device.registry_id),
-                    display_name: name.to_owned(),
-                    vendor: vendor_from_name(name),
+                    display_name: name,
+                    vendor,
                     device_class: device_class(
                         device.is_low_power != 0,
                         device.is_removable != 0,
@@ -307,5 +379,51 @@ mod tests {
         assert_eq!(device_class(false, false, true), DeviceClass::UnifiedGpu);
         assert_eq!(device_class(true, false, false), DeviceClass::IntegratedGpu);
         assert_eq!(device_class(false, true, false), DeviceClass::DiscreteGpu);
+    }
+
+    #[test]
+    fn macos_native_metadata_status_distinguishes_empty_from_every_failure() {
+        assert_eq!(validate_metadata_status(METAL_METADATA_OK, 0).unwrap(), 0);
+        assert_eq!(
+            validate_metadata_status(METAL_METADATA_OK, MAX_METAL_DEVICES).unwrap(),
+            MAX_METAL_DEVICES
+        );
+        assert!(validate_metadata_status(METAL_METADATA_OK, MAX_METAL_DEVICES + 1).is_err());
+        for status in [
+            METAL_METADATA_UNAVAILABLE,
+            METAL_METADATA_OVERFLOW,
+            METAL_METADATA_INVALID_ARGUMENT,
+            METAL_METADATA_INSUFFICIENT_CAPACITY,
+            u32::MAX,
+        ] {
+            assert!(validate_metadata_status(status, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_remap_still_rejects_empty_inference_device_sets() {
+        let provider = [ProviderMetalDevice {
+            process_index: 0,
+            display_name: "Metal".to_owned(),
+        }];
+        assert!(remap_provider_devices(&provider, &[]).is_err());
+        assert!(remap_provider_devices(&[], &[device(1, "Apple M4", true)]).is_err());
+    }
+
+    #[test]
+    fn macos_native_device_name_parser_requires_an_in_bounds_ascii_nul() {
+        let mut valid = [0 as c_char; 256];
+        for (slot, byte) in valid.iter_mut().zip(b"  Apple M4  \0") {
+            *slot = *byte as c_char;
+        }
+        assert_eq!(parse_native_device_name(&valid).unwrap(), "Apple M4");
+
+        let unterminated = [b'A' as c_char; 256];
+        assert!(parse_native_device_name(&unterminated).is_err());
+
+        let mut invalid_utf8 = [0 as c_char; 256];
+        invalid_utf8[0] = 0xff_u8 as c_char;
+        assert!(parse_native_device_name(&invalid_utf8).is_err());
+        assert!(parse_native_device_name(&[0 as c_char; 256]).is_err());
     }
 }
