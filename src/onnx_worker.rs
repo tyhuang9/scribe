@@ -17783,6 +17783,14 @@ enum WorkerLoopIdentityPolicy {
 }
 
 impl WorkerLoopIdentityPolicy {
+    #[cfg(test)]
+    fn expectation(self, role: WorkerRole) -> WorkerExpectation {
+        match self {
+            Self::Compiled => expected_worker(role),
+            Self::FixtureCpu => expected_worker_for_provider(role, WorkerProvider::Cpu),
+        }
+    }
+
     fn validate_hello(
         self,
         role: Option<WorkerRole>,
@@ -20385,6 +20393,7 @@ mod tests {
 
     struct TestLauncher {
         modes: Mutex<VecDeque<TestMode>>,
+        identity_policy: WorkerLoopIdentityPolicy,
         launch_attempts: AtomicUsize,
         launches: AtomicUsize,
         frozen_worker_approval: Option<FrozenWorkerApproval>,
@@ -20401,6 +20410,7 @@ mod tests {
         fn new(modes: impl IntoIterator<Item = TestMode>) -> Self {
             Self {
                 modes: Mutex::new(modes.into_iter().collect()),
+                identity_policy: WorkerLoopIdentityPolicy::Compiled,
                 launch_attempts: AtomicUsize::new(0),
                 launches: AtomicUsize::new(0),
                 frozen_worker_approval: None,
@@ -20412,6 +20422,11 @@ mod tests {
                 #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
                 cleanup_probe: None,
             }
+        }
+
+        fn with_fixture_cpu_identity(mut self) -> Self {
+            self.identity_policy = WorkerLoopIdentityPolicy::FixtureCpu;
+            self
         }
 
         fn with_process_events(
@@ -20465,6 +20480,14 @@ mod tests {
 
     impl WorkerLauncher for TestLauncher {
         fn launch(&self) -> Result<SpawnedWorker> {
+            if matches!(self.identity_policy, WorkerLoopIdentityPolicy::FixtureCpu)
+                && (self.frozen_worker_approval.is_some()
+                    || self.pack_launch.is_some()
+                    || self.exact_worker_sha256.is_some()
+                    || self.session_app_build.is_some())
+            {
+                bail!("CPU fixture identity cannot carry GPU pack or compatibility authority");
+            }
             self.launch_attempts.fetch_add(1, Ordering::AcqRel);
             let mode = self
                 .modes
@@ -20506,17 +20529,24 @@ mod tests {
             });
             let worker_process = Arc::clone(&process);
             let worker_output_for_exit = worker_output.clone();
+            let identity_policy = self.identity_policy;
             let worker = std::thread::spawn(move || {
                 let input = ChannelReader::new(worker_input);
                 let output = ChannelWriter {
                     sender: worker_output,
                 };
-                run_test_worker(input, output, mode, &worker_process.running);
+                run_test_worker(
+                    input,
+                    output,
+                    mode,
+                    &worker_process.running,
+                    identity_policy,
+                );
                 worker_process.running.store(false, Ordering::Release);
                 let _ = worker_output_for_exit.send(PipeChunk::Eof);
             });
             *process.worker.lock().unwrap() = Some(worker);
-            let mut expectation = expected_worker(WorkerRole::Inference);
+            let mut expectation = self.identity_policy.expectation(WorkerRole::Inference);
             if let Some(pack_launch) = &self.pack_launch {
                 expectation.provider = pack_launch.expectation.backend;
                 expectation.pack = Some(pack_launch.expectation.clone());
@@ -20575,8 +20605,12 @@ mod tests {
         }
     }
 
-    fn handshake(input: &mut impl Read, output: &mut impl Write) -> bool {
-        handshake_with_compatible_worker_hash(input, output, None, false)
+    fn handshake(
+        input: &mut impl Read,
+        output: &mut impl Write,
+        identity_policy: WorkerLoopIdentityPolicy,
+    ) -> bool {
+        handshake_with_compatible_worker_hash(input, output, None, false, identity_policy)
     }
 
     fn handshake_with_compatible_worker_hash(
@@ -20584,6 +20618,7 @@ mod tests {
         output: &mut impl Write,
         compatible_worker_sha256: Option<&str>,
         wrong_session_app: bool,
+        identity_policy: WorkerLoopIdentityPolicy,
     ) -> bool {
         let Ok(frame) = read_frame(input) else {
             return false;
@@ -20594,14 +20629,20 @@ mod tests {
                 challenge,
                 expected,
             } => {
-                let role = validate_worker_hello(None, &challenge, &expected).unwrap();
-                worker_capability(role, challenge).unwrap()
+                let role = identity_policy
+                    .validate_hello(None, &challenge, &expected)
+                    .unwrap();
+                identity_policy.capability(role, challenge).unwrap()
             }
             Control::CompatibilityHello {
                 challenge,
                 expected,
                 compatibility,
             } => {
+                assert!(
+                    matches!(identity_policy, WorkerLoopIdentityPolicy::Compiled),
+                    "CPU fixture identity cannot accept CompatibilityHello"
+                );
                 let mut local = expected_worker(WorkerRole::Inference);
                 local.pack = worker_pack_expectation_from_private_env().unwrap();
                 let session = validate_compatible_worker_hello_against_local(
@@ -20749,6 +20790,7 @@ mod tests {
         mut output: impl Write,
         mode: TestMode,
         running: &AtomicBool,
+        identity_policy: WorkerLoopIdentityPolicy,
     ) {
         let mode = match mode {
             TestMode::MetalMetadata { topology } => {
@@ -20797,6 +20839,7 @@ mod tests {
                     &mut output,
                     Some(&worker_sha256),
                     wrong_session_app,
+                    identity_policy,
                 ) {
                     run_normal_worker(&mut input, &mut output);
                 }
@@ -20920,7 +20963,9 @@ mod tests {
                 else {
                     panic!("expected worker Hello");
                 };
-                let mut capability = worker_capability(expected.role, challenge).unwrap();
+                let mut capability = identity_policy
+                    .capability(expected.role, challenge)
+                    .unwrap();
                 match mismatch {
                     CapabilityMismatch::Challenge => capability.challenge = "cd".repeat(32),
                     CapabilityMismatch::AppBuild => capability.app_build.push_str("-wrong"),
@@ -20970,7 +21015,7 @@ mod tests {
             }
             mode => mode,
         };
-        if !handshake(&mut input, &mut output) {
+        if !handshake(&mut input, &mut output, identity_policy) {
             return;
         }
         match mode {
@@ -23116,6 +23161,102 @@ mod tests {
             InferenceWorkerRegistry::for_current_build().routes[0].provider,
             WorkerProvider::Cpu
         );
+    }
+
+    #[test]
+    fn test_launcher_cpu_identity_is_symmetric_and_compiled_identity_stays_default() {
+        let cpu_fixture = gguf_artifact_fixture("test-launcher-fixture-cpu-identity");
+        let cpu_supervisor = inference_supervisor_with_launcher(Arc::new(
+            TestLauncher::new([TestMode::RuntimeLoad]).with_fixture_cpu_identity(),
+        ));
+        let cpu_registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu_supervisor.clone());
+        cpu_registry
+            .load(cpu_fixture.artifact.clone(), AccelerationPreference::Cpu)
+            .unwrap();
+        assert_eq!(
+            cpu_supervisor
+                .transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .expectation
+                .provider,
+            WorkerProvider::Cpu
+        );
+        cpu_supervisor
+            .idle_cpu_model_context(&cpu_fixture.artifact)
+            .expect("fixture CPU identity must authenticate an exact idle CPU owner");
+
+        let compiled_fixture = gguf_artifact_fixture("test-launcher-compiled-identity");
+        let compiled_supervisor =
+            inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
+                TestMode::RuntimeLoad,
+            ])));
+        let compiled_registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(compiled_supervisor.clone());
+        compiled_registry
+            .load(
+                compiled_fixture.artifact.clone(),
+                AccelerationPreference::Cpu,
+            )
+            .unwrap();
+        let compiled_provider = compiled_worker_provider(WorkerRole::Inference);
+        assert_eq!(
+            compiled_supervisor
+                .transport
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .expectation
+                .provider,
+            compiled_provider
+        );
+        let idle = compiled_supervisor.idle_cpu_model_context(&compiled_fixture.artifact);
+        if compiled_provider == WorkerProvider::Cpu {
+            idle.expect("compiled CPU worker remains an exact idle CPU owner");
+        } else {
+            let error = idle
+                .err()
+                .expect("an authenticated compiled GPU cannot own the CPU model");
+            assert!(
+                error
+                    .to_string()
+                    .contains("not the exact idle CPU model owner"),
+                "an authenticated compiled GPU must not become an idle CPU owner"
+            );
+        }
+    }
+
+    #[test]
+    fn test_launcher_cpu_identity_rejects_pack_authority_before_spawn() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root(
+            "test-launcher-cpu-pack-rejection",
+        );
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let context = PackLaunchContext::fixture(Arc::new(lease), None);
+        let launcher = TestLauncher::new([])
+            .with_fixture_cpu_identity()
+            .with_exact_pack_launch(context, "e".repeat(64));
+        let error = launcher
+            .launch()
+            .err()
+            .expect("CPU fixture identity with pack authority must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot carry GPU pack or compatibility authority")
+        );
+        assert_eq!(launcher.launch_attempts.load(Ordering::Acquire), 0);
+        drop(launcher);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
@@ -37623,9 +37764,9 @@ mod tests {
     #[test]
     fn macos_metal_metadata_deadlines_never_publish_late_authority() {
         let fixture = gguf_artifact_fixture("metal-metadata-deadline-cpu");
-        let cpu_supervisor = inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
-            TestMode::RuntimeLoad,
-        ])));
+        let cpu_supervisor = inference_supervisor_with_launcher(Arc::new(
+            TestLauncher::new([TestMode::RuntimeLoad]).with_fixture_cpu_identity(),
+        ));
         let registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu_supervisor.clone());
         registry
             .load(fixture.artifact.clone(), AccelerationPreference::Cpu)
@@ -37748,7 +37889,8 @@ mod tests {
         let RuntimeArtifact::Gguf(model) = &fixture.artifact else {
             unreachable!()
         };
-        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let cpu_launcher =
+            Arc::new(TestLauncher::new([TestMode::RuntimeLoad]).with_fixture_cpu_identity());
         let cpu_supervisor = inference_supervisor_with_launcher(Arc::clone(&cpu_launcher));
         let registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu_supervisor.clone());
         registry
@@ -37940,9 +38082,12 @@ mod tests {
             unreachable!()
         };
         let cpu_commands = Arc::new(Mutex::new(Vec::new()));
-        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadCounted {
-            commands: Arc::clone(&cpu_commands),
-        }]));
+        let cpu_launcher = Arc::new(
+            TestLauncher::new([TestMode::RuntimeLoadCounted {
+                commands: Arc::clone(&cpu_commands),
+            }])
+            .with_fixture_cpu_identity(),
+        );
         let cpu_supervisor = inference_supervisor_with_launcher(Arc::clone(&cpu_launcher));
         let registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu_supervisor.clone());
         registry
@@ -38097,9 +38242,9 @@ mod tests {
         let RuntimeArtifact::Gguf(model) = &fixture.artifact else {
             unreachable!()
         };
-        let cpu_supervisor = inference_supervisor_with_launcher(Arc::new(TestLauncher::new([
-            TestMode::RuntimeLoad,
-        ])));
+        let cpu_supervisor = inference_supervisor_with_launcher(Arc::new(
+            TestLauncher::new([TestMode::RuntimeLoad]).with_fixture_cpu_identity(),
+        ));
         let registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu_supervisor.clone());
         registry
             .load(fixture.artifact.clone(), AccelerationPreference::Cpu)
