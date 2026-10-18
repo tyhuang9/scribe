@@ -37392,18 +37392,36 @@ mod tests {
             launched_process: Arc::clone(&launched_process),
         });
         let cleanup = ProviderProbeCleanupFence::default();
-        let witness = collect_metal_metadata_witness_before(
-            &supervisor,
-            &cleanup,
-            MonotonicDeadline::after_for(
-                GPU_PROVIDER_DISCOVERY_BUDGET,
-                "native Metal metadata helper",
-            )
-            .unwrap(),
-            None,
+        let deadline = MonotonicDeadline::after_for(
+            GPU_PROVIDER_DISCOVERY_BUDGET,
+            "native Metal metadata helper",
         )
-        .expect("native Metal metadata helper cleanup must be confirmed")
-        .expect("native Metal metadata helper must return authenticated metadata");
+        .unwrap();
+        // The production Option adapter deliberately hides probe errors. This
+        // native contract retains the same transport and cleanup fence, but
+        // preserves the inner error so a real launch/handshake failure is
+        // diagnosable rather than only reporting an absent witness.
+        let observed = cleanup.run_probe(&supervisor, deadline, || {
+            supervisor.metal_metadata_witness_before(deadline, None)
+        });
+        let cleanup_confirmed = ProviderProbeCleanupFence::cleanup_confirmed(&supervisor);
+        let session_reaped = supervisor.metal_metadata_session_fully_reaped_for_test();
+        let process = launched_process.lock().unwrap().clone();
+        let process_running = process
+            .as_ref()
+            .map(|process| process.is_running())
+            .transpose();
+        let witness = match observed {
+            Ok(Ok(witness)) => witness,
+            Ok(Err(error)) => panic!(
+                "native Metal metadata probe failed; cleanup={cleanup_confirmed:?}, \
+                 session_reaped={session_reaped:?}, child_running={process_running:?}: {error:#}"
+            ),
+            Err(error) => panic!(
+                "native Metal metadata cleanup failed; cleanup={cleanup_confirmed:?}, \
+                 session_reaped={session_reaped:?}, child_running={process_running:?}: {error}"
+            ),
+        };
 
         assert_eq!(witness.pack.pack_id, pack.pack_id.as_str());
         assert_eq!(witness.pack.pack_version, pack.pack_version.as_str());
@@ -37411,19 +37429,10 @@ mod tests {
         assert_eq!(witness.pack.runtime_abi, WORKER_ABI_VERSION);
         assert_eq!(witness.pack.backend, WorkerProvider::Metal);
         assert_eq!(witness.pack.provider, pack.provider);
-        assert!(ProviderProbeCleanupFence::cleanup_confirmed(&supervisor).unwrap());
-        assert!(
-            supervisor
-                .metal_metadata_session_fully_reaped_for_test()
-                .unwrap()
-        );
+        assert!(cleanup_confirmed.unwrap());
+        assert!(session_reaped.unwrap());
         assert!(!supervisor.has_live_generation());
-        let process = launched_process
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("native metadata helper must launch one real child process");
-        assert!(!process.is_running().unwrap());
+        assert_eq!(process_running.unwrap(), Some(false));
 
         drop(cleanup);
         drop(supervisor);
