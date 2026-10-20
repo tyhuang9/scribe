@@ -315,6 +315,7 @@ mod platform {
     #[derive(Clone, Debug)]
     enum RootPolicy {
         Production,
+        CpuProduction,
         #[cfg(test)]
         Fixture {
             root: PathBuf,
@@ -344,6 +345,7 @@ mod platform {
                         &pack.pack_digest,
                     )
                 }
+                Self::CpuProduction => bail!("CPU authority cannot admit a GPU worker pack"),
                 #[cfg(test)]
                 Self::Fixture { root, .. } => Ok(root.clone()),
             }
@@ -351,11 +353,178 @@ mod platform {
 
         fn expected_uid(&self) -> libc::uid_t {
             match self {
-                Self::Production => 0,
+                Self::Production | Self::CpuProduction => 0,
                 #[cfg(test)]
                 Self::Fixture { expected_uid, .. } => *expected_uid,
             }
         }
+    }
+
+    /// Exact compiled CPU image in an installer-owned immutable directory.
+    /// This is not a GPU pack and has no catalog, activation or signing key.
+    #[derive(Debug)]
+    pub(crate) struct ProtectedCpuAuthority {
+        policy: RootPolicy,
+        root: PathBuf,
+        digest: String,
+        worker_path: CString,
+        ancestry: Vec<HeldNode>,
+        readable: HeldNode,
+        executable: File,
+    }
+
+    impl ProtectedCpuAuthority {
+        pub(crate) fn open() -> Result<Self> {
+            Self::open_with_policy(
+                crate::macos_worker_layout::embedded_cpu_root()?,
+                crate::macos_worker_layout::embedded_cpu_digest()?.to_owned(),
+                RootPolicy::CpuProduction,
+            )
+        }
+
+        #[cfg(test)]
+        pub(crate) fn open_fixture(root: &Path, digest: &str) -> Result<Self> {
+            Self::open_with_policy(
+                root.to_path_buf(),
+                digest.to_owned(),
+                RootPolicy::Fixture {
+                    root: root.to_path_buf(),
+                    expected_uid: unsafe { libc::geteuid() },
+                },
+            )
+        }
+
+        fn open_with_policy(root: PathBuf, digest: String, policy: RootPolicy) -> Result<Self> {
+            use crate::macos_worker_layout::{
+                CPU_WORKER_NAME, validate_cpu_digest, validate_cpu_size,
+            };
+
+            validate_cpu_digest(&digest)?;
+            let ancestry = open_ancestry(&policy, &root)?;
+            let root_fd = ancestry
+                .last()
+                .ok_or_else(|| anyhow!("CPU ancestry is empty"))?
+                .file
+                .as_raw_fd();
+            let names = crate::gpu_worker_pack::manifest::macos_directory_names(
+                &ancestry.last().expect("CPU root").file,
+                1,
+            )?;
+            if names != [CPU_WORKER_NAME] {
+                bail!("protected CPU directory must contain only its exact worker image");
+            }
+            let file = openat_node(
+                root_fd,
+                std::ffi::OsStr::new(CPU_WORKER_NAME),
+                PlannedKind::Regular,
+            )?;
+            let identity = validate_native_node(
+                &file,
+                PlannedKind::Regular,
+                policy.expected_uid(),
+                None,
+                true,
+            )?;
+            let length = file.metadata()?.len();
+            validate_cpu_size(length)?;
+            if cpu_image_digest(&file, length)? != digest {
+                bail!("protected CPU image does not match the compiled final-image digest");
+            }
+            let descriptor = unsafe {
+                libc::openat(
+                    root_fd,
+                    c"scribe-inference-worker".as_ptr(),
+                    libc::O_EXEC | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("could not retain protected CPU executable evidence");
+            }
+            let executable = unsafe { File::from_raw_fd(descriptor) };
+            use std::os::unix::fs::MetadataExt;
+            let executable_metadata = executable.metadata()?;
+            if !executable_metadata.is_file()
+                || executable_metadata.dev() != identity.device
+                || executable_metadata.ino() != identity.inode
+                || executable_metadata.len() != length
+                || validate_native_node(
+                    &file,
+                    PlannedKind::Regular,
+                    policy.expected_uid(),
+                    Some(length),
+                    true,
+                )? != identity
+            {
+                bail!("protected CPU image changed while its evidence was opened");
+            }
+            let worker_path = CString::new(root.join(CPU_WORKER_NAME).as_os_str().as_bytes())?;
+            Ok(Self {
+                policy,
+                root,
+                digest,
+                worker_path,
+                ancestry,
+                readable: HeldNode { file, identity },
+                executable,
+            })
+        }
+
+        pub(crate) fn recheck(&self) -> Result<()> {
+            let fresh = Self::open_with_policy(
+                self.root.clone(),
+                self.digest.clone(),
+                self.policy.clone(),
+            )?;
+            if self
+                .ancestry
+                .iter()
+                .map(|node| node.identity)
+                .ne(fresh.ancestry.iter().map(|node| node.identity))
+                || self.readable.identity != fresh.readable.identity
+            {
+                bail!("protected CPU object graph changed before launch");
+            }
+            Ok(())
+        }
+
+        pub(crate) fn root(&self) -> &Path {
+            &self.root
+        }
+        pub(crate) fn protected_executable_path(&self) -> &CStr {
+            &self.worker_path
+        }
+        pub(crate) fn executable_fd(&self) -> &File {
+            &self.executable
+        }
+        pub(crate) fn readable_executable_fd(&self) -> &File {
+            &self.readable.file
+        }
+        pub(crate) fn dependency_root_fd(&self) -> &File {
+            &self.ancestry.last().expect("CPU root").file
+        }
+    }
+
+    fn cpu_image_digest(file: &File, length: u64) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::FileExt;
+
+        let mut hasher = Sha256::new();
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        while offset < length {
+            let maximum = (length - offset).min(buffer.len() as u64) as usize;
+            let count = file.read_at(&mut buffer[..maximum], offset)?;
+            if count == 0 {
+                bail!("protected CPU image ended before its retained length");
+            }
+            hasher.update(&buffer[..count]);
+            offset += count as u64;
+        }
+        if file.read_at(&mut buffer[..1], length)? != 0 {
+            bail!("protected CPU image grew beyond its retained length");
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     /// Opaque retained authority for one protected installed pack.
@@ -513,7 +682,7 @@ mod platform {
     fn open_ancestry(policy: &RootPolicy, pack_root: &Path) -> Result<Vec<HeldNode>> {
         let mut nodes = Vec::new();
         match policy {
-            RootPolicy::Production => {
+            RootPolicy::Production | RootPolicy::CpuProduction => {
                 let mut current = open_absolute_directory(Path::new("/"))?;
                 let identity =
                     validate_native_node(&current, PlannedKind::Directory, 0, None, false)?;
@@ -521,9 +690,13 @@ mod platform {
                     file: current,
                     identity,
                 });
-                let expected = Path::new(PACKS_ROOT)
+                let base = match policy {
+                    RootPolicy::CpuProduction => crate::macos_worker_layout::CPU_ROOT,
+                    _ => PACKS_ROOT,
+                };
+                let expected = Path::new(base)
                     .components()
-                    .chain(pack_root.strip_prefix(PACKS_ROOT)?.components());
+                    .chain(pack_root.strip_prefix(base)?.components());
                 for component in expected {
                     let std::path::Component::Normal(name) = component else {
                         continue;
@@ -734,7 +907,164 @@ mod platform {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use platform::ProtectedPackAuthority;
+pub(crate) use platform::{ProtectedCpuAuthority, ProtectedPackAuthority};
+
+#[cfg(all(test, target_os = "macos"))]
+mod cpu_tests {
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::macos_worker_layout::CPU_WORKER_NAME;
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct CpuFixture {
+        root: PathBuf,
+        digest: String,
+    }
+
+    impl CpuFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "scribe-protected-cpu-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let bytes = b"known CPU image";
+            fs::write(root.join(CPU_WORKER_NAME), bytes).unwrap();
+            fs::set_permissions(
+                root.join(CPU_WORKER_NAME),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            Self {
+                root,
+                digest: format!("{:x}", Sha256::digest(bytes)),
+            }
+        }
+        fn open(&self) -> Result<ProtectedCpuAuthority> {
+            ProtectedCpuAuthority::open_fixture(&self.root, &self.digest)
+        }
+    }
+
+    impl Drop for CpuFixture {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.root) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "remove private CPU fixture: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macos_protected_cpu_authority_retains_the_exact_readable_and_executable_image() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = CpuFixture::new();
+        let authority = fixture.open().unwrap();
+        authority.recheck().unwrap();
+        let readable = authority.readable_executable_fd().metadata().unwrap();
+        let executable = authority.executable_fd().metadata().unwrap();
+        assert_eq!(
+            (readable.dev(), readable.ino()),
+            (executable.dev(), executable.ino())
+        );
+        assert_eq!(authority.root(), fixture.root);
+        assert_eq!(
+            authority.protected_executable_path().to_bytes(),
+            fixture
+                .root
+                .join(CPU_WORKER_NAME)
+                .as_os_str()
+                .as_encoded_bytes()
+        );
+    }
+
+    #[test]
+    fn macos_protected_cpu_authority_rejects_missing_wrong_digest_and_unexpected_inventory() {
+        let fixture = CpuFixture::new();
+        assert!(ProtectedCpuAuthority::open_fixture(&fixture.root, "").is_err());
+        assert!(ProtectedCpuAuthority::open_fixture(&fixture.root, &"ff".repeat(32)).is_err());
+        let authority = fixture.open().unwrap();
+        fs::write(fixture.root.join("extra.dylib"), b"unexpected").unwrap();
+        assert!(authority.recheck().is_err());
+        assert!(fixture.open().is_err());
+        fs::remove_file(fixture.root.join("extra.dylib")).unwrap();
+        fs::remove_file(fixture.root.join(CPU_WORKER_NAME)).unwrap();
+        assert!(fixture.open().is_err());
+    }
+
+    #[test]
+    fn macos_protected_cpu_authority_rejects_same_length_tampering_and_same_bytes_replacement() {
+        let fixture = CpuFixture::new();
+        let image = fixture.root.join(CPU_WORKER_NAME);
+        let authority = fixture.open().unwrap();
+        fs::write(&image, b"wrong CPU image").unwrap();
+        assert!(authority.recheck().is_err());
+        fs::write(&image, b"known CPU image").unwrap();
+        authority.recheck().unwrap();
+        let replacement = fixture.root.join("replacement");
+        fs::write(&replacement, b"known CPU image").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&replacement, &image).unwrap();
+        assert!(authority.recheck().is_err());
+        fixture.open().unwrap(); // Same authorized bytes may have a fresh authority.
+    }
+
+    #[test]
+    fn macos_protected_cpu_authority_rejects_links_and_mutable_or_nonexecutable_nodes() {
+        let fixture = CpuFixture::new();
+        let image = fixture.root.join(CPU_WORKER_NAME);
+        for mode in [0o722, 0o600, 0o4700] {
+            fs::set_permissions(&image, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(fixture.open().is_err());
+        }
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(fixture.open().is_err());
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = CpuFixture::new();
+        fs::remove_file(alias.root.join(CPU_WORKER_NAME)).unwrap();
+        fs::hard_link(&image, alias.root.join(CPU_WORKER_NAME)).unwrap();
+        assert!(fixture.open().is_err());
+        fs::remove_file(alias.root.join(CPU_WORKER_NAME)).unwrap();
+        fs::remove_file(&image).unwrap();
+        symlink("/usr/bin/true", &image).unwrap();
+        assert!(fixture.open().is_err());
+    }
+
+    #[test]
+    fn macos_protected_cpu_authority_rejects_replaced_directory_without_adopting_it() {
+        let fixture = CpuFixture::new();
+        let authority = fixture.open().unwrap();
+        let old = fixture.root.with_extension("retained");
+        fs::rename(&fixture.root, &old).unwrap();
+        let retained = CpuFixture {
+            root: old,
+            digest: fixture.digest.clone(),
+        };
+        fs::create_dir(&fixture.root).unwrap();
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::copy(
+            retained.root.join(CPU_WORKER_NAME),
+            fixture.root.join(CPU_WORKER_NAME),
+        )
+        .unwrap();
+        fs::set_permissions(
+            fixture.root.join(CPU_WORKER_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(authority.recheck().is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -250,11 +250,21 @@ fn production_pack_provisioning_allowed(
         && worker.contains("trait WorkerExecutableResolver")
         && worker.contains("Hello");
     let unix_launch_bodies = named_function_bodies(worker, "launch_verified_worker").join("\n");
+    // Follow only the exact closed Pack delegate, not an arbitrary helper or
+    // the CPU entry. Moving shared spawn mechanics must not hide Unix proof.
+    let macos_launch_bodies = if unix_launch_bodies
+        .contains("launch_worker(LaunchAuthority::Pack(authority), worker_flag, bindings)")
+    {
+        named_function_bodies(worker, "launch_worker").join("\n")
+    } else {
+        unix_launch_bodies.clone()
+    };
+    let all_launch_bodies = format!("{unix_launch_bodies}\n{macos_launch_bodies}");
     let unix_authority_constructor =
         named_function_bodies(worker, "from_verified_pack_lease").join("\n");
-    let macos_protected_launch_flow = unix_launch_bodies.contains("posix_spawn")
-        && unix_launch_bodies.contains("authority.protected_executable_path()")
-        && !unix_launch_bodies.contains("/dev/fd/")
+    let macos_protected_launch_flow = macos_launch_bodies.contains("posix_spawn")
+        && macos_launch_bodies.contains("authority.protected_executable_path()")
+        && !all_launch_bodies.contains("/dev/fd/")
         && unix_authority_constructor.contains("macos_protected_authority(")
         && worker.contains("ProtectedPackAuthority::open(");
     let unix_verified_launch_flow = !unix_target
@@ -267,13 +277,54 @@ fn production_pack_provisioning_allowed(
             && (unix_launch_bodies.contains("execveat")
                 || unix_launch_bodies.contains("fexecve")
                 || macos_protected_launch_flow)
-            && !unix_launch_bodies.contains("Command::spawn")
-            && !unix_launch_bodies.contains("Command::new"));
+            && !all_launch_bodies.contains("Command::spawn")
+            && !all_launch_bodies.contains("Command::new"));
     (registry_is_empty && trust_root_is_empty)
         || (!trust_root_is_empty
             && (registry_is_empty || registry_routes_concrete_bridge)
             && concrete_resolver_hello_flow
             && unix_verified_launch_flow)
+}
+
+#[test]
+fn macos_protected_cpu_guard_traces_only_the_closed_pack_spawn_delegate_on_unix() {
+    let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    let registry = "ProductionPackRegistry::empty()";
+    let flow = format!("{worker}\n{pack}\n{launcher}");
+    assert!(production_pack_provisioning_allowed(
+        registry, &flow, false, true
+    ));
+
+    let wrong_delegate = flow.replace(
+        "launch_worker(LaunchAuthority::Pack(authority), worker_flag, bindings)",
+        "launch_worker(LaunchAuthority::Cpu(authority), worker_flag, bindings)",
+    );
+    assert_ne!(wrong_delegate, flow);
+    assert!(!production_pack_provisioning_allowed(
+        registry,
+        &wrong_delegate,
+        false,
+        true
+    ));
+    for injected in [
+        "Command::new(\"unverified\");",
+        "Command::spawn();",
+        "let _path = \"/dev/fd/7\";",
+    ] {
+        let unsafe_delegate = flow.replace(
+            "let stderr = stderr_descriptor(libc::STDERR_FILENO)?;",
+            &format!("{injected}\nlet stderr = stderr_descriptor(libc::STDERR_FILENO)?;"),
+        );
+        assert_ne!(unsafe_delegate, flow);
+        assert!(!production_pack_provisioning_allowed(
+            registry,
+            &unsafe_delegate,
+            false,
+            true
+        ));
+    }
 }
 
 #[test]
@@ -653,11 +704,67 @@ fn stage_six_macos_verified_launch_is_installer_protected_and_command_free() {
 #[test]
 fn macos_worker_control_pipe_uses_child_only_explicit_inheritance() {
     let launcher = production_source(include_str!("macos_worker_launch.rs"));
-    let body = named_function_bodies(&launcher, "launch_verified_worker").join("\n");
+    let entry = named_function_bodies(&launcher, "launch_verified_worker").join("\n");
+    assert!(
+        entry.contains("launch_worker(LaunchAuthority::Pack(authority), worker_flag, bindings)")
+    );
+    let body = named_function_bodies(&launcher, "launch_worker").join("\n");
     assert!(body.contains("actions.inherit(liveness_pipe.read.raw())?"));
     assert!(!body.contains("actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())"));
     assert!(launcher.contains("posix_spawn_file_actions_addinherit_np(&mut self.0, descriptor)"));
     assert!(launcher.contains("POSIX_SPAWN_CLOEXEC_DEFAULT"));
+}
+
+#[test]
+fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let authority = production_source(include_str!("macos_worker_authority.rs"));
+    let layout = production_source(include_str!("macos_worker_layout.rs"));
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    let contract = include_str!("../scripts/test-macos-protected-cpu-worker.sh");
+    let resolver = named_function_bodies(&worker, "resolve_protected_macos_cpu_worker").join("\n");
+    assert!(resolver.contains("embedded_cpu_digest()?"));
+    assert!(resolver.contains("authority.recheck()?"));
+    assert!(!resolver.contains("open_fixture"));
+    assert!(!resolver.contains("current_exe"));
+    assert!(worker.contains("ProtectedCpuAuthority::open()"));
+    assert!(
+        worker.contains(
+            "executable.macos_cpu_authority.is_none() && executable.pack_launch.is_none()"
+        )
+    );
+    assert!(layout.contains("option_env!(\"SCRIBE_BUNDLED_WORKER_SHA256\")"));
+    assert!(layout.contains("/Library/Application Support/Scribe/CPU"));
+    assert!(!layout.contains("std::env::var"));
+    for required in [
+        "CpuProduction",
+        "validate_cpu_size(length)?",
+        "cpu_image_digest(&file, length)? != digest",
+        "macos_directory_names",
+        "PlannedKind::Regular",
+    ] {
+        assert!(
+            authority.contains(required),
+            "CPU authority lost {required}"
+        );
+    }
+    assert!(launcher.contains("enum LaunchAuthority"));
+    let cpu_launch = named_function_bodies(&launcher, "launch_verified_cpu_worker").join("\n");
+    assert!(cpu_launch.contains("LaunchAuthority::Cpu(authority)"));
+    assert!(cpu_launch.contains("INFERENCE_WORKER_FLAG"));
+    assert!(cpu_launch.contains("&[]"));
+    assert!(contract.contains("verify-macos-release-package.sh"));
+    assert!(contract.contains("--ignored --exact"));
+    assert!(contract.contains("[[ \"$count\" == 1 ]]"));
+    for forbidden in [
+        "sudo ",
+        "installer -",
+        "codesign --force",
+        "cargo build",
+        "--features metal-acceleration",
+    ] {
+        assert!(!contract.contains(forbidden));
+    }
 }
 
 #[test]

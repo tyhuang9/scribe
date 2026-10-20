@@ -74,6 +74,7 @@ mod platform {
 
     use super::*;
     use crate::gpu_worker_pack::UnixPackExecAuthority;
+    use crate::macos_worker_authority::ProtectedCpuAuthority;
 
     const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
     const PARENT_CONTROL_CANCEL: u8 = b'C';
@@ -337,8 +338,65 @@ mod platform {
         }
     }
 
+    // Closed dispatch: callers cannot implement an arbitrary path authority.
+    enum LaunchAuthority<'a> {
+        Pack(&'a UnixPackExecAuthority),
+        Cpu(&'a ProtectedCpuAuthority),
+    }
+
+    impl LaunchAuthority<'_> {
+        fn recheck(&self) -> Result<()> {
+            match self {
+                Self::Pack(pack) => Ok(pack.recheck()?),
+                Self::Cpu(cpu) => cpu.recheck(),
+            }
+        }
+        fn executable_fd(&self) -> &std::fs::File {
+            match self {
+                Self::Pack(pack) => pack.executable_fd(),
+                Self::Cpu(cpu) => cpu.executable_fd(),
+            }
+        }
+        fn readable_executable_fd(&self) -> &std::fs::File {
+            match self {
+                Self::Pack(pack) => pack.readable_executable_fd(),
+                Self::Cpu(cpu) => cpu.readable_executable_fd(),
+            }
+        }
+        fn dependency_root_fd(&self) -> &std::fs::File {
+            match self {
+                Self::Pack(pack) => pack.dependency_root_fd(),
+                Self::Cpu(cpu) => cpu.dependency_root_fd(),
+            }
+        }
+        fn protected_executable_path(&self) -> &std::ffi::CStr {
+            match self {
+                Self::Pack(pack) => pack.protected_executable_path(),
+                Self::Cpu(cpu) => cpu.protected_executable_path(),
+            }
+        }
+    }
+
     pub(crate) fn launch_verified_worker(
         authority: &UnixPackExecAuthority,
+        worker_flag: &str,
+        bindings: &[(String, String)],
+    ) -> Result<MacSpawnedWorker> {
+        launch_worker(LaunchAuthority::Pack(authority), worker_flag, bindings)
+    }
+
+    pub(crate) fn launch_verified_cpu_worker(
+        authority: &ProtectedCpuAuthority,
+    ) -> Result<MacSpawnedWorker> {
+        launch_worker(
+            LaunchAuthority::Cpu(authority),
+            crate::onnx_worker::INFERENCE_WORKER_FLAG,
+            &[],
+        )
+    }
+
+    fn launch_worker(
+        authority: LaunchAuthority<'_>,
         worker_flag: &str,
         bindings: &[(String, String)],
     ) -> Result<MacSpawnedWorker> {
@@ -1350,7 +1408,7 @@ mod platform {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use platform::{MacWorkerProcess, launch_verified_worker};
+pub(crate) use platform::{MacWorkerProcess, launch_verified_cpu_worker, launch_verified_worker};
 
 #[cfg(test)]
 mod tests {

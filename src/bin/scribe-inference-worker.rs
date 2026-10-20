@@ -72,6 +72,9 @@ mod macos_worker_authority;
 #[cfg(any(target_os = "macos", test))]
 #[path = "../macos_worker_launch.rs"]
 mod macos_worker_launch;
+#[cfg(any(target_os = "macos", test))]
+#[path = "../macos_worker_layout.rs"]
+mod macos_worker_layout;
 #[allow(
     dead_code,
     reason = "the dedicated worker validates only the shared catalog subset needed by an admitted request"

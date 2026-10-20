@@ -106,6 +106,8 @@ mod macos_worker_authority;
     reason = "host-side tests compile the macOS launcher without invoking posix_spawn"
 )]
 mod macos_worker_launch;
+#[cfg(any(target_os = "macos", test))]
+mod macos_worker_layout;
 mod managed_downloads;
 mod model_catalog;
 mod models;

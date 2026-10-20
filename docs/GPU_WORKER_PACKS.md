@@ -961,9 +961,47 @@ opened writable descriptors survive ownership/permission changes.
 This source unit implements admission and launch only. Installer payload,
 atomic activation, rollback/retention and clean-machine installation tests are
 still required; no privileged writer or installation is introduced here.
-The release CPU resolver remains fail-closed pending its separate protected
-CPU payload/admission unit. Missing protected Metal copies reject GPU admission
-without changing existing CPU preference/fallback policy, trust or Auto gates.
+Missing protected Metal copies reject GPU admission without changing CPU
+preference/fallback policy, trust or Auto gates.
+
+### Protected Mac CPU admission
+
+Release CPU inference uses a separate opaque authority at:
+
+```text
+/Library/Application Support/Scribe/CPU/<final-signed-universal-worker-sha256>/scribe-inference-worker
+```
+
+Only the desktop's compiled `SCRIBE_BUNDLED_WORKER_SHA256` selects that directory
+and authenticates its image. There is no CPU pack manifest, new trust key,
+activation pointer, runtime root argument or runtime digest override. The shared
+layout module is also the source contract for the forthcoming installer writer.
+The directory must contain exactly the one regular executable, at most 512 MiB.
+It uses the same retained no-follow ancestry, root/APFS/ACL/mode/link policy as
+Metal admission; the bounded final-image hash and object graph are checked again
+before launch. Missing or unsafe copies produce a clear error, never an adjacent
+bundle or cache-path fallback.
+
+CPU and Metal use a closed launch-authority dispatch and the same private pipes,
+process supervision and challenge-bound protocol. The CPU entry supplies no GPU
+bindings. Its child accepts the retained image pair only for the compiled CPU
+provider, exact inference role, and absence of private pack/device/metadata
+fields. Release workers reject missing image evidence. Developer debug behavior
+remains separate; no public preference or protocol version changes.
+
+`test-macos-protected-cpu-worker.sh` consumes an independently verified universal
+release app, copies its final signed CPU worker into a fresh unprivileged test
+directory, and requires exact native test discovery. That contract authenticates
+Ready, performs model-free Health, requests Shutdown and confirms retirement and
+reaping. It never installs under `/Library`, elevates, loads audio/models, or
+changes settings, history or GPU security state. Ordinary native tests cover
+tampering, replacement, links, modes, extra files and descriptor-role confusion.
+
+This is still source-only admission, not a finished installer experience. The
+CPU/Metal writer, no-replace publication, previous-version retention and combined
+app installation remain separate work. Release VAD still fails closed pending
+its own protected executable authority. No installation or Auto enablement is
+implied by these tests.
 
 Metal framework linkage is confined to the per-architecture Metal worker. The
 desktop and universal CPU worker use only an IOKit power-source shim plus the
