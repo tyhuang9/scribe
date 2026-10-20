@@ -1110,7 +1110,7 @@ impl Drop for MacosDirectoryStream {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_directory_names(
+pub(crate) fn macos_directory_names(
     directory: &File,
     maximum_entries: usize,
 ) -> Result<Vec<String>, PackVerificationError> {

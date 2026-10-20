@@ -2047,6 +2047,9 @@ fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprin
             })
         }
         None => {
+            if !cfg!(debug_assertions) {
+                bail!("release macOS worker requires inherited protected image evidence");
+            }
             let executable = std::env::current_exe()
                 .context("could not locate inference worker for capability fingerprint")?;
             Ok(InferenceWorkerFingerprint {
@@ -2111,6 +2114,7 @@ fn parse_macos_pack_worker_image_descriptors(
     executable: Option<&std::ffi::OsStr>,
     readable: Option<&std::ffi::OsStr>,
     private_pack_present: bool,
+    private_cpu_inference: bool,
     forbidden: Option<std::os::fd::RawFd>,
 ) -> Result<Option<MacosPackWorkerImageDescriptors>> {
     let (Some(executable), Some(readable)) = (executable, readable) else {
@@ -2119,8 +2123,8 @@ fn parse_macos_pack_worker_image_descriptors(
         }
         return Ok(None);
     };
-    if !private_pack_present {
-        bail!("private macOS worker image descriptors require a verified pack binding");
+    if private_pack_present == private_cpu_inference {
+        bail!("private macOS worker image descriptors require exactly one pack or CPU context");
     }
     let descriptors = MacosPackWorkerImageDescriptors {
         executable: parse_canonical_private_descriptor(executable)?,
@@ -2157,12 +2161,33 @@ fn macos_pack_worker_image_descriptors_from_env(
 ) -> Result<Option<MacosPackWorkerImageDescriptors>> {
     let executable = std::env::var_os(crate::macos_worker_launch::EXECUTABLE_FD_ENV);
     let readable = std::env::var_os(crate::macos_worker_launch::EXECUTABLE_READ_FD_ENV);
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let forbidden_cpu_bindings = std::env::vars_os().any(|(name, _)| {
+        name.to_str().is_some_and(|name| {
+            name.starts_with("SCRIBE_PRIVATE_PACK_") || name == METAL_METADATA_SESSION_ENV
+        })
+    });
+    let private_cpu_inference = macos_cpu_image_context(
+        compiled_worker_provider(WorkerRole::Inference),
+        matches!(args.as_slice(), [arg] if arg == INFERENCE_WORKER_FLAG),
+        forbidden_cpu_bindings,
+    );
     parse_macos_pack_worker_image_descriptors(
         executable.as_deref(),
         readable.as_deref(),
         private_worker_pack_environment_present(),
+        private_cpu_inference,
         forbidden,
     )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_cpu_image_context(
+    provider: WorkerProvider,
+    exact_inference_role: bool,
+    forbidden_bindings: bool,
+) -> bool {
+    provider == WorkerProvider::Cpu && exact_inference_role && !forbidden_bindings
 }
 
 #[cfg(target_os = "macos")]
@@ -4432,6 +4457,8 @@ struct VerifiedWorkerExecutable {
     pack_launch: Option<PackLaunchContext>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
     linux_exec_authority: Option<Arc<dyn crate::linux_worker_launch::LinuxExecAuthority>>,
+    #[cfg(target_os = "macos")]
+    macos_cpu_authority: Option<Arc<crate::macos_worker_authority::ProtectedCpuAuthority>>,
     // On Windows this read-only, non-delete-sharing handle prevents replacement
     // between verification and CreateProcess. Other platforms still retain the
     // open inode while the immediate identity recheck closes ordinary races.
@@ -4463,6 +4490,10 @@ impl std::fmt::Debug for VerifiedWorkerExecutable {
 
 impl VerifiedWorkerExecutable {
     fn revalidate(&self) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if let Some(authority) = &self.macos_cpu_authority {
+            authority.recheck()?;
+        }
         let mut verified = verify_worker_executable(
             &self.path,
             &self.root,
@@ -4484,6 +4515,13 @@ impl VerifiedWorkerExecutable {
         }
         verified.frozen_worker_approval = self.frozen_worker_approval.clone();
         verified.pack_launch = self.pack_launch.clone();
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(authority) = &self.macos_cpu_authority {
+                authority.recheck()?;
+            }
+            verified.macos_cpu_authority = self.macos_cpu_authority.clone();
+        }
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         {
             verified.linux_exec_authority = self.linux_exec_authority.clone();
@@ -4610,6 +4648,8 @@ fn verify_worker_executable(
         identity,
         frozen_worker_approval: None,
         pack_launch: None,
+        #[cfg(target_os = "macos")]
+        macos_cpu_authority: None,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         linux_exec_authority: None,
         _open_file: open_file,
@@ -4809,16 +4849,25 @@ fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBu
 
 impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
     fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        #[cfg(target_os = "macos")]
+        if role == WorkerRole::Inference && !cfg!(debug_assertions) {
+            let authority = Arc::new(
+                crate::macos_worker_authority::ProtectedCpuAuthority::open()
+                    .context("could not admit the installer-protected macOS CPU worker")?,
+            );
+            return resolve_protected_macos_cpu_worker(authority);
+        }
         #[cfg(all(
             unix,
             not(debug_assertions),
             not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
         ))]
         {
-            let _ = role;
-            bail!(
-                "release inference workers are unsupported on Unix until launch is bound to the verified executable descriptor"
-            );
+            // macOS CPU inference returned only with protected authority above.
+            // The desktop/VAD image needs its own separate installer authority.
+            if role == WorkerRole::Vad || !cfg!(target_os = "macos") {
+                bail!("release Unix worker role has no protected executable authority");
+            }
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         if role == WorkerRole::Inference {
@@ -4890,6 +4939,29 @@ impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
             )
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_protected_macos_cpu_worker(
+    authority: Arc<crate::macos_worker_authority::ProtectedCpuAuthority>,
+) -> Result<VerifiedWorkerExecutable> {
+    use crate::macos_worker_layout::{CPU_WORKER_NAME, embedded_cpu_digest};
+
+    authority.recheck()?;
+    let path = authority.root().join(CPU_WORKER_NAME);
+    let mut executable = verify_worker_executable(
+        &path,
+        authority.root(),
+        std::ffi::OsStr::new(CPU_WORKER_NAME),
+        embedded_cpu_digest()?,
+    )?;
+    authority.recheck()?;
+    executable.macos_cpu_authority = Some(authority);
+    Ok(attach_installed_cpu_compatibility(
+        executable,
+        WorkerRole::Inference,
+        embedded_cpu_digest()?,
+    ))
 }
 
 #[cfg(test)]
@@ -5124,6 +5196,26 @@ impl WorkerLauncher for OsWorkerLauncher {
             bail!("Linux inference worker resolved without descriptor launch authority");
         }
         #[cfg(target_os = "macos")]
+        if let Some(authority) = executable.macos_cpu_authority.as_ref() {
+            if self.role != WorkerRole::Inference
+                || self.purpose != WorkerSessionPurpose::Runtime
+                || expectation.provider != WorkerProvider::Cpu
+                || expectation.pack.is_some()
+                || executable.pack_launch.is_some()
+            {
+                bail!("protected CPU authority cannot launch a GPU, VAD or metadata session");
+            }
+            let launched = crate::macos_worker_launch::launch_verified_cpu_worker(authority)?;
+            return Ok(SpawnedWorker {
+                stdin: Box::new(launched.stdin),
+                stdout: Box::new(launched.stdout),
+                process: Arc::new(launched.process),
+                expectation,
+                frozen_worker_approval: executable.frozen_worker_approval,
+                pack_launch: None,
+            });
+        }
+        #[cfg(target_os = "macos")]
         if let Some(pack) = executable.pack_launch.as_ref() {
             let mut bindings = worker_pack_environment_bindings(pack);
             if self.purpose == WorkerSessionPurpose::MetalMetadata {
@@ -5145,6 +5237,10 @@ impl WorkerLauncher for OsWorkerLauncher {
                 frozen_worker_approval: executable.frozen_worker_approval,
                 pack_launch: executable.pack_launch,
             });
+        }
+        #[cfg(all(target_os = "macos", not(debug_assertions)))]
+        if executable.macos_cpu_authority.is_none() && executable.pack_launch.is_none() {
+            bail!("release macOS worker role resolved without protected launch authority");
         }
         let mut command = Command::new(&executable.path);
         configure_worker_current_directory(&mut command, &executable.path)?;
@@ -20007,6 +20103,19 @@ mod tests {
     struct RetainingNativeWorkerLauncher {
         actual: Arc<dyn WorkerLauncher>,
         launched_process: Arc<Mutex<Option<Arc<dyn WorkerProcess>>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct ProtectedCpuFixtureResolver(Arc<crate::macos_worker_authority::ProtectedCpuAuthority>);
+
+    #[cfg(target_os = "macos")]
+    impl WorkerExecutableResolver for ProtectedCpuFixtureResolver {
+        fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+            if role != WorkerRole::Inference {
+                bail!("CPU fixture cannot admit another worker role");
+            }
+            resolve_protected_macos_cpu_worker(Arc::clone(&self.0))
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -37670,7 +37779,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         assert_eq!(
-            parse_macos_pack_worker_image_descriptors(None, None, false, None).unwrap(),
+            parse_macos_pack_worker_image_descriptors(None, None, false, false, None).unwrap(),
             None
         );
         let non_utf8 = OsStr::from_bytes(&[0xff]);
@@ -37701,6 +37810,7 @@ mod tests {
                     executable,
                     readable,
                     pack_present,
+                    false,
                     forbidden,
                 )
                 .is_err()
@@ -37711,6 +37821,7 @@ mod tests {
                 Some(OsStr::new("7")),
                 Some(OsStr::new("8")),
                 true,
+                false,
                 Some(9),
             )
             .unwrap(),
@@ -37718,6 +37829,131 @@ mod tests {
                 executable: 7,
                 readable: 8,
             })
+        );
+    }
+
+    #[test]
+    fn macos_protected_cpu_image_context_rejects_gpu_vad_and_private_gpu_overrides() {
+        assert!(macos_cpu_image_context(WorkerProvider::Cpu, true, false));
+        for provider in [
+            WorkerProvider::Cpu,
+            WorkerProvider::Cuda,
+            WorkerProvider::Vulkan,
+            WorkerProvider::Metal,
+        ] {
+            assert!(!macos_cpu_image_context(provider, false, false));
+            assert!(!macos_cpu_image_context(provider, true, true));
+            if provider != WorkerProvider::Cpu {
+                assert!(!macos_cpu_image_context(provider, true, false));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_protected_cpu_descriptor_parser_requires_exclusive_complete_evidence() {
+        use std::ffi::OsStr;
+
+        let executable = Some(OsStr::new("7"));
+        let readable = Some(OsStr::new("8"));
+        assert!(
+            parse_macos_pack_worker_image_descriptors(executable, readable, false, true, Some(9))
+                .unwrap()
+                .is_some()
+        );
+        for (exec, read, pack, cpu, forbidden) in [
+            (executable, readable, true, true, None),
+            (executable, readable, false, false, None),
+            (executable, None, false, true, None),
+            (None, readable, false, true, None),
+            (executable, executable, false, true, None),
+            (executable, readable, false, true, Some(7)),
+            (executable, readable, false, true, Some(8)),
+        ] {
+            assert!(
+                parse_macos_pack_worker_image_descriptors(exec, read, pack, cpu, forbidden)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the independently verified release app's final signed universal CPU worker"]
+    fn macos_native_protected_cpu_worker_authenticates_health_shutdown_and_reap() {
+        let root = std::env::var_os("SCRIBE_MACOS_NATIVE_CPU_FIXTURE_ROOT")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .expect("private CPU fixture root required");
+        let digest = crate::macos_worker_layout::embedded_cpu_digest().unwrap();
+        let authority = Arc::new(
+            crate::macos_worker_authority::ProtectedCpuAuthority::open_fixture(&root, digest)
+                .unwrap(),
+        );
+        let mut launcher = OsWorkerLauncher::inference();
+        launcher.resolver = Arc::new(ProtectedCpuFixtureResolver(authority));
+        let process = Arc::new(Mutex::new(None));
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            Arc::new(RetainingNativeWorkerLauncher {
+                actual: Arc::new(launcher),
+                launched_process: Arc::clone(&process),
+            }),
+            SupervisorDeadlines::default(),
+        );
+        let observed = (|| -> Result<()> {
+            let generation = transport.ensure_generation()?; // Authenticated Ready, not just successful spawn.
+            let state = transport
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("native CPU state lock poisoned"))?;
+            let current = state
+                .current
+                .as_ref()
+                .ok_or_else(|| anyhow!("authenticated CPU generation disappeared"))?;
+            if current.expectation.provider != WorkerProvider::Cpu
+                || current.expectation.pack.is_some()
+                || current.expectation.bundled_worker_sha256 != digest
+                || state.active_model.is_some()
+            {
+                bail!("native CPU Ready did not preserve the model-free CPU-only identity");
+            }
+            drop(state);
+            transport.health(7, 1)?; // No model or audio is admitted.
+            transport.round_trip_on_generation(
+                generation,
+                7,
+                2,
+                Control::Shutdown,
+                transport.inner.deadlines.control,
+            )?;
+            transport.invalidate_generation(generation, "native CPU shutdown completed", false)?;
+            Ok(())
+        })();
+        let deadline =
+            MonotonicDeadline::after_for(Duration::from_secs(10), "native CPU cleanup").unwrap();
+        let retirement = transport.terminate_current_before(Some(deadline));
+        let settlement = transport.await_retirement_settlement_before(deadline);
+        assert!(
+            observed.is_ok(),
+            "native CPU contract failed: {observed:?}; retirement={retirement:?}; settlement={settlement:?}"
+        );
+        retirement.unwrap();
+        settlement.unwrap();
+        let state = transport.inner.state.lock().unwrap();
+        assert!(state.current.is_none());
+        assert!(state.retiring_generations.is_empty());
+        assert!(state.pending_launches.is_empty());
+        assert!(state.active_model.is_none());
+        drop(state);
+        let process = process
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actual native CPU child must launch");
+        assert!(
+            !process.is_running().unwrap(),
+            "native CPU process was not reaped"
         );
     }
 
