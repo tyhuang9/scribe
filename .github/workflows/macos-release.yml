@@ -105,8 +105,8 @@ jobs:
           projection_count="$(printf '%s\n' "$projection_tests" | awk '/^gpu_worker_pack::protected_macos_projection_tests::macos_protected_projection_.*: test$/ { count++ } END { print count+0 }')"
           test "$projection_count" -eq 3
           cpu_tests="$(cargo test --locked --bin local-transcriber macos_protected_cpu_ -- --list)"
-          cpu_count="$(printf '%s\n' "$cpu_tests" | awk '/^(macos_worker_layout::tests|macos_worker_authority::cpu_tests|onnx_worker::tests)::macos_protected_cpu_.*: test$/ { count++ } END { print count+0 }')"
-          test "$cpu_count" -eq 9
+          cpu_count="$(printf '%s\n' "$cpu_tests" | awk '/^(macos_worker_layout::tests|macos_worker_authority::cpu_tests|macos_worker_launch::tests|onnx_worker::tests)::macos_protected_cpu_.*: test$/ { count++ } END { print count+0 }')"
+          test "$cpu_count" -eq 14
           cargo test --locked --test build_revision_invalidation -- --test-threads=1
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture

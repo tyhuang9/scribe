@@ -20,6 +20,8 @@ compile_error!(
 );
 
 mod app;
+// Binary-local authority, never selected by environment, flags or features.
+pub(crate) const DEDICATED_INFERENCE_WORKER: bool = false;
 mod audio;
 #[allow(
     dead_code,

@@ -7,7 +7,10 @@
 //! Dedicated native inference process.
 //!
 //! This binary is the only production target that includes GGUF and ASR ONNX
-//! execution code. The desktop retains its existing same-executable VAD role.
+//! execution code. macOS CPU builds also serve isolated protected VAD sessions;
+//! other targets retain the desktop's existing same-executable VAD role.
+
+pub(crate) const DEDICATED_INFERENCE_WORKER: bool = true;
 
 #[allow(
     dead_code,

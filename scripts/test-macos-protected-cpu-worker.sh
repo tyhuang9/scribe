@@ -61,7 +61,6 @@ sys.exit(status)
 PY
 }
 
-test_name='onnx_worker::tests::macos_native_protected_cpu_worker_authenticates_health_shutdown_and_reap'
 run_test() {
   run_bounded 1200 env -u DOCS_RS -u SCRIBE_BUILDING_WORKER \
     -u SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP \
@@ -71,7 +70,11 @@ run_test() {
     cargo test --locked --offline --release --bin local-transcriber "$test_name" \
       --manifest-path "$repo_root/Cargo.toml" -- --ignored --exact "$@"
 }
-listing="$(run_test --list)"
-count="$(printf '%s\n' "$listing" | awk -v expected="$test_name" '$0 == expected ": test" { count++ } END { print count+0 }')"
-[[ "$count" == 1 ]] || { echo 'native CPU contract was not discovered exactly once.' >&2; exit 1; }
-run_test --nocapture --test-threads=1
+for test_name in \
+  onnx_worker::tests::macos_native_protected_cpu_worker_authenticates_health_shutdown_and_reap \
+  onnx_worker::tests::macos_native_protected_cpu_vad_authenticates_health_shutdown_and_reap; do
+  listing="$(run_test --list)"
+  count="$(printf '%s\n' "$listing" | awk -v expected="$test_name" '$0 == expected ": test" { count++ } END { print count+0 }')"
+  [[ "$count" == 1 ]] || { echo 'native CPU role contract was not discovered exactly once.' >&2; exit 1; }
+  run_test --nocapture --test-threads=1
+done

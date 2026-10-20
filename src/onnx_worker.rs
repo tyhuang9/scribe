@@ -1447,6 +1447,24 @@ fn compiled_worker_provider(role: WorkerRole) -> WorkerProvider {
     }
 }
 
+fn macos_cpu_vad_build(
+    is_macos: bool,
+    dedicated_binary: bool,
+    inference_provider: WorkerProvider,
+) -> bool {
+    is_macos && dedicated_binary && inference_provider == WorkerProvider::Cpu
+}
+
+fn protected_macos_vad_worker_build() -> bool {
+    // VAD's reported provider is always CPU, even in GPU binaries. The actual
+    // image must be the dedicated CPU build, not a desktop or GPU image.
+    macos_cpu_vad_build(
+        cfg!(target_os = "macos"),
+        crate::DEDICATED_INFERENCE_WORKER,
+        compiled_worker_provider(WorkerRole::Inference),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WorkerArtifactKind {
@@ -1901,6 +1919,9 @@ fn worker_capability_for_provider_with_metal_topology(
     };
     let inference_fingerprint = match role {
         WorkerRole::Inference => Some(inference_worker_capability_fingerprint()?),
+        WorkerRole::Vad if protected_macos_vad_worker_build() => {
+            Some(inference_worker_capability_fingerprint()?)
+        }
         WorkerRole::Vad => None,
     };
     let bundled_worker_sha256 = inference_fingerprint.as_ref().map_or_else(
@@ -2162,14 +2183,13 @@ fn macos_pack_worker_image_descriptors_from_env(
     let executable = std::env::var_os(crate::macos_worker_launch::EXECUTABLE_FD_ENV);
     let readable = std::env::var_os(crate::macos_worker_launch::EXECUTABLE_READ_FD_ENV);
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let forbidden_cpu_bindings = std::env::vars_os().any(|(name, _)| {
-        name.to_str().is_some_and(|name| {
-            name.starts_with("SCRIBE_PRIVATE_PACK_") || name == METAL_METADATA_SESSION_ENV
-        })
-    });
+    let forbidden_cpu_bindings = macos_forbidden_cpu_bindings_present();
+    let exact_cpu_role = matches!(args.as_slice(), [arg] if arg == INFERENCE_WORKER_FLAG)
+        || (protected_macos_vad_worker_build()
+            && matches!(args.as_slice(), [arg] if arg == VAD_WORKER_FLAG));
     let private_cpu_inference = macos_cpu_image_context(
         compiled_worker_provider(WorkerRole::Inference),
-        matches!(args.as_slice(), [arg] if arg == INFERENCE_WORKER_FLAG),
+        exact_cpu_role,
         forbidden_cpu_bindings,
     );
     parse_macos_pack_worker_image_descriptors(
@@ -2182,12 +2202,24 @@ fn macos_pack_worker_image_descriptors_from_env(
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn macos_cpu_binding_name_forbidden(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.starts_with("SCRIBE_PRIVATE_PACK_") || name == METAL_METADATA_SESSION_ENV
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_forbidden_cpu_bindings_present() -> bool {
+    std::env::vars_os().any(|(name, _)| macos_cpu_binding_name_forbidden(&name))
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn macos_cpu_image_context(
     provider: WorkerProvider,
-    exact_inference_role: bool,
+    exact_cpu_role: bool,
     forbidden_bindings: bool,
 ) -> bool {
-    provider == WorkerProvider::Cpu && exact_inference_role && !forbidden_bindings
+    provider == WorkerProvider::Cpu && exact_cpu_role && !forbidden_bindings
 }
 
 #[cfg(target_os = "macos")]
@@ -4850,12 +4882,12 @@ fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBu
 impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
     fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
         #[cfg(target_os = "macos")]
-        if role == WorkerRole::Inference && !cfg!(debug_assertions) {
+        if !cfg!(debug_assertions) {
             let authority = Arc::new(
                 crate::macos_worker_authority::ProtectedCpuAuthority::open()
                     .context("could not admit the installer-protected macOS CPU worker")?,
             );
-            return resolve_protected_macos_cpu_worker(authority);
+            return resolve_protected_macos_cpu_worker(authority, role);
         }
         #[cfg(all(
             unix,
@@ -4863,9 +4895,8 @@ impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
             not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
         ))]
         {
-            // macOS CPU inference returned only with protected authority above.
-            // The desktop/VAD image needs its own separate installer authority.
-            if role == WorkerRole::Vad || !cfg!(target_os = "macos") {
+            // Both macOS CPU roles returned with protected authority above.
+            if !cfg!(target_os = "macos") {
                 bail!("release Unix worker role has no protected executable authority");
             }
         }
@@ -4944,6 +4975,7 @@ impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
 #[cfg(target_os = "macos")]
 fn resolve_protected_macos_cpu_worker(
     authority: Arc<crate::macos_worker_authority::ProtectedCpuAuthority>,
+    role: WorkerRole,
 ) -> Result<VerifiedWorkerExecutable> {
     use crate::macos_worker_layout::{CPU_WORKER_NAME, embedded_cpu_digest};
 
@@ -4959,7 +4991,7 @@ fn resolve_protected_macos_cpu_worker(
     executable.macos_cpu_authority = Some(authority);
     Ok(attach_installed_cpu_compatibility(
         executable,
-        WorkerRole::Inference,
+        role,
         embedded_cpu_digest()?,
     ))
 }
@@ -5116,7 +5148,16 @@ fn resolved_worker_expectation(
     executable: &VerifiedWorkerExecutable,
 ) -> Result<WorkerExpectation> {
     let mut expectation = expected_worker(role);
+    #[cfg(target_os = "macos")]
+    if executable.macos_cpu_authority.is_some() {
+        // Both roles authenticate the final signed CPU image. VAD keeps its
+        // distinct build/role contract, never the legacy same-executable token.
+        expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
+    }
     if let Some(pack) = &executable.pack_launch {
+        if role != WorkerRole::Inference {
+            bail!("GPU pack authority cannot launch the VAD role");
+        }
         expectation.provider = pack.expectation.backend;
         expectation.pack = Some(pack.expectation.clone());
         expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
@@ -5197,15 +5238,19 @@ impl WorkerLauncher for OsWorkerLauncher {
         }
         #[cfg(target_os = "macos")]
         if let Some(authority) = executable.macos_cpu_authority.as_ref() {
-            if self.role != WorkerRole::Inference
-                || self.purpose != WorkerSessionPurpose::Runtime
+            if self.purpose != WorkerSessionPurpose::Runtime
                 || expectation.provider != WorkerProvider::Cpu
                 || expectation.pack.is_some()
                 || executable.pack_launch.is_some()
+                || executable.frozen_worker_approval.is_some()
             {
-                bail!("protected CPU authority cannot launch a GPU, VAD or metadata session");
+                bail!("protected CPU authority cannot launch a GPU or metadata session");
             }
-            let launched = crate::macos_worker_launch::launch_verified_cpu_worker(authority)?;
+            let role = match self.role {
+                WorkerRole::Inference => crate::macos_worker_launch::CpuWorkerRole::Inference,
+                WorkerRole::Vad => crate::macos_worker_launch::CpuWorkerRole::Vad,
+            };
+            let launched = crate::macos_worker_launch::launch_verified_cpu_worker(authority, role)?;
             return Ok(SpawnedWorker {
                 stdin: Box::new(launched.stdin),
                 stdout: Box::new(launched.stdout),
@@ -10082,6 +10127,10 @@ pub(crate) fn maybe_run_vad_worker() -> Option<i32> {
             return Some(2);
         }
     };
+    if cfg!(all(target_os = "macos", not(debug_assertions))) {
+        eprintln!("release macOS VAD requires the installer-protected CPU worker");
+        return Some(2);
+    }
     let parent_control = match take_parent_control_reader_from_env() {
         Ok(reader) => reader,
         Err(error) => {
@@ -10116,8 +10165,9 @@ pub(crate) fn maybe_run_vad_worker() -> Option<i32> {
 )]
 pub(crate) fn run_inference_worker_with_factory<F: WorkerRecognizerFactory>(factory: &F) -> i32 {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    match worker_role_from_args(&args) {
-        Ok(Some(WorkerRole::Inference)) => {}
+    let role = match worker_role_from_args(&args) {
+        Ok(Some(WorkerRole::Inference)) => WorkerRole::Inference,
+        Ok(Some(WorkerRole::Vad)) if protected_macos_vad_worker_build() => WorkerRole::Vad,
         Ok(Some(WorkerRole::Vad)) => {
             eprintln!("the dedicated inference executable cannot run the VAD role");
             return 2;
@@ -10130,6 +10180,11 @@ pub(crate) fn run_inference_worker_with_factory<F: WorkerRecognizerFactory>(fact
             eprintln!("invalid private Scribe inference worker invocation: {error}");
             return 2;
         }
+    };
+    #[cfg(target_os = "macos")]
+    if role == WorkerRole::Vad && macos_forbidden_cpu_bindings_present() {
+        eprintln!("protected VAD rejects GPU pack and metadata bindings");
+        return 2;
     }
     let parent_control = match take_parent_control_reader_from_env() {
         Ok(reader) => reader,
@@ -10138,6 +10193,21 @@ pub(crate) fn run_inference_worker_with_factory<F: WorkerRecognizerFactory>(fact
             return 1;
         }
     };
+    if role == WorkerRole::Vad {
+        // This path uses DisabledRecognizerFactory, never ASR/GGUF or a GPU.
+        return match worker_loop_for_role(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+            role,
+            parent_control,
+        ) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("Scribe protected VAD worker failed: {error:#}");
+                1
+            }
+        };
+    }
     let purpose = match take_worker_session_purpose_from_env() {
         Ok(purpose) => purpose,
         Err(error) => {
@@ -20111,10 +20181,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl WorkerExecutableResolver for ProtectedCpuFixtureResolver {
         fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
-            if role != WorkerRole::Inference {
-                bail!("CPU fixture cannot admit another worker role");
-            }
-            resolve_protected_macos_cpu_worker(Arc::clone(&self.0))
+            resolve_protected_macos_cpu_worker(Arc::clone(&self.0), role)
         }
     }
 
@@ -37833,7 +37900,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_protected_cpu_image_context_rejects_gpu_vad_and_private_gpu_overrides() {
+    fn macos_protected_cpu_image_context_rejects_gpu_and_private_gpu_overrides() {
         assert!(macos_cpu_image_context(WorkerProvider::Cpu, true, false));
         for provider in [
             WorkerProvider::Cpu,
@@ -37847,6 +37914,149 @@ mod tests {
                 assert!(!macos_cpu_image_context(provider, true, false));
             }
         }
+    }
+
+    #[test]
+    fn macos_protected_cpu_vad_gate_requires_mac_dedicated_cpu_image() {
+        for is_macos in [false, true] {
+            for dedicated in [false, true] {
+                for provider in [
+                    WorkerProvider::Cpu,
+                    WorkerProvider::Cuda,
+                    WorkerProvider::Vulkan,
+                    WorkerProvider::Metal,
+                ] {
+                    assert_eq!(
+                        macos_cpu_vad_build(is_macos, dedicated, provider),
+                        is_macos && dedicated && provider == WorkerProvider::Cpu
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            compiled_worker_provider(WorkerRole::Vad),
+            WorkerProvider::Cpu
+        );
+        assert!(!protected_macos_vad_worker_build());
+    }
+
+    #[test]
+    fn macos_protected_cpu_vad_rejects_all_private_gpu_namespace_bindings() {
+        use std::ffi::OsStr;
+        for name in [
+            PACK_ID_ENV,
+            PACK_PROVIDER_ENV,
+            PACK_DEVICE_ID_ENV,
+            PACK_DRIVER_ID_ENV,
+            "SCRIBE_PRIVATE_PACK_UNKNOWN_FUTURE_FIELD",
+            METAL_METADATA_SESSION_ENV,
+        ] {
+            assert!(macos_cpu_binding_name_forbidden(OsStr::new(name)));
+        }
+        for name in [
+            PARENT_LIVENESS_ENV,
+            "SCRIBE_PRIVATE_MACOS_EXECUTABLE_FD",
+            "SCRIBE_PRIVATE_MACOS_EXECUTABLE_READ_FD",
+            "LANG",
+        ] {
+            assert!(!macos_cpu_binding_name_forbidden(OsStr::new(name)));
+        }
+    }
+
+    #[test]
+    fn macos_protected_cpu_vad_capability_binds_image_and_all_role_fields() {
+        let challenge = "ab".repeat(32);
+        let mut expected = expected_worker_for_provider(WorkerRole::Vad, WorkerProvider::Cpu);
+        expected.bundled_worker_sha256 = "cd".repeat(32);
+        let mut capability = worker_capability_for_provider(
+            WorkerRole::Vad,
+            challenge.clone(),
+            WorkerProvider::Cpu,
+            None,
+        )
+        .unwrap();
+        capability.bundled_worker_sha256 = expected.bundled_worker_sha256.clone();
+        validate_worker_capability(&capability, &challenge, &expected).unwrap();
+        for field in 0..10 {
+            let mut changed = capability.clone();
+            match field {
+                0 => changed.challenge = "ef".repeat(32),
+                1 => changed.app_build.push_str("-other"),
+                2 => changed.worker_build = INFERENCE_WORKER_BUILD_ID.to_owned(),
+                3 => changed.bundled_worker_sha256 = "same-executable".to_owned(),
+                4 => changed.bundled_worker_sha256 = "ef".repeat(32),
+                5 => changed.abi += 1,
+                6 => changed.role = WorkerRole::Inference,
+                7 => changed.provider = WorkerProvider::Metal,
+                8 => changed.artifacts[0].artifact = WorkerArtifactKind::OnnxAsr,
+                9 => changed.artifacts[0].target = "wrong-target".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_worker_capability(&changed, &challenge, &expected).is_err(),
+                "field {field}"
+            );
+        }
+        let local = expected_worker_for_provider(WorkerRole::Vad, WorkerProvider::Cpu);
+        assert!(
+            validate_worker_hello_against_local(
+                Some(WorkerRole::Inference),
+                &challenge,
+                &expected,
+                &expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_hello_against_local(
+                Some(WorkerRole::Vad),
+                &challenge,
+                &expected_worker_for_provider(WorkerRole::Inference, WorkerProvider::Cpu),
+                &local
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn macos_protected_cpu_vad_cross_role_controls_never_create_models() {
+        let recognizer_factory = FakeRecognizerFactory::new();
+        let vad_factory = FakeVadFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 1, test_hello(WorkerRole::Vad));
+        append_control(&mut input, 0, 2, Control::StartStream);
+        append_control(
+            &mut input,
+            0,
+            3,
+            Control::RefreshMetalTopology {
+                version: METAL_TOPOLOGY_REFRESH_VERSION_V1,
+                challenge: "ab".repeat(32),
+                nonce: "cd".repeat(32),
+            },
+        );
+        append_control(&mut input, 0, 4, Control::Shutdown);
+        let mut output = Vec::new();
+        // The older generic fixture deliberately has no enforced role. Match
+        // the dedicated VAD entry's Some(Vad) boundary in this regression.
+        worker_loop_with_factories(
+            Cursor::new(input),
+            &mut output,
+            &recognizer_factory,
+            &vad_factory,
+            Some(WorkerRole::Vad),
+            None,
+        )
+        .unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        assert_error(&responses[1], "cross-role");
+        assert_error(&responses[2], "cross-role");
+        assert_eq!(recognizer_factory.snapshot().create_attempts, 0);
+        assert_eq!(vad_factory.snapshot().creates, 0);
     }
 
     #[cfg(target_os = "macos")]
@@ -37881,6 +38091,18 @@ mod tests {
     #[test]
     #[ignore = "requires the independently verified release app's final signed universal CPU worker"]
     fn macos_native_protected_cpu_worker_authenticates_health_shutdown_and_reap() {
+        macos_native_protected_cpu_role_contract(WorkerRole::Inference);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the independently verified release app's final signed universal CPU worker"]
+    fn macos_native_protected_cpu_vad_authenticates_health_shutdown_and_reap() {
+        macos_native_protected_cpu_role_contract(WorkerRole::Vad);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_native_protected_cpu_role_contract(role: WorkerRole) {
         let root = std::env::var_os("SCRIBE_MACOS_NATIVE_CPU_FIXTURE_ROOT")
             .map(PathBuf::from)
             .filter(|root| root.is_absolute())
@@ -37890,7 +38112,10 @@ mod tests {
             crate::macos_worker_authority::ProtectedCpuAuthority::open_fixture(&root, digest)
                 .unwrap(),
         );
-        let mut launcher = OsWorkerLauncher::inference();
+        let mut launcher = match role {
+            WorkerRole::Inference => OsWorkerLauncher::inference(),
+            WorkerRole::Vad => OsWorkerLauncher::vad(),
+        };
         launcher.resolver = Arc::new(ProtectedCpuFixtureResolver(authority));
         let process = Arc::new(Mutex::new(None));
         let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
@@ -37912,6 +38137,8 @@ mod tests {
                 .as_ref()
                 .ok_or_else(|| anyhow!("authenticated CPU generation disappeared"))?;
             if current.expectation.provider != WorkerProvider::Cpu
+                || current.expectation.role != role
+                || current.expectation.worker_build != expected_worker(role).worker_build
                 || current.expectation.pack.is_some()
                 || current.expectation.bundled_worker_sha256 != digest
                 || state.active_model.is_some()
@@ -37920,10 +38147,26 @@ mod tests {
             }
             drop(state);
             transport.health(7, 1)?; // No model or audio is admitted.
+            let cross_role = match role {
+                WorkerRole::Inference => Control::ResetVad,
+                WorkerRole::Vad => Control::StartStream,
+            };
+            if !matches!(
+                transport.round_trip_on_generation(
+                    generation,
+                    7,
+                    2,
+                    cross_role,
+                    transport.inner.deadlines.control
+                )?,
+                Control::Error { message } if message.contains("cross-role")
+            ) {
+                bail!("protected CPU role accepted a cross-role control");
+            }
             transport.round_trip_on_generation(
                 generation,
                 7,
-                2,
+                3,
                 Control::Shutdown,
                 transport.inner.deadlines.control,
             )?;
