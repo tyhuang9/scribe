@@ -38101,6 +38101,49 @@ mod tests {
         macos_native_protected_cpu_role_contract(WorkerRole::Vad);
     }
 
+    // Compile this protocol exchange on every test host. The completion-only
+    // round_trip_on_generation returns Result<()> and maps worker Error into
+    // its error channel; this contract needs the correlated Control itself.
+    fn macos_cpu_contract_cross_role_reply(
+        transport: &ProcessWorkerSupervisor,
+        generation: u64,
+        role: WorkerRole,
+    ) -> Result<Control> {
+        transport.generation_context_exact(generation)?;
+        let cross_role = match role {
+            WorkerRole::Inference => Control::ResetVad,
+            WorkerRole::Vad => Control::StartStream,
+        };
+        let frame = control_frame(7, 2, &cross_role)?;
+        transport.active_round_trip_with_timeout(
+            generation,
+            7,
+            2,
+            &[frame],
+            transport.inner.deadlines.control,
+        )
+    }
+
+    #[test]
+    fn macos_cpu_contract_reads_raw_error_response_without_changing_generation() {
+        for (role, expected) in [
+            (WorkerRole::Inference, "VAD unavailable"),
+            (WorkerRole::Vad, "streaming unavailable"),
+        ] {
+            let transport = test_supervisor(Arc::new(TestLauncher::new([TestMode::Normal])));
+            let generation = transport.current_generation().unwrap().unwrap();
+            assert!(matches!(
+                macos_cpu_contract_cross_role_reply(&transport, generation, role).unwrap(),
+                Control::Error { message } if message == expected
+            ));
+            // An unrelated Error is observable, not a successful role rejection
+            // or a generation-ending transport failure. Native validation below
+            // still requires the distinct cross-role rejection message.
+            transport.health(7, 3).unwrap();
+            assert_eq!(transport.current_generation().unwrap(), Some(generation));
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn macos_native_protected_cpu_role_contract(role: WorkerRole) {
         let root = std::env::var_os("SCRIBE_MACOS_NATIVE_CPU_FIXTURE_ROOT")
@@ -38147,18 +38190,8 @@ mod tests {
             }
             drop(state);
             transport.health(7, 1)?; // No model or audio is admitted.
-            let cross_role = match role {
-                WorkerRole::Inference => Control::ResetVad,
-                WorkerRole::Vad => Control::StartStream,
-            };
             if !matches!(
-                transport.round_trip_on_generation(
-                    generation,
-                    7,
-                    2,
-                    cross_role,
-                    transport.inner.deadlines.control
-                )?,
+                macos_cpu_contract_cross_role_reply(&transport, generation, role)?,
                 Control::Error { message } if message.contains("cross-role")
             ) {
                 bail!("protected CPU role accepted a cross-role control");
