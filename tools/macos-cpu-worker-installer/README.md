@@ -134,7 +134,7 @@ does not contain the component. Structural CI assembles and inspects it, but
 does not upload it, install it, or invoke the production installer entry.
 
 Run `python3 -B build_support/test_macos_cpu_component.py` for exact-discovery
-source checks: 21 portable, 17 additional POSIX, and four additional Darwin tests.
+source checks: 25 portable, 17 additional POSIX, and four additional Darwin tests.
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
 
@@ -193,6 +193,40 @@ compression. Do not thin/re-sign the frozen worker to reduce this overhead;
 actual compressed/installed package size must be reported when package authoring
 is implemented. No PKG authoring, certificate provisioning, signing/notarization,
 application installation, replacement or update/removal is supplied by this unit.
+
+### Internal entry construction
+
+`build_support/macos_cpu_pkg_entry.py` supplies an internal `build_entry`
+function for the future PKG author, not a public command or installer. It accepts
+the finalized app, an absolute author-owned workspace outside that app, and the
+independently frozen worker SHA/build revision. On an unprivileged Mac only, it
+applies the existing CPU-only app policy, copies and verifies the signed desktop
+and worker snapshots, then uses fresh per-architecture Cargo directories with
+locked/offline release builds and only `installer-package-entry` enabled.
+
+Both slices embed the same complete worker snapshot. Each thin result must have
+its expected architecture; the combined candidate is inspected without execution
+for exactly ARM64/x64, macOS 13.0, system-only CPU dependencies and frozen markers.
+Input signature verification remains mandatory; the separate structural check
+on the fresh candidate is not signature or publisher authentication. No entry
+invocation, signing, package assembly, extraction or installation occurs here.
+
+Each slice is bounded by the 512 MiB worker allowance plus 32 MiB for code and
+alignment; the combined entry is bounded by 1,088 MiB. These are rejection bounds,
+not measured package sizes. The ordinary development writer remains limited to
+64 MiB. The function exclusively publishes `postinstall` in the caller's workspace
+and returns its **pre-sign** hash/size. The future author must finalize/sign,
+remeasure and reverify those bytes; the returned identity grants no authority.
+Existing or ambiguously published finals are never removed. Only owned temporary
+files are cleaned after confirmed child retirement; uncertainty retains them.
+
+Run `python3 -B build_support/test_macos_cpu_pkg_entry.py`, also used by Mac CI:
+17 portable tests plus two POSIX tests. All native tools/builds are mocked, even
+on macOS. These cover frozen inputs, both builds, environment isolation, missing,
+linked, oversized and wrong-architecture outputs, tool failures, publication
+collisions and uncertain cleanup. They do not establish actual native
+construction, package acceptance or installation. Trusted source/toolchain/Cargo
+configuration and non-hostile same-user/root writers remain build assumptions.
 
 ### Native package-format prerequisite
 
