@@ -1028,6 +1028,12 @@ operation behavior remain native gates. This is a prerequisite for the real
 installer bootstrap, not another trusted development-component envelope or an
 already-authorized installation. See the CPU writer's package-entry source
 contract for exact source checks, size tradeoff and remaining PKG authoring work.
+An internal authoring function can now construct that future native entry from
+the same verified frozen worker, using fresh ARM64/x64 builds and non-executing
+structural inspection. It neither runs nor signs the entry, and its returned
+pre-sign hash is not installation authority. Mocked source tests cover bounded
+construction and exclusive publication; actual native construction remains
+unverified. This does not add a PKG author, shipping release option or installer.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not

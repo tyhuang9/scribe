@@ -1076,6 +1076,72 @@ fn macos_cpu_package_entry_is_compile_time_embedded_and_never_run_by_ci() {
 }
 
 #[test]
+fn macos_cpu_entry_construction_is_frozen_source_only_and_not_installation_authority() {
+    let source = include_str!("../build_support/macos_cpu_pkg_entry.py");
+    let shared = include_str!("../build_support/macos_cpu_component.py");
+    let tests = include_str!("../build_support/test_macos_cpu_pkg_entry.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let build = &source[source.find("def build_entry(").unwrap()..];
+    assert!(build.find("os.geteuid() != 0").unwrap() < build.find("app.is_dir()").unwrap());
+    for required in [
+        "component.verify_cpu_app(app)",
+        "copied_digest == digest",
+        "component.inspect_universal(worker,",
+        "component.inspect_universal(desktop,",
+        "environment[\"SCRIBE_MACOS_CPU_PACKAGE_WORKER\"] = str(worker)",
+        "for target in component.TARGETS:",
+        "cwd=component.REPO",
+        "\"--no-default-features\"",
+        "\"--features\", \"installer-package-entry\"",
+        "component.hash_file(binary, MAX_SLICE)",
+        "component.inspect_universal_structure(candidate,",
+        "component.publish_no_replace(candidate, output)",
+    ] {
+        assert!(
+            build.contains(required),
+            "entry construction lost {required}"
+        );
+    }
+    assert!(source.contains("MAX_SLICE = component.MAX_WORKER + SLICE_CODE_AND_ALIGNMENT"));
+    assert!(source.contains("MAX_ENTRY = 2 * MAX_SLICE"));
+    assert!(shared.contains("MAX_WRITER = 64 * 1024 * 1024"));
+    let signed = &shared[shared.find("def inspect_universal(").unwrap()
+        ..shared.find("def inspect_universal_structure(").unwrap()];
+    assert!(
+        signed.find("\"--verify\", \"--strict\"").unwrap()
+            < signed.find("_inspect_universal_slices(").unwrap()
+    );
+    let structure = &shared[shared.find("def inspect_universal_structure(").unwrap()
+        ..shared.find("def _inspect_universal_slices(").unwrap()];
+    assert!(!structure.contains("codesign"));
+    for forbidden in [
+        "__main__",
+        "argparse",
+        "pkgbuild",
+        "--sign",
+        "--expand",
+        "subprocess.Popen",
+        "sudo ",
+        "/usr/sbin/installer",
+        "\"describe\"",
+        "\"install\"",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "entry construction gained {forbidden}"
+        );
+    }
+    assert!(tests.contains("expected = 17 + (2 if os.name == \"posix\" else 0)"));
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg_entry.py"));
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_cpu_pkg_entry.py")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
     let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");

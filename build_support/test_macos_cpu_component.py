@@ -212,6 +212,66 @@ class Portable(unittest.TestCase):
             component.require_outside_app(child, app)
         component.require_outside_app(self.root, app)
 
+    def test_slice_inspection_retains_thin_after_uncertain_child_cleanup(self):
+        binary = self.root / "binary"
+        binary.write_bytes(b"fixture")
+        thin = self.root / "binary-arm64"
+        def capture(arguments, **_kwargs):
+            if arguments[0] == "/usr/bin/lipo":
+                Path(arguments[-1]).write_bytes(b"fixture")
+                return b""
+            raise component.CleanupUncertain("synthetic otool cleanup uncertainty")
+        with patch.object(component, "capture", side_effect=capture), \
+             self.assertRaises(component.CleanupUncertain):
+            component._inspect_universal_slices(binary, [], self.root, 1024)
+        self.assertEqual(thin.read_bytes(), b"fixture")
+        # The child is mocked; the test-owned directory can safely be removed.
+
+    def test_signed_wrapper_keeps_signature_verification_before_slices(self):
+        binary = self.root / "binary"
+        binary.write_bytes(b"fixture")
+        calls = []
+        def capture(arguments, **_kwargs):
+            calls.append(arguments)
+            return b"arm64 x86_64" if arguments[0] == "/usr/bin/lipo" else b""
+        def inspect(*_args):
+            self.assertEqual(calls[-1], ["/usr/bin/codesign", "--verify", "--strict", str(binary)])
+        with patch.object(component, "capture", side_effect=capture), \
+             patch.object(component, "_inspect_universal_slices", side_effect=inspect) as slices:
+            component.inspect_universal(binary, [], self.root, 1024)
+        slices.assert_called_once_with(binary, [], self.root, 1024)
+        def reject(arguments, **_kwargs):
+            if arguments[0] == "/usr/bin/codesign":
+                raise component.ComponentError("invalid signature")
+            return b"arm64 x86_64"
+        with patch.object(component, "capture", side_effect=reject), \
+             patch.object(component, "_inspect_universal_slices") as slices, \
+             self.assertRaises(component.ComponentError):
+            component.inspect_universal(binary, [], self.root, 1024)
+        slices.assert_not_called()
+
+    def test_structure_wrapper_does_not_verify_signatures_or_execute_an_image(self):
+        binary = self.root / "postinstall"
+        binary.write_bytes(b"fixture")
+        with patch.object(component, "capture", return_value=b"arm64 x86_64") as capture, \
+             patch.object(component, "_inspect_universal_slices") as slices:
+            component.inspect_universal_structure(binary, [], self.root, 1024)
+        capture.assert_called_once_with(["/usr/bin/lipo", str(binary), "-archs"])
+        slices.assert_called_once_with(binary, [], self.root, 1024)
+
+    def test_structure_wrapper_preserves_size_and_exact_architecture_checks(self):
+        binary = self.root / "binary"
+        binary.write_bytes(b"fixture")
+        with patch.object(component, "capture") as capture, self.assertRaises(component.ComponentError):
+            component.inspect_universal_structure(binary, [], self.root, 1)
+        capture.assert_not_called()
+        for architectures in [b"arm64", b"x86_64", b"arm64 x86_64 arm64e"]:
+            with patch.object(component, "capture", return_value=architectures), \
+                 patch.object(component, "_inspect_universal_slices") as slices, \
+                 self.assertRaises(component.ComponentError):
+                component.inspect_universal_structure(binary, [], self.root, 1024)
+            slices.assert_not_called()
+
 
 class Posix(Portable):
     # Do not inherit/re-run Portable tests: runner loads only names defined here.
@@ -468,7 +528,7 @@ def suite():
         classes.append(Posix)
     if sys.platform == "darwin":
         classes.append(NativeMac)
-    expected = 21 + (17 if os.name == "posix" else 0) + (4 if sys.platform == "darwin" else 0)
+    expected = 25 + (17 if os.name == "posix" else 0) + (4 if sys.platform == "darwin" else 0)
     for cls in classes:
         for name in sorted(cls.__dict__):
             if name.startswith("test_"):
