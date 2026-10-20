@@ -1132,13 +1132,71 @@ fn macos_cpu_entry_construction_is_frozen_source_only_and_not_installation_autho
         );
     }
     assert!(tests.contains("expected = 17 + (2 if os.name == \"posix\" else 0)"));
-    assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg_entry.py"));
+    assert!(workflow.contains("python3 -B build_support/test_macos_cpu_pkg_entry.py"));
     assert_eq!(
         workflow
             .matches("build_support/*macos_cpu_pkg_entry.py")
             .count(),
         2
     );
+}
+
+#[test]
+fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
+    let source =
+        include_str!("../build_support/native_macos_cpu_pkg_entry.py").replace("\r\n", "\n");
+    let tests = include_str!("../build_support/test_native_macos_cpu_pkg_entry.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let run =
+        &source[source.find("def run_contract(").unwrap()..source.find("def main()").unwrap()];
+    assert!(run.find("os.geteuid() != 0").unwrap() < run.find("app.is_dir()").unwrap());
+    assert_eq!(run.matches("entry.build_entry(").count(), 2);
+    assert!(run.contains("component.hash_file(output, entry.MAX_ENTRY)"));
+    assert!(run.contains("component.fingerprint(output.lstat()) == identity"));
+    assert!(run.contains("input_snapshot(app) == before"));
+    assert!(run.contains("except component.CleanupUncertain:\n            raise"));
+    assert_eq!(run.matches("component.capture(").count(), 1);
+    assert!(run.contains("[\"/usr/bin/lipo\", str(output), \"-archs\"]"));
+    for forbidden in [
+        "subprocess",
+        "os.system",
+        "--sign",
+        "pkgbuild",
+        "/usr/sbin/installer",
+        "--destination",
+        "--expand",
+        "upload",
+        "Keychain",
+    ] {
+        // The module docstring states that no upload occurs; inspect code only.
+        assert!(
+            !run.contains(forbidden),
+            "native contract gained {forbidden}"
+        );
+    }
+    assert!(tests.contains("expected = 13 + (1 if os.name == \"posix\" else 0)"));
+    assert!(workflow.contains("python3 -B build_support/test_native_macos_cpu_pkg_entry.py"));
+    let native_step = workflow
+        .find("- name: Construct real universal CPU entry")
+        .unwrap();
+    assert!(
+        workflow
+            .find("- name: Build ad hoc signed universal structural package")
+            .unwrap()
+            < native_step
+    );
+    let step = &workflow[native_step
+        ..workflow[native_step..]
+            .find("- name: Run protected CPU")
+            .unwrap()
+            + native_step];
+    assert!(step.contains("timeout-minutes: 50"));
+    assert!(step.contains("shasum -a 256"));
+    assert!(step.contains("python3 -B build_support/native_macos_cpu_pkg_entry.py --app"));
+    assert!(step.contains(
+        "--worker-sha256 \"$worker_sha256\" --build-revision \"$SCRIBE_BUILD_REVISION\""
+    ));
+    assert!(!step.contains("upload-artifact"));
 }
 
 #[test]
