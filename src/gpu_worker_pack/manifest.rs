@@ -1085,122 +1085,28 @@ fn verify_exact_tree(
 }
 
 #[cfg(target_os = "macos")]
-struct MacosDirectoryStream(*mut libc::DIR);
-
-#[cfg(target_os = "macos")]
-impl MacosDirectoryStream {
-    fn close(mut self) -> Result<(), PackVerificationError> {
-        let stream = std::mem::replace(&mut self.0, std::ptr::null_mut());
-        if unsafe { libc::closedir(stream) } != 0 {
-            return Err(PackVerificationError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for MacosDirectoryStream {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
 pub(crate) fn macos_directory_names(
     directory: &File,
     maximum_entries: usize,
 ) -> Result<Vec<String>, PackVerificationError> {
-    use std::os::unix::io::AsRawFd;
-
-    let expected = macos_descriptor_stat(directory.as_raw_fd())?;
-    let duplicated = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            b".\0".as_ptr().cast(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if duplicated < 0 {
-        return Err(PackVerificationError::Io(io::Error::last_os_error()));
-    }
-    let reopened = match macos_descriptor_stat(duplicated) {
-        Ok(stat) => stat,
-        Err(error) => {
-            unsafe {
-                libc::close(duplicated);
+    use crate::macos_worker_fs::DirectoryReadError;
+    crate::macos_worker_fs::macos_directory_names(directory, maximum_entries).map_err(|error| {
+        match error {
+            DirectoryReadError::Io(error) => PackVerificationError::Io(error),
+            DirectoryReadError::AncestorChanged => PackVerificationError::PackStoreAncestorChanged(
+                PathBuf::from("descriptor-relative directory"),
+            ),
+            DirectoryReadError::InvalidName(reason) => {
+                PackVerificationError::UnsafePath(reason.to_owned())
             }
-            return Err(error);
+            DirectoryReadError::TooManyEntries => PackVerificationError::InvalidFileCount,
         }
-    };
-    if reopened.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || reopened.st_dev != expected.st_dev
-        || reopened.st_ino != expected.st_ino
-    {
-        unsafe {
-            libc::close(duplicated);
-        }
-        return Err(PackVerificationError::PackStoreAncestorChanged(
-            PathBuf::from("descriptor-relative directory"),
-        ));
-    }
-    let raw_stream = unsafe { libc::fdopendir(duplicated) };
-    if raw_stream.is_null() {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(duplicated);
-        }
-        return Err(PackVerificationError::Io(error));
-    }
-    let stream = MacosDirectoryStream(raw_stream);
-    let mut names = Vec::new();
-    loop {
-        unsafe {
-            *libc::__error() = 0;
-        }
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let error_number = unsafe { *libc::__error() };
-            if error_number != 0 {
-                return Err(PackVerificationError::Io(io::Error::from_raw_os_error(
-                    error_number,
-                )));
-            }
-            break;
-        }
-        let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        let name = std::str::from_utf8(bytes)
-            .map_err(|_| PackVerificationError::UnsafePath("non-UTF-8 pack entry".to_owned()))?;
-        if name.is_empty() {
-            return Err(PackVerificationError::UnsafePath(
-                "empty pack entry".to_owned(),
-            ));
-        }
-        names.push(name.to_owned());
-        if names.len() > maximum_entries {
-            return Err(PackVerificationError::InvalidFileCount);
-        }
-    }
-    stream.close()?;
-    names.sort_unstable();
-    Ok(names)
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn macos_descriptor_stat(descriptor: libc::c_int) -> Result<libc::stat, PackVerificationError> {
-    use std::mem::MaybeUninit;
-
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) } != 0 {
-        return Err(PackVerificationError::Io(io::Error::last_os_error()));
-    }
-    Ok(unsafe { stat.assume_init() })
+    crate::macos_worker_fs::descriptor_stat(descriptor).map_err(PackVerificationError::Io)
 }
 
 #[cfg(target_os = "macos")]

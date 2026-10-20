@@ -70,6 +70,9 @@ mod macos_power;
 #[path = "../macos_worker_authority.rs"]
 mod macos_worker_authority;
 #[cfg(any(target_os = "macos", test))]
+#[path = "../macos_worker_fs.rs"]
+mod macos_worker_fs;
+#[cfg(any(target_os = "macos", test))]
 #[path = "../macos_worker_launch.rs"]
 mod macos_worker_launch;
 #[cfg(any(target_os = "macos", test))]

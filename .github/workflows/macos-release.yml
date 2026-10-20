@@ -83,7 +83,10 @@ jobs:
           test "$executable_count" -eq 4
           authority_tests="$(cargo test --locked --bin local-transcriber macos_worker_authority::tests:: -- --list)"
           authority_count="$(printf '%s\n' "$authority_tests" | awk '/^macos_worker_authority::tests::.*: test$/ { count++ } END { print count+0 }')"
-          test "$authority_count" -eq 12
+          test "$authority_count" -eq 9
+          filesystem_tests="$(cargo test --locked --bin local-transcriber macos_worker_fs::tests:: -- --list)"
+          filesystem_count="$(printf '%s\n' "$filesystem_tests" | awk '/^macos_worker_fs::tests::.*: test$/ { count++ } END { print count+0 }')"
+          test "$filesystem_count" -eq 8
           projection_tests="$(cargo test --locked --bin local-transcriber macos_protected_projection_ -- --list)"
           projection_count="$(printf '%s\n' "$projection_tests" | awk '/^gpu_worker_pack::protected_macos_projection_tests::macos_protected_projection_.*: test$/ { count++ } END { print count+0 }')"
           test "$projection_count" -eq 3

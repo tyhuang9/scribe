@@ -101,6 +101,8 @@ mod macos_power;
 )]
 mod macos_worker_authority;
 #[cfg(any(target_os = "macos", test))]
+mod macos_worker_fs;
+#[cfg(any(target_os = "macos", test))]
 #[allow(
     dead_code,
     reason = "host-side tests compile the macOS launcher without invoking posix_spawn"

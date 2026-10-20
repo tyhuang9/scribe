@@ -6,6 +6,14 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "the authoring verifier uses only shared directory-inspection primitives"
+)]
+#[path = "../../../src/macos_worker_fs.rs"]
+mod macos_worker_fs;
+
 #[allow(
     dead_code,
     reason = "the authoring tool reuses the production verifier but not its runtime lease API"
