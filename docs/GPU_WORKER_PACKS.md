@@ -1003,6 +1003,21 @@ app installation remain separate work. Release VAD still fails closed pending
 its own protected executable authority. No installation or Auto enablement is
 implied by these tests.
 
+The shared read-only `macos_worker_fs` module now owns the existing mode,
+ownership, link, ACL, APFS and descriptor-relative opening/enumeration checks.
+CPU authority uses its bounded directory reader directly instead of depending
+on the GPU manifest verifier; that verifier retains a thin adapter preserving
+its error categories. Opening alone is not trusted ancestry. Child-open helpers
+accept only a single canonical component, and repeated enumeration reopens `.`
+relative to the retained descriptor with an independent cursor. The desktop,
+inference worker and isolated authoring tool compile the same implementation.
+This is the installer source prerequisite, not an installer writer: filesystem
+creation, copying, publication, locking and cleanup are intentionally absent.
+The forthcoming writer must consume this same policy, create fresh private
+inodes, publish without replacement, reverify identical existing destinations
+and retain previously admitted versions. A post-publication confirmation error
+must never delete a directory an application may already have admitted.
+
 Metal framework linkage is confined to the per-architecture Metal worker. The
 desktop and universal CPU worker use only an IOKit power-source shim plus the
 `kern.osversion` witness and must have no Metal load command. Stable

@@ -768,6 +768,58 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
 }
 
 #[test]
+fn macos_shared_worker_filesystem_policy_is_read_only_and_provider_independent() {
+    let shared = production_source(include_str!("macos_worker_fs.rs"));
+    let authority = production_source(include_str!("macos_worker_authority.rs"));
+    let manifest = production_source(include_str!("gpu_worker_pack/manifest.rs"));
+    assert!(authority.contains("use crate::macos_worker_fs::{"));
+    assert!(authority.contains("crate::macos_worker_fs::macos_directory_names("));
+    assert!(!authority.contains("crate::gpu_worker_pack::manifest::macos_directory_names("));
+    assert!(
+        manifest
+            .contains("crate::macos_worker_fs::macos_directory_names(directory, maximum_entries)")
+    );
+    assert!(!shared.contains("crate::gpu_worker_pack"));
+    for required in [
+        "O_NOFOLLOW",
+        "O_CLOEXEC",
+        "O_NONBLOCK",
+        "validate_child_name(name.as_bytes())?",
+        "validate_node_policy(",
+        "validate_acl_entry(tag, rights)?",
+        "validate_filesystem_policy(",
+        "libc::fdopendir",
+        "libc::openat",
+        "NodeIdentity",
+    ] {
+        assert!(shared.contains(required), "shared policy lost {required}");
+    }
+    for forbidden in [
+        "libc::mkdir",
+        "libc::rename",
+        "libc::unlink",
+        "libc::chown",
+        "libc::fchmod",
+        "Command::",
+        "O_CREAT",
+        "O_WRONLY",
+        "O_RDWR",
+    ] {
+        assert!(
+            !shared.contains(forbidden),
+            "runtime filesystem policy gained mutation: {forbidden}"
+        );
+    }
+    for source in [
+        include_str!("main.rs"),
+        include_str!("bin/scribe-inference-worker.rs"),
+        include_str!("../tools/worker-pack-author/src/main.rs"),
+    ] {
+        assert!(source.contains("mod macos_worker_fs;"));
+    }
+}
+
+#[test]
 fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() {
     let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
     let authority = production_source(include_str!("gpu_worker_pack/device_release_epoch.rs"));
