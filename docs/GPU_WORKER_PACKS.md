@@ -1002,6 +1002,16 @@ tampering, replacement, links, modes, extra files and descriptor-role confusion.
 This is still source-only admission, not a finished installer experience. CPU
 writer and development-component source exist; shipping installer integration,
 the protected Metal writer and combined app installation remain separate work.
+The isolated [Metal installer source-admission tool](../tools/macos-metal-pack-installer/README.md)
+now shares the application's compiled release-inclusion parser and production
+signature verifier. Its private permit binds one exact native Metal pack and
+three-file inventory to a retained source lease. It rejects auxiliary payloads,
+foreign builds and source aliases; hostile FIFO reads cannot block before type
+validation. This is read-only content admission, not protected filesystem or
+execution authority: no install command, store write, Keychain access or worker
+launch exists. The copy-only protected Metal transaction remains the next
+installer-source boundary; shipping bootstrap and actual installation are not
+established by this tool.
 Release VAD now uses the same frozen
 protected CPU image, in its own VAD-only process/session. A binary-local constant
 and the underlying inference provider restrict that entry to the dedicated Mac

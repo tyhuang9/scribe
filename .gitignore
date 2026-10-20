@@ -3,6 +3,7 @@
 /artifacts/gpu-worker-packs/
 /tools/worker-pack-author/target/
 /tools/macos-cpu-worker-installer/target/
+/tools/macos-metal-pack-installer/target/
 /tools/windows-gpu-promotion-broker/target/
 /NUL
 /.stitch/

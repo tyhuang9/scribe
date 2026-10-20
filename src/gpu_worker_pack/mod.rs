@@ -10,6 +10,7 @@ mod device_release_epoch;
 mod execution_path;
 pub(crate) mod health;
 pub(crate) mod manifest;
+mod release_authority;
 pub(crate) mod store;
 
 use std::fs::{File, OpenOptions};
@@ -25,10 +26,16 @@ use std::sync::Arc;
 ))]
 use std::sync::{Mutex, OnceLock};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MAX_RELEASE_SECURITY_EPOCH: u64 = 9_007_199_254_740_991;
+#[cfg(any(test, target_os = "macos"))]
+use release_authority::validated_release_authority_document;
+use release_authority::{
+    MAX_PRODUCTION_PACKS, MAX_RELEASE_SECURITY_EPOCH, PackCatalog, ReleaseBuildIdentity,
+    canonical_keychain_access_group,
+};
+#[cfg(test)]
+use release_authority::{PackReleaseAuthority, PackReleaseAuthorityEntry};
 
 // Platform resolvers consume the bridge through this stable re-export.
 #[cfg(unix)]
@@ -585,7 +592,6 @@ pub(crate) fn production_registry() -> ProductionPackRegistry {
 
 const PACK_CATALOG_NAME: &str = "worker-pack-catalog.json";
 const MAX_PACK_CATALOG_BYTES: u64 = 512 * 1024;
-const MAX_PRODUCTION_PACKS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackDiscoveryIssue {
@@ -881,90 +887,10 @@ pub(crate) fn diagnostic_summary(diagnostics: &[PackDiscoveryDiagnostic]) -> Str
         .join("; ")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PackCatalog {
-    schema_version: u16,
-    packs: Vec<PackCatalogEntry>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PackCatalogEntry {
-    pack_id: manifest::StoreComponent,
-    pack_version: manifest::StoreComponent,
-    pack_digest: String,
-    security_epoch: u64,
-    runtime_abi_version: u16,
-    backend: manifest::PackBackend,
-    provider: String,
-    target_os: String,
-    target_arch: String,
-    worker_relative_path: String,
-    root: String,
-    installed_size_bytes: u64,
-    compressed_size_bytes: u64,
-    files: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PackReleaseAuthority {
-    schema_version: u16,
-    catalog_sha256: String,
-    release_security_epoch: u64,
-    keychain_access_group: String,
-    entries: Vec<PackReleaseAuthorityEntry>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedReleaseAuthority {
     release_security_epoch: u64,
     keychain_access_group: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PackReleaseAuthorityEntry {
-    app_version: String,
-    build_revision: String,
-    app_protocol_version: u16,
-    pack_id: manifest::StoreComponent,
-    pack_version: manifest::StoreComponent,
-    pack_digest: String,
-    security_epoch: u64,
-    runtime_abi_version: u16,
-    backend: manifest::PackBackend,
-    provider: String,
-    target_os: String,
-    target_arch: String,
-    worker_relative_path: String,
-    root: String,
-    installed_size_bytes: u64,
-    compressed_size_bytes: u64,
-    files: Vec<String>,
-}
-
-impl PackReleaseAuthorityEntry {
-    fn matches_catalog_entry(&self, entry: &PackCatalogEntry) -> bool {
-        self.app_version == env!("CARGO_PKG_VERSION")
-            && self.build_revision == env!("SCRIBE_BUILD_REVISION")
-            && self.app_protocol_version == manifest::APP_PROTOCOL_VERSION
-            && self.pack_id == entry.pack_id
-            && self.pack_version == entry.pack_version
-            && self.pack_digest == entry.pack_digest
-            && self.security_epoch == entry.security_epoch
-            && self.runtime_abi_version == entry.runtime_abi_version
-            && self.backend == entry.backend
-            && self.provider == entry.provider
-            && self.target_os == entry.target_os
-            && self.target_arch == entry.target_arch
-            && self.worker_relative_path == entry.worker_relative_path
-            && self.root == entry.root
-            && self.installed_size_bytes == entry.installed_size_bytes
-            && self.compressed_size_bytes == entry.compressed_size_bytes
-            && self.files == entry.files
-    }
 }
 
 const EMBEDDED_PACK_RELEASE_AUTHORITY: &[u8] = include_bytes!(concat!(
@@ -976,63 +902,23 @@ fn validated_release_authority(
     catalog_bytes: &[u8],
     authority_bytes: &[u8],
 ) -> Option<ValidatedReleaseAuthority> {
-    let authority = validated_release_authority_document(authority_bytes)?;
-    if !manifest::is_canonical_sha256(&authority.catalog_sha256)
-        || format!("{:x}", Sha256::digest(catalog_bytes)) != authority.catalog_sha256
-    {
-        return None;
-    }
-    let Ok(catalog) = serde_json::from_slice::<PackCatalog>(catalog_bytes) else {
-        return None;
-    };
-    if catalog.schema_version != 1
-        || catalog.packs.len() != authority.entries.len()
-        || !catalog
-            .packs
-            .iter()
-            .zip(&authority.entries)
-            .all(|(catalog, authority)| authority.matches_catalog_entry(catalog))
-    {
-        return None;
-    }
+    let authority = release_authority::validated_release_authority(
+        catalog_bytes,
+        authority_bytes,
+        ReleaseBuildIdentity {
+            app_version: env!("CARGO_PKG_VERSION"),
+            build_revision: env!("SCRIBE_BUILD_REVISION"),
+            app_protocol_version: manifest::APP_PROTOCOL_VERSION,
+        },
+    )?;
     Some(ValidatedReleaseAuthority {
         release_security_epoch: authority.release_security_epoch,
         keychain_access_group: authority.keychain_access_group,
     })
 }
 
-fn validated_release_authority_document(authority_bytes: &[u8]) -> Option<PackReleaseAuthority> {
-    let authority = serde_json::from_slice::<PackReleaseAuthority>(authority_bytes).ok()?;
-    if authority.schema_version != 2
-        || authority.entries.len() > MAX_PRODUCTION_PACKS
-        || serde_json::to_vec(&authority).ok().as_deref() != Some(authority_bytes)
-        || authority.release_security_epoch > MAX_RELEASE_SECURITY_EPOCH
-        || !authority
-            .entries
-            .iter()
-            .all(|entry| entry.security_epoch == authority.release_security_epoch)
-        || (authority.release_security_epoch == 0
-            && (!authority.entries.is_empty() || !authority.keychain_access_group.is_empty()))
-        || (authority.release_security_epoch > 0
-            && !canonical_keychain_access_group(&authority.keychain_access_group))
-    {
-        return None;
-    }
-    Some(authority)
-}
-
 fn catalog_matches_release_authority(catalog_bytes: &[u8], authority_bytes: &[u8]) -> bool {
     validated_release_authority(catalog_bytes, authority_bytes).is_some()
-}
-
-fn canonical_keychain_access_group(group: &str) -> bool {
-    let Some((team_id, suffix)) = group.split_at_checked(10) else {
-        return false;
-    };
-    suffix == ".com.scribe.local-transcriber"
-        && team_id
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 fn release_epoch_identity_matches(

@@ -2,8 +2,8 @@
 
 This isolated tool is installer **source**, not a shipping installer, privileged
 service, runtime download mechanism, or permission to install it. The desktop
-never starts it. It does not install the application, VAD, or Metal workers and
-does not change Auto eligibility.
+never starts it. It installs only the shared CPU inference/VAD worker image, not
+the application or Metal workers, and does not change Auto eligibility.
 
 ## Authority and transaction
 

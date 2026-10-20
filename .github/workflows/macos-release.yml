@@ -17,6 +17,7 @@ on:
       - 'src/**'
       - 'tools/worker-pack-author/**'
       - 'tools/macos-cpu-worker-installer/**'
+      - 'tools/macos-metal-pack-installer/**'
   push:
     branches: [main]
     paths:
@@ -34,6 +35,7 @@ on:
       - 'src/**'
       - 'tools/worker-pack-author/**'
       - 'tools/macos-cpu-worker-installer/**'
+      - 'tools/macos-metal-pack-installer/**'
   workflow_dispatch:
     inputs:
       notarize:
@@ -77,6 +79,11 @@ jobs:
           bash scripts/verify-macos-cpu-installer-source.sh
       - name: Verify non-installing CPU component source
         run: python3 -B build_support/test_macos_cpu_component.py
+      - name: Verify Metal installer source admission without installation
+        timeout-minutes: 15
+        run: |
+          cargo fetch --locked --manifest-path tools/macos-metal-pack-installer/Cargo.toml
+          bash scripts/verify-macos-metal-installer-source.sh
       - name: Validate canonical packaging inputs
         run: bash scripts/test-macos-release-packaging.sh
       - name: Run macOS runtime and worker-pack authoring tests
