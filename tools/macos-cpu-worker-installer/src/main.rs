@@ -1,6 +1,20 @@
 //! Installer-owned source component; never a runtime elevation service.
 use anyhow::{Result, bail};
 
+#[cfg(target_os = "macos")]
+#[allow(dead_code, reason = "CPU retains its literal ancestor policy wrapper")]
+#[path = "../../../src/macos_installer_bootstrap.rs"]
+mod installer_bootstrap;
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "shared installer primitives have CPU and Metal consumers"
+)]
+#[path = "../../../src/macos_installer_fs.rs"]
+mod installer_fs;
+#[path = "../../../src/macos_installer_transaction.rs"]
+mod installer_transaction;
+
 #[allow(
     dead_code,
     reason = "shared read-only policy consumers use different primitive subsets"

@@ -70,6 +70,10 @@ collisions with legitimate descendants, unsafe existing ancestors, ambiguous
 publication, confirmation failure, and unproven/replaced/nonempty stage residue.
 No model, audio, driver, real protected root, signing material, or user cache is
 used. CI runs the same check on Intel and ARM.
+Exact discovery requires 21 portable tests or 42 on macOS. Transaction, bounded
+byte and native filesystem/bootstrap mechanics are installer-only shared source;
+the CPU adapter still enforces literal Scribe/CPU ancestors and its 512-MiB
+compiled-image bound. The desktop and worker do not import these write helpers.
 
 ## Non-installing development component
 
