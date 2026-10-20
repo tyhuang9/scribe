@@ -4,22 +4,25 @@ IFS=$'\n\t'
 
 usage() {
   cat <<'EOF'
-Usage: build-macos-release.sh --output-directory <directory> --pack-version <version> [--signing-mode <adhoc|developer-id>] [--include-metal-packs]
+Usage: build-macos-release.sh --output-directory <directory> --pack-version <version> [--signing-mode <adhoc|developer-id>] [--include-metal-packs] [--prepare-protected-cpu-component]
 
 Creates a universal Scribe.app with a universal CPU worker and a default-empty
 Metal pack catalog. A positive SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH creates
 a protected release and requires the reviewed Developer-ID profile and stable
 Keychain access group. --include-metal-packs is only for protected builds with
 the reviewed Ed25519 signing key and Developer-ID keychain identity.
+--prepare-protected-cpu-component creates a separate, non-installing CPU-only
+development component using Python 3.13+. It is not an authenticated installer.
 EOF
 }
 
-output='' pack_version='' signing_mode="${SCRIBE_MACOS_SIGNING_MODE:-adhoc}" include_metal_packs=false
+output='' pack_version='' signing_mode="${SCRIBE_MACOS_SIGNING_MODE:-adhoc}" include_metal_packs=false prepare_cpu_component=false
 while (($#)); do case "$1" in
   --output-directory) output="${2:-}"; shift 2 ;;
   --pack-version) pack_version="${2:-}"; shift 2 ;;
   --signing-mode) signing_mode="${2:-}"; shift 2 ;;
   --include-metal-packs) include_metal_packs=true; shift ;;
+  --prepare-protected-cpu-component) prepare_cpu_component=true; shift ;;
   -h|--help) usage; exit 0 ;;
   *) echo "unknown argument: $1" >&2; exit 2 ;;
 esac; done
@@ -80,6 +83,12 @@ verify_no_keychain_group() {
 
 release_security_epoch="${SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH:-0}"
 is_canonical_json_epoch "$release_security_epoch" || { echo 'SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH must be a canonical exact JSON integer from 0 through 9007199254740991.' >&2; exit 2; }
+if "$prepare_cpu_component"; then
+  [[ "$release_security_epoch" == 0 && "$include_metal_packs" == false && "$signing_mode" == adhoc ]] || {
+    echo 'development CPU components require an ad hoc CPU-only epoch-zero build.' >&2; exit 2;
+  }
+  python3 -c 'import os; assert hasattr(os, "waitid"), "Python 3.13+ is required on macOS"'
+fi
 reviewed_namespace="$repo_root/runtime-manifests/gpu-keychain-namespace-macos-release.json"
 reviewed_namespace_json="$(jq -c . "$reviewed_namespace")"
 [[ "$reviewed_namespace_json" == "$(cat "$reviewed_namespace")" ]] || { echo 'reviewed macOS Keychain namespace manifest is not canonical.' >&2; exit 1; }
@@ -247,4 +256,12 @@ if "$protected_release"; then verify_exact_keychain_group "$app" "$keychain_acce
 [[ "$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')" == "$worker_digest" ]] || { echo 'outer application signing changed the anchored CPU worker.' >&2; exit 1; }
 rm -rf "$output"/cargo-cpu-* "$output"/cargo-desktop-* "$output"/metal-*.json "$output"/Scribe.protected.entitlements
 ditto -c -k --sequesterRsrc --keepParent "$app" "$output/Scribe-macos-universal.zip"
+if "$prepare_cpu_component"; then
+  # Preserve the finished app and any retained workspace on uncertain cleanup.
+  trap - ERR
+  python3 "$repo_root/build_support/macos_cpu_component.py" assemble --app "$app" \
+    --output-directory "$output/protected-cpu-component" \
+    --worker-sha256 "$worker_digest" --build-revision "$build_revision"
+fi
+
 echo "$app"
