@@ -268,7 +268,7 @@ execution, installation or release qualification.
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-16 portable tests, plus one native test on each Mac lane. That native test uses
+18 portable tests, plus one native test on each Mac lane. That native test uses
 the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 `postinstall`, with no interpreter or program content. The file has executable
 mode only to model an operation archive; **nothing executes it**. Neither the
@@ -288,6 +288,16 @@ and decoded Scripts prefix. The header layout follows [Apple's XAR source](https
 No CPIO dialect, optional Bom/Payload member or native tool compatibility is
 presumed from synthetic fixtures. Review both actual Mac reports before freezing
 the supported PKG profile and implementing full bounded Scripts parsing.
+
+Outer member `mode` is observation metadata: an absent field is reported as JSON
+`null`, never defaulted to permissions or treated as safe/executable. A present
+field still requires one bounded leaf scalar; duplicate, nested, empty or unsafe
+values reject. Apple's [XAR stat source](https://github.com/apple-oss-distributions/xar/blob/main/xar/lib/stat.c)
+writes this property conditionally. This reporting rule does not relax required
+member names/types, data bounds or encoding checks, and grants no extraction or
+installation authority. Portable fixtures cover missing modes independently and
+together. A native failure at mode lookup alone cannot distinguish missing from
+duplicate/nested metadata; only the corrected native report can establish that.
 
 This probe does not validate checksums, signatures, exact operation inventory or
 package authenticity. It is not a reusable arbitrary-archive inspector, trusted

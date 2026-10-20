@@ -76,6 +76,15 @@ def scalar(node: ET.Element, name: str) -> str:
     return value
 
 
+def observed_mode(node: ET.Element) -> str | None:
+    # Reporting only: absence is unknown, never inferred permissions. Apple's
+    # xar/lib/stat.c writes this property conditionally; duplicate or malformed
+    # fields still use the existing strict scalar validation.
+    if not node.findall("mode"):
+        return None
+    return scalar(node, "mode")
+
+
 def number(node: ET.Element, name: str, maximum: int) -> int:
     text = scalar(node, name)
     require(re.fullmatch(r"0|[1-9][0-9]{0,9}", text) is not None, "invalid numeric scalar")
@@ -138,7 +147,7 @@ def observe_generated(data: bytes) -> dict:
                 require(re.fullmatch(r"[a-z0-9-]{1,16}", style) is not None,
                         "unsafe checksum label")
                 styles[tag] = style
-        members.append({"name": name, "type": kind, "mode": scalar(file, "mode"),
+        members.append({"name": name, "type": kind, "mode": observed_mode(file),
                         "encoding": encoding, "stored_bytes": length,
                         "decoded_bytes": declared, "prefix_hex": decoded[:8].hex(),
                         "checksum_styles": styles})

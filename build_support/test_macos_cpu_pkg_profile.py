@@ -63,6 +63,39 @@ class Portable(unittest.TestCase):
                     self.assertTrue(all(member["encoding"] == outer for member in report["members"]))
                     self.assertEqual(report["scripts_inner_compression"], inner)
 
+    def test_absent_mode_is_reported_as_unknown_without_inferred_permissions(self):
+        for absent in [(0,), (1,), (0, 1)]:
+            def mutation(toc):
+                for index in absent:
+                    file = toc.findall("file")[index]
+                    file.remove(file.find("mode"))
+            with self.subTest(absent=absent):
+                report = profile.observe_generated(synthetic_package(mutate=mutation))
+                modes = [member["mode"] for member in report["members"]]
+                self.assertEqual(modes, [None if index in absent else "0644" for index in range(2)])
+                self.assertTrue(report["observation_only"])
+                encoded = json.dumps(report)
+                self.assertEqual(encoded.count('"mode": null'), len(absent))
+                self.assertNotIn('"mode": "0755"', encoded)
+
+    def test_present_mode_keeps_strict_scalar_validation(self):
+        for index in (0, 1):
+            for malformed in ("duplicate", "nested", "empty", "unsafe", "oversized"):
+                def mutation(toc):
+                    file = toc.findall("file")[index]
+                    mode = file.find("mode")
+                    if malformed == "duplicate":
+                        ET.SubElement(file, "mode").text = "0755"
+                    elif malformed == "nested":
+                        ET.SubElement(mode, "value").text = "0755"
+                    else:
+                        mode.text = {"empty": "", "unsafe": "mode with spaces", "oversized": "0" * 97}[malformed]
+                with self.subTest(index=index, malformed=malformed), \
+                     self.assertRaises(profile.component.ComponentError):
+                    profile.observe_generated(synthetic_package(mutate=mutation))
+        report = profile.observe_generated(synthetic_package())
+        self.assertEqual([member["mode"] for member in report["members"]], ["0644", "0644"])
+
     def test_inflate_rejects_truncation_trailing_concatenation_and_bombs(self):
         for source in [b"invalid", zlib.compress(b"x")[:-1], zlib.compress(b"x") + b"extra",
                        gzip.compress(b"x") + gzip.compress(b"x"), zlib.compress(b"x" * 1025)]:
@@ -255,7 +288,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 16 + (1 if sys.platform == "darwin" else 0)
+    expected = 18 + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result
