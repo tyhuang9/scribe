@@ -95,6 +95,7 @@ mod platform {
     struct ProcessState {
         pid: libc::pid_t,
         reaped: bool,
+        group_retired: bool,
     }
 
     pub(crate) struct MacWorkerProcess {
@@ -111,23 +112,7 @@ mod platform {
             if state.reaped {
                 return Ok(false);
             }
-            let mut status = 0;
-            // SAFETY: state.pid is a child created by this object and status is writable.
-            let result = unsafe { libc::waitpid(state.pid, &mut status, libc::WNOHANG) };
-            if result == 0 {
-                Ok(true)
-            } else if result == state.pid {
-                state.reaped = true;
-                Ok(false)
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    state.reaped = true;
-                    Ok(false)
-                } else {
-                    Err(error).context("could not poll the macOS worker process")
-                }
-            }
+            owned_child_has_exited(&mut state).map(|exited| !exited)
         }
 
         pub(crate) fn request_cooperative_cancel(&self) -> Result<bool> {
@@ -143,17 +128,50 @@ mod platform {
         }
 
         pub(crate) fn terminate(&self) -> Result<()> {
-            let state = self
+            self.terminate_with_group_signal(signal_group)
+        }
+
+        fn terminate_with_group_signal(
+            &self,
+            signal: impl Fn(libc::pid_t, c_int) -> std::io::Result<()>,
+        ) -> Result<()> {
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| anyhow!("macOS worker process lock was poisoned"))?;
-            if state.reaped {
+            if state.group_retired {
                 return Ok(());
             }
+            if state.reaped {
+                // Reaping releases the PID reservation. Only a non-delivering
+                // absence probe is safe now; a reused group may conservatively
+                // keep cleanup fenced, but must never receive our SIGKILL.
+                require_group_absent(state.pid, &signal)?;
+                state.group_retired = true;
+                return Ok(());
+            }
+            owned_child_has_exited(&mut state)?;
             // posix_spawn created a process group whose id equals the child pid.
-            if unsafe { libc::killpg(state.pid, libc::SIGKILL) } == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
+            match signal(state.pid, libc::SIGKILL) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                    state.group_retired = true;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                    // Darwin excludes zombies from killpg's targets and can
+                    // return EPERM for a zombie-only group. A terminal leader
+                    // alone does NOT prove its descendants are gone. Reserve
+                    // its PID with WNOWAIT, reap only that owned zombie, then
+                    // require ESRCH from a non-delivering group probe.
+                    if !owned_child_has_exited(&mut state)? {
+                        return Err(error)
+                            .context("could not terminate the macOS worker process group");
+                    }
+                    reap_child(&mut state, libc::WNOHANG)?;
+                    require_group_absent(state.pid, &signal)?;
+                    state.group_retired = true;
+                }
+                Err(error) => {
                     return Err(error)
                         .context("could not terminate the macOS worker process group");
                 }
@@ -162,31 +180,105 @@ mod platform {
         }
 
         pub(crate) fn wait(&self) -> Result<()> {
+            self.wait_with_group_signal(signal_group)
+        }
+
+        fn wait_with_group_signal(
+            &self,
+            signal: impl Fn(libc::pid_t, c_int) -> std::io::Result<()>,
+        ) -> Result<()> {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| anyhow!("macOS worker process lock was poisoned"))?;
-            if state.reaped {
+            if !state.reaped {
+                reap_child(&mut state, 0)?;
+            }
+            if !state.group_retired {
+                require_group_absent(state.pid, &signal)?;
+                state.group_retired = true;
+            }
+            Ok(())
+        }
+    }
+
+    fn owned_child_has_exited(state: &mut ProcessState) -> Result<bool> {
+        match child_has_exited(state.pid) {
+            Ok(exited) => Ok(exited),
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    // Ownership was lost; no later path may signal a possibly
+                    // reused PID/process group with a nonzero signal.
+                    state.reaped = true;
+                }
+                Err(error).context("could not poll the owned macOS worker process")
+            }
+        }
+    }
+
+    fn child_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
+        loop {
+            let mut information = MaybeUninit::<libc::siginfo_t>::zeroed();
+            // WNOWAIT preserves the child's PID until group-directed cleanup
+            // finishes. Polling must not silently release that reservation.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    information.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                let information = unsafe { information.assume_init() };
+                return Ok(unsafe { information.si_pid() } == pid);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn signal_group(pid: libc::pid_t, signal: c_int) -> std::io::Result<()> {
+        if unsafe { libc::killpg(pid, signal) } == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_group_absent(
+        pid: libc::pid_t,
+        signal: &impl Fn(libc::pid_t, c_int) -> std::io::Result<()>,
+    ) -> Result<()> {
+        match signal(pid, 0) {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(error) => Err(error).context("macOS worker group cleanup remains unconfirmed"),
+            Ok(()) => bail!("macOS worker group remains present after its leader exited"),
+        }
+    }
+
+    fn reap_child(state: &mut ProcessState, options: c_int) -> Result<()> {
+        loop {
+            let mut status = 0;
+            // SAFETY: state.pid is a child created by this object and status is writable.
+            let result = unsafe { libc::waitpid(state.pid, &mut status, options) };
+            if result == state.pid {
+                state.reaped = true;
                 return Ok(());
             }
-            loop {
-                let mut status = 0;
-                // SAFETY: state.pid is a child created by this object and status is writable.
-                let result = unsafe { libc::waitpid(state.pid, &mut status, 0) };
-                if result == state.pid {
-                    state.reaped = true;
-                    return Ok(());
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    state.reaped = true;
-                    return Ok(());
-                }
-                return Err(error).context("could not reap the macOS worker process");
+            if result == 0 {
+                bail!("macOS worker was not terminal at its reap boundary");
             }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                state.reaped = true;
+            }
+            return Err(error).context("could not reap the macOS worker process");
         }
     }
 
@@ -197,6 +289,11 @@ mod platform {
                 .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.reaped {
+                return;
+            }
+            if child_has_exited(state.pid).is_err() {
+                // A lost/unverifiable child is not authority to signal a PID
+                // that may already belong to an unrelated process.
                 return;
             }
 
@@ -241,6 +338,10 @@ mod platform {
         worker_flag: &str,
         bindings: &[(String, String)],
     ) -> Result<MacSpawnedWorker> {
+        // Snapshot stderr before rechecks/pipes can reuse an initially closed
+        // fd 2. The retained copy and every private pipe are allocated above
+        // stdio, so spawn actions cannot alias their own sources/destinations.
+        let stderr = stderr_descriptor(libc::STDERR_FILENO)?;
         authority
             .recheck()
             .context("verified macOS worker authority changed before spawn")?;
@@ -291,6 +392,9 @@ mod platform {
         actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())?;
         actions.dup2(stdin_pipe.read.raw(), libc::STDIN_FILENO)?;
         actions.dup2(stdout_pipe.write.raw(), libc::STDOUT_FILENO)?;
+        // CLOEXEC_DEFAULT would otherwise discard startup diagnostics. Match
+        // the ordinary worker launcher's inherited stderr, never its IPC pipe.
+        actions.dup2(stderr.raw(), libc::STDERR_FILENO)?;
         actions.close(stdin_pipe.write.raw())?;
         actions.close(stdout_pipe.read.raw())?;
         actions.close(liveness_pipe.write.raw())?;
@@ -330,7 +434,11 @@ mod platform {
             stdin,
             stdout,
             process: MacWorkerProcess {
-                state: Mutex::new(ProcessState { pid, reaped: false }),
+                state: Mutex::new(ProcessState {
+                    pid,
+                    reaped: false,
+                    group_retired: false,
+                }),
                 parent_control: Mutex::new(parent_control),
             },
         })
@@ -356,6 +464,41 @@ mod platform {
                 unsafe { libc::close(self.0) };
             }
         }
+    }
+
+    fn stderr_descriptor(source: RawFd) -> Result<FdGuard> {
+        let duplicate = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate >= 0 {
+            return Ok(FdGuard(duplicate));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(error).context("could not retain macOS worker stderr");
+        }
+        // GUI launch need not provide stderr. Never let that prevent worker
+        // startup, and never route native diagnostics into the protocol pipe.
+        let null = c"/dev/null";
+        let descriptor = unsafe {
+            libc::open(
+                null.as_ptr(),
+                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not open macOS worker null stderr");
+        }
+        let null = FdGuard(descriptor);
+        duplicate_private_fd(null.raw())
+    }
+
+    fn duplicate_private_fd(source: RawFd) -> Result<FdGuard> {
+        let descriptor = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 3) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not retain private macOS worker descriptor");
+        }
+        Ok(FdGuard(descriptor))
     }
 
     struct InheritableFd(FdGuard);
@@ -393,21 +536,13 @@ mod platform {
                 return Err(std::io::Error::last_os_error())
                     .context("could not create a macOS worker pipe");
             }
-            for descriptor in raw {
-                if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                    unsafe {
-                        libc::close(raw[0]);
-                        libc::close(raw[1]);
-                    }
-                    return Err(std::io::Error::last_os_error())
-                        .context("could not harden a macOS worker pipe");
-                }
-            }
+            let read = FdGuard(raw[0]);
+            let write = FdGuard(raw[1]);
             // The liveness read end and stdio ends are explicitly preserved by
             // file actions; CLOEXEC_DEFAULT closes every unrelated descriptor.
             Ok(Self {
-                read: FdGuard(raw[0]),
-                write: FdGuard(raw[1]),
+                read: duplicate_private_fd(read.raw())?,
+                write: duplicate_private_fd(write.raw())?,
             })
         }
     }
@@ -754,6 +889,300 @@ mod platform {
             assert_cwd_descriptor_rejected(-1, false);
         }
 
+        fn lifecycle_process(program: &str, args: &[&str]) -> MacWorkerProcess {
+            let mut command = Command::new(program);
+            command.args(args);
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn lifecycle fixture");
+            let pid = child.id() as libc::pid_t;
+            std::mem::forget(child);
+            MacWorkerProcess {
+                state: Mutex::new(ProcessState {
+                    pid,
+                    reaped: false,
+                    group_retired: false,
+                }),
+                parent_control: Mutex::new(std::fs::File::open("/dev/null").unwrap()),
+            }
+        }
+
+        fn await_terminal(process: &MacWorkerProcess) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while process.is_running().unwrap() {
+                assert!(Instant::now() < deadline, "lifecycle fixture did not exit");
+                std::thread::yield_now();
+            }
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_poll_reserves_terminal_child_until_group_cleanup() {
+            let process = lifecycle_process("/usr/bin/true", &[]);
+            await_terminal(&process);
+            let state = process.state.lock().unwrap();
+            assert!(!state.reaped, "polling must retain PID ownership");
+            assert!(child_has_exited(state.pid).unwrap());
+            drop(state);
+            process.terminate().unwrap();
+            process.wait().unwrap();
+            assert!(!process.is_running().unwrap());
+            assert!(process.state.lock().unwrap().group_retired);
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_live_permission_failure_remains_fenced() {
+            let process = lifecycle_process("/bin/sleep", &["30"]);
+            assert!(process.is_running().unwrap());
+            assert!(
+                process
+                    .terminate_with_group_signal(|_, signal| {
+                        assert_eq!(signal, libc::SIGKILL);
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    })
+                    .is_err()
+            );
+            let state = process.state.lock().unwrap();
+            assert!(!state.reaped);
+            assert!(!state.group_retired);
+            drop(state);
+            process.terminate().unwrap();
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_surviving_group_never_receives_stale_signals() {
+            let process = lifecycle_process("/usr/bin/true", &[]);
+            await_terminal(&process);
+            assert!(
+                process
+                    .terminate_with_group_signal(|_, signal| {
+                        if signal == libc::SIGKILL {
+                            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                        } else {
+                            assert_eq!(signal, 0);
+                            Ok(()) // Inject a surviving group after the real leader is reaped.
+                        }
+                    })
+                    .is_err()
+            );
+            assert!(process.state.lock().unwrap().reaped);
+            assert!(!process.state.lock().unwrap().group_retired);
+            assert!(
+                process
+                    .terminate_with_group_signal(|_, signal| {
+                        assert_eq!(signal, 0, "never signal a group after releasing its PID");
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    })
+                    .is_err()
+            );
+            assert!(!process.state.lock().unwrap().group_retired);
+            // The actual disposable group is absent; only a zero probe is used.
+            process.terminate().unwrap();
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_lost_child_ownership_never_authorizes_signals() {
+            let process = lifecycle_process("/usr/bin/true", &[]);
+            await_terminal(&process);
+            let pid = process.state.lock().unwrap().pid;
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(
+                process
+                    .terminate_with_group_signal(|_, _| {
+                        panic!("ownership loss must be detected before signalling")
+                    })
+                    .is_err()
+            );
+            assert!(process.state.lock().unwrap().reaped);
+            assert!(
+                process
+                    .terminate_with_group_signal(|_, signal| {
+                        assert_eq!(signal, 0);
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(!process.state.lock().unwrap().group_retired);
+            process.terminate().unwrap();
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_wait_also_confirms_group_absence() {
+            let process = lifecycle_process("/usr/bin/true", &[]);
+            process.wait().unwrap();
+            let state = process.state.lock().unwrap();
+            assert!(state.reaped);
+            assert!(state.group_retired);
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_signal_success_is_not_group_cleanup_confirmation() {
+            let process = lifecycle_process("/usr/bin/true", &[]);
+            await_terminal(&process);
+            process
+                .terminate_with_group_signal(|_, signal| {
+                    assert_eq!(signal, libc::SIGKILL);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!process.state.lock().unwrap().group_retired);
+            assert!(
+                process
+                    .wait_with_group_signal(|_, signal| {
+                        assert_eq!(signal, 0);
+                        Ok(()) // A successful signal must not hide a surviving group.
+                    })
+                    .is_err()
+            );
+            assert!(process.state.lock().unwrap().reaped);
+            assert!(!process.state.lock().unwrap().group_retired);
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_terminal_permission_failure_requires_absent_group() {
+            let process = lifecycle_process("/usr/bin/true", &[]);
+            await_terminal(&process);
+            let signals = Mutex::new(Vec::new());
+            process
+                .terminate_with_group_signal(|_, signal| {
+                    signals.lock().unwrap().push(signal);
+                    Err(std::io::Error::from_raw_os_error(
+                        if signal == libc::SIGKILL {
+                            libc::EPERM
+                        } else {
+                            assert_eq!(signal, 0);
+                            libc::ESRCH
+                        },
+                    ))
+                })
+                .unwrap();
+            assert_eq!(*signals.lock().unwrap(), [libc::SIGKILL, 0]);
+            let state = process.state.lock().unwrap();
+            assert!(state.reaped);
+            assert!(state.group_retired);
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_stderr_retains_only_the_selected_descriptor() {
+            let pipe = Pipe::new().unwrap();
+            let stderr = stderr_descriptor(pipe.write.raw()).unwrap();
+            assert_ne!(
+                unsafe { libc::fcntl(stderr.raw(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let message = b"startup failure";
+            assert_eq!(
+                unsafe { libc::write(stderr.raw(), message.as_ptr().cast(), message.len()) },
+                message.len() as isize
+            );
+            drop(stderr);
+            drop(pipe.write);
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe.read.into_raw()) };
+            let mut observed = Vec::new();
+            reader.read_to_end(&mut observed).unwrap();
+            assert_eq!(observed, message);
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_closed_stderr_uses_null_without_global_fd_changes() {
+            const CHILD_ENV: &str = "SCRIBE_PRIVATE_TEST_CLOSED_STDIO";
+            if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "macos_worker_launch::platform::tests::macos_worker_lifecycle_closed_stderr_uses_null_without_global_fd_changes",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD_ENV, "1")
+                    .spawn().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(
+                            status.success(),
+                            "isolated closed-stdio child failed: {status}"
+                        );
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("isolated closed-stdio child exceeded its deadline");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            // Only this disposable, exact-test subprocess loses its stdio.
+            // The parallel parent test runner's descriptors are untouched.
+            struct RestoreStdio([FdGuard; 3]);
+            impl Drop for RestoreStdio {
+                fn drop(&mut self) {
+                    for (destination, source) in self.0.iter().enumerate() {
+                        unsafe { libc::dup2(source.raw(), destination as c_int) };
+                    }
+                }
+            }
+            // Restore even on unwind so the child libtest harness can report
+            // its real result; the closed-fd window below remains genuine.
+            let _restore = RestoreStdio([
+                duplicate_private_fd(libc::STDIN_FILENO).unwrap(),
+                duplicate_private_fd(libc::STDOUT_FILENO).unwrap(),
+                duplicate_private_fd(libc::STDERR_FILENO).unwrap(),
+            ]);
+            unsafe {
+                libc::close(libc::STDIN_FILENO);
+                libc::close(libc::STDOUT_FILENO);
+                libc::close(libc::STDERR_FILENO);
+            }
+            let stderr = stderr_descriptor(libc::STDERR_FILENO).unwrap();
+            assert!(stderr.raw() >= 3);
+            assert_ne!(
+                unsafe { libc::fcntl(stderr.raw(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let message = b"startup failure";
+            assert_eq!(
+                unsafe { libc::write(stderr.raw(), message.as_ptr().cast(), message.len()) },
+                message.len() as isize
+            );
+            let pipe = Pipe::new().unwrap();
+            assert!(pipe.read.raw() >= 3 && pipe.write.raw() >= 3);
+            let mut actions = SpawnFileActions::new().unwrap();
+            actions.dup2(pipe.write.raw(), libc::STDOUT_FILENO).unwrap();
+            actions.dup2(stderr.raw(), libc::STDERR_FILENO).unwrap();
+            actions.close(pipe.read.raw()).unwrap();
+            let mut attributes = SpawnAttributes::new().unwrap();
+            attributes.process_group().unwrap();
+            let (result, pid) = spawn_pwd(&actions, &attributes);
+            assert_eq!(result, 0, "closed-stdio spawn failed");
+            let mut child = TestChild { pid, reaped: false };
+            drop(pipe.write);
+            assert_eq!(
+                child
+                    .wait_before(Instant::now() + Duration::from_secs(2))
+                    .unwrap(),
+                0
+            );
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe.read.into_raw()) };
+            let mut output = String::new();
+            reader.read_to_string(&mut output).unwrap();
+            assert!(
+                !output.trim().is_empty(),
+                "stdout was accidentally closed by aliased pipe actions"
+            );
+        }
+
         #[test]
         fn drop_terminates_and_reaps_worker_even_after_state_lock_poisoning() {
             let mut command = Command::new("/bin/sh");
@@ -773,7 +1202,11 @@ mod platform {
             let pid = child.id() as libc::pid_t;
             std::mem::forget(child);
             let process = MacWorkerProcess {
-                state: Mutex::new(ProcessState { pid, reaped: false }),
+                state: Mutex::new(ProcessState {
+                    pid,
+                    reaped: false,
+                    group_retired: false,
+                }),
                 parent_control: Mutex::new(
                     std::fs::File::open("/dev/null").expect("open worker control fixture"),
                 ),
