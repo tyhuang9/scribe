@@ -1076,6 +1076,46 @@ fn macos_cpu_package_entry_is_compile_time_embedded_and_never_run_by_ci() {
 }
 
 #[test]
+fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
+    let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
+    let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let probe = &source[source.find("def probe()").unwrap()..source.find("def main()").unwrap()];
+    assert!(probe.find("os.geteuid() != 0").unwrap() < probe.find("private_workspace(").unwrap());
+    assert!(probe.contains("fixture.open(\"xb\")"));
+    assert_eq!(probe.matches("component.capture(").count(), 2);
+    assert!(probe.contains("[\"/usr/bin/pkgbuild\", \"--nopayload\", \"--scripts\""));
+    assert!(probe.contains("[\"/usr/bin/xar\", \"-tf\", str(package)]"));
+    assert!(source.contains("len(sys.argv) == 1"));
+    assert!(source.contains("decoder.decompress(data, maximum + 1)"));
+    assert!(source.contains("not decoder.unused_data"));
+    assert!(source.contains("\"observation_only\": True"));
+    for forbidden in [
+        "/usr/sbin/installer",
+        "/usr/bin/codesign",
+        "subprocess.Popen",
+        "os.system(",
+        "--expand",
+        "extractall",
+        "--sign",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "format probe gained {forbidden}"
+        );
+    }
+    assert!(tests.contains("expected = 16 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("test_actual_unsigned_nopayload_format_without_installation"));
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg_profile.py"));
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_cpu_pkg_profile.py")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn macos_metal_installer_copies_only_admitted_content_and_ci_never_installs() {
     let entry = production_source(include_str!(
         "../tools/macos-metal-pack-installer/src/main.rs"

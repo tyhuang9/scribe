@@ -9,6 +9,7 @@ on:
       - 'build.rs'
       - 'build_support/build_revision.rs'
       - 'build_support/*macos_cpu_component.py'
+      - 'build_support/*macos_cpu_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
       - 'native/**'
@@ -27,6 +28,7 @@ on:
       - 'build.rs'
       - 'build_support/build_revision.rs'
       - 'build_support/*macos_cpu_component.py'
+      - 'build_support/*macos_cpu_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
       - 'native/**'
@@ -79,6 +81,9 @@ jobs:
           bash scripts/verify-macos-cpu-installer-source.sh
       - name: Verify non-installing CPU component source
         run: python3 -B build_support/test_macos_cpu_component.py
+      - name: Observe fixed unsigned PKG fixture format without installation
+        timeout-minutes: 2
+        run: python3 -B build_support/test_macos_cpu_pkg_profile.py
       - name: Verify Metal writer source in private unprivileged fixtures
         timeout-minutes: 15
         run: |
