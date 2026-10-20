@@ -373,10 +373,10 @@ impl PinnedPackRoot {
     fn verification_root(&self) -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            return PathBuf::from(format!(
+            PathBuf::from(format!(
                 "/proc/self/fd/{}",
                 self.handles.last().expect("digest handle").as_raw_fd()
-            ));
+            ))
         }
         #[cfg(target_os = "macos")]
         {
@@ -384,14 +384,14 @@ impl PinnedPackRoot {
             // not support traversing children below that path. All reads and
             // exact-tree inspection remain descriptor-relative; this path is
             // used only for diagnostics and test-hook labels.
-            return self.path.clone();
+            self.path.clone()
         }
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         {
-            return PathBuf::from(format!(
+            PathBuf::from(format!(
                 "/dev/fd/{}",
                 self.handles.last().expect("digest handle").as_raw_fd()
-            ));
+            ))
         }
         #[cfg(windows)]
         {
@@ -406,10 +406,10 @@ impl PinnedPackRoot {
     fn open_regular(&self, relative: &Path) -> Result<File, PackVerificationError> {
         #[cfg(unix)]
         {
-            return open_regular_at(
+            open_regular_at(
                 self.handles.last().expect("digest handle").as_raw_fd(),
                 relative,
-            );
+            )
         }
         #[cfg(windows)]
         {
