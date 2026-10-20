@@ -73,7 +73,7 @@ jobs:
           archive_dir="$RUNNER_TEMP/scribe-sherpa-onnx"
           bash scripts/prepare-macos-release-inputs.sh --output-directory "$archive_dir"
           echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
-      - name: Verify CPU installer source in private unprivileged fixtures
+      - name: Verify CPU writer and package-entry source without installation
         run: |
           cargo fetch --locked --manifest-path tools/macos-cpu-worker-installer/Cargo.toml
           bash scripts/verify-macos-cpu-installer-source.sh

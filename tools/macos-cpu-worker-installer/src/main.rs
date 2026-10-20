@@ -1,4 +1,5 @@
 //! Installer-owned source component; never a runtime elevation service.
+#[cfg(not(feature = "installer-package-entry"))]
 use anyhow::{Result, bail};
 
 #[cfg(target_os = "macos")]
@@ -29,8 +30,15 @@ mod macos_worker_fs;
 mod macos_worker_layout;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(feature = "installer-package-entry")]
+mod package_entry;
+#[cfg(feature = "installer-package-entry")]
+mod package_payload;
+#[cfg(all(test, feature = "installer-package-entry"))]
+mod package_snapshot;
 mod transaction;
 
+#[cfg(not(feature = "installer-package-entry"))]
 fn run() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.as_slice() == ["describe"] {
@@ -66,7 +74,11 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    #[cfg(feature = "installer-package-entry")]
+    let result = package_entry::run();
+    #[cfg(not(feature = "installer-package-entry"))]
+    let result = run();
+    if let Err(error) = result {
         eprintln!("{error:#}");
         std::process::exit(1);
     }

@@ -138,6 +138,62 @@ source checks: 21 portable, 17 additional POSIX, and four additional Darwin test
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
 
+## Dedicated native package-entry source
+
+The non-default `installer-package-entry` Cargo feature builds a **different
+entry mode**, intended to become the package's native `postinstall` executable.
+The default `describe | install --source-worker` command parser is compiled out;
+package mode has no source, root, digest, revision, key or environment authority
+override. It launches no sibling executable, shell or service. This mode is not
+assembled into a PKG, signed, installed or executed by the source check.
+
+Build-only `SCRIBE_MACOS_CPU_PACKAGE_WORKER` selects the already-finalized signed
+universal worker from a reviewed private build snapshot. Release compilation
+requires that input and the existing frozen SHA/revision. The build checks a
+bounded regular input (including native no-follow/link/type checks), copies it
+exclusively, independently hashes the reopened output, and embeds that snapshot.
+Directive/control characters in build paths reject before Cargo metadata output.
+The build toolchain and Cargo output remain trusted; this is not a hermetic build
+or a signature/Mach-O verifier. The future package author must independently
+verify the final worker and supply the exact same frozen inputs as the desktop.
+Source tests may compile an empty debug snapshot, which cannot pass admission.
+
+The runtime obtains its actual effective UID and accepts only the Installer
+operation context: package-path argument, install location `/`, live volume `/`,
+and an optional system-root argument that must also be `/`. Three or four
+arguments are accepted; aliases, alternate/offline volumes and CLI modes reject.
+The package path is never opened or used as authority. Invocation/UID checks
+constrain scope; **they do not authenticate an Installer caller**. After those
+checks, the embedded bytes are bounded and hashed against the compiled anchor
+before constructing the existing protected CPU transaction. Its closed source
+enum retains all original file-candidate checks in the default mode; package
+mode uses only a read-only cursor, not an external image path.
+
+Apple's current [packaging guidance](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
+describes signed PKGs as protecting included files and using Installer for custom
+installation code. Its [archived install-operation contract](https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/SoftwareDistribution4/Install_Operations/Install_Operations.html)
+allows binary operation executables and documents these arguments. The archive
+is retired: direct native `postinstall` invocation, exact current argument
+semantics and protected execution of the exact authenticated entry remain
+explicit native acceptance requirements. Root, Installer, the authenticated
+signed package and build toolchain form the intended trusted boundary; an
+Installer-shaped command line or an ad hoc development component is not proof.
+
+The canonical source check also runs this feature's exact suite: 32 Windows,
+33 Linux or 57 Mac tests, including all four invocation tests and three native
+embedded-copy fixtures on Mac. It checks release rejection of missing payload,
+unsafe paths, missing/nonregular input and mismatched digest, plus a compile-only
+synthetic positive. No production entry runs. The existing default 21/42 tests
+still run independently. Native fixtures cover embedded copy/reuse, corruption,
+collisions and ambiguous-publication cleanup only—not caller authenticity.
+
+Both architectures must embed the **same complete final universal worker**.
+A universal entry therefore holds approximately two worker copies before
+compression. Do not thin/re-sign the frozen worker to reduce this overhead;
+actual compressed/installed package size must be reported when package authoring
+is implemented. No PKG authoring, certificate provisioning, signing/notarization,
+application installation, replacement or update/removal is supplied by this unit.
+
 ## Not yet established
 
 The enclosing installer must authenticate this executable and its compiled

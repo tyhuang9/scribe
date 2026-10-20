@@ -1019,6 +1019,15 @@ Interrupted stages are not adopted or swept. Private native fixtures never invok
 the production installation entry. No actual installation, Keychain access,
 activation or worker launch is introduced; native acceptance, shipping bootstrap
 and actual installation are not established by this source tool.
+The CPU writer now also has a default-off native package-entry feature. It embeds
+the exact finalized universal CPU image and calls the same transaction directly,
+with no source-path or helper-execution step. Actual UID/live-volume invocation
+checks constrain scope, not caller trust; independent compiled-image hashing
+precedes protected mutation. Package authentication and current Installer binary
+operation behavior remain native gates. This is a prerequisite for the real
+installer bootstrap, not another trusted development-component envelope or an
+already-authorized installation. See the CPU writer's package-entry source
+contract for exact source checks, size tradeoff and remaining PKG authoring work.
 Release VAD now uses the same frozen
 protected CPU image, in its own VAD-only process/session. A binary-local constant
 and the underlying inference provider restrict that entry to the dedicated Mac

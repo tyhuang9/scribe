@@ -990,6 +990,92 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
 }
 
 #[test]
+fn macos_cpu_package_entry_is_compile_time_embedded_and_never_run_by_ci() {
+    let main = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/main.rs"
+    ));
+    let entry = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/package_entry.rs"
+    ));
+    let native = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/native.rs"
+    ));
+    let build = production_source(include_str!("../tools/macos-cpu-worker-installer/build.rs"));
+    let payload = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/package_payload.rs"
+    ));
+    let snapshot = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/package_snapshot.rs"
+    ));
+    let check = include_str!("../scripts/verify-macos-cpu-installer-source.sh");
+    assert!(main.contains("#[cfg(not(feature = \"installer-package-entry\"))]\nfn run()"));
+    assert!(main.contains("let result = package_entry::run();"));
+    let run = named_function_bodies(&entry, "run").join("\n");
+    assert!(
+        run.find("validate_invocation(").unwrap() < run.find("production_embedded()?").unwrap()
+    );
+    assert!(run.contains("libc::geteuid()"));
+    let context = named_function_bodies(&entry, "validate_invocation").join("\n");
+    assert!(context.find("effective_uid != 0").unwrap() < context.find("arguments.len()").unwrap());
+    assert!(context.contains("arguments[1] != \"/\""));
+    assert!(context.contains("arguments[2] != \"/\""));
+    assert!(context.contains("arguments.get(3).is_some_and(|root| root != \"/\")"));
+    assert!(entry.contains("include_bytes!(concat!(env!(\"OUT_DIR\"), \"/package-worker.bin\"))"));
+    assert!(entry.contains("crate::package_payload::verify(IMAGE, digest)?"));
+    let constructor = named_function_bodies(&native, "production_embedded").join("\n");
+    assert!(
+        constructor.find("libc::geteuid()").unwrap()
+            < constructor.find("compiled_worker()?").unwrap()
+    );
+    assert!(
+        constructor.find("compiled_worker()?").unwrap() < constructor.find("Self::new(").unwrap()
+    );
+    assert!(native.contains("Self::File(file) => candidate_size(file)"));
+    assert!(payload.contains("validate_cpu_size(u64::try_from(bytes.len())?)?"));
+    assert!(payload.contains("Sha256::digest(bytes)"));
+    assert!(build.contains("release package entry requires SCRIBE_MACOS_CPU_PACKAGE_WORKER"));
+    let emit = named_function_bodies(&build, "emit_package_worker").join("\n");
+    assert!(
+        emit.find("validate_source_path(&source)").unwrap()
+            < emit.find("cargo:rerun-if-changed=").unwrap()
+    );
+    assert!(emit.find("package_snapshot::snapshot(").unwrap() < emit.find("fs::rename(").unwrap());
+    for required in [
+        "create_new(true)",
+        "libc::O_NOFOLLOW | libc::O_NONBLOCK",
+        "copied package image is unadmitted",
+    ] {
+        assert!(snapshot.contains(required));
+    }
+    for forbidden in [
+        "std::fs",
+        "std::process::Command",
+        "current_exe",
+        "std::env::var",
+        "--source-worker",
+        "--destination",
+        "Keychain",
+    ] {
+        assert!(
+            !entry.contains(forbidden),
+            "package entry gained {forbidden}"
+        );
+    }
+    for required in [
+        "installer-package-entry",
+        "package_expected=57",
+        "native_expected=3",
+        "expect_package_rejection",
+        "cargo check --release",
+    ] {
+        assert!(check.contains(required));
+    }
+    for forbidden in ["cargo run", "sudo ", "installer -pkg"] {
+        assert!(!check.contains(forbidden));
+    }
+}
+
+#[test]
 fn macos_metal_installer_copies_only_admitted_content_and_ci_never_installs() {
     let entry = production_source(include_str!(
         "../tools/macos-metal-pack-installer/src/main.rs"

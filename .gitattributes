@@ -24,6 +24,7 @@ scripts/test-windows-gpu-qualification-preflight.ps1 text eol=lf
 scripts/qualify-windows-gpu-evidence.ps1 text eol=lf
 scripts/test-windows-gpu-qualification.ps1 text eol=lf
 *.sh text eol=lf
+tools/macos-cpu-worker-installer/tests/fixtures/package-worker.txt text eol=lf
 resources/windows/application.manifest text eol=lf
 scripts/inspect-linux-deb.py text eol=lf
 scripts/qualify-linux-gpu-evidence.py text eol=lf
