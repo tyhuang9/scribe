@@ -4722,6 +4722,8 @@ fn resolve_verified_pack_executable(
     lease: Arc<VerifiedPackLease>,
     expected_device: Option<BackendTarget>,
 ) -> Result<VerifiedWorkerExecutable> {
+    #[cfg(target_os = "macos")]
+    let lease = crate::gpu_worker_pack::prepare_macos_protected_pack(lease)?;
     let frozen_worker_approval = lease.frozen_worker_approval().cloned();
     let pack = lease.verified_pack();
     let allowed = match pack.backend {
@@ -37956,8 +37958,11 @@ mod tests {
         // native contract retains the same transport and cleanup fence, but
         // preserves the inner error so a real launch/handshake failure is
         // diagnosable rather than only reporting an absent witness.
+        let mut primary_error = None;
         let observed = cleanup.run_probe(&supervisor, deadline, || {
-            supervisor.metal_metadata_witness_before(deadline, None)
+            let result = supervisor.metal_metadata_witness_before(deadline, None);
+            primary_error = result.as_ref().err().map(|error| format!("{error:#}"));
+            result
         });
         let cleanup_confirmed = ProviderProbeCleanupFence::cleanup_confirmed(&supervisor);
         let session_reaped = supervisor.metal_metadata_session_fully_reaped_for_test();
@@ -37974,7 +37979,8 @@ mod tests {
             ),
             Err(error) => panic!(
                 "native Metal metadata cleanup failed; cleanup={cleanup_confirmed:?}, \
-                 session_reaped={session_reaped:?}, child_running={process_running:?}: {error}"
+                 session_reaped={session_reaped:?}, child_running={process_running:?}, \
+                 primary_error={primary_error:?}: {error}"
             ),
         };
 

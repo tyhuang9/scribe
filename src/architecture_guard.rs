@@ -252,7 +252,12 @@ fn production_pack_provisioning_allowed(
     let unix_launch_bodies = named_function_bodies(worker, "launch_verified_worker").join("\n");
     let unix_authority_constructor =
         named_function_bodies(worker, "from_verified_pack_lease").join("\n");
-    let unix_fd_launch_flow = !unix_target
+    let macos_protected_launch_flow = unix_launch_bodies.contains("posix_spawn")
+        && unix_launch_bodies.contains("authority.protected_executable_path()")
+        && !unix_launch_bodies.contains("/dev/fd/")
+        && unix_authority_constructor.contains("macos_protected_authority(")
+        && worker.contains("ProtectedPackAuthority::open(");
+    let unix_verified_launch_flow = !unix_target
         || (worker.contains("UnixPackExecAuthority")
             && worker.contains("resolver_unix_launch_authority")
             && worker.contains("executable_fd")
@@ -261,15 +266,14 @@ fn production_pack_provisioning_allowed(
             && unix_authority_constructor.contains("hash_exact_length")
             && (unix_launch_bodies.contains("execveat")
                 || unix_launch_bodies.contains("fexecve")
-                || (unix_launch_bodies.contains("posix_spawn")
-                    && unix_launch_bodies.contains("/dev/fd/")))
+                || macos_protected_launch_flow)
             && !unix_launch_bodies.contains("Command::spawn")
             && !unix_launch_bodies.contains("Command::new"));
     (registry_is_empty && trust_root_is_empty)
         || (!trust_root_is_empty
             && (registry_is_empty || registry_routes_concrete_bridge)
             && concrete_resolver_hello_flow
-            && unix_fd_launch_flow)
+            && unix_verified_launch_flow)
 }
 
 #[test]
@@ -347,11 +351,36 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         true,
     ));
     let unix_fd_flow = format!(
-        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn from_verified_pack_lease(lease: &VerifiedPackLease) {{ open_copy_file(); hash_exact_length(); }}\nfn launch_verified_worker() {{ posix_spawn(format!(\"/dev/fd/{{}}\", executable_fd), dependency_root_fd); }}"
+        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn from_verified_pack_lease(lease: &VerifiedPackLease) {{ open_copy_file(); hash_exact_length(); }}\nfn launch_verified_worker() {{ execveat(executable_fd, dependency_root_fd); }}"
     );
     assert!(production_pack_provisioning_allowed(
         populated_registry,
         &unix_fd_flow,
+        false,
+        true,
+    ));
+    let descriptor_path_flow = unix_fd_flow.replace(
+        "execveat(executable_fd, dependency_root_fd)",
+        "posix_spawn(format!(\"/dev/fd/{}\", executable_fd))",
+    );
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        &descriptor_path_flow,
+        false,
+        true,
+    ));
+    let mac_protected_flow = unix_fd_flow
+        .replace("hash_exact_length();", "hash_exact_length(); macos_protected_authority(); ProtectedPackAuthority::open(lease);")
+        .replace("execveat(executable_fd, dependency_root_fd)", "posix_spawn(authority.protected_executable_path())");
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        &mac_protected_flow,
+        false,
+        true,
+    ));
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        &mac_protected_flow.replace("macos_protected_authority();", ""),
         false,
         true,
     ));
@@ -449,7 +478,7 @@ fn macos_exec_authority_is_descriptor_paired_and_child_measured() {
     }
     for required in [
         "authority.readable_executable_fd().as_raw_fd()",
-        "CString::new(format!(\"/dev/fd/{}\", executable.raw()))",
+        "authority.protected_executable_path().to_owned()",
         "actions.dup2(executable.raw(), executable.raw())?",
         "actions.dup2(readable_executable.raw(), readable_executable.raw())?",
     ] {
@@ -496,7 +525,7 @@ fn macos_exec_authority_is_descriptor_paired_and_child_measured() {
 }
 
 #[test]
-fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
+fn stage_six_macos_verified_launch_is_installer_protected_and_command_free() {
     let launcher = production_source(include_str!("macos_worker_launch.rs"));
     let worker = production_source(include_str!("onnx_worker.rs"));
     let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
@@ -512,7 +541,7 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
 
     for required in [
         "posix_spawn(",
-        "/dev/fd/",
+        "authority.protected_executable_path()",
         "posix_spawn_file_actions_addfchdir_np",
         "actions.fchdir(dependency_root.raw())?",
         "actions.dup2(dependency_root.raw(), dependency_root.raw())?",
@@ -533,6 +562,24 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     assert!(!launcher.contains("executable.path"));
     assert!(!launcher.contains("posix_spawn_file_actions_addchdir_np"));
     assert!(!launcher.contains("dependency_root_path"));
+    let spawn = named_function_bodies(&launcher, "launch_verified_worker").join("\n");
+    assert!(!spawn.contains("/dev/fd/"));
+    assert!(!spawn.contains("worker_path()"));
+    assert!(worker.contains("prepare_macos_protected_pack(lease)?"));
+    let preparation = named_function_bodies(&pack, "prepare_macos_protected_pack").join("\n");
+    assert!(preparation.contains("ProtectedPackAuthority::open(&source)"));
+    assert!(preparation.contains("project_macos_protected_pack(source, &authority, &verifier)"));
+    let projection = named_function_bodies(&pack, "project_macos_protected_pack").join("\n");
+    assert!(projection.contains("verify_pinned(authority.pinned_root()?)"));
+    assert!(projection.contains("retain_execution_source(source)"));
+    for forbidden in [
+        "create_dir",
+        "std::fs::copy",
+        "PackStore::new",
+        "open_fixture",
+    ] {
+        assert!(!preparation.contains(forbidden));
+    }
     assert!(launcher.contains("SAFE_PARENT_ENVIRONMENT"));
     assert!(launcher.contains("SCRIBE_PRIVATE_"));
     for required in [
@@ -601,6 +648,16 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     assert!(packaging.contains("CPU/UI binary must not load Metal.framework"));
     assert!(packaging.contains("catalog Metal worker has no Metal load command"));
     assert!(packaging.contains("desktop does not embed the exact pack-catalog authority"));
+}
+
+#[test]
+fn macos_worker_control_pipe_uses_child_only_explicit_inheritance() {
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    let body = named_function_bodies(&launcher, "launch_verified_worker").join("\n");
+    assert!(body.contains("actions.inherit(liveness_pipe.read.raw())?"));
+    assert!(!body.contains("actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())"));
+    assert!(launcher.contains("posix_spawn_file_actions_addinherit_np(&mut self.0, descriptor)"));
+    assert!(launcher.contains("POSIX_SPAWN_CLOEXEC_DEFAULT"));
 }
 
 #[test]
