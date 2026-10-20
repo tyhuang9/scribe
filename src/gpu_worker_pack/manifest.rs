@@ -1389,7 +1389,9 @@ pub(crate) fn open_regular_no_follow(path: &Path) -> Result<File, PackVerificati
 #[cfg(unix)]
 fn configure_no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
+    // A hostile candidate can be a FIFO. Opening must not wait for a writer
+    // before the regular-file check gets a chance to reject it.
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 }
 
 #[cfg(windows)]
@@ -1444,7 +1446,7 @@ fn open_regular_at(directory_fd: i32, relative: &Path) -> Result<File, PackVerif
         libc::openat(
             current.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
