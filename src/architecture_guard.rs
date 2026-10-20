@@ -1293,7 +1293,10 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 16 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 18 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(source.contains("\"mode\": observed_mode(file)"));
+    assert!(tests.contains("test_absent_mode_is_reported_as_unknown_without_inferred_permissions"));
+    assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));
     assert!(tests.contains("test_actual_unsigned_nopayload_format_without_installation"));
     assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg_profile.py"));
     assert_eq!(
