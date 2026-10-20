@@ -1200,6 +1200,71 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
 }
 
 #[test]
+fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
+    let source = include_str!("../build_support/macos_cpu_component.py");
+    let entry = include_str!("../build_support/macos_cpu_pkg_entry.py");
+    let tests = include_str!("../build_support/test_macos_cpu_component.py");
+    let capture =
+        &source[source.find("def capture(").unwrap()..source.find("def has_markers(").unwrap()];
+    assert!(
+        capture.find("validate_tool_operation(operation)").unwrap()
+            < capture.find("subprocess.Popen(").unwrap()
+    );
+    assert!(
+        capture.find("process.wait(").unwrap()
+            < capture
+                .find("raise ToolExitError(operation, status)")
+                .unwrap()
+    );
+    assert!(
+        capture.contains("raise CleanupUncertain(\"process group remains after leader exit\")")
+    );
+    let error = &source[source.find("class ToolExitError(").unwrap()
+        ..source.find("def validate_identity(").unwrap()];
+    assert!(error.contains("validate_tool_operation(operation)"));
+    assert!(error.contains("type(status) is int"));
+    assert!(error.contains("self.operation, self.status = operation, status"));
+    for forbidden in [
+        "self.command",
+        "self.arguments",
+        "self.stdout",
+        "self.stderr",
+        "self.output",
+        "CalledProcessError",
+    ] {
+        assert!(
+            !error.contains(forbidden),
+            "authoring tool error gained {forbidden}"
+        );
+    }
+    for phase in [
+        "application-verification",
+        "artifact-architectures",
+        "artifact-signature-verification",
+        "artifact-slice",
+        "artifact-load-commands",
+        "artifact-dependencies",
+        "writer-build-arm64",
+        "writer-build-x86_64",
+        "writer-combine",
+        "development-writer-signing",
+        "writer-description",
+    ] {
+        assert!(
+            source.matches(phase).count() >= 2,
+            "unlabelled component operation {phase}"
+        );
+    }
+    for phase in ["entry-build-arm64", "entry-build-x86_64", "entry-combine"] {
+        assert!(entry.contains(phase));
+    }
+    assert!(tests.contains("expected = 27 + (18 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains(
+        "test_tool_exit_diagnostic_redacts_real_child_arguments_environment_and_streams"
+    ));
+}
+
+#[test]
 fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
     let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");

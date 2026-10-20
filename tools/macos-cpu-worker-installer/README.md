@@ -134,9 +134,21 @@ does not contain the component. Structural CI assembles and inspects it, but
 does not upload it, install it, or invoke the production installer entry.
 
 Run `python3 -B build_support/test_macos_cpu_component.py` for exact-discovery
-source checks: 25 portable, 17 additional POSIX, and four additional Darwin tests.
+source checks: 27 portable, 18 additional POSIX, and four additional Darwin tests.
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
+
+Nonzero native tool exits report a closed operation label and numeric status
+(including signal termination on POSIX), not a command path, argv, environment,
+stdout or stderr. Labels distinguish app verification, structural inspection,
+each architecture's writer/entry build, combination, development-only signing
+and the read-only writer description. Unknown labels reject before spawning.
+This diagnoses which operation failed without publishing sensitive diagnostics;
+it does not infer the underlying native/compiler error. Process bounds, exact
+child/group retirement, signature checks and failure policy are unchanged.
+Uncertain child cleanup takes precedence over an ordinary exit diagnostic and
+retains its workspace. POSIX tests exercise real failing children with sentinel
+arguments/environment/streams and check that none appears in the rendered error.
 
 ## Dedicated native package-entry source
 
