@@ -17,6 +17,8 @@ use crate::macos_worker_fs::{
 use crate::macos_worker_layout::{CPU_WORKER_NAME, embedded_cpu_digest, validate_cpu_size};
 use crate::transaction::{Operations, PublishResult, copy_exact, verify_bytes};
 
+mod bootstrap;
+
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const LOCK_NAME: &str = ".installer.lock";
 
@@ -112,21 +114,8 @@ impl NativeOperations {
             let file = match openat_node(parent, OsStr::new(name), NodeKind::Directory) {
                 Ok(file) => file,
                 Err(error) if may_create && has_errno(&error, libc::ENOENT) => {
-                    let name_c = CString::new(name)?;
-                    let created = unsafe { libc::mkdirat(parent, name_c.as_ptr(), 0o700) } == 0;
-                    if !created && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-                        return Err(io::Error::last_os_error())
-                            .context("could not create fixed CPU ancestor");
-                    }
-                    let file = openat_node(parent, OsStr::new(name), NodeKind::Directory)?;
-                    // Never normalize a preexisting node, including an EEXIST race.
-                    checked_directory(&file, self.uid, if created { Some(0o700) } else { None })?;
-                    if created {
-                        set_mode(&file, 0o755)?;
-                        file.sync_all()?;
-                        self.cpu()?.sync_all()?;
-                    }
-                    file
+                    self.recheck_anchors()?;
+                    bootstrap::ensure_fixed_ancestor(self.cpu()?, name, self.uid)?
                 }
                 Err(error) => return Err(error),
             };

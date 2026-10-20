@@ -825,6 +825,9 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
     let native = production_source(include_str!(
         "../tools/macos-cpu-worker-installer/src/native.rs"
     ));
+    let bootstrap = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/native/bootstrap.rs"
+    ));
     let transaction = production_source(include_str!(
         "../tools/macos-cpu-worker-installer/src/transaction.rs"
     ));
@@ -853,6 +856,10 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
             !manifest.contains(forbidden),
             "isolated installer gained {forbidden}"
         );
+        assert!(
+            !bootstrap.contains(forbidden),
+            "ancestor bootstrap gained {forbidden}"
+        );
     }
     for required in [
         "embedded_cpu_digest()?",
@@ -873,9 +880,30 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
     );
     assert!(check.contains("--locked --offline"));
     assert!(check.contains("--all-targets -- -D warnings"));
-    assert!(check.contains("Darwin) expected=32"));
+    assert!(check.contains("Darwin) expected=40"));
     assert!(check.contains("[[ \"$count\" == \"$expected\" ]]"));
     assert!(workflow.contains("bash scripts/verify-macos-cpu-installer-source.sh"));
+    let root_walk = named_function_bodies(&native, "walk_protected_root").join("\n");
+    assert!(root_walk.contains("bootstrap::ensure_fixed_ancestor("));
+    assert!(!root_walk.contains("libc::mkdirat"));
+    assert!(!root_walk.contains("set_mode("));
+    for required in [
+        "impl Operations for Bootstrap",
+        "install(&mut operation)",
+        "matches!(final_name, \"Scribe\" | \"CPU\")",
+        "self.check_empty_stage(0o700)?",
+        "self.check_empty_stage(0o755)?",
+        "libc::RENAME_EXCL",
+        "original ancestor stage name changed",
+    ] {
+        assert!(
+            bootstrap.contains(required),
+            "ancestor transaction lost {required}"
+        );
+    }
+    let bootstrap_confirm = named_function_bodies(&bootstrap, "confirm").join("\n");
+    assert!(bootstrap_confirm.contains("checked_directory("));
+    assert!(!bootstrap_confirm.contains("check_empty_stage("));
     for source in [check, workflow] {
         for forbidden in ["sudo ", "installer -pkg", "--source-worker"] {
             assert!(

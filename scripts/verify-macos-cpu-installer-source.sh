@@ -11,7 +11,7 @@ cargo clippy --locked --offline --manifest-path "$manifest" --all-targets -- -D 
 listing="$(cargo test --locked --offline --manifest-path "$manifest" -- --list)"
 count="$(printf '%s\n' "$listing" | awk '/: test$/ { count++ } END { print count+0 }')"
 case "$(uname -s)" in
-  Darwin) expected=32 ;;
+  Darwin) expected=40 ;;
   *) expected=19 ;;
 esac
 [[ "$count" == "$expected" ]] || { echo "CPU writer test discovery mismatch: expected $expected, got $count." >&2; exit 1; }

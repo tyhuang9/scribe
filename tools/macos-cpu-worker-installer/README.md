@@ -22,7 +22,9 @@ The fixed destination is:
 
 The writer retains and rechecks no-follow descriptors through the fixed root,
 requires ownership-enforcing local APFS and the shared ACL/mode/link policy, and
-creates only missing Scribe/CPU directories. Existing nodes are never repaired.
+creates only missing Scribe/CPU directories. Each missing ancestor uses an
+independently verified empty private stage, sealed 0755 and synced before
+no-replace publication. Existing nodes are never repaired.
 A permanent root-owned single-link 0600 `.installer.lock` provides nonblocking
 mutual exclusion; it is never unlinked. Ancestors remain user-traversable.
 
@@ -62,6 +64,10 @@ Native Mac tests exercise the real Darwin writer only in exclusively created
 unprivileged APFS fixtures. They cover permanent-lock contention and malformed
 locks, exact reuse without inode replacement, no-replace publication, malformed
 existing inventory/modes/links, source special files, and ambiguous cleanup.
+The same transaction ordering also governs ancestor creation. Private native
+fixtures cover interruption before/after sealing and retry, competing-installer
+collisions with legitimate descendants, unsafe existing ancestors, ambiguous
+publication, confirmation failure, and unproven/replaced/nonempty stage residue.
 No model, audio, driver, real protected root, signing material, or user cache is
 used. CI runs the same check on Intel and ARM.
 
@@ -75,11 +81,13 @@ real installation/update/removal, and clean-machine acceptance are separate
 delivery work. Root itself must not be a concurrent hostile writer; this is not
 a defense against a compromised root account.
 
-Private fixtures bypass production ancestor bootstrap. A first-install crash
-between creating a missing ancestor privately and sealing it user-traversable
-can leave that root-owned ancestor inaccessible. A retry deliberately refuses
-to repair existing nodes; installer-level recovery must be designed and tested
-before shipping. No automatic permission repair is authorized by this tool.
+Private fixtures exercise the real fixed-ancestor creation helper, but never
+the production /Library root walk or installation entry. Interruption before
+ancestor publication leaves only an unadmitted temporary name; retry creates a
+new stage instead of adopting or sweeping an earlier one. A published ancestor
+already has its final traversal permissions. Existing unsafe nodes still fail
+closed without repair. Native execution, actual power-loss durability and
+installer-level recovery acceptance remain unverified until qualified.
 
 Native CI, filesystem sync behavior under power loss, actual signed-image
 admission, and installer-level durability/rollback require their own evidence.
