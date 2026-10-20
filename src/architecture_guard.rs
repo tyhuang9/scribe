@@ -705,7 +705,9 @@ fn stage_six_macos_verified_launch_is_installer_protected_and_command_free() {
 fn macos_worker_control_pipe_uses_child_only_explicit_inheritance() {
     let launcher = production_source(include_str!("macos_worker_launch.rs"));
     let entry = named_function_bodies(&launcher, "launch_verified_worker").join("\n");
-    assert!(entry.contains("launch_worker(LaunchAuthority::Pack(authority), worker_flag, bindings)"));
+    assert!(
+        entry.contains("launch_worker(LaunchAuthority::Pack(authority), worker_flag, bindings)")
+    );
     let body = named_function_bodies(&launcher, "launch_worker").join("\n");
     assert!(body.contains("actions.inherit(liveness_pipe.read.raw())?"));
     assert!(!body.contains("actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())"));
