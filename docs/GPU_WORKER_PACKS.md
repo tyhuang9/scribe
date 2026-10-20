@@ -1028,6 +1028,11 @@ operation behavior remain native gates. This is a prerequisite for the real
 installer bootstrap, not another trusted development-component envelope or an
 already-authorized installation. See the CPU writer's package-entry source
 contract for exact source checks, size tradeoff and remaining PKG authoring work.
+Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
+unsigned scripts-only fixture using system tools without installing or executing
+it. The path-free profile is a prerequisite for author/validator source, not
+package authenticity or acceptance of arbitrary archives. Portable synthetic
+fixtures cannot establish the native tool's actual inventory or Scripts dialect.
 Release VAD now uses the same frozen
 protected CPU image, in its own VAD-only process/session. A binary-local constant
 and the underlying inference provider restrict that entry to the dedicated Mac
