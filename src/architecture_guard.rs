@@ -975,6 +975,7 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
 #[test]
 fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() {
     let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
+    let release_policy = production_source(include_str!("gpu_worker_pack/release_authority.rs"));
     let authority = production_source(include_str!("gpu_worker_pack/device_release_epoch.rs"));
     let native = include_str!("../native/scribe_macos_keychain_epoch.c");
     let header = include_str!("../native/scribe_macos_keychain_epoch.h");
@@ -986,7 +987,6 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
     for required in [
         "release_security_epoch",
         "keychain_access_group",
-        "schema_version != 2",
         "DeviceRollbackAuthorityRejected",
         "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
         "SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
@@ -995,6 +995,33 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
         assert!(
             pack.contains(required),
             "release authority lost {required:?}"
+        );
+    }
+    let release_wrapper = named_function_bodies(&pack, "validated_release_authority").join("\n");
+    for required in [
+        "release_authority::validated_release_authority(",
+        "app_version: env!(\"CARGO_PKG_VERSION\")",
+        "build_revision: env!(\"SCRIBE_BUILD_REVISION\")",
+        "app_protocol_version: manifest::APP_PROTOCOL_VERSION",
+    ] {
+        assert!(
+            release_wrapper.contains(required),
+            "runtime release delegation lost {required:?}"
+        );
+    }
+    let document_validation =
+        named_function_bodies(&release_policy, "validated_release_authority_document").join("\n");
+    for required in [
+        "authority.schema_version != 2",
+        "authority_bytes.len() > MAX_RELEASE_AUTHORITY_BYTES",
+        "authority.entries.len() > MAX_PRODUCTION_PACKS",
+        "serde_json::to_vec(&authority).ok().as_deref() != Some(authority_bytes)",
+        "entry.security_epoch == authority.release_security_epoch",
+        "canonical_keychain_access_group(&authority.keychain_access_group)",
+    ] {
+        assert!(
+            document_validation.contains(required),
+            "shared release policy lost {required:?}"
         );
     }
     let authority_validation = pack
