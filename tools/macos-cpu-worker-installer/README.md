@@ -194,6 +194,38 @@ actual compressed/installed package size must be reported when package authoring
 is implemented. No PKG authoring, certificate provisioning, signing/notarization,
 application installation, replacement or update/removal is supplied by this unit.
 
+### Native package-format prerequisite
+
+Before implementing a real PKG author/validator, run the same source command as
+CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
+16 portable tests, plus one native test on each Mac lane. That native test uses
+the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
+`postinstall`, with no interpreter or program content. The file has executable
+mode only to model an operation archive; **nothing executes it**. Neither the
+real entry nor any worker/application is built, signed, packaged or launched.
+
+Only this freshly generated unsigned fixture is read, entirely in bounded memory.
+The probe has no archive/path/options input and never extracts an archive. It
+reuses the existing private workspace and bounded process/reaping helper, rejects
+root, and invokes only absolute system `pkgbuild` and `xar -tf` paths. Its own
+temporary package and source are removed after confirmed child cleanup; uncertain
+cleanup retains that private workspace. Nothing is uploaded as an artifact.
+
+`SCRIBE_NATIVE_CPU_PKG_PROFILE` in completed native CI logs records a path-free
+observation: actual outer member inventory, modes, encodings/checksum labels,
+bounded header/TOC/member sizes, fixed PackageInfo identity/operation reference
+and decoded Scripts prefix. The header layout follows [Apple's XAR source](https://github.com/apple-oss-distributions/xar/blob/main/xar/include/xar.h.in).
+No CPIO dialect, optional Bom/Payload member or native tool compatibility is
+presumed from synthetic fixtures. Review both actual Mac reports before freezing
+the supported PKG profile and implementing full bounded Scripts parsing.
+
+This probe does not validate checksums, signatures, exact operation inventory or
+package authenticity. It is not a reusable arbitrary-archive inspector, trusted
+installer, installation test or shipping format validator. Actual package entry
+composition, full hostile-archive validation, signed-package authenticity,
+Installer binary execution and install/update/removal/rollback remain separate
+gates. Until the native jobs finish, only the portable observation code is tested.
+
 ## Not yet established
 
 The enclosing installer must authenticate this executable and its compiled
