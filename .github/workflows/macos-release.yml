@@ -87,6 +87,9 @@ jobs:
           projection_tests="$(cargo test --locked --bin local-transcriber macos_protected_projection_ -- --list)"
           projection_count="$(printf '%s\n' "$projection_tests" | awk '/^gpu_worker_pack::protected_macos_projection_tests::macos_protected_projection_.*: test$/ { count++ } END { print count+0 }')"
           test "$projection_count" -eq 3
+          cpu_tests="$(cargo test --locked --bin local-transcriber macos_protected_cpu_ -- --list)"
+          cpu_count="$(printf '%s\n' "$cpu_tests" | awk '/^(macos_worker_layout::tests|macos_worker_authority::cpu_tests|onnx_worker::tests)::macos_protected_cpu_.*: test$/ { count++ } END { print count+0 }')"
+          test "$cpu_count" -eq 9
           cargo test --locked --test build_revision_invalidation -- --test-threads=1
           cargo test --locked macos_ -- --nocapture
           cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
@@ -105,9 +108,16 @@ jobs:
           SCRIBE_BUILD_REVISION: stage6-macos-ci
         run: bash scripts/test-macos-metal-metadata-helper.sh
       - name: Build ad hoc signed universal structural package
+        env:
+          SCRIBE_BUILD_REVISION: ${{ github.sha }}
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc
           SCRIBE_MACOS_TEST_BUNDLE="$PWD/dist-macos/Scribe.app" bash scripts/test-macos-release-packaging.sh
+      - name: Run protected CPU worker contract without installation
+        timeout-minutes: 25
+        env:
+          SCRIBE_BUILD_REVISION: ${{ github.sha }}
+        run: bash scripts/test-macos-protected-cpu-worker.sh --app "$PWD/dist-macos/Scribe.app"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: macos-${{ matrix.arch }}-structural-evidence
