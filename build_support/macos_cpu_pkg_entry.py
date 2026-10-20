@@ -64,15 +64,18 @@ def build_entry(app: Path, workspace: Path, digest: str, revision: str) -> tuple
                                "--bin", "scribe-macos-cpu-worker-installer", "--no-default-features",
                                "--features", "installer-package-entry"],
                               environment=environment, cwd=component.REPO, timeout=1200,
-                              limit=4 * 1024 * 1024, error_limit=4 * 1024 * 1024)
+                              limit=4 * 1024 * 1024, error_limit=4 * 1024 * 1024,
+                              operation="entry-build-arm64" if target == "aarch64-apple-darwin" else "entry-build-x86_64")
             binary = directory / target / "release/scribe-macos-cpu-worker-installer"
             component.hash_file(binary, MAX_SLICE)
             expected = "arm64" if target == "aarch64-apple-darwin" else "x86_64"
-            actual = component.capture(["/usr/bin/lipo", str(binary), "-archs"]).decode("ascii").split()
+            actual = component.capture(["/usr/bin/lipo", str(binary), "-archs"],
+                                       operation="artifact-architectures").decode("ascii").split()
             component.require(actual == [expected], "fresh CPU entry slice has the wrong architecture")
             slices.append(str(binary))
         candidate = private / "postinstall"
-        component.capture(["/usr/bin/lipo", "-create", "-output", str(candidate), *slices], timeout=60)
+        component.capture(["/usr/bin/lipo", "-create", "-output", str(candidate), *slices], timeout=60,
+                          operation="entry-combine")
         component.inspect_universal_structure(candidate, [digest.encode(), revision.encode(), component.CPU_ROOT.encode()],
                                               private, MAX_ENTRY)
         component.require(component.hash_file(worker, component.MAX_WORKER)[0] == digest,

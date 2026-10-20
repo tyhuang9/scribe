@@ -212,6 +212,28 @@ class Portable(unittest.TestCase):
             component.require_outside_app(child, app)
         component.require_outside_app(self.root, app)
 
+    def test_tool_exit_diagnostic_contains_only_closed_operation_and_numeric_status(self):
+        for status in [1, 101, -9, 3221225477]:
+            error = component.ToolExitError("writer-build-arm64", status)
+            self.assertIsInstance(error, component.ComponentError)
+            self.assertEqual(error.__dict__, {"operation": "writer-build-arm64", "status": status})
+            self.assertIn("writer-build-arm64", str(error))
+            self.assertIn(str(status), str(error))
+            if os.name == "posix" and status == -9:
+                self.assertIn("signal 9", str(error))
+        for status in [0, True, "secret", 1 << 32, -(1 << 31) - 1]:
+            with self.subTest(status=status), self.assertRaises(component.ComponentError):
+                component.ToolExitError("writer-description", status)
+
+    def test_unknown_operation_rejects_before_spawning_or_rendering_input(self):
+        for operation in ["private-path-or-secret", "", None, [], 5]:
+            with self.subTest(operation=operation), patch.object(component.subprocess, "Popen") as spawn, \
+                 self.assertRaisesRegex(component.ComponentError, "unknown bounded tool operation"):
+                component.capture([sys.executable, "private-argument"], operation=operation)
+            spawn.assert_not_called()
+        with self.assertRaisesRegex(component.ComponentError, "unknown bounded tool operation"):
+            component.ToolExitError("private-path-or-secret", 1)
+
     def test_slice_inspection_retains_thin_after_uncertain_child_cleanup(self):
         binary = self.root / "binary"
         binary.write_bytes(b"fixture")
@@ -256,7 +278,7 @@ class Portable(unittest.TestCase):
         with patch.object(component, "capture", return_value=b"arm64 x86_64") as capture, \
              patch.object(component, "_inspect_universal_slices") as slices:
             component.inspect_universal_structure(binary, [], self.root, 1024)
-        capture.assert_called_once_with(["/usr/bin/lipo", str(binary), "-archs"])
+        capture.assert_called_once_with(["/usr/bin/lipo", str(binary), "-archs"], operation="artifact-architectures")
         slices.assert_called_once_with(binary, [], self.root, 1024)
 
     def test_structure_wrapper_preserves_size_and_exact_architecture_checks(self):
@@ -310,6 +332,24 @@ class Posix(Portable):
     def test_capture_nonzero(self):
         with self.assertRaises(component.ComponentError):
             component.capture([sys.executable, "-I", "-S", "-c", "raise SystemExit(7)"])
+
+    def test_tool_exit_diagnostic_redacts_real_child_arguments_environment_and_streams(self):
+        sentinel = "private-path-audio-transcript-secret-sentinel"
+        command = [sys.executable, "-I", "-S", "-c",
+                   f"import sys; print('{sentinel}'); print('{sentinel}', file=sys.stderr); sys.exit(17)"]
+        with self.assertRaises(component.ToolExitError) as result:
+            component.capture(command, environment={**component.probe_environment(), "PRIVATE": sentinel},
+                              operation="application-verification")
+        error = result.exception
+        self.assertEqual((error.operation, error.status), ("application-verification", 17))
+        rendered = str(error) + repr(error) + repr(error.args) + repr(error.__dict__)
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn(sys.executable, rendered)
+        self.assertIsNone(error.__cause__)
+        # An uncertain descendant outcome wins even when the leader exits nonzero.
+        with patch.object(os, "killpg"), self.assertRaises(component.CleanupUncertain):
+            component.capture([sys.executable, "-I", "-S", "-c", "raise SystemExit(17)"],
+                              operation="application-verification")
 
     def test_capture_timeout_and_reap(self):
         with self.assertRaisesRegex(component.ComponentError, "deadline"):
@@ -397,6 +437,8 @@ class Posix(Portable):
         output = self.root / "published"
         builds, probes = [], []
         def execute(arguments, **kwargs):
+            self.assertIn(kwargs["operation"], component.TOOL_OPERATIONS)
+            self.assertNotEqual(kwargs["operation"], "tool")
             if arguments[0] == "/usr/bin/cargo":
                 self.assertIn("--locked", arguments)
                 self.assertIn("--offline", arguments)
@@ -405,6 +447,8 @@ class Posix(Portable):
                 self.assertEqual(environment["SCRIBE_BUNDLED_WORKER_SHA256"], DIGEST)
                 self.assertEqual(environment["SCRIBE_BUILD_REVISION"], REVISION)
                 target = arguments[arguments.index("--target") + 1]
+                self.assertEqual(kwargs["operation"], "writer-build-arm64" if target.startswith("aarch64")
+                                 else "writer-build-x86_64")
                 builds.append(target)
                 if failure == "build" and len(builds) == 2:
                     raise component.ComponentError("build fixture")
@@ -528,7 +572,7 @@ def suite():
         classes.append(Posix)
     if sys.platform == "darwin":
         classes.append(NativeMac)
-    expected = 25 + (17 if os.name == "posix" else 0) + (4 if sys.platform == "darwin" else 0)
+    expected = 27 + (18 if os.name == "posix" else 0) + (4 if sys.platform == "darwin" else 0)
     for cls in classes:
         for name in sorted(cls.__dict__):
             if name.startswith("test_"):

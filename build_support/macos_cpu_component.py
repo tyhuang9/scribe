@@ -35,6 +35,13 @@ MAX_WRITER = 64 * 1024 * 1024
 MAX_JSON = 8192
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 NATIVE_DARWIN = sys.platform == "darwin"
+TOOL_OPERATIONS = frozenset({
+    "tool", "application-verification", "artifact-architectures", "artifact-signature-verification",
+    "artifact-slice", "artifact-load-commands", "artifact-dependencies",
+    "writer-build-arm64", "writer-build-x86_64", "writer-combine",
+    "development-writer-signing", "writer-description",
+    "entry-build-arm64", "entry-build-x86_64", "entry-combine",
+})
 
 
 class ComponentError(Exception):
@@ -48,6 +55,22 @@ class CleanupUncertain(ComponentError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ComponentError(message)
+
+
+def validate_tool_operation(operation: str) -> None:
+    require(type(operation) is str and operation in TOOL_OPERATIONS, "unknown bounded tool operation")
+
+
+class ToolExitError(ComponentError):
+    """Only closed phase/status evidence, never command, environment or output."""
+
+    def __init__(self, operation: str, status: int):
+        validate_tool_operation(operation)
+        require(type(status) is int and -2147483648 <= status <= 4294967295 and status != 0,
+                "invalid bounded tool exit status")
+        self.operation, self.status = operation, status
+        result = f"signal {-status}, status {status}" if os.name == "posix" and status < 0 else f"exit {status}"
+        super().__init__(f"{operation} exited unsuccessfully ({result})")
 
 
 def validate_identity(digest: str, revision: str) -> None:
@@ -352,13 +375,15 @@ def require_outside_app(parent: Path, app: Path) -> None:
 
 
 def capture(arguments: list[str], *, timeout: float = 10, limit: int = 262144,
-            error_limit: int = 65536, environment: dict | None = None, cwd: Path | None = None) -> bytes:
+            error_limit: int = 65536, environment: dict | None = None, cwd: Path | None = None,
+            operation: str = "tool") -> bytes:
     """Bound output and time while reserving PID ownership until final reap.
 
     macOS needs Python >=3.13 for waitid/WNOWAIT:
     https://docs.python.org/3/library/os.html#os.waitid
     Never call poll()/communicate() before a failure's process-group signal.
     """
+    validate_tool_operation(operation)
     require(all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WEXITED", "P_PID")),
             "metadata process checks require waitid/WNOWAIT (Python 3.13+ on macOS)")
     require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL,
@@ -401,7 +426,8 @@ def capture(arguments: list[str], *, timeout: float = 10, limit: int = 262144,
                         raise CleanupUncertain("cannot confirm process-group exit") from error
                     else:
                         raise CleanupUncertain("process group remains after leader exit")
-                    require(status == 0, "bounded tool exited unsuccessfully")
+                    if status != 0:
+                        raise ToolExitError(operation, status)
                     return bytes(output[0])
                 for key, _ in selector.select(min(remaining, 0.05)):
                     index = key.data
@@ -478,9 +504,10 @@ def has_markers(path: Path, markers: list[bytes], maximum: int) -> None:
 
 def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum: int) -> None:
     hash_file(path, maximum)
-    architectures = capture(["/usr/bin/lipo", str(path), "-archs"]).decode("ascii").split()
+    architectures = capture(["/usr/bin/lipo", str(path), "-archs"],
+                            operation="artifact-architectures").decode("ascii").split()
     require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
-    capture(["/usr/bin/codesign", "--verify", "--strict", str(path)])
+    capture(["/usr/bin/codesign", "--verify", "--strict", str(path)], operation="artifact-signature-verification")
     _inspect_universal_slices(path, markers, workspace, maximum)
 
 
@@ -491,7 +518,8 @@ def inspect_universal_structure(path: Path, markers: list[bytes], workspace: Pat
     The existing signed wrapper keeps its independent signature check.
     """
     hash_file(path, maximum)
-    architectures = capture(["/usr/bin/lipo", str(path), "-archs"]).decode("ascii").split()
+    architectures = capture(["/usr/bin/lipo", str(path), "-archs"],
+                            operation="artifact-architectures").decode("ascii").split()
     require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
     _inspect_universal_slices(path, markers, workspace, maximum)
 
@@ -500,14 +528,15 @@ def _inspect_universal_slices(path: Path, markers: list[bytes], workspace: Path,
     for architecture in ("arm64", "x86_64"):
         thin = workspace / (path.name + "-" + architecture)
         require(not os.path.lexists(thin), "slice inspection output already exists")
-        capture(["/usr/bin/lipo", str(path), "-thin", architecture, "-output", str(thin)])
+        capture(["/usr/bin/lipo", str(path), "-thin", architecture, "-output", str(thin)], operation="artifact-slice")
         cleanup_confirmed = True
         try:
-            loads = capture(["/usr/bin/otool", "-l", str(thin)])
+            loads = capture(["/usr/bin/otool", "-l", str(thin)], operation="artifact-load-commands")
             require(re.search(rb"\bminos\s+13\.0(?:\.0)?\s*(?:\n|$)", loads) is not None,
                     "binary slice must target macOS 13.0")
             require(b"/Metal.framework/" not in loads, "CPU component must not load Metal")
-            dependencies = capture(["/usr/bin/otool", "-L", str(thin)]).decode("utf-8").splitlines()[1:]
+            dependencies = capture(["/usr/bin/otool", "-L", str(thin)],
+                                   operation="artifact-dependencies").decode("utf-8").splitlines()[1:]
             for line in dependencies:
                 library = line.strip().split(" (compatibility version", 1)[0]
                 require(library.startswith(("/usr/lib/", "/System/Library/Frameworks/")),
@@ -565,7 +594,8 @@ def publish_no_replace(stage: Path, output: Path) -> None:
 def verify_cpu_app(app: Path) -> str:
     """Read-only existing CPU-only app policy; return its declared version."""
     capture(["/bin/bash", str(REPO / "scripts/verify-macos-release-package.sh"), "--app", str(app)],
-            timeout=60, environment={**probe_environment(), "PATH": os.environ.get("PATH", "")})
+            timeout=60, environment={**probe_environment(), "PATH": os.environ.get("PATH", "")},
+            operation="application-verification")
     resources = app / "Contents/Resources"
     catalog = strict_json(read_bounded(resources / "worker-pack-catalog.json", MAX_JSON))
     authority = strict_json(read_bounded(resources / "gpu-pack-release-authority.json", MAX_JSON))
@@ -617,15 +647,18 @@ def assemble(app: Path, output: Path, digest: str, revision: str) -> None:
             capture([cargo, "build", "--locked", "--offline", "--release", "--target", target,
                      "--manifest-path", str(REPO / "tools/macos-cpu-worker-installer/Cargo.toml")],
                     environment=environment, cwd=REPO, timeout=1200,
-                    limit=4 * 1024 * 1024, error_limit=4 * 1024 * 1024)
+                    limit=4 * 1024 * 1024, error_limit=4 * 1024 * 1024,
+                    operation="writer-build-arm64" if target == "aarch64-apple-darwin" else "writer-build-x86_64")
             binary = target_directory / target / "release/scribe-macos-cpu-worker-installer"
             hash_file(binary, MAX_WRITER)
             slices.append(str(binary))
         writer = tree / WRITER
-        capture(["/usr/bin/lipo", "-create", "-output", str(writer), *slices])
-        capture(["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime", str(writer)])
+        capture(["/usr/bin/lipo", "-create", "-output", str(writer), *slices], operation="writer-combine")
+        capture(["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime", str(writer)],
+                operation="development-writer-signing")
         # This is the ONLY component executable launched, freshly built above.
-        check_description(capture([str(writer), "describe"], timeout=5, limit=4096, error_limit=4096),
+        check_description(capture([str(writer), "describe"], timeout=5, limit=4096, error_limit=4096,
+                                  operation="writer-description"),
                           digest, revision)
         writer_digest, writer_size = hash_file(writer, MAX_WRITER)
         record = record_for(digest, revision, worker_size, writer_digest, writer_size)
