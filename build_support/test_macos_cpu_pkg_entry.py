@@ -63,6 +63,8 @@ class Portable(unittest.TestCase):
             self.assertEqual(kwargs["cwd"], component.REPO)
             environment = dict(kwargs["environment"])
             target = arguments[arguments.index("--target") + 1]
+            self.assertEqual(kwargs["operation"], "entry-build-arm64" if target.startswith("aarch64")
+                             else "entry-build-x86_64")
             self.builds.append((target, environment, arguments))
             if self.failure in ("build", "uncertain"):
                 error = component.CleanupUncertain if self.failure == "uncertain" else component.ComponentError
