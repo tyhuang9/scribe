@@ -1033,7 +1033,11 @@ the same verified frozen worker, using fresh ARM64/x64 builds and non-executing
 structural inspection. It neither runs nor signs the entry, and its returned
 pre-sign hash is not installation authority. Mocked source tests cover bounded
 construction and exclusive publication; actual native construction remains
-unverified. This does not add a PKG author, shipping release option or installer.
+unverified. A separate hosted-Mac contract now exercises actual construction
+after the finalized universal app build, including output readback, repeat
+no-replace and unchanged-input checks, without ever executing/signing/packaging
+or uploading the candidate. Native acceptance remains pending those exact-head
+jobs. This does not add a PKG author, shipping release option or installer.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not

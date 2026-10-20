@@ -228,6 +228,30 @@ collisions and uncertain cleanup. They do not establish actual native
 construction, package acceptance or installation. Trusted source/toolchain/Cargo
 configuration and non-hostile same-user/root writers remain build assumptions.
 
+The dedicated native `native_macos_cpu_pkg_entry.py` construction contract
+now runs after the finalized universal app is built on each Intel/ARM structural
+lane. The CI step supplies the app's independently measured worker SHA and exact
+build revision. It calls the real two-architecture builder in an owned private
+workspace, requires one regular/single-link/executable `postinstall`, independently
+checks returned hash/size and both architectures, and requires repeat construction
+to reject without changing the entry's bytes or identity. Worker, desktop,
+signature record and app metadata remain unchanged; the app is reverified too.
+
+The candidate is never executed, signed, assembled into a PKG or uploaded. It
+stays outside `dist-macos` and is removed only as an owned test fixture after
+confirmed child cleanup. Uncertainty retains the entire fixture, including on
+the repeated-build path. The step has a 50-minute bound; absent inputs, tools or
+either target fail rather than skip. Its successful log report contains only
+construction status, expected architectures and byte counts, not local paths
+or hashes. Running the driver on Windows/Linux rejects before input access.
+
+`python3 -B build_support/test_native_macos_cpu_pkg_entry.py` checks the driver's
+assertions and failure handling using mocked builders/tools: exactly 13 portable
+and one additional POSIX test. The original fast entry suite remains mocked.
+Actual native construction is not established until the new exact-head jobs
+pass. Even then, this proves construction, not package authenticity, Installer
+execution, installation or release qualification.
+
 ### Native package-format prerequisite
 
 Before implementing a real PKG author/validator, run the same source command as
