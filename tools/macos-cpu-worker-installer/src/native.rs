@@ -4,18 +4,23 @@ use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+#[cfg(any(not(feature = "installer-package-entry"), test))]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(any(not(feature = "installer-package-entry"), test))]
+use crate::installer_fs::owned_fd;
 use crate::installer_fs::{
-    checked_directory, checked_lock, has_errno, open_rw, owned_fd, require_mode, set_mode, unlink,
+    checked_directory, checked_lock, has_errno, open_rw, require_mode, set_mode, unlink,
 };
+#[cfg(any(not(feature = "installer-package-entry"), test))]
+use crate::macos_worker_fs::descriptor_stat;
 use crate::macos_worker_fs::{
-    NodeIdentity, NodeKind, descriptor_stat, macos_directory_names, open_absolute_directory,
-    openat_node, validate_native_node,
+    NodeIdentity, NodeKind, macos_directory_names, open_absolute_directory, openat_node,
+    validate_native_node,
 };
 use crate::macos_worker_layout::{CPU_WORKER_NAME, embedded_cpu_digest, validate_cpu_size};
 use crate::transaction::{Operations, PublishResult, copy_exact, verify_bytes};
@@ -42,8 +47,39 @@ struct InstalledIdentity {
     worker: NodeIdentity,
 }
 
+enum CpuSource {
+    #[cfg(any(not(feature = "installer-package-entry"), test))]
+    File(File),
+    #[cfg(feature = "installer-package-entry")]
+    Embedded(io::Cursor<&'static [u8]>),
+}
+impl CpuSource {
+    fn size(&self) -> Result<u64> {
+        match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
+            Self::File(file) => candidate_size(file),
+            #[cfg(feature = "installer-package-entry")]
+            Self::Embedded(bytes) => {
+                let length = u64::try_from(bytes.get_ref().len())?;
+                validate_cpu_size(length)?;
+                Ok(length)
+            }
+        }
+    }
+}
+impl io::Read for CpuSource {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
+            Self::File(file) => io::Read::read(file, buffer),
+            #[cfg(feature = "installer-package-entry")]
+            Self::Embedded(bytes) => io::Read::read(bytes, buffer),
+        }
+    }
+}
+
 pub(crate) struct NativeOperations {
-    source: File,
+    source: CpuSource,
     length: u64,
     digest: String,
     uid: libc::uid_t,
@@ -58,6 +94,7 @@ pub(crate) struct NativeOperations {
 }
 
 impl NativeOperations {
+    #[cfg(not(feature = "installer-package-entry"))]
     pub(crate) fn production(candidate: &Path) -> Result<Self> {
         // Must precede candidate opening and every protected-root mutation.
         if unsafe { libc::geteuid() } != 0 {
@@ -72,7 +109,26 @@ impl NativeOperations {
         }
         let source = open_candidate(candidate)?;
         let length = candidate_size(&source)?;
-        Ok(Self {
+        Ok(Self::new(CpuSource::File(source), length, digest))
+    }
+
+    #[cfg(feature = "installer-package-entry")]
+    pub(crate) fn production_embedded() -> Result<Self> {
+        if unsafe { libc::geteuid() } != 0 {
+            bail!("CPU worker installation requires the trusted root installer");
+        }
+        let bytes = crate::package_entry::compiled_worker()?;
+        let digest = embedded_cpu_digest()?.to_owned();
+        let length = u64::try_from(bytes.len())?;
+        Ok(Self::new(
+            CpuSource::Embedded(io::Cursor::new(bytes)),
+            length,
+            digest,
+        ))
+    }
+
+    fn new(source: CpuSource, length: u64, digest: String) -> Self {
+        Self {
             source,
             length,
             digest,
@@ -85,7 +141,7 @@ impl NativeOperations {
             published: false,
             #[cfg(test)]
             fixture: false,
-        })
+        }
     }
 
     fn cpu(&self) -> Result<&File> {
@@ -340,7 +396,7 @@ impl Operations for NativeOperations {
         let identity = validate_native_node(&output, NodeKind::Regular, self.uid, Some(0), false)?;
         require_mode(&output, 0o600)?;
         stage.worker = Some(identity);
-        if candidate_size(&self.source)? != self.length {
+        if self.source.size()? != self.length {
             bail!("candidate size changed before copying");
         }
         copy_exact(&mut self.source, &mut output, self.length)?;
@@ -427,6 +483,7 @@ impl Operations for NativeOperations {
     }
 }
 
+#[cfg(any(not(feature = "installer-package-entry"), test))]
 fn open_candidate(path: &Path) -> Result<File> {
     let path = CString::new(path.as_os_str().as_bytes())?;
     owned_fd(unsafe {
@@ -436,6 +493,7 @@ fn open_candidate(path: &Path) -> Result<File> {
         )
     })
 }
+#[cfg(any(not(feature = "installer-package-entry"), test))]
 fn candidate_size(file: &File) -> Result<u64> {
     let stat = descriptor_stat(file.as_raw_fd())?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
@@ -491,7 +549,7 @@ mod tests {
             let file = open_absolute_directory(&self.cpu).unwrap();
             let identity = checked_directory(&file, uid, Some(0o755)).unwrap();
             NativeOperations {
-                source,
+                source: CpuSource::File(source),
                 length,
                 digest: self.digest.clone(),
                 uid,
@@ -510,6 +568,12 @@ mod tests {
         }
         fn installed(&self) -> PathBuf {
             self.cpu.join(&self.digest)
+        }
+        #[cfg(feature = "installer-package-entry")]
+        fn embedded_ops(&self) -> NativeOperations {
+            let mut operation = self.ops();
+            operation.source = CpuSource::Embedded(io::Cursor::new(b"fixture CPU image"));
+            operation
         }
     }
     impl Drop for Fixture {
@@ -546,6 +610,63 @@ mod tests {
         assert!(install(&mut ops).is_err());
         assert!(!fixture.installed().exists());
         assert_eq!(std::fs::read_dir(&fixture.cpu).unwrap().count(), 1);
+    }
+    #[cfg(feature = "installer-package-entry")]
+    #[test]
+    fn package_native_embedded_copy_and_reuse_preserve_the_original_inode() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            install(&mut fixture.embedded_ops()).unwrap(),
+            Outcome::PublishedNew
+        );
+        let worker = fixture.installed().join(CPU_WORKER_NAME);
+        let before = descriptor_stat(File::open(&worker).unwrap().as_raw_fd()).unwrap();
+        assert_eq!(std::fs::read(&worker).unwrap(), b"fixture CPU image");
+        assert_eq!(
+            install(&mut fixture.embedded_ops()).unwrap(),
+            Outcome::ReusedExisting
+        );
+        let after = descriptor_stat(File::open(&worker).unwrap().as_raw_fd()).unwrap();
+        assert_eq!((before.st_dev, before.st_ino), (after.st_dev, after.st_ino));
+    }
+    #[cfg(feature = "installer-package-entry")]
+    #[test]
+    fn package_native_embedded_corruption_never_publishes() {
+        let fixture = Fixture::new();
+        let mut operation = fixture.embedded_ops();
+        operation.source = CpuSource::Embedded(io::Cursor::new(b"tampered CPU data"));
+        assert!(install(&mut operation).is_err());
+        assert!(!fixture.installed().exists());
+        assert_eq!(std::fs::read_dir(&fixture.cpu).unwrap().count(), 1);
+    }
+    #[cfg(feature = "installer-package-entry")]
+    #[test]
+    fn package_native_embedded_collision_and_uncertain_publication_never_delete_finals() {
+        for collision in [false, true] {
+            let fixture = Fixture::new();
+            let mut operation = fixture.embedded_ops();
+            operation.prepare().unwrap();
+            operation.stage().unwrap();
+            operation.populate().unwrap();
+            operation.seal().unwrap();
+            if collision {
+                std::fs::create_dir(fixture.installed()).unwrap();
+                assert_eq!(operation.publish().unwrap(), PublishResult::Collision);
+                assert!(operation.existing().is_err());
+                operation.cleanup().unwrap();
+                assert!(fixture.installed().is_dir());
+                assert_eq!(std::fs::read_dir(fixture.installed()).unwrap().count(), 0);
+            } else {
+                assert_eq!(operation.publish().unwrap(), PublishResult::New);
+                operation.published = false; // Applied rename with uncertain return.
+                assert!(operation.cleanup().is_err());
+                drop(operation);
+                assert_eq!(
+                    install(&mut fixture.embedded_ops()).unwrap(),
+                    Outcome::ReusedExisting
+                );
+            }
+        }
     }
     #[test]
     fn installer_native_existing_tamper_extra_entry_and_wrong_mode_are_not_repaired() {
