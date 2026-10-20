@@ -820,6 +820,107 @@ fn macos_shared_worker_filesystem_policy_is_read_only_and_provider_independent()
 }
 
 #[test]
+fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
+    let entry = include_str!("../tools/macos-cpu-worker-installer/src/main.rs");
+    let native = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/native.rs"
+    ));
+    let bootstrap = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/native/bootstrap.rs"
+    ));
+    let transaction = production_source(include_str!(
+        "../tools/macos-cpu-worker-installer/src/transaction.rs"
+    ));
+    let manifest = include_str!("../tools/macos-cpu-worker-installer/Cargo.toml");
+    let check = include_str!("../scripts/verify-macos-cpu-installer-source.sh");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    for required in ["mod macos_worker_fs;", "mod macos_worker_layout;"] {
+        assert!(entry.contains(required));
+    }
+    for forbidden in [
+        "gpu_worker_pack",
+        "onnx_worker",
+        "transcribe-cpp",
+        "sherpa",
+        "std::process::Command",
+        "std::env::var(",
+        "std::env::var_os(",
+        "remove_dir_all",
+        "libc::chown",
+    ] {
+        assert!(
+            !native.contains(forbidden),
+            "installer native boundary gained {forbidden}"
+        );
+        assert!(
+            !manifest.contains(forbidden),
+            "isolated installer gained {forbidden}"
+        );
+        assert!(
+            !bootstrap.contains(forbidden),
+            "ancestor bootstrap gained {forbidden}"
+        );
+    }
+    for required in [
+        "embedded_cpu_digest()?",
+        "libc::geteuid()",
+        "libc::LOCK_EX | libc::LOCK_NB",
+        "libc::RENAME_EXCL",
+        "drop(output)",
+        "verify_bytes(&mut image",
+        "old stage name no longer identifies",
+    ] {
+        assert!(native.contains(required), "CPU writer lost {required}");
+    }
+    assert!(
+        transaction
+            .find("publication = Publication::PossiblyPublished;")
+            .unwrap()
+            < transaction.find("match ops.publish()?").unwrap()
+    );
+    assert!(check.contains("--locked --offline"));
+    assert!(check.contains("--all-targets -- -D warnings"));
+    assert!(check.contains("Darwin) expected=40"));
+    assert!(check.contains("[[ \"$count\" == \"$expected\" ]]"));
+    assert!(workflow.contains("bash scripts/verify-macos-cpu-installer-source.sh"));
+    let root_walk = named_function_bodies(&native, "walk_protected_root").join("\n");
+    assert!(root_walk.contains("bootstrap::ensure_fixed_ancestor("));
+    assert!(!root_walk.contains("libc::mkdirat"));
+    assert!(!root_walk.contains("set_mode("));
+    for required in [
+        "impl Operations for Bootstrap",
+        "install(&mut operation)",
+        "matches!(final_name, \"Scribe\" | \"CPU\")",
+        "self.check_empty_stage(0o700)?",
+        "self.check_empty_stage(0o755)?",
+        "libc::RENAME_EXCL",
+        "original ancestor stage name changed",
+    ] {
+        assert!(
+            bootstrap.contains(required),
+            "ancestor transaction lost {required}"
+        );
+    }
+    let bootstrap_confirm = named_function_bodies(&bootstrap, "confirm").join("\n");
+    assert!(bootstrap_confirm.contains("checked_directory("));
+    assert!(!bootstrap_confirm.contains("check_empty_stage("));
+    for source in [check, workflow] {
+        for forbidden in ["sudo ", "installer -pkg", "--source-worker"] {
+            assert!(
+                !source.contains(forbidden),
+                "source verification must not install: {forbidden}"
+            );
+        }
+    }
+    for source in [
+        include_str!("main.rs"),
+        include_str!("bin/scribe-inference-worker.rs"),
+    ] {
+        assert!(!source.contains("macos-cpu-worker-installer"));
+    }
+}
+
+#[test]
 fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() {
     let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
     let authority = production_source(include_str!("gpu_worker_pack/device_release_epoch.rs"));
