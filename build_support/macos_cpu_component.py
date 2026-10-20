@@ -481,10 +481,27 @@ def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum
     architectures = capture(["/usr/bin/lipo", str(path), "-archs"]).decode("ascii").split()
     require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
     capture(["/usr/bin/codesign", "--verify", "--strict", str(path)])
+    _inspect_universal_slices(path, markers, workspace, maximum)
+
+
+def inspect_universal_structure(path: Path, markers: list[bytes], workspace: Path, maximum: int) -> None:
+    """Non-executing structure only, for freshly built untrusted entry candidates.
+
+    This is NOT a replacement for signed input verification or code provenance.
+    The existing signed wrapper keeps its independent signature check.
+    """
+    hash_file(path, maximum)
+    architectures = capture(["/usr/bin/lipo", str(path), "-archs"]).decode("ascii").split()
+    require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
+    _inspect_universal_slices(path, markers, workspace, maximum)
+
+
+def _inspect_universal_slices(path: Path, markers: list[bytes], workspace: Path, maximum: int) -> None:
     for architecture in ("arm64", "x86_64"):
         thin = workspace / (path.name + "-" + architecture)
         require(not os.path.lexists(thin), "slice inspection output already exists")
         capture(["/usr/bin/lipo", str(path), "-thin", architecture, "-output", str(thin)])
+        cleanup_confirmed = True
         try:
             loads = capture(["/usr/bin/otool", "-l", str(thin)])
             require(re.search(rb"\bminos\s+13\.0(?:\.0)?\s*(?:\n|$)", loads) is not None,
@@ -498,8 +515,11 @@ def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum
                 require(not any(name in library.lower() for name in ("metal.framework", "cuda", "vulkan")),
                         "component contains a GPU dependency")
             has_markers(thin, markers, maximum)
+        except CleanupUncertain:
+            cleanup_confirmed = False
+            raise
         finally:
-            if thin.is_file() and not thin.is_symlink():
+            if cleanup_confirmed and thin.is_file() and not thin.is_symlink():
                 thin.unlink()
 
 
@@ -542,6 +562,23 @@ def publish_no_replace(stage: Path, output: Path) -> None:
         os.close(source_parent)
 
 
+def verify_cpu_app(app: Path) -> str:
+    """Read-only existing CPU-only app policy; return its declared version."""
+    capture(["/bin/bash", str(REPO / "scripts/verify-macos-release-package.sh"), "--app", str(app)],
+            timeout=60, environment={**probe_environment(), "PATH": os.environ.get("PATH", "")})
+    resources = app / "Contents/Resources"
+    catalog = strict_json(read_bounded(resources / "worker-pack-catalog.json", MAX_JSON))
+    authority = strict_json(read_bounded(resources / "gpu-pack-release-authority.json", MAX_JSON))
+    require(typed_equal(catalog, {"schema_version": 1, "packs": []}), "component requires a CPU-only catalog")
+    expected_authority = strict_json(read_bounded(
+        REPO / "runtime-manifests/gpu-pack-release-authority-macos-empty.json", MAX_JSON))
+    require(typed_equal(authority, expected_authority), "component requires default-deny epoch-zero authority")
+    info = plistlib.loads(read_bounded(app / "Contents/Info.plist", MAX_JSON))
+    version = info.get("CFBundleShortVersionString", "")
+    require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None, "invalid application version")
+    return version
+
+
 def assemble(app: Path, output: Path, digest: str, revision: str) -> None:
     require(sys.platform == "darwin", "component assembly requires macOS")
     require(os.geteuid() != 0, "development components must be built unprivileged")
@@ -556,18 +593,7 @@ def assemble(app: Path, output: Path, digest: str, revision: str) -> None:
     output = output.parent.resolve(strict=True) / output.name
     require_outside_app(output.parent, app)
     require(not os.path.lexists(output), "component output already exists")
-    capture(["/bin/bash", str(REPO / "scripts/verify-macos-release-package.sh"), "--app", str(app)],
-            timeout=60, environment={**probe_environment(), "PATH": os.environ.get("PATH", "")})
-    resources = app / "Contents/Resources"
-    catalog = strict_json(read_bounded(resources / "worker-pack-catalog.json", MAX_JSON))
-    authority = strict_json(read_bounded(resources / "gpu-pack-release-authority.json", MAX_JSON))
-    require(typed_equal(catalog, {"schema_version": 1, "packs": []}), "component requires a CPU-only catalog")
-    expected_authority = strict_json(read_bounded(
-        REPO / "runtime-manifests/gpu-pack-release-authority-macos-empty.json", MAX_JSON))
-    require(typed_equal(authority, expected_authority), "component requires default-deny epoch-zero authority")
-    info = plistlib.loads(read_bounded(app / "Contents/Info.plist", MAX_JSON))
-    version = info.get("CFBundleShortVersionString", "")
-    require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None, "invalid application version")
+    version = verify_cpu_app(app)
     with private_workspace(output.parent, ".scribe-cpu-component-build-") as workspace:
         tree = workspace / "component"
         (tree / "payload").mkdir(parents=True, mode=0o700)
