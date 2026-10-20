@@ -1,0 +1,59 @@
+//! Installer-owned source component; never a runtime elevation service.
+use anyhow::{Result, bail};
+
+#[allow(
+    dead_code,
+    reason = "shared read-only policy consumers use different primitive subsets"
+)]
+#[path = "../../../src/macos_worker_fs.rs"]
+mod macos_worker_fs;
+#[allow(
+    dead_code,
+    reason = "shared fixed CPU layout includes runtime-only helpers"
+)]
+#[path = "../../../src/macos_worker_layout.rs"]
+mod macos_worker_layout;
+#[cfg(target_os = "macos")]
+mod native;
+mod transaction;
+
+fn run() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.as_slice() == ["describe"] {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schemaVersion": 1,
+                "component": "protected-cpu-writer",
+                "cpuRoot": macos_worker_layout::CPU_ROOT,
+                "workerName": macos_worker_layout::CPU_WORKER_NAME,
+                "workerSha256": option_env!("SCRIBE_BUNDLED_WORKER_SHA256"),
+                "buildRevision": option_env!("SCRIBE_BUILD_REVISION"),
+                "installsApplication": false,
+            })
+        );
+        return Ok(());
+    }
+    if arguments.len() == 3 && arguments[0] == "install" && arguments[1] == "--source-worker" {
+        #[cfg(target_os = "macos")]
+        {
+            let mut operations =
+                native::NativeOperations::production(std::path::Path::new(&arguments[2]))?;
+            let outcome = transaction::install(&mut operations)?;
+            println!("{outcome:?}");
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("protected CPU installation is supported only on macOS");
+    }
+    bail!(
+        "usage: scribe-macos-cpu-worker-installer describe | install --source-worker ABSOLUTE_PATH"
+    )
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
