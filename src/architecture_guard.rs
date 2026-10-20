@@ -751,7 +751,7 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
     assert!(launcher.contains("enum LaunchAuthority"));
     let cpu_launch = named_function_bodies(&launcher, "launch_verified_cpu_worker").join("\n");
     assert!(cpu_launch.contains("LaunchAuthority::Cpu(authority)"));
-    assert!(cpu_launch.contains("INFERENCE_WORKER_FLAG"));
+    assert!(cpu_launch.contains("role.flag()"));
     assert!(cpu_launch.contains("&[]"));
     assert!(contract.contains("verify-macos-release-package.sh"));
     assert!(contract.contains("--ignored --exact"));
@@ -765,6 +765,58 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
     ] {
         assert!(!contract.contains(forbidden));
     }
+}
+
+#[test]
+fn macos_protected_cpu_vad_gate_is_binary_local_and_role_isolated() {
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let desktop = production_source(include_str!("main.rs"));
+    let dedicated = production_source(include_str!("bin/scribe-inference-worker.rs"));
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    assert!(desktop.contains("const DEDICATED_INFERENCE_WORKER: bool = false;"));
+    assert!(dedicated.contains("const DEDICATED_INFERENCE_WORKER: bool = true;"));
+    let gate = named_function_bodies(&worker, "protected_macos_vad_worker_build").join("\n");
+    assert!(gate.contains("crate::DEDICATED_INFERENCE_WORKER"));
+    assert!(gate.contains("compiled_worker_provider(WorkerRole::Inference)"));
+    assert!(!gate.contains("compiled_worker_provider(WorkerRole::Vad)"));
+    let entry = named_function_bodies(&worker, "run_inference_worker_with_factory").join("\n");
+    assert!(entry.contains("WorkerRole::Vad)) if protected_macos_vad_worker_build()"));
+    assert!(entry.contains("macos_forbidden_cpu_bindings_present()"));
+    assert!(entry.contains("return match worker_loop_for_role("));
+    let vad_loop = named_function_bodies(&worker, "worker_loop_for_role").join("\n");
+    assert!(vad_loop.contains("&DisabledRecognizerFactory"));
+    assert!(vad_loop.contains("&NativeVadFactory"));
+    let capability = named_function_bodies(
+        &worker,
+        "worker_capability_for_provider_with_metal_topology",
+    )
+    .join("\n");
+    assert!(capability.contains("WorkerRole::Vad if protected_macos_vad_worker_build()"));
+    assert!(capability.contains("Some(inference_worker_capability_fingerprint()?)"));
+    let descriptors =
+        named_function_bodies(&worker, "macos_pack_worker_image_descriptors_from_env").join("\n");
+    assert!(descriptors.contains("protected_macos_vad_worker_build()"));
+    assert!(descriptors.contains("VAD_WORKER_FLAG"));
+    assert!(launcher.contains("enum CpuWorkerRole"));
+    let role_flag = named_function_bodies(&launcher, "flag").join("\n");
+    assert!(role_flag.contains("Self::Inference => crate::onnx_worker::INFERENCE_WORKER_FLAG"));
+    assert!(role_flag.contains("Self::Vad => crate::onnx_worker::VAD_WORKER_FLAG"));
+    let desktop_entry = named_function_bodies(&worker, "maybe_run_vad_worker").join("\n");
+    let rejection = desktop_entry.find("release macOS VAD requires").unwrap();
+    assert!(
+        rejection
+            < desktop_entry
+                .find("take_parent_control_reader_from_env()")
+                .unwrap()
+    );
+    let contract = include_str!("../scripts/test-macos-protected-cpu-worker.sh");
+    assert!(
+        contract.contains("macos_native_protected_cpu_vad_authenticates_health_shutdown_and_reap")
+    );
+    assert!(
+        contract
+            .contains("macos_native_protected_cpu_worker_authenticates_health_shutdown_and_reap")
+    );
 }
 
 #[test]

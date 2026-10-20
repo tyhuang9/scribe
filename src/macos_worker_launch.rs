@@ -10,6 +10,21 @@ use anyhow::{Result, bail};
 
 const SAFE_PARENT_ENVIRONMENT: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL"];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuWorkerRole {
+    Inference,
+    Vad,
+}
+
+impl CpuWorkerRole {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Inference => crate::onnx_worker::INFERENCE_WORKER_FLAG,
+            Self::Vad => crate::onnx_worker::VAD_WORKER_FLAG,
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) const EXECUTABLE_FD_ENV: &str = "SCRIBE_PRIVATE_MACOS_EXECUTABLE_FD";
 #[cfg(target_os = "macos")]
@@ -387,12 +402,9 @@ mod platform {
 
     pub(crate) fn launch_verified_cpu_worker(
         authority: &ProtectedCpuAuthority,
+        role: CpuWorkerRole,
     ) -> Result<MacSpawnedWorker> {
-        launch_worker(
-            LaunchAuthority::Cpu(authority),
-            crate::onnx_worker::INFERENCE_WORKER_FLAG,
-            &[],
-        )
+        launch_worker(LaunchAuthority::Cpu(authority), role.flag(), &[])
     }
 
     fn launch_worker(
@@ -1413,6 +1425,18 @@ pub(crate) use platform::{MacWorkerProcess, launch_verified_cpu_worker, launch_v
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_protected_cpu_closed_roles_map_only_to_exact_worker_flags() {
+        assert_eq!(
+            CpuWorkerRole::Inference.flag(),
+            crate::onnx_worker::INFERENCE_WORKER_FLAG
+        );
+        assert_eq!(
+            CpuWorkerRole::Vad.flag(),
+            crate::onnx_worker::VAD_WORKER_FLAG
+        );
+    }
 
     #[test]
     fn verified_worker_environment_drops_loader_and_backend_overrides() {
