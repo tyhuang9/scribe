@@ -877,12 +877,15 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
     let native = production_source(include_str!(
         "../tools/macos-cpu-worker-installer/src/native.rs"
     ));
-    let bootstrap = production_source(include_str!(
+    let bootstrap_adapter = production_source(include_str!(
         "../tools/macos-cpu-worker-installer/src/native/bootstrap.rs"
     ));
-    let transaction = production_source(include_str!(
+    let transaction_adapter = production_source(include_str!(
         "../tools/macos-cpu-worker-installer/src/transaction.rs"
     ));
+    let bootstrap = production_source(include_str!("macos_installer_bootstrap.rs"));
+    let transaction = production_source(include_str!("macos_installer_transaction.rs"));
+    let filesystem = production_source(include_str!("macos_installer_fs.rs"));
     let manifest = include_str!("../tools/macos-cpu-worker-installer/Cargo.toml");
     let check = include_str!("../scripts/verify-macos-cpu-installer-source.sh");
     let workflow = include_str!("../.github/workflows/macos-release.yml");
@@ -912,6 +915,8 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
             !bootstrap.contains(forbidden),
             "ancestor bootstrap gained {forbidden}"
         );
+        assert!(!filesystem.contains(forbidden));
+        assert!(!transaction.contains(forbidden));
     }
     for required in [
         "embedded_cpu_digest()?",
@@ -932,7 +937,7 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
     );
     assert!(check.contains("--locked --offline"));
     assert!(check.contains("--all-targets -- -D warnings"));
-    assert!(check.contains("Darwin) expected=40"));
+    assert!(check.contains("Darwin) expected=42"));
     assert!(check.contains("[[ \"$count\" == \"$expected\" ]]"));
     assert!(workflow.contains("bash scripts/verify-macos-cpu-installer-source.sh"));
     let root_walk = named_function_bodies(&native, "walk_protected_root").join("\n");
@@ -941,8 +946,8 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
     assert!(!root_walk.contains("set_mode("));
     for required in [
         "impl Operations for Bootstrap",
-        "install(&mut operation)",
-        "matches!(final_name, \"Scribe\" | \"CPU\")",
+        "run_transaction(&mut operation, component)",
+        "matches!(name, \"Scribe\" | \"CPU\")",
         "self.check_empty_stage(0o700)?",
         "self.check_empty_stage(0o755)?",
         "libc::RENAME_EXCL",
@@ -956,6 +961,11 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
     let bootstrap_confirm = named_function_bodies(&bootstrap, "confirm").join("\n");
     assert!(bootstrap_confirm.contains("checked_directory("));
     assert!(!bootstrap_confirm.contains("check_empty_stage("));
+    assert!(bootstrap_adapter.contains("ensure_cpu_ancestor as ensure_fixed_ancestor"));
+    assert!(transaction_adapter.contains("run_transaction(ops, \"CPU\")"));
+    assert!(transaction_adapter.contains("validate_cpu_size(length)?"));
+    assert!(transaction_adapter.contains("validate_cpu_digest(expected)?"));
+    assert!(transaction_adapter.contains("MAX_CPU_WORKER_BYTES"));
     for source in [check, workflow] {
         for forbidden in ["sudo ", "installer -pkg", "--source-worker"] {
             assert!(
@@ -969,6 +979,112 @@ fn macos_cpu_installer_is_isolated_compiled_authority_and_ci_never_installs() {
         include_str!("bin/scribe-inference-worker.rs"),
     ] {
         assert!(!source.contains("macos-cpu-worker-installer"));
+        for module in [
+            "installer_bootstrap",
+            "installer_fs",
+            "installer_transaction",
+        ] {
+            assert!(!source.contains(&format!("mod {module};")));
+        }
+    }
+}
+
+#[test]
+fn macos_metal_installer_copies_only_admitted_content_and_ci_never_installs() {
+    let entry = production_source(include_str!(
+        "../tools/macos-metal-pack-installer/src/main.rs"
+    ));
+    let native = production_source(include_str!(
+        "../tools/macos-metal-pack-installer/src/native.rs"
+    ));
+    let admission = production_source(include_str!(
+        "../tools/macos-metal-pack-installer/src/admission.rs"
+    ));
+    let check = include_str!("../scripts/verify-macos-metal-installer-source.sh");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let constructor = named_function_bodies(&native, "production").join("\n");
+    assert!(
+        constructor.find("require_installer_root(").unwrap()
+            < constructor.find("admit_source(candidate)?").unwrap()
+    );
+    let prepare = named_function_bodies(&native, "prepare").join("\n");
+    assert!(
+        prepare.find("self.source.reverify()?").unwrap()
+            < prepare.find("self.prepare_store()?").unwrap()
+    );
+    assert!(
+        prepare.find("libc::flock(").unwrap()
+            < prepare
+                .find("self.source.destination_components()")
+                .unwrap()
+    );
+    let root = named_function_bodies(&native, "prepare_store").join("\n");
+    for name in ["Library", "Application Support", "Scribe", "WorkerPacks"] {
+        assert!(root.contains(&format!("\"{name}\"")));
+    }
+    for required in [
+        "libc::LOCK_EX | libc::LOCK_NB",
+        "libc::RENAME_EXCL",
+        "self.source.open_for_copy(slot)?",
+        "slot.maximum()",
+        "drop(output)",
+        "self.source.verify_materialized(pinned)?",
+        "self.inspect_nodes(root)?",
+        "self.published = true;",
+        "self.prove_cleanup_tree(stage)?",
+    ] {
+        assert!(native.contains(required), "Metal writer lost {required}");
+    }
+    assert!(admission.contains("copy.copy_entries() != self.lease.copy_entries()"));
+    let cleanup = named_function_bodies(&native, "cleanup").join("\n");
+    assert!(
+        cleanup.find("self.prove_cleanup_tree(stage)?").unwrap() < cleanup.find("unlink(").unwrap()
+    );
+    for forbidden in [
+        "fixture_uid",
+        "fixture_root",
+        "copy_hook",
+        "std::process::Command",
+        "std::env::var(",
+        "std::env::var_os(",
+        "remove_dir_all",
+        "libc::chown",
+        "PackStore",
+        "activate(",
+        "Keychain",
+        "SecItem",
+    ] {
+        assert!(
+            !native.contains(forbidden),
+            "Metal writer gained {forbidden}"
+        );
+    }
+    for forbidden in [
+        "--destination",
+        "--trust-root",
+        "--release-authority",
+        "--epoch",
+    ] {
+        assert!(!entry.contains(forbidden));
+    }
+    assert!(check.contains("Darwin) expected=90; admission_expected=19"));
+    assert!(check.contains("native_expected=16"));
+    assert!(check.contains("--locked --offline"));
+    assert!(check.contains("--all-targets -- -D warnings"));
+    assert!(workflow.contains("bash scripts/verify-macos-metal-installer-source.sh"));
+    for source in [check, workflow] {
+        for forbidden in ["sudo ", "installer -pkg", "--source-pack"] {
+            assert!(
+                !source.contains(forbidden),
+                "CI must not install: {forbidden}"
+            );
+        }
+    }
+    for source in [
+        include_str!("main.rs"),
+        include_str!("bin/scribe-inference-worker.rs"),
+    ] {
+        assert!(!source.contains("macos-metal-pack-installer"));
     }
 }
 

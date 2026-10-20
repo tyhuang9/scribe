@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 struct FixtureTrust(Vec<u8>);
 impl TrustRoot for FixtureTrust {
     fn public_key(&self, id: &str) -> Option<&[u8]> {
-        (id == "fixture-ed25519-v1").then_some(self.0.as_slice())
+        matches!(id, "fixture-ed25519-v1" | "fixture-ed25519-v2").then_some(self.0.as_slice())
     }
 }
 fn fixture_key() -> Ed25519KeyPair {
@@ -30,7 +30,7 @@ fn fixture_verifier(trust: &dyn TrustRoot) -> PackVerifier<'_> {
     )
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     owner: PathBuf,
     root: PathBuf,
     manifest: PackManifest,
@@ -38,7 +38,7 @@ struct Fixture {
     authority: PackReleaseAuthority,
 }
 impl Fixture {
-    fn new(change: impl FnOnce(&mut PackManifest)) -> Self {
+    pub(crate) fn new(change: impl FnOnce(&mut PackManifest)) -> Self {
         let owner = manifest::test_support::temp_root("metal-installer-admission");
         let mut manifest = manifest::test_support::base_manifest();
         manifest.pack_id = StoreComponent::new("scribe-metal").unwrap();
@@ -166,12 +166,15 @@ impl Fixture {
         )
         .unwrap()
     }
-    fn admit(&self) -> Result<AdmittedSource<'static>> {
+    pub(crate) fn admit(&self) -> Result<AdmittedSource<'static>> {
         admit_pinned(
             MetalReleasePermit::for_native_release(self.release()?)?,
             self.pinned(),
             fixture_verifier(fixture_trust()),
         )
+    }
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.root
     }
 }
 impl Drop for Fixture {
@@ -187,6 +190,83 @@ fn metal_admission_exact_fixture_reverifies_without_installing() {
     assert_eq!(admitted.lease.copy_entries().len(), 3);
     admitted.reverify().unwrap();
     assert_eq!(fs::read_dir(&fixture.owner).unwrap().count(), 1);
+}
+
+#[test]
+fn metal_admission_copy_interface_is_closed_and_preserves_per_file_limits() {
+    use std::io::Cursor;
+    let fixture = Fixture::new(|_| {});
+    let admitted = fixture.admit().unwrap();
+    assert_eq!(
+        admitted.destination_components(),
+        [
+            fixture.manifest.pack_id.as_str(),
+            fixture.manifest.pack_version.as_str(),
+            fixture.manifest.pack_digest.as_str()
+        ]
+    );
+    for slot in FileSlot::ALL {
+        let (expected, mut input) = admitted.open_for_copy(slot).unwrap();
+        assert_eq!(expected.path, slot.path());
+        let mut copied = Vec::new();
+        crate::installer_transaction::copy_exact(
+            &mut input,
+            &mut copied,
+            expected.size_bytes,
+            slot.maximum(),
+        )
+        .unwrap();
+        crate::installer_transaction::verify_bytes(
+            &mut Cursor::new(copied),
+            expected.size_bytes,
+            &expected.sha256,
+            slot.maximum(),
+        )
+        .unwrap();
+        assert!(
+            crate::installer_transaction::copy_exact(
+                &mut Cursor::new(b"x"),
+                &mut Vec::new(),
+                slot.maximum() + 1,
+                slot.maximum()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn metal_admission_materialized_copy_requires_the_original_signature_envelope() {
+    let fixture = Fixture::new(|_| {});
+    let other = Fixture::new(|_| {});
+    let admitted = fixture.admit().unwrap();
+    let signature = other.root.join(manifest::SIGNATURE_NAME);
+    let original = fs::read_to_string(&signature).unwrap();
+    let alternate = original.replace("fixture-ed25519-v1", "fixture-ed25519-v2");
+    assert_eq!(original.len(), alternate.len());
+    fs::write(signature, alternate).unwrap();
+    fixture_verifier(fixture_trust())
+        .verify(&other.root)
+        .unwrap();
+    let copy = fixture_verifier(fixture_trust())
+        .verify_pinned(other.pinned())
+        .unwrap();
+    assert!(admitted.permit.matches(&copy)); // Identity and total size alone pass.
+    drop(copy);
+    assert!(admitted.verify_materialized(other.pinned()).is_err());
+    assert!(
+        ProductionTrustRoot
+            .public_key("fixture-ed25519-v2")
+            .is_none()
+    );
+}
+
+#[test]
+fn metal_admission_identical_materialized_copy_reverifies() {
+    let fixture = Fixture::new(|_| {});
+    let other = Fixture::new(|_| {});
+    let admitted = fixture.admit().unwrap();
+    admitted.verify_materialized(other.pinned()).unwrap();
 }
 
 #[test]

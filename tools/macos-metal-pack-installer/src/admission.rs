@@ -15,6 +15,46 @@ const PROVIDER: &str = "transcribe-cpp-metal";
 const CATALOG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/catalog.json"));
 const AUTHORITY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/authority.json"));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileSlot {
+    Manifest,
+    Signature,
+    Worker,
+}
+impl FileSlot {
+    pub(crate) const ALL: [Self; 3] = [Self::Manifest, Self::Signature, Self::Worker];
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Manifest => 0,
+            Self::Signature => 1,
+            Self::Worker => 2,
+        }
+    }
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::Manifest => manifest::MANIFEST_NAME,
+            Self::Signature => manifest::SIGNATURE_NAME,
+            Self::Worker => WORKER,
+        }
+    }
+    pub(crate) fn basename(self) -> &'static str {
+        match self {
+            Self::Worker => "scribe-inference-worker",
+            _ => self.path(),
+        }
+    }
+    pub(crate) fn maximum(self) -> u64 {
+        match self {
+            Self::Manifest => manifest::MAX_MANIFEST_BYTES,
+            Self::Signature => manifest::MAX_SIGNATURE_BYTES,
+            Self::Worker => manifest::MAX_FILE_BYTES,
+        }
+    }
+    pub(crate) fn mode(self) -> u32 {
+        if self == Self::Worker { 0o755 } else { 0o644 }
+    }
+}
+
 fn build_identity() -> ReleaseBuildIdentity<'static> {
     ReleaseBuildIdentity {
         app_version: env!("CARGO_PKG_VERSION"),
@@ -112,6 +152,49 @@ pub(crate) struct AdmittedSource<'a> {
 }
 
 impl AdmittedSource<'_> {
+    pub(crate) fn destination_components(&self) -> [&str; 3] {
+        let entry = &self.permit.entry;
+        [
+            entry.pack_id.as_str(),
+            entry.pack_version.as_str(),
+            &entry.pack_digest,
+        ]
+    }
+
+    pub(crate) fn expected(&self, slot: FileSlot) -> Result<&manifest::VerifiedCopyEntry> {
+        let entry = self
+            .lease
+            .copy_entries()
+            .get(slot.index())
+            .context("admitted file slot is missing")?;
+        if entry.path != slot.path() || entry.size_bytes == 0 || entry.size_bytes > slot.maximum() {
+            bail!("admitted file slot violates its closed path or byte limit");
+        }
+        Ok(entry)
+    }
+
+    /// Reopens beneath the pinned source. The returned handle is NOT immutable;
+    /// the writer must hash its independently reopened copy against this entry.
+    pub(crate) fn open_for_copy(
+        &self,
+        slot: FileSlot,
+    ) -> Result<(&manifest::VerifiedCopyEntry, std::fs::File)> {
+        self.lease.recheck()?;
+        let entry = self.expected(slot)?;
+        let file = self.lease.open_copy_file(entry)?;
+        Ok((entry, file))
+    }
+
+    pub(crate) fn verify_materialized(&self, pinned: PinnedPackRoot) -> Result<VerifiedPackLease> {
+        self.reverify()?;
+        let copy = self.verifier.verify_pinned(pinned)?;
+        if !self.permit.matches(&copy) || copy.copy_entries() != self.lease.copy_entries() {
+            bail!("materialized copy differs from the exact admitted source inventory");
+        }
+        self.reverify()?;
+        Ok(copy)
+    }
+
     pub(crate) fn reverify(&self) -> Result<()> {
         self.verifier.launchable_worker(&self.lease)?; // Verification only; never spawn.
         if !self.permit.matches(&self.lease) {
@@ -189,4 +272,4 @@ fn pin_candidate(candidate: &std::path::Path) -> Result<PinnedPackRoot> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

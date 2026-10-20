@@ -1,5 +1,19 @@
-//! Installer-source admission only. No install command, elevation, or runtime caller.
+//! Installer-owned copy-only source. No elevation, activation, or runtime caller.
 use anyhow::{Result, bail};
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code, reason = "Metal consumes only admitted ancestor mechanics")]
+#[path = "../../../src/macos_installer_bootstrap.rs"]
+mod installer_bootstrap;
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "shared installer primitives have CPU and Metal consumers"
+)]
+#[path = "../../../src/macos_installer_fs.rs"]
+mod installer_fs;
+#[path = "../../../src/macos_installer_transaction.rs"]
+mod installer_transaction;
 
 #[allow(
     dead_code,
@@ -30,6 +44,8 @@ mod admission;
 )]
 #[path = "../../../src/macos_worker_fs.rs"]
 mod macos_worker_fs;
+#[cfg(target_os = "macos")]
+mod native;
 
 fn run() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -43,13 +59,13 @@ fn run_arguments(arguments: &[std::ffi::OsString]) -> Result<()> {
             "{}",
             serde_json::json!({
                 "schemaVersion": 1,
-                "component": "protected-metal-source-admission",
+                "component": "protected-metal-writer",
                 "appVersion": env!("CARGO_PKG_VERSION"),
                 "buildRevision": env!("SCRIBE_BUILD_REVISION"),
                 "releaseSecurityEpoch": release.release_security_epoch,
                 "releaseEntryCount": release.entries.len(),
                 "installsApplication": false,
-                "writesProtectedStore": false,
+                "supportsProtectedCopy": true,
             })
         );
         return Ok(());
@@ -65,9 +81,29 @@ fn run_arguments(arguments: &[std::ffi::OsString]) -> Result<()> {
         #[cfg(not(target_os = "macos"))]
         bail!("production Metal source admission is supported only on macOS");
     }
+    if arguments.len() == 3 && arguments[0] == "install" && arguments[1] == "--source-pack" {
+        #[cfg(target_os = "macos")]
+        {
+            let mut operation =
+                native::NativeOperations::production(std::path::Path::new(&arguments[2]))?;
+            let outcome = installer_transaction::run_transaction(&mut operation, "Metal")?;
+            println!("{outcome:?}");
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("protected Metal installation is supported only on macOS");
+    }
     bail!(
-        "usage: scribe-macos-metal-pack-installer describe | verify-source --source-pack ABSOLUTE_PATH"
+        "usage: scribe-macos-metal-pack-installer describe | verify-source --source-pack ABSOLUTE_PATH | install --source-pack ABSOLUTE_PATH"
     )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn require_installer_root(effective_uid: u32) -> Result<()> {
+    if effective_uid != 0 {
+        bail!("Metal worker installation requires the trusted root installer");
+    }
+    Ok(())
 }
 
 fn main() {
@@ -80,10 +116,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn metal_admission_cli_rejects_install_and_runtime_authority_options() {
+    fn metal_admission_cli_rejects_invalid_install_and_runtime_authority_options() {
         for arguments in [
             vec![],
-            vec!["install", "--source-pack", "/candidate"],
+            vec!["install", "--source-worker", "/candidate"],
             vec!["describe", "--release-authority", "/authority"],
             vec!["verify-source", "--trust-root", "/key"],
             vec![
@@ -106,6 +142,13 @@ mod tests {
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>();
             assert!(super::run_arguments(&arguments).is_err());
+        }
+    }
+    #[test]
+    fn metal_install_requires_root_without_touching_a_candidate() {
+        assert!(super::require_installer_root(0).is_ok());
+        for uid in [1, 501, u32::MAX] {
+            assert!(super::require_installer_root(uid).is_err());
         }
     }
 }

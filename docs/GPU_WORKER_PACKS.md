@@ -999,19 +999,26 @@ model-free contract and reject a cross-role command. It never installs under
 security state. Ordinary native tests cover
 tampering, replacement, links, modes, extra files and descriptor-role confusion.
 
-This is still source-only admission, not a finished installer experience. CPU
-writer and development-component source exist; shipping installer integration,
-the protected Metal writer and combined app installation remain separate work.
-The isolated [Metal installer source-admission tool](../tools/macos-metal-pack-installer/README.md)
+This is still source-only development, not a finished installer experience. CPU
+writer and development-component source exist; shipping installer integration
+and combined app installation remain separate work.
+The isolated [Metal copy-only writer](../tools/macos-metal-pack-installer/README.md)
 now shares the application's compiled release-inclusion parser and production
 signature verifier. Its private permit binds one exact native Metal pack and
 three-file inventory to a retained source lease. It rejects auxiliary payloads,
 foreign builds and source aliases; hostile FIFO reads cannot block before type
-validation. This is read-only content admission, not protected filesystem or
-execution authority: no install command, store write, Keychain access or worker
-launch exists. The copy-only protected Metal transaction remains the next
-installer-source boundary; shipping bootstrap and actual installation are not
-established by this tool.
+validation. Its effective-root-only mutation entry consumes that permit and
+copies only the admitted three-file tree under the fixed protected hierarchy.
+Shared installer-only mechanics provide permanent nonblocking locking, sealed
+ancestor/stage publication, exclusive bounded copying, independent byte/signature
+readback and no-replace publication. The exact original signature envelope is
+bound too. Existing versions are verified, never repaired or overwritten;
+ambiguous publication/confirmation retains finals. Cleanup proves the entire
+invocation-owned tree and original temporary basename before its first unlink.
+Interrupted stages are not adopted or swept. Private native fixtures never invoke
+the production installation entry. No actual installation, Keychain access,
+activation or worker launch is introduced; native acceptance, shipping bootstrap
+and actual installation are not established by this source tool.
 Release VAD now uses the same frozen
 protected CPU image, in its own VAD-only process/session. A binary-local constant
 and the underlying inference provider restrict that entry to the dedicated Mac
