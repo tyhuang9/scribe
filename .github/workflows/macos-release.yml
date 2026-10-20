@@ -77,7 +77,7 @@ jobs:
           test "$directory_count" -eq 2
           lifecycle_tests="$(cargo test --locked --bin local-transcriber macos_worker_lifecycle_ -- --list)"
           lifecycle_count="$(printf '%s\n' "$lifecycle_tests" | awk '/^macos_worker_launch::platform::tests::macos_worker_lifecycle_.*: test$/ { count++ } END { print count+0 }')"
-          test "$lifecycle_count" -eq 9
+          test "$lifecycle_count" -eq 10
           executable_tests="$(cargo test --locked --bin local-transcriber macos_exec_authority_ -- --list)"
           executable_count="$(printf '%s\n' "$executable_tests" | awk '/^(macos_worker_launch::platform::tests|gpu_worker_pack::launch_binding::macos_exec_authority_tests|onnx_worker::tests)::macos_exec_authority_.*: test$/ { count++ } END { print count+0 }')"
           test "$executable_count" -eq 4

@@ -651,6 +651,16 @@ fn stage_six_macos_verified_launch_is_installer_protected_and_command_free() {
 }
 
 #[test]
+fn macos_worker_control_pipe_uses_child_only_explicit_inheritance() {
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    let body = named_function_bodies(&launcher, "launch_verified_worker").join("\n");
+    assert!(body.contains("actions.inherit(liveness_pipe.read.raw())?"));
+    assert!(!body.contains("actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())"));
+    assert!(launcher.contains("posix_spawn_file_actions_addinherit_np(&mut self.0, descriptor)"));
+    assert!(launcher.contains("POSIX_SPAWN_CLOEXEC_DEFAULT"));
+}
+
+#[test]
 fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() {
     let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
     let authority = production_source(include_str!("gpu_worker_pack/device_release_epoch.rs"));

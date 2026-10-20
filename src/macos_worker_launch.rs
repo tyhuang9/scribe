@@ -80,6 +80,10 @@ mod platform {
     const DROP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
     unsafe extern "C" {
+        fn posix_spawn_file_actions_addinherit_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            descriptor: c_int,
+        ) -> c_int;
         fn posix_spawn_file_actions_addfchdir_np(
             actions: *mut libc::posix_spawn_file_actions_t,
             descriptor: c_int,
@@ -389,7 +393,10 @@ mod platform {
         actions.dup2(executable.raw(), executable.raw())?;
         actions.dup2(readable_executable.raw(), readable_executable.raw())?;
         actions.dup2(dependency_root.raw(), dependency_root.raw())?;
-        actions.dup2(liveness_pipe.read.raw(), liveness_pipe.read.raw())?;
+        // Darwin's dup2(fd, fd) preserves FD_CLOEXEC. An explicit inherit
+        // action clears it in the child only; otherwise the watchdog sees a
+        // closed control pipe and exits before the authenticated handshake.
+        actions.inherit(liveness_pipe.read.raw())?;
         actions.dup2(stdin_pipe.read.raw(), libc::STDIN_FILENO)?;
         actions.dup2(stdout_pipe.write.raw(), libc::STDOUT_FILENO)?;
         // CLOEXEC_DEFAULT would otherwise discard startup diagnostics. Match
@@ -575,6 +582,13 @@ mod platform {
             spawn_result(
                 unsafe { libc::posix_spawn_file_actions_addclose(&mut self.0, descriptor) },
                 "could not configure macOS worker descriptor closure",
+            )
+        }
+
+        fn inherit(&mut self, descriptor: RawFd) -> Result<()> {
+            spawn_result(
+                unsafe { posix_spawn_file_actions_addinherit_np(&mut self.0, descriptor) },
+                "could not preserve macOS worker parent-control descriptor",
             )
         }
 
@@ -1071,6 +1085,111 @@ mod platform {
             let state = process.state.lock().unwrap();
             assert!(state.reaped);
             assert!(state.group_retired);
+        }
+
+        #[test]
+        fn macos_worker_lifecycle_control_pipe_survives_exec_without_leaking_other_descriptors() {
+            const CONTROL_ENV: &str = "SCRIBE_PRIVATE_TEST_CONTROL_FD";
+            const UNRELATED_ENV: &str = "SCRIBE_PRIVATE_TEST_UNRELATED_FD";
+            const TEST_NAME: &str = "macos_worker_launch::platform::tests::macos_worker_lifecycle_control_pipe_survives_exec_without_leaking_other_descriptors";
+            if let Ok(raw) = std::env::var(CONTROL_ENV) {
+                let descriptor: RawFd = raw.parse().unwrap();
+                let unrelated: RawFd = std::env::var(UNRELATED_ENV).unwrap().parse().unwrap();
+                let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+                assert!(
+                    flags >= 0,
+                    "parent-control descriptor was closed during exec"
+                );
+                assert_eq!(flags & libc::FD_CLOEXEC, 0);
+                assert_eq!(unsafe { libc::fcntl(unrelated, libc::F_GETFD) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "an unrelated non-CLOEXEC descriptor escaped the spawn allowlist"
+                );
+                let mut reader = unsafe { std::fs::File::from_raw_fd(descriptor) };
+                let mut message = [0];
+                reader.read_exact(&mut message).unwrap();
+                assert_eq!(message, [PARENT_CONTROL_CANCEL]);
+                return;
+            }
+
+            let control = Pipe::new().unwrap();
+            let original_flags = unsafe { libc::fcntl(control.read.raw(), libc::F_GETFD) };
+            assert_ne!(original_flags & libc::FD_CLOEXEC, 0);
+            // This otherwise inheritable high descriptor must still be closed
+            // by CLOEXEC_DEFAULT. Keep it away from the child's stdio/runtime.
+            let unrelated_raw = unsafe { libc::fcntl(control.write.raw(), libc::F_DUPFD, 200) };
+            assert!(unrelated_raw >= 200);
+            let unrelated = FdGuard(unrelated_raw);
+            let output = duplicate_private_fd(libc::STDOUT_FILENO).unwrap();
+            let stderr = stderr_descriptor(libc::STDERR_FILENO).unwrap();
+            let mut actions = SpawnFileActions::new().unwrap();
+            actions.inherit(control.read.raw()).unwrap();
+            actions.dup2(output.raw(), libc::STDOUT_FILENO).unwrap();
+            actions.dup2(stderr.raw(), libc::STDERR_FILENO).unwrap();
+            let mut attributes = SpawnAttributes::new().unwrap();
+            attributes.process_group().unwrap();
+            let executable = CString::new(
+                std::env::current_exe()
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )
+            .unwrap();
+            let arguments = [
+                executable.clone(),
+                CString::new("--exact").unwrap(),
+                CString::new(TEST_NAME).unwrap(),
+                CString::new("--test-threads=1").unwrap(),
+            ];
+            let mut argv = arguments
+                .iter()
+                .map(|value| value.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect::<Vec<_>>();
+            let environment = sanitized_environment(&[
+                (CONTROL_ENV.to_owned(), control.read.raw().to_string()),
+                (UNRELATED_ENV.to_owned(), unrelated.raw().to_string()),
+            ])
+            .unwrap()
+            .into_iter()
+            .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap())
+            .collect::<Vec<_>>();
+            let mut envp = environment
+                .iter()
+                .map(|value| value.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect::<Vec<_>>();
+            let message = [PARENT_CONTROL_CANCEL];
+            assert_eq!(
+                unsafe { libc::write(control.write.raw(), message.as_ptr().cast(), 1) },
+                1
+            );
+            let mut pid = 0;
+            let result = unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    executable.as_ptr(),
+                    actions.as_ptr(),
+                    attributes.as_ptr(),
+                    argv.as_mut_ptr(),
+                    envp.as_mut_ptr(),
+                )
+            };
+            assert_eq!(result, 0, "control inheritance fixture spawn failed");
+            let mut child = TestChild { pid, reaped: false };
+            assert_eq!(
+                unsafe { libc::fcntl(control.read.raw(), libc::F_GETFD) },
+                original_flags,
+                "spawn must not clear close-on-exec in the parent"
+            );
+            assert_eq!(
+                child
+                    .wait_before(Instant::now() + Duration::from_secs(10))
+                    .unwrap(),
+                0
+            );
         }
 
         #[test]
