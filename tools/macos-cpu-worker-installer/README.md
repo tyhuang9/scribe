@@ -274,6 +274,16 @@ the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 mode only to model an operation archive; **nothing executes it**. Neither the
 real entry nor any worker/application is built, signed, packaged or launched.
 
+CI runs this command once per architecture in the short `package-profile`
+preflight matrix. The structural matrix requires both preflights to succeed;
+official signing still requires structural success and its unchanged protected
+manual gate. Completed preflight logs can be read independently, before the
+long native builds finish. No secrets or artifacts are added. Each preflight has
+a ten-minute execution bound and the probe step retains its two-minute bound;
+neither limits queue delay. Two additional job startups and the both-architecture
+barrier can increase total workflow time; this is earlier report availability,
+not a promise of faster full CI or package/installation acceptance.
+
 Only this freshly generated unsigned fixture is read, entirely in bounded memory.
 The probe has no archive/path/options input and never extracts an archive. It
 reuses the existing private workspace and bounded process/reaping helper, rejects
@@ -304,7 +314,8 @@ package authenticity. It is not a reusable arbitrary-archive inspector, trusted
 installer, installation test or shipping format validator. Actual package entry
 composition, full hostile-archive validation, signed-package authenticity,
 Installer binary execution and install/update/removal/rollback remain separate
-gates. Until the native jobs finish, only the portable observation code is tested.
+gates. Portable checks do not establish native observations; review completed
+preflight reports separately from full structural results.
 
 ## Not yet established
 
