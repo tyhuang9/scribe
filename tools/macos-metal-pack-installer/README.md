@@ -225,6 +225,48 @@ Actual native feature compilation/fixtures, authenticated package composition,
 Installer invocation, installation and cross-component update/rollback remain
 unverified until their own gates pass. No production entry is run in CI.
 
+## Internal universal entry construction (source only)
+
+`build_support/macos_metal_pkg_entry.py` exposes an internal function, not a CLI
+or shipping package workflow. An unprivileged Mac author supplies a finalized
+application, a fresh output workspace outside it, and frozen revision, CPU-worker,
+catalog, authority and exactly two architecture-keyed manifest hashes. The
+existing full application verifier is mandatory, including the reviewed Keychain
+namespace and profile policy. The empty reviewed namespace still prevents an
+actual positive Metal release from passing. CPU-only admission is unchanged.
+
+The constructor copies the exact application context and both closed three-file
+packs into its owned private workspace, binding independent readback hashes to
+source hashes and node identities. Catalog and authority bytes must equal their
+compiled bytes (no terminal LF normalization). It builds the existing author
+tool fresh for the host, offline and locked, then runs only its production Metal
+content verifier on each private native pack. It independently joins the
+descriptors, release entries, build identity, provider, layout and measured sizes.
+A descriptor is not a retained lease or release, native or execution authority.
+The existing Rust signature and compatibility validators remain authoritative;
+there is no Python cryptography or runtime key override.
+
+Separate fresh target directories compile both `installer-package-entry` slices
+with the same frozen release documents and only the corresponding native pack.
+The combined entry must contain exactly ARM64 and x64 slices, target macOS 13.0
+and load only trusted system libraries, with no GPU dependency. Embedded Metal
+worker bytes do not make the outer entry a GPU-linked process. Each entry slice
+is bounded by the existing 2 GiB worker, 256 KiB manifest, 4 KiB signature, two
+512 KiB release documents and 32 MiB code/alignment allowance. CPU bounds do not
+change. Source and private snapshots are rechecked before exclusive publication.
+Only a PRE-SIGN path/hash/size is returned; uncertain child cleanup retains the
+private workspace and an ambiguous publication never deletes the final path.
+
+The reviewed source, Cargo configuration/cache/toolchain, finalized app and
+non-hostile same-user/root writers remain build assumptions, not a hermetic
+bootstrap. Its source suite is
+`python3 -B build_support/test_macos_metal_pkg_entry.py` (21 portable, 23 POSIX
+tests), with all native builds/tools mocked. These synthetic positives are not
+authentic packs, Mac construction acceptance, signature qualification or
+installation evidence. CI adds only this source suite under the unchanged
+profile/structural gate; it does not build, upload, sign or execute a real Metal
+entry.
+
 ## Remaining boundaries, not implemented here
 
 The writer is source-tested, not an installed or qualified release. Native Mac

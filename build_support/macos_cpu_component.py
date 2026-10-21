@@ -49,6 +49,8 @@ TOOL_OPERATIONS = frozenset({
     "writer-build-arm64", "writer-build-x86_64", "writer-combine",
     "development-writer-signing", "writer-description",
     "entry-build-arm64", "entry-build-x86_64", "entry-combine",
+    "metal-author-build", "metal-content-verification",
+    "metal-entry-build-arm64", "metal-entry-build-x86_64", "metal-entry-combine",
 })
 
 
@@ -86,8 +88,9 @@ def validate_identity(digest: str, revision: str) -> None:
     require(re.fullmatch(r"[\x21-\x7e]{12,96}", revision) is not None, "invalid frozen build revision")
 
 
-def strict_json(data: bytes) -> dict:
-    require(0 < len(data) <= MAX_JSON, "metadata size is outside its bound")
+def strict_json(data: bytes, maximum: int = MAX_JSON) -> dict:
+    require(type(maximum) is int and 0 < maximum <= 512 * 1024, "invalid metadata bound")
+    require(0 < len(data) <= maximum, "metadata size is outside its bound")
 
     def pairs(entries):
         result = {}
