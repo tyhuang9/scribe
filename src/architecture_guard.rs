@@ -1333,7 +1333,52 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 18 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 28 + (1 if sys.platform == \"darwin\" else 0)"));
+    let decoder = &source
+        [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
+    for required in [
+        "ODC_HEADER_BYTES = 76",
+        "ODC_MAX_RECORDS = 16",
+        "ODC_MAX_NAME_BYTES = 256",
+        "\"schema_version\": 2",
+        "scripts_inventory = _observe_scripts_fixture(scripts)",
+        "\"scripts_inventory\": scripts_inventory",
+    ] {
+        assert!(
+            source.contains(required),
+            "fixed ODC observation lost {required}"
+        );
+    }
+    for required in [
+        "48 <= byte <= 55",
+        "end <= len(data)",
+        "len(records) < ODC_MAX_RECORDS",
+        "not any(data[end:])",
+        "record[\"data\"] == FIXTURE",
+        "identity not in seen",
+    ] {
+        assert!(decoder.contains(required));
+    }
+    for forbidden in ["component.capture(", "Path(", "open(", "os."] {
+        assert!(!decoder.contains(forbidden));
+    }
+    for forbidden in [
+        "prefix_hex",
+        "scripts.count(FIXTURE)",
+        "fixture_occurrences",
+    ] {
+        assert!(!source.contains(forbidden));
+    }
+    for required in [
+        "test_odc_literal_header_and_unaligned_records",
+        "test_odc_every_numeric_field_rejects_non_octal",
+        "test_odc_all_truncations_name_terminators_and_entry_padding_reject",
+        "test_fixed_inventory_rejects_aliases_extra_records_types_and_partial_payloads",
+        "test_link_counts_and_permissions_are_observations_not_admission",
+        "test_full_report_omits_payload_prefixes_and_private_numeric_metadata",
+    ] {
+        assert!(tests.contains(required));
+    }
     assert!(source.contains("\"mode\": observed_mode(file)"));
     assert!(tests.contains("test_absent_mode_is_reported_as_unknown_without_inferred_permissions"));
     assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));

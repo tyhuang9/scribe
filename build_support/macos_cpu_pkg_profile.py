@@ -24,6 +24,9 @@ FIXTURE = b"# Scribe package-format fixture; intentionally no interpreter.\n"
 MAX_PACKAGE = 1024 * 1024
 MAX_TOC = 64 * 1024
 MAX_MEMBER = 64 * 1024
+ODC_HEADER_BYTES = 76
+ODC_MAX_RECORDS = 16
+ODC_MAX_NAME_BYTES = 256
 HEADER = struct.Struct(">4sHHQQI")
 
 
@@ -93,6 +96,76 @@ def number(node: ET.Element, name: str, maximum: int) -> int:
     return value
 
 
+def _decode_odc(data: bytes) -> tuple[list[dict], dict, int]:
+    """Decode the bounded generated fixture, without extraction or admission.
+
+    Apple's libarchive cpio.5 defines the 76-byte octal header and no name/data
+    alignment. Raw identities/times are validated but never returned or logged.
+    This decoder is private; the CLI still accepts no archive or path input.
+    """
+    require(type(data) is bytes and 0 < len(data) <= MAX_MEMBER, "ODC archive exceeds its bound")
+    records, offset = [], 0
+    fields = (("device", 6), ("inode", 6), ("mode", 6), ("uid", 6), ("gid", 6),
+              ("links", 6), ("rdev", 6), ("mtime", 11), ("name_bytes", 6), ("data_bytes", 11))
+    while True:
+        require(offset + ODC_HEADER_BYTES <= len(data), "missing or truncated ODC header/trailer")
+        require(data[offset:offset + 6] == b"070707", "unsupported ODC magic")
+        values, cursor = {}, offset + 6
+        for key, width in fields:
+            field = data[cursor:cursor + width]
+            require(all(48 <= byte <= 55 for byte in field), "malformed ODC numeric field")
+            values[key] = int(field, 8)
+            cursor += width
+        require(2 <= values["name_bytes"] <= ODC_MAX_NAME_BYTES
+                and values["data_bytes"] <= MAX_MEMBER, "ODC name/data exceeds its bound")
+        name_end = cursor + values["name_bytes"]
+        end = name_end + values["data_bytes"]
+        require(end <= len(data), "truncated ODC name/data")
+        name = data[cursor:name_end]
+        require(name[-1:] == b"\0" and b"\0" not in name[:-1], "invalid ODC name terminator")
+        name = name[:-1]
+        require(name == b"TRAILER!!!" or len(records) < ODC_MAX_RECORDS, "too many ODC records")
+        record = {"name": name, "mode": values["mode"], "links": values["links"],
+                  "data": data[name_end:end], "header_offset": offset,
+                  "name_bytes": values["name_bytes"], "data_offset": name_end, "end_offset": end}
+        if name == b"TRAILER!!!":
+            require(values["data_bytes"] == 0 and not any(data[end:]),
+                    "ODC trailer has data or a nonzero trailing stream")
+            return records, record, len(data) - end
+        records.append(record)
+        offset = end
+
+
+def _observe_scripts_fixture(data: bytes) -> dict:
+    records, trailer, padding = _decode_odc(data)
+    names = {b".": ".", b"./": "./", b"postinstall": "postinstall", b"./postinstall": "./postinstall"}
+    seen, report = set(), []
+    for record in records:
+        name, kind = record["name"], record["mode"] & 0o170000
+        require(name in names, "unexpected fixed-fixture ODC record")
+        root = name in (b".", b"./")
+        identity = "root" if root else "postinstall"
+        require(identity not in seen, "duplicate or aliased fixed-fixture ODC record")
+        seen.add(identity)
+        require((root and kind == 0o040000 and not record["data"])
+                or (not root and kind == 0o100000 and record["data"] == FIXTURE),
+                "fixed-fixture ODC type/content mismatch")
+        report.append(_odc_report_record(record, names[name], "directory" if root else "regular-file"))
+    require("postinstall" in seen, "missing fixed-fixture ODC postinstall")
+    # Permissions and link counts are OBSERVATIONS, including zero/multiple
+    # links. Nothing resolves a link, shares data, extracts or marks this safe.
+    return {"format": "odc", "header_bytes": ODC_HEADER_BYTES, "entry_alignment_bytes": 1,
+            "records": report, "trailer": _odc_report_record(trailer, "TRAILER!!!", "trailer"),
+            "trailing_zero_bytes": padding, "fixture_exact_bytes_match": True}
+
+
+def _odc_report_record(record: dict, name: str, kind: str) -> dict:
+    return {"name": name, "type": kind, "mode_octal": format(record["mode"], "06o"),
+            "links": record["links"], "data_bytes": len(record["data"]),
+            "header_offset": record["header_offset"], "name_bytes": record["name_bytes"],
+            "data_offset": record["data_offset"], "end_offset": record["end_offset"]}
+
+
 def observe_generated(data: bytes) -> dict:
     """Private probe decoding, not reusable admission of arbitrary archives.
 
@@ -149,15 +222,15 @@ def observe_generated(data: bytes) -> dict:
                 styles[tag] = style
         members.append({"name": name, "type": kind, "mode": observed_mode(file),
                         "encoding": encoding, "stored_bytes": length,
-                        "decoded_bytes": declared, "prefix_hex": decoded[:8].hex(),
+                        "decoded_bytes": declared,
                         "checksum_styles": styles})
     require({"PackageInfo", "Scripts"}.issubset(contents), "missing required observation member")
     package_info = xml_tree(contents["PackageInfo"])
     require(package_info.tag == "pkg-info" and package_info.get("identifier") == IDENTIFIER
             and package_info.get("version") == VERSION
             and package_info.get("install-location") == "/", "fixture package identity changed")
-    # XAR may already have decoded the archive. Do not presume a second gzip
-    # layer or a CPIO dialect. Record each observed layer and the final prefix.
+    # XAR may already have decoded the archive. Both native basic reports showed
+    # ODC, but compression layers are still recorded independently.
     scripts = contents["Scripts"]
     inner = "none"
     if scripts.startswith(b"\x1f\x8b"):
@@ -167,11 +240,11 @@ def observe_generated(data: bytes) -> dict:
         inner = "zlib"
     if inner != "none":
         scripts = inflate(scripts, MAX_MEMBER)
-    require(scripts.count(FIXTURE) == 1, "fixture is absent or duplicated in Scripts")
+    scripts_inventory = _observe_scripts_fixture(scripts)
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
             "unexpected operation reference")
-    return {"schema_version": 1, "observation_only": True, "package_bytes": len(data),
+    return {"schema_version": 2, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),
@@ -179,8 +252,7 @@ def observe_generated(data: bytes) -> dict:
             "package_identifier": IDENTIFIER, "package_version": VERSION,
             "install_location": "/", "postinstall_reference": references[0],
             "scripts_inner_compression": inner, "scripts_decoded_bytes": len(scripts),
-            "scripts_prefix_hex": scripts[:16].hex(),
-            "fixture_occurrences": 1}
+            "scripts_inventory": scripts_inventory}
 
 
 def probe() -> dict:
