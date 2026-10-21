@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -189,6 +190,46 @@ class Portable(unittest.TestCase):
         with self.assertRaises(component.ComponentError):
             component.has_markers(binary, [b"missing"], component.MAX_WORKER)
 
+    def test_marker_diagnostic_labels_are_closed_before_reading(self):
+        for role, architecture in [("private-sentinel", "arm64"), ([], "arm64"),
+                                   ("writer", "private-sentinel"), ("writer", None)]:
+            with self.subTest(role=role, architecture=architecture), \
+                 patch.object(component, "open_regular") as opened, \
+                 self.assertRaises(component.ComponentError) as result:
+                component.has_markers(self.root / "private-sentinel", [], 1024,
+                                      role=role, architecture=architecture)
+            opened.assert_not_called()
+            self.assertNotIn("private-sentinel", str(result.exception))
+        with patch.object(component, "capture") as execute, self.assertRaises(component.ComponentError):
+            component._inspect_universal_slices(self.root / "unused", [], self.root, 1024, role="private-sentinel")
+        execute.assert_not_called()
+
+    def test_each_missing_slice_marker_rejects_with_redacted_context(self):
+        binary = self.root / "private-path-sentinel"
+        markers = [b"private-build-sentinel", b"private-digest-sentinel"]
+        binary.write_bytes(b" ".join(markers))  # Presence in the fat image is insufficient.
+        for architecture in ("arm64", "x86_64"):
+            for missing_index in (0, 1):
+                def execute(arguments, **_kwargs):
+                    if arguments[0] == "/usr/bin/lipo":
+                        content = [marker for index, marker in enumerate(markers)
+                                   if arguments[3] != architecture or index != missing_index]
+                        Path(arguments[-1]).write_bytes(b" ".join(content))
+                        return b""
+                    if arguments[1] == "-l":
+                        return b"minos 13.0\n"
+                    return b"fixture:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n"
+                with self.subTest(architecture=architecture, missing_index=missing_index), \
+                     patch.object(component, "capture", side_effect=execute), \
+                     self.assertRaises(component.ComponentError) as result:
+                    component._inspect_universal_slices(binary, markers, self.root, 1024, role="writer")
+                error = result.exception
+                self.assertEqual(str(error), "binary slice does not contain the frozen identities "
+                                 f"(role=writer; architecture={architecture}; marker-indices={missing_index})")
+                self.assertNotIn("sentinel", str(error) + repr(error) + repr(error.args) + repr(error.__dict__))
+                self.assertFalse((self.root / (binary.name + "-arm64")).exists())
+                self.assertFalse((self.root / (binary.name + "-x86_64")).exists())
+
     def test_sterile_probe_environment(self):
         with patch.dict(os.environ, {"DYLD_INSERT_LIBRARIES": "untrusted", "SECRET": "never"}):
             self.assertEqual(set(component.probe_environment()), {"PATH", "LANG", "LC_ALL"})
@@ -258,12 +299,13 @@ class Portable(unittest.TestCase):
         def capture(arguments, **_kwargs):
             calls.append(arguments)
             return b"arm64 x86_64" if arguments[0] == "/usr/bin/lipo" else b""
-        def inspect(*_args):
+        def inspect(*_args, **kwargs):
             self.assertEqual(calls[-1], ["/usr/bin/codesign", "--verify", "--strict", str(binary)])
+            self.assertEqual(kwargs, {"role": "artifact"})
         with patch.object(component, "capture", side_effect=capture), \
              patch.object(component, "_inspect_universal_slices", side_effect=inspect) as slices:
             component.inspect_universal(binary, [], self.root, 1024)
-        slices.assert_called_once_with(binary, [], self.root, 1024)
+        slices.assert_called_once_with(binary, [], self.root, 1024, role="artifact")
         def reject(arguments, **_kwargs):
             if arguments[0] == "/usr/bin/codesign":
                 raise component.ComponentError("invalid signature")
@@ -281,7 +323,7 @@ class Portable(unittest.TestCase):
              patch.object(component, "_inspect_universal_slices") as slices:
             component.inspect_universal_structure(binary, [], self.root, 1024)
         capture.assert_called_once_with(["/usr/bin/lipo", str(binary), "-archs"], operation="artifact-architectures")
-        slices.assert_called_once_with(binary, [], self.root, 1024)
+        slices.assert_called_once_with(binary, [], self.root, 1024, role="structure")
 
     def test_structure_wrapper_preserves_size_and_exact_architecture_checks(self):
         binary = self.root / "binary"
@@ -661,6 +703,45 @@ class Posix(Portable):
 
 
 class NativeMac(Portable):
+    def test_optimized_rust_provenance_survives_both_slices_without_execution(self):
+        # Include the production definitions, not a C lookalike or runtime use of
+        # the values. Full LTO, symbol stripping and linker GC must retain bytes.
+        compiler = shutil.which("rustc")
+        self.assertIsNotNone(compiler, "reviewed Rust compiler is required")
+        self.assertTrue(Path(compiler).is_absolute())
+        with component.private_workspace(self.root, "native-retained-provenance-") as root:
+            source = root / "fixture.rs"
+            source.write_text(
+                '#[allow(dead_code)]\n#[path = ' + json.dumps(str(component.REPO / "src/worker_identity.rs")) +
+                '] mod worker_identity;\n#[allow(dead_code)]\n#[path = ' +
+                json.dumps(str(component.REPO / "src/macos_cpu_identity.rs")) +
+                '] mod cpu_identity;\nfn main() {}\n', encoding="utf-8")
+            previous = []
+            for variant, digit in enumerate(("a", "b")):
+                digest, revision = digit * 64, f"native-retained-revision-{variant}"
+                markers = [f"local-transcriber@0.1.0#{revision}".encode(),
+                           f"scribe-inference-worker@0.1.0#{revision}".encode(),
+                           digest.encode(), revision.encode(), component.CPU_ROOT.encode()]
+                environment = component.build_environment(digest, revision)
+                environment["CARGO_PKG_VERSION"] = "0.1.0"
+                slices = []
+                for target in component.TARGETS:
+                    output = root / f"fixture-{variant}-{target}"
+                    component.capture([compiler, "--edition=2024", "--target", target,
+                                       "-C", "opt-level=3", "-C", "lto=fat", "-C", "codegen-units=1",
+                                       "-C", "strip=symbols", "-C", "link-arg=-Wl,-dead_strip",
+                                       str(source), "-o", str(output)], cwd=component.REPO,
+                                      environment=environment, timeout=60, limit=65536, error_limit=65536)
+                    component.has_markers(output, markers, component.MAX_WRITER)
+                    image = output.read_bytes()
+                    for stale in previous:
+                        self.assertNotIn(stale, image)
+                    slices.append(str(output))
+                universal = root / f"universal-{variant}"
+                component.capture(["/usr/bin/lipo", "-create", *slices, "-output", str(universal)])
+                component.inspect_universal_structure(universal, markers, root, component.MAX_WRITER)
+                previous = markers[:4]  # The protected root intentionally stays constant.
+
     def test_actual_bundle_context_preserves_signed_input_binding_without_execution(self):
         # Fresh inert code, never launched. Match release's worker/main/outer-app
         # signing order, using ad hoc signatures only (no key or identity).
@@ -769,7 +850,7 @@ def suite():
         classes.append(Posix)
     if sys.platform == "darwin":
         classes.append(NativeMac)
-    expected = 33 + (18 if os.name == "posix" else 0) + (5 if sys.platform == "darwin" else 0)
+    expected = 35 + (18 if os.name == "posix" else 0) + (6 if sys.platform == "darwin" else 0)
     for cls in classes:
         for name in sorted(cls.__dict__):
             if name.startswith("test_"):

@@ -7,13 +7,15 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-pub(crate) const CPU_ROOT: &str = "/Library/Application Support/Scribe/CPU";
+#[path = "macos_cpu_identity.rs"]
+mod cpu_identity;
+pub(crate) use cpu_identity::CPU_ROOT;
 pub(crate) const CPU_WORKER_NAME: &str = "scribe-inference-worker";
 pub(crate) const MAX_CPU_WORKER_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn embedded_cpu_digest() -> Result<&'static str> {
-    let digest = option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or("");
+    let digest = cpu_identity::CPU_WORKER_SHA256;
     validate_cpu_digest(digest)?;
     Ok(digest)
 }

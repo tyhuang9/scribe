@@ -19,6 +19,8 @@ mod package_snapshot;
 
 fn main() {
     println!("cargo:rerun-if-changed=../../src/macos_worker_layout.rs");
+    println!("cargo:rerun-if-changed=../../src/macos_cpu_identity.rs");
+    println!("cargo:rerun-if-changed=../../src/macos_retained_marker.rs");
     println!("cargo:rerun-if-changed=../../build_support/build_revision.rs");
     for name in ["SCRIBE_BUNDLED_WORKER_SHA256", "SCRIBE_BUILD_REVISION"] {
         println!("cargo:rerun-if-env-changed={name}");
