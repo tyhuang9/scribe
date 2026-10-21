@@ -35,8 +35,16 @@ MAX_WRITER = 64 * 1024 * 1024
 MAX_JSON = 8192
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 NATIVE_DARWIN = sys.platform == "darwin"
+CPU_APP_INPUTS = (
+    "Contents/MacOS/scribe-inference-worker", "Contents/MacOS/Scribe",
+    "Contents/_CodeSignature/CodeResources", "Contents/Info.plist",
+    "Contents/Resources/worker-pack-catalog.json",
+    "Contents/Resources/gpu-pack-release-authority.json",
+)
 TOOL_OPERATIONS = frozenset({
     "tool", "application-verification", "artifact-architectures", "artifact-signature-verification",
+    "copied-worker-signature-verification", "desktop-bundle-signature-verification",
+    "writer-signature-verification",
     "artifact-slice", "artifact-load-commands", "artifact-dependencies",
     "writer-build-arm64", "writer-build-x86_64", "writer-combine",
     "development-writer-signing", "writer-description",
@@ -502,12 +510,15 @@ def has_markers(path: Path, markers: list[bytes], maximum: int) -> None:
     require(all(found), "binary slice does not contain the frozen identities")
 
 
-def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum: int) -> None:
+def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum: int,
+                      *, signature_operation: str = "artifact-signature-verification") -> None:
+    require(signature_operation in ("artifact-signature-verification", "copied-worker-signature-verification",
+                                    "writer-signature-verification"), "unknown signature operation")
     hash_file(path, maximum)
     architectures = capture(["/usr/bin/lipo", str(path), "-archs"],
                             operation="artifact-architectures").decode("ascii").split()
     require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
-    capture(["/usr/bin/codesign", "--verify", "--strict", str(path)], operation="artifact-signature-verification")
+    capture(["/usr/bin/codesign", "--verify", "--strict", str(path)], operation=signature_operation)
     _inspect_universal_slices(path, markers, workspace, maximum)
 
 
@@ -566,9 +577,10 @@ def inspect_component(root: Path, digest: str, revision: str) -> dict:
             copy_new(root / name, snapshot / name, maximum)
         # Tools see only our private bounded snapshot, not mutable external paths.
         record = verify_files(snapshot, digest, revision)
-        inspect_universal(snapshot / WORKER, [], workspace, MAX_WORKER)
+        inspect_universal(snapshot / WORKER, [], workspace, MAX_WORKER,
+                          signature_operation="copied-worker-signature-verification")
         inspect_universal(snapshot / WRITER, [digest.encode(), revision.encode(), CPU_ROOT.encode()],
-                          workspace, MAX_WRITER)
+                          workspace, MAX_WRITER, signature_operation="writer-signature-verification")
     return record
 
 
@@ -609,6 +621,39 @@ def verify_cpu_app(app: Path) -> str:
     return version
 
 
+def cpu_app_input_snapshot(app: Path) -> dict:
+    return {name: (*hash_file(app / name, MAX_WORKER), fingerprint((app / name).lstat()))
+            for name in CPU_APP_INPUTS}
+
+
+def snapshot_cpu_app_inputs(app: Path, worker: Path, desktop: Path, workspace: Path,
+                            digest: str, revision: str) -> int:
+    """Bind private byte copies to the verified app, retaining bundle context.
+
+    A bundle main's signature seals metadata outside the Mach-O file. Never
+    treat its loose copy as standalone signed code, re-sign it, or bypass the
+    full app verifier. Source/toolchain and non-hostile same-UID/root writers
+    remain build assumptions; before/after checks do not defeat swap-and-restore.
+    """
+    before = cpu_app_input_snapshot(app)
+    require(before[CPU_APP_INPUTS[0]][0] == digest, "copied worker differs from frozen authority")
+    copied_worker = copy_new(app / CPU_APP_INPUTS[0], worker, MAX_WORKER)
+    copied_desktop = copy_new(app / CPU_APP_INPUTS[1], desktop, MAX_WORKER)
+    require(copied_worker == before[CPU_APP_INPUTS[0]][:2]
+            and copied_desktop == before[CPU_APP_INPUTS[1]][:2], "application input copy differs from source")
+    version = verify_cpu_app(app)
+    capture(["/usr/bin/codesign", "--verify", "--strict", str(app / CPU_APP_INPUTS[1])],
+            operation="desktop-bundle-signature-verification")
+    require(cpu_app_input_snapshot(app) == before, "application inputs changed during signature verification")
+    inspect_universal(worker, [f"scribe-inference-worker@{version}#{revision}".encode()], workspace, MAX_WORKER,
+                      signature_operation="copied-worker-signature-verification")
+    inspect_universal_structure(desktop, [f"local-transcriber@{version}#{revision}".encode(), digest.encode()],
+                                workspace, MAX_WORKER)
+    require(cpu_app_input_snapshot(app) == before and hash_file(worker, MAX_WORKER) == copied_worker
+            and hash_file(desktop, MAX_WORKER) == copied_desktop, "application input inspection changed bytes or identity")
+    return copied_worker[1]
+
+
 def assemble(app: Path, output: Path, digest: str, revision: str) -> None:
     require(sys.platform == "darwin", "component assembly requires macOS")
     require(os.geteuid() != 0, "development components must be built unprivileged")
@@ -623,20 +668,12 @@ def assemble(app: Path, output: Path, digest: str, revision: str) -> None:
     output = output.parent.resolve(strict=True) / output.name
     require_outside_app(output.parent, app)
     require(not os.path.lexists(output), "component output already exists")
-    version = verify_cpu_app(app)
     with private_workspace(output.parent, ".scribe-cpu-component-build-") as workspace:
         tree = workspace / "component"
         (tree / "payload").mkdir(parents=True, mode=0o700)
         (tree / "tools").mkdir(mode=0o700)
-        native = app / "Contents/MacOS"
-        copied_digest, worker_size = copy_new(native / "scribe-inference-worker", tree / WORKER, MAX_WORKER)
-        require(copied_digest == digest, "copied final worker differs from frozen build input")
         desktop_snapshot = workspace / "Scribe"
-        copy_new(native / "Scribe", desktop_snapshot, MAX_WORKER)
-        inspect_universal(tree / WORKER,
-                          [f"scribe-inference-worker@{version}#{revision}".encode()], workspace, MAX_WORKER)
-        inspect_universal(desktop_snapshot,
-                          [f"local-transcriber@{version}#{revision}".encode(), digest.encode()], workspace, MAX_WORKER)
+        worker_size = snapshot_cpu_app_inputs(app, tree / WORKER, desktop_snapshot, workspace, digest, revision)
         environment = build_environment(digest, revision)
         cargo = shutil.which("cargo")
         require(cargo is not None, "reviewed Rust toolchain is required")

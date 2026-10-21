@@ -1084,10 +1084,7 @@ fn macos_cpu_entry_construction_is_frozen_source_only_and_not_installation_autho
     let build = &source[source.find("def build_entry(").unwrap()..];
     assert!(build.find("os.geteuid() != 0").unwrap() < build.find("app.is_dir()").unwrap());
     for required in [
-        "component.verify_cpu_app(app)",
-        "copied_digest == digest",
-        "component.inspect_universal(worker,",
-        "component.inspect_universal(desktop,",
+        "component.snapshot_cpu_app_inputs(app, worker, desktop, private, digest, revision)",
         "environment[\"SCRIBE_MACOS_CPU_PACKAGE_WORKER\"] = str(worker)",
         "for target in component.TARGETS:",
         "cwd=component.REPO",
@@ -1114,6 +1111,40 @@ fn macos_cpu_entry_construction_is_frozen_source_only_and_not_installation_autho
     let structure = &shared[shared.find("def inspect_universal_structure(").unwrap()
         ..shared.find("def _inspect_universal_slices(").unwrap()];
     assert!(!structure.contains("codesign"));
+    let bound = &shared[shared.find("def snapshot_cpu_app_inputs(").unwrap()
+        ..shared.find("def assemble(").unwrap()];
+    for required in [
+        "before = cpu_app_input_snapshot(app)",
+        "version = verify_cpu_app(app)",
+        "copied_worker == before[CPU_APP_INPUTS[0]][:2]",
+        "copied_desktop == before[CPU_APP_INPUTS[1]][:2]",
+        "str(app / CPU_APP_INPUTS[1])",
+        "desktop-bundle-signature-verification",
+        "inspect_universal(worker,",
+        "signature_operation=\"copied-worker-signature-verification\"",
+        "inspect_universal_structure(desktop,",
+        "hash_file(desktop, MAX_WORKER) == copied_desktop",
+    ] {
+        assert!(
+            bound.contains(required),
+            "bound input admission lost {required}"
+        );
+    }
+    assert_eq!(
+        bound
+            .matches("cpu_app_input_snapshot(app) == before")
+            .count(),
+        2
+    );
+    assert!(
+        bound.find("version = verify_cpu_app(app)").unwrap()
+            < bound.find("inspect_universal_structure(desktop,").unwrap()
+    );
+    assert!(!bound.contains("--sign"));
+    assert!(!bound.contains("inspect_universal(desktop,"));
+    let native = include_str!("../build_support/native_macos_cpu_pkg_entry.py");
+    assert!(native.contains("INPUTS = component.CPU_APP_INPUTS"));
+    assert!(native.contains("return component.cpu_app_input_snapshot(app)"));
     for forbidden in [
         "__main__",
         "argparse",
@@ -1258,7 +1289,16 @@ fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
     for phase in ["entry-build-arm64", "entry-build-x86_64", "entry-combine"] {
         assert!(entry.contains(phase));
     }
-    assert!(tests.contains("expected = 27 + (18 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 33 + (18 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_actual_bundle_context_preserves_signed_input_binding_without_execution",
+        "test_every_source_context_change_or_same_bytes_replacement_rejects",
+        "test_copied_byte_mismatch_and_changes_during_inspection_reject",
+        "test_app_or_worker_signature_failure_cannot_reach_desktop_inspection",
+        "test_both_callers_stop_before_build_or_publication_after_admission_rejection",
+    ] {
+        assert!(tests.contains(required));
+    }
     assert!(tests.contains(
         "test_tool_exit_diagnostic_redacts_real_child_arguments_environment_and_streams"
     ));

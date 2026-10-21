@@ -104,6 +104,22 @@ tools/scribe-macos-cpu-worker-installer
 ```
 
 The worker is copied from the final signed app and independently rehashed.
+Both component assembly and package-entry construction share one bound-input
+admission path. It snapshots hashes and file identities for the six fixed app
+inputs (worker, main executable, signature record, Info.plist, catalog and release
+authority), copies both executables, and verifies the complete original app and
+its main executable **in the original bundle context**. Source inputs must stay
+unchanged and independently reopened copied bytes must match. Only that bound
+desktop copy receives structure/marker inspection: it is not treated as a
+standalone signed tool or re-signed. Copied workers and writers still require
+strict standalone signature verification. Copies and source context are checked
+again after inspection; failure cannot proceed to a writer/entry build.
+
+These checks retain the trusted source/toolchain and non-hostile same-user/root
+build assumption. They do not defeat hostile same-UID swap-and-restore or grant
+installer/root authentication. The latest shared CI signature-failure label did
+not identify its artifact, so the bundle-context defect is a source diagnosis,
+not a claim that the original failure has been reproduced or fixed natively.
 Both worker/writer architectures, minimum OS, signatures, native dependencies
 and frozen writer identities are checked. Only the freshly built native writer
 is probed via its read-only `describe` command, without stdin, loader overrides
@@ -134,13 +150,23 @@ does not contain the component. Structural CI assembles and inspects it, but
 does not upload it, install it, or invoke the production installer entry.
 
 Run `python3 -B build_support/test_macos_cpu_component.py` for exact-discovery
-source checks: 27 portable, 18 additional POSIX, and four additional Darwin tests.
+source checks: 33 portable, 18 additional POSIX, and five additional Darwin tests.
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
 
+The additional Darwin regression compiles tiny inert universal fixture images,
+signs worker/main/outer app in release order using ad hoc signatures (no private
+key), and inspects original and independently copied bytes. It never executes
+the fixture images, worker or installer. Its path-free report observes whether
+the loose main verifies; neither possible outcome bypasses mandatory bundle and
+bound-input checks. This isolates signing context, not Scribe's complete resource
+policy. The existing full structural build exercises the real app verifier and
+the same helper; actual Mac results remain required.
+
 Nonzero native tool exits report a closed operation label and numeric status
 (including signal termination on POSIX), not a command path, argv, environment,
-stdout or stderr. Labels distinguish app verification, structural inspection,
+stdout or stderr. Labels distinguish app verification, copied-worker/in-bundle
+desktop/writer signature checks, structural inspection,
 each architecture's writer/entry build, combination, development-only signing
 and the read-only writer description. Unknown labels reject before spawning.
 This diagnoses which operation failed without publishing sensitive diagnostics;

@@ -15,17 +15,11 @@ import tempfile
 import macos_cpu_component as component
 import macos_cpu_pkg_entry as entry
 
-INPUTS = (
-    "Contents/MacOS/scribe-inference-worker", "Contents/MacOS/Scribe",
-    "Contents/_CodeSignature/CodeResources", "Contents/Info.plist",
-    "Contents/Resources/worker-pack-catalog.json",
-    "Contents/Resources/gpu-pack-release-authority.json",
-)
+INPUTS = component.CPU_APP_INPUTS
 
 
 def input_snapshot(app: Path) -> dict:
-    return {name: (*component.hash_file(app / name, component.MAX_WORKER),
-                   component.fingerprint((app / name).lstat())) for name in INPUTS}
+    return component.cpu_app_input_snapshot(app)
 
 
 def run_contract(app: Path, digest: str, revision: str) -> dict:
