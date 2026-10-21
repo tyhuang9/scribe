@@ -70,6 +70,7 @@ commands:\n\
   verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path> [--worker-source-revision <40-lowercase-hex>]\n\
   verify-fixture --pack-root <path>\n\
   verify-production-linux --pack-root <path>\n\
+  verify-production-macos-metal --pack-root <path> --target-arch <aarch64|x86_64>\n\
   install-production-linux --pack-root <path> --packs-root <path> --state-root <path>\n\
   check-production-key --key-id <id> --private-key <path>\n\
 Author targets: cuda or vulkan on windows/x86_64 or linux/x86_64; metal on macos/aarch64 or macos/x86_64.\n\
@@ -148,6 +149,11 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&verified)?);
             Ok(())
         }
+        Some("verify-production-macos-metal") => {
+            let verified = verify_production_macos_metal(&options)?;
+            println!("{}", serde_json::to_string(&verified)?);
+            Ok(())
+        }
         Some("install-production-linux") => {
             require_exact_options(&options, &["--pack-root", "--packs-root", "--state-root"])?;
             let verifier = linux_production_verifier();
@@ -184,6 +190,37 @@ fn linux_production_verifier() -> PackVerifier<'static> {
             allowed_backends: &ALLOWED_BACKENDS,
         },
     )
+}
+
+/// Build-time content inspection, not native release or execution admission.
+/// Explicit targets let an author authenticate both packs without executing a
+/// worker or requiring the host to run the other architecture's executable.
+fn macos_metal_compatibility(target_arch: &str) -> Result<Compatibility<'static>> {
+    let target_arch = match target_arch {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        _ => bail!("Metal content verification requires target architecture aarch64 or x86_64"),
+    };
+    Ok(Compatibility {
+        app_build: worker_identity::DESKTOP_BUILD_ID,
+        worker_build: worker_identity::INFERENCE_WORKER_BUILD_ID,
+        target_os: "macos",
+        target_arch,
+        allowed_backends: &[PackBackend::Metal],
+    })
+}
+
+fn verify_production_macos_metal(
+    options: &BTreeMap<String, OsString>,
+) -> Result<manifest::VerifiedPack> {
+    require_exact_options(options, &["--pack-root", "--target-arch"])?;
+    let compatibility = macos_metal_compatibility(required_utf8(options, "--target-arch")?)?;
+    // No input key/trust override. The ordinary verifier authenticates metadata,
+    // exact inventory and payload bytes under the compiled production public key.
+    // Its returned descriptor is point-in-time information, NOT a retained lease
+    // or authority to reopen/execute/install this path later.
+    let verifier = PackVerifier::new(&ProductionTrustRoot, compatibility);
+    Ok(verifier.verify(&PathBuf::from(required(options, "--pack-root")?))?)
 }
 
 fn run_verify_signed_windows_set(options: &BTreeMap<String, OsString>) -> Result<()> {
@@ -582,6 +619,9 @@ mod tests {
         assert!(HELP_TEXT.contains("metal on macos/aarch64 or macos/x86_64"));
         assert!(HELP_TEXT.contains("defaults to windows/x86_64"));
         assert!(HELP_TEXT.contains("verify-production-linux"));
+        assert!(HELP_TEXT.contains(
+            "verify-production-macos-metal --pack-root <path> --target-arch <aarch64|x86_64>"
+        ));
         assert!(HELP_TEXT.contains("install-production-linux"));
         assert!(HELP_TEXT.contains(
             "verify-signed-windows-set --signed-root <path> --policy <path> --toolchain-manifest <path> [--worker-source-revision <40-lowercase-hex>]"
@@ -640,5 +680,272 @@ mod tests {
         let error = linux_production_verifier().verify(&root).unwrap_err();
         assert!(matches!(error, manifest::PackVerificationError::UnknownKey));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn metal_verification_options(
+        root: &std::path::Path,
+        arch: &str,
+    ) -> BTreeMap<String, OsString> {
+        BTreeMap::from([
+            ("--pack-root".to_owned(), root.as_os_str().to_owned()),
+            ("--target-arch".to_owned(), OsString::from(arch)),
+        ])
+    }
+
+    struct MetalContentFixture {
+        root: PathBuf,
+        manifest: manifest::PackManifest,
+        trust: &'static manifest::test_support::FixtureTrustRoot,
+    }
+
+    impl MetalContentFixture {
+        fn new(arch: &str) -> Self {
+            let root = manifest::test_support::temp_root("metal-content-verification");
+            let mut manifest = manifest::test_support::base_manifest();
+            manifest.backend = PackBackend::Metal;
+            manifest.provider = "transcribe-cpp-metal".to_owned();
+            manifest.target_os = "macos".to_owned();
+            manifest.target_arch = arch.to_owned();
+            let trust = manifest::test_support::write_signed(&root, manifest.clone());
+            Self {
+                root,
+                manifest,
+                trust,
+            }
+        }
+
+        fn verifier(&self, arch: &str) -> PackVerifier<'_> {
+            // This test-only trust injection is deliberately NOT in the
+            // production command. The same compatibility factory is exercised.
+            PackVerifier::new(self.trust, macos_metal_compatibility(arch).unwrap())
+        }
+    }
+
+    impl Drop for MetalContentFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn macos_metal_verification_rejects_invalid_architectures_before_input_access() {
+        let missing = PathBuf::from("missing-metal-pack-must-not-be-opened");
+        for arch in [
+            "",
+            "arm64",
+            "ARM64",
+            "AARCH64",
+            "x64",
+            "X86_64",
+            " aarch64",
+            "aarch64 ",
+            "aarch64\n",
+            "aarch64-apple-darwin",
+        ] {
+            let error = verify_production_macos_metal(&metal_verification_options(&missing, arch))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("requires target architecture"),
+                "{arch:?}: {error}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut options = metal_verification_options(&missing, "aarch64");
+            options.insert("--target-arch".to_owned(), OsString::from_vec(vec![0xff]));
+            assert!(
+                verify_production_macos_metal(&options)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must be UTF-8")
+            );
+        }
+    }
+
+    #[test]
+    fn macos_metal_verification_has_a_closed_read_only_option_set() {
+        let missing = PathBuf::from("missing-metal-pack-must-not-be-opened");
+        let valid = metal_verification_options(&missing, "aarch64");
+        for absent in ["--pack-root", "--target-arch"] {
+            let mut options = valid.clone();
+            options.remove(absent);
+            assert!(
+                verify_production_macos_metal(&options)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown or missing options")
+            );
+        }
+        for extra in [
+            "--fixture-signing",
+            "--key-id",
+            "--private-key",
+            "--trust-root",
+            "--target-os",
+            "--backend",
+            "--provider",
+            "--packs-root",
+            "--state-root",
+            "--output-root",
+            "--build-revision",
+        ] {
+            let mut options = valid.clone();
+            options.insert(extra.to_owned(), OsString::from("not-an-authority"));
+            assert!(
+                verify_production_macos_metal(&options)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown or missing options")
+            );
+        }
+        assert!(
+            parse_options(
+                [
+                    "--pack-root",
+                    "missing",
+                    "--target-arch",
+                    "aarch64",
+                    "--target-arch",
+                    "x86_64"
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                ["--pack-root", "missing", "--target-arch"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn macos_metal_verification_authenticates_both_targets_with_test_only_trust() {
+        for arch in ["aarch64", "x86_64"] {
+            let fixture = MetalContentFixture::new(arch);
+            let verified = fixture.verifier(arch).verify(&fixture.root).unwrap();
+            assert_eq!(verified.target_arch, arch);
+            assert_eq!(verified.target_os, "macos");
+            assert_eq!(verified.backend, PackBackend::Metal);
+            let other = if arch == "aarch64" {
+                "x86_64"
+            } else {
+                "aarch64"
+            };
+            assert!(matches!(
+                fixture.verifier(other).verify(&fixture.root),
+                Err(manifest::PackVerificationError::ArchitectureMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn macos_metal_verification_rejects_fixture_keys_under_production_trust() {
+        for arch in ["aarch64", "x86_64"] {
+            let fixture = MetalContentFixture::new(arch);
+            let error =
+                verify_production_macos_metal(&metal_verification_options(&fixture.root, arch))
+                    .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<manifest::PackVerificationError>(),
+                Some(manifest::PackVerificationError::UnknownKey)
+            ));
+        }
+    }
+
+    #[test]
+    fn macos_metal_verification_preserves_all_compiled_compatibility_checks() {
+        use manifest::PackVerificationError as E;
+        type Mutation = fn(&mut manifest::PackManifest);
+        let cases: [(&str, Mutation, E); 9] = [
+            (
+                "os",
+                |m| m.target_os = "linux".to_owned(),
+                E::ArchitectureMismatch,
+            ),
+            (
+                "cuda",
+                |m| m.backend = PackBackend::Cuda,
+                E::BackendMismatch,
+            ),
+            (
+                "vulkan",
+                |m| m.backend = PackBackend::Vulkan,
+                E::BackendMismatch,
+            ),
+            (
+                "app-build",
+                |m| m.app_build = "local-transcriber@0.1.0#different-source".to_owned(),
+                E::BuildMismatch,
+            ),
+            (
+                "worker-build",
+                |m| m.worker_build = "scribe-inference-worker@0.1.0#different-source".to_owned(),
+                E::BuildMismatch,
+            ),
+            (
+                "app-protocol",
+                |m| m.app_protocol_version += 1,
+                E::ProtocolMismatch,
+            ),
+            (
+                "worker-protocol",
+                |m| m.worker_protocol_version += 1,
+                E::ProtocolMismatch,
+            ),
+            ("abi", |m| m.runtime_abi_version += 1, E::AbiMismatch),
+            ("epoch", |m| m.security_epoch = 0, E::SecurityEpochTooOld),
+        ];
+        for arch in ["aarch64", "x86_64"] {
+            for (label, mutation, expected) in &cases {
+                let mut fixture = MetalContentFixture::new(arch);
+                mutation(&mut fixture.manifest);
+                manifest::test_support::write_signed(&fixture.root, fixture.manifest.clone());
+                let error = fixture.verifier(arch).verify(&fixture.root).unwrap_err();
+                assert_eq!(
+                    std::mem::discriminant(&error),
+                    std::mem::discriminant(expected),
+                    "{arch}/{label}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macos_metal_verification_checks_signature_payload_and_exact_tree() {
+        use manifest::PackVerificationError as E;
+        for arch in ["aarch64", "x86_64"] {
+            let fixture = MetalContentFixture::new(arch);
+            let manifest_path = fixture.root.join(manifest::MANIFEST_NAME);
+            let original = std::fs::read(&manifest_path).unwrap();
+            let mut tampered = original.clone();
+            tampered.push(b' ');
+            std::fs::write(&manifest_path, tampered).unwrap();
+            assert!(matches!(
+                fixture.verifier(arch).verify(&fixture.root),
+                Err(E::BadSignature)
+            ));
+            std::fs::write(&manifest_path, original).unwrap();
+            let worker = fixture.root.join(&fixture.manifest.worker_path);
+            std::fs::write(&worker, b"forged worker").unwrap();
+            assert!(matches!(
+                fixture.verifier(arch).verify(&fixture.root),
+                Err(E::PayloadDigestMismatch(_))
+            ));
+            std::fs::write(&worker, b"signed worker").unwrap();
+            std::fs::write(fixture.root.join("extra"), b"unexpected").unwrap();
+            assert!(matches!(
+                fixture.verifier(arch).verify(&fixture.root),
+                Err(E::TreeMismatch)
+            ));
+        }
     }
 }
