@@ -52,8 +52,30 @@ permissions:
   contents: read
 
 jobs:
+  package-profile:
+    name: macOS ${{ matrix.arch }} native PKG profile
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-14
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6; Python is authoring-only
+        with:
+          python-version: '3.13'
+      - name: Observe fixed unsigned PKG fixture format without installation
+        timeout-minutes: 2
+        run: python3 -B build_support/test_macos_cpu_pkg_profile.py
+
   structural:
     name: macOS ${{ matrix.arch }} structural package validation
+    needs: package-profile
     strategy:
       fail-fast: false
       matrix:
@@ -87,9 +109,6 @@ jobs:
         run: |
           python3 -B build_support/test_macos_cpu_pkg_entry.py
           python3 -B build_support/test_native_macos_cpu_pkg_entry.py
-      - name: Observe fixed unsigned PKG fixture format without installation
-        timeout-minutes: 2
-        run: python3 -B build_support/test_macos_cpu_pkg_profile.py
       - name: Verify Metal writer source in private unprivileged fixtures
         timeout-minutes: 15
         run: |

@@ -61,8 +61,8 @@ grep -F 'codesign_args=(--force --sign "$identity" --options runtime)' "$repo_ro
 grep -F 'if [[ "$signing_mode" == developer-id ]]; then codesign_args+=(--timestamp); fi' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'Developer ID signing must request a trusted timestamp.' >&2; exit 1; }
 sign_line="$(grep -Fn 'codesign "${codesign_args[@]}" --entitlements "$desktop_entitlements" "$app"' "$repo_root/scripts/build-macos-release.sh" | tail -n 1 | cut -d: -f1)"
 [[ "$embed_line" =~ ^[0-9]+$ && "$sign_line" =~ ^[0-9]+$ && "$embed_line" -lt "$sign_line" ]] || { echo 'provisioning profile must be embedded before final app signing.' >&2; exit 1; }
-structural_job="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
-! grep -F 'secrets.' <<<"$structural_job" >/dev/null || { echo 'pull-request structural job must not receive production secrets.' >&2; exit 1; }
+unprivileged_jobs="$(sed -n '/^  package-profile:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
+! grep -F 'secrets.' <<<"$unprivileged_jobs" >/dev/null || { echo 'pull-request preflight and structural jobs must not receive production secrets.' >&2; exit 1; }
 grep -F 'lipo "$worker" -verify_arch "$pack_lipo_arch"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
 grep -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
 grep -F 'catalog Metal worker has no Metal load command' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'Metal worker load-command requirement is missing.' >&2; exit 1; }

@@ -1268,7 +1268,7 @@ fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
 fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
     let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");
-    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let workflow = include_str!("../.github/workflows/macos-release.yml").replace("\r\n", "\n");
     let probe = &source[source.find("def probe()").unwrap()..source.find("def main()").unwrap()];
     assert!(probe.find("os.geteuid() != 0").unwrap() < probe.find("private_workspace(").unwrap());
     assert!(probe.contains("fixture.open(\"xb\")"));
@@ -1298,7 +1298,69 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert!(tests.contains("test_absent_mode_is_reported_as_unknown_without_inferred_permissions"));
     assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));
     assert!(tests.contains("test_actual_unsigned_nopayload_format_without_installation"));
-    assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg_profile.py"));
+    let profile_job = workflow
+        .split("\n  package-profile:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  structural:\n")
+        .next()
+        .unwrap();
+    let structural_job = workflow
+        .split("\n  structural:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  official-sign-notarize:\n")
+        .next()
+        .unwrap();
+    let official_job = workflow
+        .split("\n  official-sign-notarize:\n")
+        .nth(1)
+        .unwrap();
+    let profile_command = "run: python3 -B build_support/test_macos_cpu_pkg_profile.py";
+    assert_eq!(workflow.matches(profile_command).count(), 1);
+    assert!(profile_job.contains(profile_command));
+    assert_eq!(profile_job.matches("- uses:").count(), 2);
+    assert_eq!(profile_job.matches("run:").count(), 1);
+    for required in [
+        "timeout-minutes: 10",
+        "timeout-minutes: 2",
+        "fail-fast: false",
+        "runner: macos-15-intel\n            arch: x86_64",
+        "runner: macos-14\n            arch: aarch64",
+        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+        "python-version: '3.13'",
+    ] {
+        assert!(
+            profile_job.contains(required),
+            "profile preflight lost {required}"
+        );
+    }
+    for forbidden in ["secrets.", "continue-on-error:", "always()"] {
+        assert!(!profile_job.contains(forbidden));
+        assert!(!structural_job.contains(forbidden));
+    }
+    for forbidden in [
+        "cargo ",
+        "codesign",
+        "notarytool",
+        "sudo ",
+        "upload-artifact",
+        "environment:",
+        "permissions:",
+    ] {
+        assert!(
+            !profile_job.contains(forbidden),
+            "profile preflight gained {forbidden}"
+        );
+    }
+    assert!(structural_job.contains("\n    needs: package-profile\n"));
+    assert!(official_job.contains("\n    needs: structural\n"));
+    let packaging_check = include_str!("../scripts/test-macos-release-packaging.sh");
+    assert!(
+        packaging_check.contains("sed -n '/^  package-profile:/,/^  official-sign-notarize:/p'")
+    );
+    assert!(packaging_check.contains("<<<\"$unprivileged_jobs\""));
     assert_eq!(
         workflow
             .matches("build_support/*macos_cpu_pkg_profile.py")
