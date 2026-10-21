@@ -39,18 +39,10 @@ def build_entry(app: Path, workspace: Path, digest: str, revision: str) -> tuple
     component.require_outside_app(workspace, app)
     output = workspace / "postinstall"
     component.require(not os.path.lexists(output), "CPU entry output already exists")
-    version = component.verify_cpu_app(app)
     with component.private_workspace(workspace, ".scribe-cpu-pkg-entry-") as private:
         worker = private / "scribe-inference-worker"
-        copied_digest, _ = component.copy_new(app / "Contents/MacOS/scribe-inference-worker",
-                                             worker, component.MAX_WORKER)
-        component.require(copied_digest == digest, "copied worker differs from frozen authority")
         desktop = private / "Scribe"
-        component.copy_new(app / "Contents/MacOS/Scribe", desktop, component.MAX_WORKER)
-        component.inspect_universal(worker, [f"scribe-inference-worker@{version}#{revision}".encode()],
-                                    private, component.MAX_WORKER)
-        component.inspect_universal(desktop, [f"local-transcriber@{version}#{revision}".encode(), digest.encode()],
-                                    private, component.MAX_WORKER)
+        component.snapshot_cpu_app_inputs(app, worker, desktop, private, digest, revision)
         environment = component.build_environment(digest, revision)
         environment["SCRIBE_MACOS_CPU_PACKAGE_WORKER"] = str(worker)
         cargo = shutil.which("cargo")

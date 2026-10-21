@@ -1,4 +1,5 @@
 """Source-only component checks; never invoke the installer command or /Library."""
+from contextlib import ExitStack, contextmanager
 import hashlib
 import ctypes
 import errno
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import macos_cpu_component as component
+import macos_cpu_pkg_entry as entry
 
 REVISION = "source-component-fixture"
 WORKER_BYTES = b"bounded CPU worker fixture"
@@ -294,6 +296,135 @@ class Portable(unittest.TestCase):
                 component.inspect_universal_structure(binary, [], self.root, 1024)
             slices.assert_not_called()
 
+    def app_snapshot_fixture(self, name="app-fixture"):
+        root = self.root / name
+        root.mkdir()
+        app = root / "Scribe.app"
+        for relative in component.CPU_APP_INPUTS:
+            path = app / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(WORKER_BYTES if relative == component.CPU_APP_INPUTS[0] else b"context fixture")
+        workspace = root / "private"
+        workspace.mkdir()
+        return app, workspace / "worker", workspace / "Scribe", workspace
+
+    def test_desktop_copy_keeps_signature_verification_in_bundle_context(self):
+        app, worker, desktop, workspace = self.app_snapshot_fixture()
+        calls = []
+        with patch.object(component, "verify_cpu_app", return_value="0.1.0") as verify, \
+             patch.object(component, "capture", side_effect=lambda args, **kwargs: calls.append((args, kwargs))) as capture, \
+             patch.object(component, "inspect_universal") as signed, \
+             patch.object(component, "inspect_universal_structure", side_effect=lambda *_args: self.assertEqual(len(calls), 1)) as structure:
+            size = component.snapshot_cpu_app_inputs(app, worker, desktop, workspace, DIGEST, REVISION)
+        self.assertEqual(size, len(WORKER_BYTES))
+        verify.assert_called_once_with(app)
+        capture.assert_called_once_with(["/usr/bin/codesign", "--verify", "--strict",
+                                         str(app / component.CPU_APP_INPUTS[1])],
+                                        operation="desktop-bundle-signature-verification")
+        signed.assert_called_once_with(worker, [f"scribe-inference-worker@0.1.0#{REVISION}".encode()],
+                                       workspace, component.MAX_WORKER,
+                                       signature_operation="copied-worker-signature-verification")
+        structure.assert_called_once_with(desktop, [f"local-transcriber@0.1.0#{REVISION}".encode(), DIGEST.encode()],
+                                          workspace, component.MAX_WORKER)
+        self.assertEqual(worker.read_bytes(), WORKER_BYTES)
+        self.assertEqual(desktop.read_bytes(), (app / component.CPU_APP_INPUTS[1]).read_bytes())
+
+    def test_app_or_worker_signature_failure_cannot_reach_desktop_inspection(self):
+        for failure in ("app", "main", "worker"):
+            app, worker, desktop, workspace = self.app_snapshot_fixture(failure)
+            def verify(_app):
+                if failure == "app":
+                    raise component.ComponentError("invalid app signature")
+                return "0.1.0"
+            def capture(*_args, **_kwargs):
+                if failure == "main":
+                    raise component.ToolExitError("desktop-bundle-signature-verification", 1)
+            def signed(*_args, **_kwargs):
+                if failure == "worker":
+                    raise component.ToolExitError("copied-worker-signature-verification", 1)
+            with patch.object(component, "verify_cpu_app", side_effect=verify), \
+                 patch.object(component, "capture", side_effect=capture), \
+                 patch.object(component, "inspect_universal", side_effect=signed), \
+                 patch.object(component, "inspect_universal_structure") as structure, \
+                 self.assertRaises(component.ComponentError):
+                component.snapshot_cpu_app_inputs(app, worker, desktop, workspace, DIGEST, REVISION)
+            structure.assert_not_called()
+
+    def test_every_source_context_change_or_same_bytes_replacement_rejects(self):
+        for index, relative in enumerate(component.CPU_APP_INPUTS):
+            for replace in (False, True):
+                app, worker, desktop, workspace = self.app_snapshot_fixture(f"change-{index}-{replace}")
+                def verify(_app):
+                    path = app / relative
+                    saved = path.read_bytes()
+                    if replace:
+                        path.rename(path.with_name(path.name + ".old"))
+                    path.write_bytes(saved if replace else saved + b"changed")
+                    return "0.1.0"
+                with self.subTest(relative=relative, replace=replace), \
+                     patch.object(component, "verify_cpu_app", side_effect=verify), \
+                     patch.object(component, "capture"), \
+                     patch.object(component, "inspect_universal") as signed, \
+                     self.assertRaisesRegex(component.ComponentError, "inputs changed"):
+                    component.snapshot_cpu_app_inputs(app, worker, desktop, workspace, DIGEST, REVISION)
+                signed.assert_not_called()
+
+    def test_copied_byte_mismatch_and_changes_during_inspection_reject(self):
+        original_copy = component.copy_new
+        for index, failure in enumerate(("wrong-copy", "worker", "desktop", *component.CPU_APP_INPUTS)):
+            app, worker, desktop, workspace = self.app_snapshot_fixture(f"copy-{index}")
+            def copy(source, output, maximum):
+                result = original_copy(source, output, maximum)
+                return ("0" * 64, result[1]) if failure == "wrong-copy" and output == desktop else result
+            def inspect(*_args):
+                if failure != "wrong-copy":
+                    path = worker if failure == "worker" else desktop if failure == "desktop" else app / failure
+                    path.write_bytes(path.read_bytes() + b"changed")
+            with self.subTest(failure=failure), patch.object(component, "copy_new", side_effect=copy), \
+                 patch.object(component, "verify_cpu_app", return_value="0.1.0") as verify, \
+                 patch.object(component, "capture"), patch.object(component, "inspect_universal"), \
+                 patch.object(component, "inspect_universal_structure", side_effect=inspect), \
+                 self.assertRaisesRegex(component.ComponentError, "copy differs|inspection changed"):
+                component.snapshot_cpu_app_inputs(app, worker, desktop, workspace, DIGEST, REVISION)
+            if failure == "wrong-copy":
+                verify.assert_not_called()
+
+    def test_signature_role_is_closed_before_any_tool(self):
+        with patch.object(component, "capture") as capture, self.assertRaises(component.ComponentError):
+            component.inspect_universal(self.root / "absent", [], self.root, 1024,
+                                        signature_operation="private/arbitrary/path")
+        capture.assert_not_called()
+
+    def test_both_callers_stop_before_build_or_publication_after_admission_rejection(self):
+        @contextmanager
+        def private(parent, prefix):
+            with tempfile.TemporaryDirectory(dir=parent, prefix=prefix) as directory:
+                yield Path(directory)
+        for caller in ("component", "entry"):
+            for failure in ("app", "main", "worker", "copy", "context"):
+                app, _worker, _desktop, workspace = self.app_snapshot_fixture(f"{caller}-{failure}")
+                output = app.parent / "published" if caller == "component" else workspace / "postinstall"
+                with self.subTest(caller=caller, failure=failure), ExitStack() as stack:
+                    stack.enter_context(patch.object(component.sys, "platform", "darwin"))
+                    stack.enter_context(patch.object(component.os, "geteuid", return_value=501, create=True))
+                    stack.enter_context(patch.object(component.os, "waitid", create=True))
+                    stack.enter_context(patch.object(component, "private_workspace", side_effect=private))
+                    admission = stack.enter_context(patch.object(component, "snapshot_cpu_app_inputs",
+                        side_effect=component.ComponentError(f"synthetic {failure} admission rejection")))
+                    environment = stack.enter_context(patch.object(component, "build_environment"))
+                    capture = stack.enter_context(patch.object(component, "capture"))
+                    publication = stack.enter_context(patch.object(component, "publish_no_replace"))
+                    with self.assertRaisesRegex(component.ComponentError, f"synthetic {failure} admission rejection"):
+                        if caller == "component":
+                            component.assemble(app, output, DIGEST, REVISION)
+                        else:
+                            entry.build_entry(app, workspace, DIGEST, REVISION)
+                    admission.assert_called_once()
+                    environment.assert_not_called()
+                    capture.assert_not_called()
+                    publication.assert_not_called()
+                    self.assertFalse(output.exists())
+
 
 class Posix(Portable):
     # Do not inherit/re-run Portable tests: runner loads only names defined here.
@@ -374,7 +505,9 @@ class Posix(Portable):
     def test_inspector_uses_private_snapshot_and_never_writer(self):
         self.fixture()
         seen = []
-        def inspect(path, markers, workspace, maximum):
+        def inspect(path, markers, workspace, maximum, *, signature_operation):
+            self.assertEqual(signature_operation, "copied-worker-signature-verification"
+                             if path.name == "scribe-inference-worker" else "writer-signature-verification")
             self.assertNotEqual(path.parent.parent, self.root)
             self.assertEqual(path.parent.parent.name, "snapshot")
             seen.append(path.name)
@@ -434,6 +567,8 @@ class Posix(Portable):
         (resources / "gpu-pack-release-authority.json").write_bytes((component.REPO /
             "runtime-manifests/gpu-pack-release-authority-macos-empty.json").read_bytes())
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.1.0"}))
+        (app / "Contents/_CodeSignature").mkdir()
+        (app / "Contents/_CodeSignature/CodeResources").write_bytes(b"synthetic signature context")
         output = self.root / "published"
         builds, probes = [], []
         def execute(arguments, **kwargs):
@@ -475,6 +610,7 @@ class Posix(Portable):
              patch.object(component.shutil, "which", return_value="/usr/bin/cargo"), \
              patch.object(component, "capture", side_effect=execute), \
              patch.object(component, "inspect_universal"), \
+             patch.object(component, "inspect_universal_structure"), \
              patch.object(component, "publish_no_replace", side_effect=lambda a, b: a.rename(b)):
             component.assemble(app, output, DIGEST, REVISION)
         self.assertEqual(builds, list(component.TARGETS))
@@ -494,6 +630,7 @@ class Posix(Portable):
                          patch.object(component.shutil, "which", return_value="/usr/bin/cargo"), \
                          patch.object(component, "capture", side_effect=execute), \
                          patch.object(component, "inspect_universal"), \
+                         patch.object(component, "inspect_universal_structure"), \
                          patch.object(component, "publish_no_replace") as publish, \
                          self.assertRaises(component.ComponentError):
                         component.assemble(app, output, DIGEST, REVISION)
@@ -524,6 +661,66 @@ class Posix(Portable):
 
 
 class NativeMac(Portable):
+    def test_actual_bundle_context_preserves_signed_input_binding_without_execution(self):
+        # Fresh inert code, never launched. Match release's worker/main/outer-app
+        # signing order, using ad hoc signatures only (no key or identity).
+        with component.private_workspace(self.root, "native-signature-context-") as root:
+            app = root / "Fixture.app"
+            native, resources = app / "Contents/MacOS", app / "Contents/Resources"
+            native.mkdir(parents=True, mode=0o700)
+            resources.mkdir(mode=0o700)
+            worker, desktop = native / "scribe-inference-worker", native / "Scribe"
+            (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleIdentifier": "com.scribe.source-test.signature-context",
+                "CFBundleExecutable": "Scribe", "CFBundlePackageType": "APPL",
+                "CFBundleName": "SourceFixture", "CFBundleShortVersionString": "0.1.0",
+                "LSMinimumSystemVersion": "13.0"}))
+            (resources / "worker-pack-catalog.json").write_bytes(b'{"schema_version":1,"packs":[]}')
+            (resources / "gpu-pack-release-authority.json").write_bytes((component.REPO /
+                "runtime-manifests/gpu-pack-release-authority-macos-empty.json").read_bytes())
+            def compile_image(output, marker):
+                source = root / (output.name + ".c")
+                source.write_text('const char marker[] = ' + json.dumps(marker) + ';\n'
+                                  'int main(void) { return marker[0] == 0; }\n', encoding="ascii")
+                component.capture(["/usr/bin/clang", "-arch", "arm64", "-arch", "x86_64",
+                                   "-mmacosx-version-min=13.0", str(source), "-o", str(output)],
+                                  timeout=30, limit=65536, error_limit=65536)
+                component.capture(["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime", str(output)])
+            compile_image(worker, f"scribe-inference-worker@0.1.0#{REVISION}")
+            digest = component.hash_file(worker, component.MAX_WORKER)[0]
+            compile_image(desktop, f"local-transcriber@0.1.0#{REVISION} {digest}")
+            component.capture(["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime", str(app)])
+            before = component.cpu_app_input_snapshot(app)
+            self.assertEqual(before[component.CPU_APP_INPUTS[0]][0], digest)
+            for path in (app, worker, desktop):
+                component.capture(["/usr/bin/codesign", "--verify", "--strict", str(path)])
+            loose_worker, loose_main = root / "loose-worker", root / "loose-main"
+            component.copy_new(worker, loose_worker, component.MAX_WORKER)
+            component.copy_new(desktop, loose_main, component.MAX_WORKER)
+            component.capture(["/usr/bin/codesign", "--verify", "--strict", str(loose_worker)],
+                              operation="copied-worker-signature-verification")
+            loose_main_verified = True
+            try:
+                component.capture(["/usr/bin/codesign", "--verify", "--strict", str(loose_main)])
+            except component.ToolExitError:
+                loose_main_verified = False
+            # The fixture isolates signature context, not Scribe's full resource
+            # policy. That production verifier is never replaced by the helper.
+            def verify_context(candidate):
+                self.assertEqual(candidate, app)
+                component.capture(["/usr/bin/codesign", "--verify", "--strict", str(candidate)])
+                return "0.1.0"
+            workspace = root / "private"
+            workspace.mkdir(mode=0o700)
+            with patch.object(component, "verify_cpu_app", side_effect=verify_context):
+                component.snapshot_cpu_app_inputs(app, workspace / "worker", workspace / "Scribe",
+                                                  workspace, digest, REVISION)
+            self.assertEqual(component.cpu_app_input_snapshot(app), before)
+            print("SCRIBE_NATIVE_CPU_SIGNATURE_CONTEXT=" + json.dumps({
+                "bundle_verified": True, "loose_worker_verified": True,
+                "loose_main_verified": loose_main_verified, "bound_snapshot_verified": True,
+                "executed": False}, sort_keys=True))
+
     def test_mutation_acl_parent_is_rejected(self):
         component.capture(["/bin/chmod", "+a", "everyone allow delete_child,add_subdirectory", str(self.root)])
         try:
@@ -572,7 +769,7 @@ def suite():
         classes.append(Posix)
     if sys.platform == "darwin":
         classes.append(NativeMac)
-    expected = 27 + (18 if os.name == "posix" else 0) + (4 if sys.platform == "darwin" else 0)
+    expected = 33 + (18 if os.name == "posix" else 0) + (5 if sys.platform == "darwin" else 0)
     for cls in classes:
         for name in sorted(cls.__dict__):
             if name.startswith("test_"):

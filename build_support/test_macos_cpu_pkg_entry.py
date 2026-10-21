@@ -31,6 +31,8 @@ class Portable(unittest.TestCase):
         (self.native / "scribe-inference-worker").write_bytes(WORKER)
         (self.native / "Scribe").write_bytes(f"local-transcriber@0.1.0#{REVISION} {DIGEST}".encode())
         (self.app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.1.0"}))
+        (self.app / "Contents/_CodeSignature").mkdir()
+        (self.app / "Contents/_CodeSignature/CodeResources").write_bytes(b"synthetic signature context")
         (self.resources / "worker-pack-catalog.json").write_bytes(b'{"schema_version":1,"packs":[]}')
         (self.resources / "gpu-pack-release-authority.json").write_bytes(
             (component.REPO / "runtime-manifests/gpu-pack-release-authority-macos-empty.json").read_bytes())
@@ -167,7 +169,7 @@ class Portable(unittest.TestCase):
             self.assertIn(arguments[0], ("/bin/bash", "/usr/bin/cargo", "/usr/bin/lipo", "/usr/bin/otool", "/usr/bin/codesign"))
             self.assertFalse({"--sign", "--force", "describe", "install", "--nopayload", "--expand"}.intersection(arguments))
         self.assertEqual([args[-1] for args, _ in self.calls if args[0] == "/usr/bin/codesign"],
-                         [next(iter(workers)), str(Path(next(iter(workers))).parent / "Scribe")])
+                         [str(self.native / "Scribe"), next(iter(workers))])
         self.assertFalse(list(self.workspace.glob(".scribe-cpu-pkg-entry-*")))
 
     def test_root_and_foreign_hosts_reject_before_input_access(self):
