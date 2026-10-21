@@ -1175,6 +1175,60 @@ fn macos_cpu_entry_construction_is_frozen_source_only_and_not_installation_autho
 }
 
 #[test]
+fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
+    let source = include_str!("../build_support/macos_metal_pkg_entry.py");
+    let tests = include_str!("../build_support/test_macos_metal_pkg_entry.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let build = &source[source.find("def build_entry(").unwrap()..];
+    assert!(build.find("os.geteuid() != 0").unwrap() < build.find("app.is_dir()").unwrap());
+    for required in [
+        "snapshot(app, files)",
+        "snapshot(copied, files)",
+        "scripts/verify-macos-release-package.sh",
+        "desktop-bundle-signature-verification",
+        "component.copy_new(app / name, destination, maximum) == before[name][:2]",
+        "verify_pack(tool, root, arch, pack, release, version, frozen)",
+        "\"--locked\", \"--offline\", \"--release\"",
+        "\"--no-default-features\", \"--features\", \"installer-package-entry\"",
+        "component.hash_file(binary, MAX_SLICE)",
+        "component.inspect_universal_structure(candidate,",
+        "component.publish_no_replace(candidate, output)",
+    ] {
+        assert!(
+            build.contains(required),
+            "Metal entry constructor lost {required}"
+        );
+    }
+    assert!(source.contains("verify-production-macos-metal"));
+    assert!(source.contains("@dataclass(frozen=True)"));
+    assert!(source.contains("MAX_ENTRY = 2 * MAX_SLICE"));
+    for forbidden in [
+        "__main__",
+        "argparse",
+        "--sign",
+        "pkgbuild",
+        "productbuild",
+        "subprocess.Popen",
+        "sudo ",
+        "/usr/sbin/installer",
+        "\"install\"",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Metal construction gained {forbidden}"
+        );
+    }
+    assert!(tests.contains("expected = 21 + (2 if os.name == \"posix\" else 0)"));
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_metal_pkg_entry.py"));
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_metal_pkg_entry.py")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
     let source =
         include_str!("../build_support/native_macos_cpu_pkg_entry.py").replace("\r\n", "\n");
