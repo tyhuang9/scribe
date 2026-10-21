@@ -176,11 +176,214 @@ impl Fixture {
     pub(crate) fn root(&self) -> &std::path::Path {
         &self.root
     }
+    pub(crate) fn embedded_bytes(&self) -> [Vec<u8>; 3] {
+        FileSlot::ALL.map(|slot| fs::read(self.root.join(slot.path())).unwrap())
+    }
+    pub(crate) fn embedded<'bytes>(
+        &self,
+        bytes: &'bytes [Vec<u8>; 3],
+    ) -> Result<CopySource<'bytes>> {
+        Ok(CopySource::Embedded(Box::new(EmbeddedSource::admit(
+            MetalReleasePermit::for_native_release(self.release()?)?,
+            bytes.each_ref().map(Vec::as_slice),
+            fixture_verifier(fixture_trust()),
+        )?)))
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.owner).expect("remove exclusively created private fixture");
     }
+}
+
+#[test]
+fn metal_embedded_exact_slots_copy_without_a_filesystem_source_or_lease() {
+    let fixture = Fixture::new(|_| {});
+    let bytes = fixture.embedded_bytes();
+    let source = fixture.embedded(&bytes).unwrap();
+    for slot in FileSlot::ALL {
+        fs::remove_file(fixture.root.join(slot.path())).unwrap();
+    }
+    source.reverify().unwrap();
+    for slot in FileSlot::ALL {
+        let (expected, mut input) = source.open_for_copy(slot).unwrap();
+        let mut output = Vec::new();
+        crate::installer_transaction::copy_exact(
+            &mut input,
+            &mut output,
+            expected.size_bytes,
+            slot.maximum(),
+        )
+        .unwrap();
+        assert_eq!(output, bytes[slot.index()]);
+        assert_eq!(source.expected(slot).unwrap(), expected);
+    }
+}
+
+#[test]
+fn metal_embedded_rejects_mutated_truncated_growing_and_empty_slots() {
+    let fixture = Fixture::new(|_| {});
+    for slot in FileSlot::ALL {
+        for mutation in 0..4 {
+            let mut bytes = fixture.embedded_bytes();
+            let value = &mut bytes[slot.index()];
+            match mutation {
+                0 => value[0] ^= 1,
+                1 => {
+                    value.pop();
+                }
+                2 => value.push(b' '),
+                _ => value.clear(),
+            }
+            assert!(
+                fixture.embedded(&bytes).is_err(),
+                "slot {slot:?} mutation {mutation}"
+            );
+        }
+    }
+    for slot in FileSlot::ALL {
+        validate_embedded_length(slot, 1).unwrap();
+        validate_embedded_length(slot, slot.maximum()).unwrap();
+        for length in [0, slot.maximum() + 1, u64::MAX] {
+            assert!(validate_embedded_length(slot, length).is_err());
+        }
+    }
+}
+
+#[test]
+fn metal_embedded_shared_metadata_is_bounded_and_not_payload_authority() {
+    let fixture = Fixture::new(|_| {});
+    let bytes = fixture.embedded_bytes();
+    let verifier = fixture_verifier(fixture_trust());
+    verifier
+        .authenticate_metadata(&bytes[0], &bytes[1])
+        .unwrap();
+    // Metadata is authentic even when the independent payload is missing/bad.
+    let mut corrupt = bytes.clone();
+    corrupt[2] = b"not signed worker".to_vec();
+    assert!(fixture.embedded(&corrupt).is_err());
+    for (manifest, signature) in [
+        (vec![], bytes[1].clone()),
+        (bytes[0].clone(), vec![]),
+        (
+            vec![b'x'; manifest::MAX_MANIFEST_BYTES as usize + 1],
+            bytes[1].clone(),
+        ),
+        (
+            bytes[0].clone(),
+            vec![b'x'; manifest::MAX_SIGNATURE_BYTES as usize + 1],
+        ),
+    ] {
+        assert!(matches!(
+            verifier.authenticate_metadata(&manifest, &signature),
+            Err(manifest::PackVerificationError::EnvelopeTooLarge)
+        ));
+    }
+}
+
+#[test]
+fn metal_embedded_rejects_release_incompatible_or_nonclosed_signed_metadata() {
+    let changes: [fn(&mut PackManifest); 8] = [
+        |m| m.provider = "other-provider".to_owned(),
+        |m| m.backend = PackBackend::Cuda,
+        |m| m.target_arch = "other-arch".to_owned(),
+        |m| m.target_os = "linux".to_owned(),
+        |m| m.runtime_abi_version += 1,
+        |m| m.app_build.push_str("-foreign"),
+        |m| m.security_epoch = 0,
+        |m| {
+            let mut extra = m.payload[0].clone();
+            extra.path = "worker/extra".to_owned();
+            m.payload.push(extra);
+        },
+    ];
+    for change in changes {
+        let fixture = Fixture::new(change);
+        assert!(fixture.embedded(&fixture.embedded_bytes()).is_err());
+    }
+    let fixture = Fixture::new(|_| {});
+    let bytes = fixture.embedded_bytes();
+    let changes: [fn(&mut PackReleaseAuthorityEntry); 12] = [
+        |e| e.pack_id = StoreComponent::new("other-id").unwrap(),
+        |e| e.pack_version = StoreComponent::new("other-version").unwrap(),
+        |e| e.pack_digest = "0".repeat(64),
+        |e| e.security_epoch += 1,
+        |e| e.runtime_abi_version += 1,
+        |e| e.backend = PackBackend::Cuda,
+        |e| e.provider = "other-provider".to_owned(),
+        |e| e.target_os = "linux".to_owned(),
+        |e| e.target_arch = "other-arch".to_owned(),
+        |e| e.worker_relative_path = "worker/other".to_owned(),
+        |e| e.installed_size_bytes += 1,
+        |e| e.installed_size_bytes -= 1,
+    ];
+    for change in changes {
+        let mut permit =
+            MetalReleasePermit::for_native_release(fixture.release().unwrap()).unwrap();
+        change(&mut permit.entry);
+        assert!(
+            EmbeddedSource::admit(
+                permit,
+                bytes.each_ref().map(Vec::as_slice),
+                fixture_verifier(fixture_trust())
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn metal_embedded_default_release_and_production_trust_never_admit_fixture() {
+    let error = match admit_embedded([&[]; 3]) {
+        Ok(_) => panic!("empty release admitted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("no native Metal pack"));
+    let fixture = Fixture::new(|_| {});
+    let bytes = fixture.embedded_bytes();
+    let permit = MetalReleasePermit::for_native_release(fixture.release().unwrap()).unwrap();
+    assert!(
+        EmbeddedSource::admit(
+            permit,
+            bytes.each_ref().map(Vec::as_slice),
+            fixture_verifier(&ProductionTrustRoot)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn metal_embedded_materialization_requires_exact_original_envelope_and_all_bytes() {
+    let fixture = Fixture::new(|_| {});
+    let bytes = fixture.embedded_bytes();
+    let source = fixture.embedded(&bytes).unwrap();
+    let other = Fixture::new(|_| {});
+    source.verify_materialized(other.pinned()).unwrap();
+    for slot in FileSlot::ALL {
+        let original = fs::read(other.root.join(slot.path())).unwrap();
+        let changed = if slot == FileSlot::Signature {
+            String::from_utf8(original.clone())
+                .unwrap()
+                .replace("fixture-ed25519-v1", "fixture-ed25519-v2")
+                .into_bytes()
+        } else {
+            let mut changed = original.clone();
+            changed[0] ^= 1;
+            changed
+        };
+        fs::write(other.root.join(slot.path()), changed).unwrap();
+        if slot == FileSlot::Signature {
+            // Both IDs are trusted and same-size; signature validity alone is
+            // insufficient to replace the exact compiled envelope.
+            fixture_verifier(fixture_trust())
+                .verify(&other.root)
+                .unwrap();
+        }
+        assert!(source.verify_materialized(other.pinned()).is_err());
+        fs::write(other.root.join(slot.path()), original).unwrap();
+    }
+    fs::write(other.root.join("unexpected"), b"extra").unwrap();
+    assert!(source.verify_materialized(other.pinned()).is_err());
 }
 
 #[test]

@@ -28,8 +28,10 @@ impl Fixture {
             store,
         }
     }
-    fn ops(&self) -> NativeOperations {
-        let source = self.source.admit().unwrap();
+    fn ops(&self) -> NativeOperations<'_> {
+        self.ops_with_source(CopySource::Leased(Box::new(self.source.admit().unwrap())))
+    }
+    fn ops_with_source<'bytes>(&self, source: CopySource<'bytes>) -> NativeOperations<'bytes> {
         let uid = unsafe { libc::geteuid() };
         let file = open_absolute_directory(&self.store).unwrap();
         let identity = checked_directory(&file, uid, Some(0o755)).unwrap();
@@ -79,6 +81,143 @@ fn sealed(ops: &mut NativeOperations) {
 fn inode(path: &Path) -> (u64, u64) {
     let stat = std::fs::metadata(path).unwrap();
     (stat.dev(), stat.ino())
+}
+
+#[test]
+fn metal_native_embedded_copy_reuses_exact_bytes_without_source_files() {
+    let fixture = Fixture::new();
+    let bytes = fixture.source.embedded_bytes();
+    let installed = fixture.installed();
+    let mut ops = fixture.ops_with_source(fixture.source.embedded(&bytes).unwrap());
+    for slot in FileSlot::ALL {
+        std::fs::remove_file(fixture.source.root().join(slot.path())).unwrap();
+    }
+    assert_eq!(
+        run_transaction(&mut ops, "Metal").unwrap(),
+        Outcome::PublishedNew
+    );
+    drop(ops);
+    let before = inode(&installed);
+    for slot in FileSlot::ALL {
+        let path = installed.join(slot.path());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes[slot.index()]);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            slot.mode()
+        );
+    }
+    assert_eq!(
+        run_transaction(
+            &mut fixture.ops_with_source(fixture.source.embedded(&bytes).unwrap()),
+            "Metal"
+        )
+        .unwrap(),
+        Outcome::ReusedExisting
+    );
+    assert_eq!(before, inode(&installed));
+}
+
+#[test]
+fn metal_native_embedded_corruption_and_partial_population_never_publish() {
+    for slot in FileSlot::ALL {
+        for corrupt in [false, true] {
+            let fixture = Fixture::new();
+            let bytes = fixture.source.embedded_bytes();
+            let mut ops = fixture.ops_with_source(fixture.source.embedded(&bytes).unwrap());
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = fired.clone();
+            ops.copy_hook = Some(Box::new(move |point, current, path| {
+                if current == slot {
+                    if corrupt && point == CopyPoint::AfterWrite {
+                        observed.store(true, Ordering::SeqCst);
+                        let mut bytes = std::fs::read(path)?;
+                        bytes[0] ^= 1;
+                        std::fs::write(path, bytes)?;
+                    } else if !corrupt && point == CopyPoint::BeforeRead {
+                        observed.store(true, Ordering::SeqCst);
+                        bail!("injected embedded copy failure");
+                    }
+                }
+                Ok(())
+            }));
+            assert!(run_transaction(&mut ops, "Metal").is_err());
+            assert!(
+                fired.load(Ordering::SeqCst),
+                "fault hook was not exercised: {slot:?}/{corrupt}"
+            );
+            assert!(!fixture.installed().exists());
+            assert!(
+                std::fs::read_dir(fixture.version())
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn metal_native_embedded_collision_verifies_winner_without_replacement() {
+    for identical in [false, true] {
+        let fixture = Fixture::new();
+        let bytes = fixture.source.embedded_bytes();
+        let mut ops = fixture.ops_with_source(fixture.source.embedded(&bytes).unwrap());
+        sealed(&mut ops);
+        if identical {
+            let other = Fixture::new();
+            run_transaction(&mut other.ops(), "Metal").unwrap();
+            std::fs::rename(other.installed(), fixture.installed()).unwrap();
+        } else {
+            std::fs::create_dir(fixture.installed()).unwrap();
+        }
+        let before = inode(&fixture.installed());
+        assert_eq!(ops.publish().unwrap(), PublishResult::Collision);
+        if identical {
+            assert!(ops.existing().unwrap());
+        } else {
+            assert!(ops.existing().is_err());
+        }
+        ops.cleanup().unwrap();
+        if identical {
+            ops.confirm().unwrap();
+        }
+        assert_eq!(before, inode(&fixture.installed()));
+    }
+}
+
+#[test]
+fn metal_native_embedded_uncertain_publication_and_confirmation_retain_final() {
+    for ambiguous in [false, true] {
+        let fixture = Fixture::new();
+        let bytes = fixture.source.embedded_bytes();
+        let mut ops = fixture.ops_with_source(fixture.source.embedded(&bytes).unwrap());
+        sealed(&mut ops);
+        assert_eq!(ops.publish().unwrap(), PublishResult::New);
+        let before = inode(&fixture.installed());
+        if ambiguous {
+            ops.published = false;
+        } else {
+            std::fs::set_permissions(fixture.version(), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            assert!(ops.confirm().is_err());
+        }
+        assert!(ops.cleanup().is_err());
+        assert_eq!(before, inode(&fixture.installed()));
+        if !ambiguous {
+            std::fs::set_permissions(fixture.version(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        drop(ops);
+        assert_eq!(
+            run_transaction(
+                &mut fixture.ops_with_source(fixture.source.embedded(&bytes).unwrap()),
+                "Metal"
+            )
+            .unwrap(),
+            Outcome::ReusedExisting
+        );
+        assert_eq!(before, inode(&fixture.installed()));
+    }
 }
 
 #[test]

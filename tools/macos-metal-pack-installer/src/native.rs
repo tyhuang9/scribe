@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::admission::{AdmittedSource, FileSlot};
+use crate::admission::{CopySource, FileSlot};
 use crate::installer_bootstrap::ensure_admitted_ancestor;
 use crate::installer_fs::{
     checked_directory, checked_lock, has_errno, open_rw, require_mode, set_mode, unlink,
@@ -53,8 +53,8 @@ struct TreeIdentity {
     files: [NodeIdentity; 3],
 }
 
-pub(crate) struct NativeOperations {
-    source: AdmittedSource<'static>,
+pub(crate) struct NativeOperations<'bytes> {
+    source: CopySource<'bytes>,
     anchors: Vec<Anchor>,
     store_index: Option<usize>,
     lock: Option<(File, NodeIdentity)>,
@@ -72,11 +72,11 @@ pub(crate) struct NativeOperations {
     copy_hook: Option<CopyHook>,
 }
 
-impl NativeOperations {
+impl NativeOperations<'_> {
     pub(crate) fn production(candidate: &Path) -> Result<Self> {
         // Must precede candidate access and every protected-root mutation.
         crate::require_installer_root(unsafe { libc::geteuid() })?;
-        let source = crate::admission::admit_source(candidate)?;
+        let source = CopySource::Leased(Box::new(crate::admission::admit_source(candidate)?));
         Ok(Self {
             source,
             anchors: vec![],
@@ -398,7 +398,7 @@ fn stage_parent(stage: &Stage, slot: FileSlot) -> Result<&File> {
     }
 }
 
-impl Operations for NativeOperations {
+impl Operations for NativeOperations<'_> {
     fn prepare(&mut self) -> Result<()> {
         self.source.reverify()?; // Before creating even a fixed protected ancestor.
         self.prepare_store()?;

@@ -1532,8 +1532,13 @@ fn macos_metal_installer_copies_only_admitted_content_and_ci_never_installs() {
     ] {
         assert!(!entry.contains(forbidden));
     }
-    assert!(check.contains("Darwin) expected=90; admission_expected=19"));
-    assert!(check.contains("native_expected=16"));
+    assert!(check.contains("Darwin) expected=100; admission_expected=19"));
+    assert!(check.contains("native_expected=20"));
+    assert!(check.contains("\"$embedded_count\" == 6"));
+    assert!(admission.contains("pub(crate) struct EmbeddedSource<'bytes>"));
+    assert!(admission.contains("pub(crate) enum CopySource<'bytes>"));
+    assert!(admission.contains("verifier.authenticate_metadata(bytes[0], bytes[1])?"));
+    assert!(admission.contains("copy.copy_entries() != source.entries"));
     assert!(check.contains("--locked --offline"));
     assert!(check.contains("--all-targets -- -D warnings"));
     assert!(workflow.contains("bash scripts/verify-macos-metal-installer-source.sh"));
