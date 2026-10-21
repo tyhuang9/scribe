@@ -720,6 +720,8 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
     let worker = production_source(include_str!("onnx_worker.rs"));
     let authority = production_source(include_str!("macos_worker_authority.rs"));
     let layout = production_source(include_str!("macos_worker_layout.rs"));
+    let cpu_identity = production_source(include_str!("macos_cpu_identity.rs"));
+    let retained_marker = production_source(include_str!("macos_retained_marker.rs"));
     let launcher = production_source(include_str!("macos_worker_launch.rs"));
     let contract = include_str!("../scripts/test-macos-protected-cpu-worker.sh");
     let resolver = named_function_bodies(&worker, "resolve_protected_macos_cpu_worker").join("\n");
@@ -733,9 +735,16 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
             "executable.macos_cpu_authority.is_none() && executable.pack_launch.is_none()"
         )
     );
-    assert!(layout.contains("option_env!(\"SCRIBE_BUNDLED_WORKER_SHA256\")"));
-    assert!(layout.contains("/Library/Application Support/Scribe/CPU"));
+    assert!(layout.contains("use cpu_identity::CPU_ROOT"));
+    assert!(layout.contains("let digest = cpu_identity::CPU_WORKER_SHA256;"));
+    assert!(cpu_identity.contains("option_env!(\"SCRIBE_BUNDLED_WORKER_SHA256\")"));
+    assert!(cpu_identity.contains("/Library/Application Support/Scribe/CPU"));
+    assert!(cpu_identity.contains("RETAINED_CPU_WORKER_SHA256, CPU_WORKER_SHA256"));
+    assert!(retained_marker.contains("#[used]"));
+    assert!(retained_marker.contains("__DATA,__scribe_id,regular,no_dead_strip"));
+    assert!(retained_marker.contains("static $name: [u8; ($value).len()]"));
     assert!(!layout.contains("std::env::var"));
+    assert!(!cpu_identity.contains("std::env::var"));
     for required in [
         "CpuProduction",
         "validate_cpu_size(length)?",
@@ -1455,13 +1464,17 @@ fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
     for phase in ["entry-build-arm64", "entry-build-x86_64", "entry-combine"] {
         assert!(entry.contains(phase));
     }
-    assert!(tests.contains("expected = 33 + (18 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 35 + (18 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("(6 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_actual_bundle_context_preserves_signed_input_binding_without_execution",
         "test_every_source_context_change_or_same_bytes_replacement_rejects",
         "test_copied_byte_mismatch_and_changes_during_inspection_reject",
         "test_app_or_worker_signature_failure_cannot_reach_desktop_inspection",
         "test_both_callers_stop_before_build_or_publication_after_admission_rejection",
+        "test_optimized_rust_provenance_survives_both_slices_without_execution",
+        "test_each_missing_slice_marker_rejects_with_redacted_context",
+        "test_marker_diagnostic_labels_are_closed_before_reading",
     ] {
         assert!(tests.contains(required));
     }

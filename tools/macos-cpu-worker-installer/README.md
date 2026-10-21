@@ -150,7 +150,7 @@ does not contain the component. Structural CI assembles and inspects it, but
 does not upload it, install it, or invoke the production installer entry.
 
 Run `python3 -B build_support/test_macos_cpu_component.py` for exact-discovery
-source checks: 33 portable, 18 additional POSIX, and five additional Darwin tests.
+source checks: 35 portable, 18 additional POSIX, and six additional Darwin tests.
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
 
@@ -162,6 +162,25 @@ the loose main verifies; neither possible outcome bypasses mandatory bundle and
 bound-input checks. This isolates signing context, not Scribe's complete resource
 policy. The existing full structural build exercises the real app verifier and
 the same helper; actual Mac results remain required.
+
+Full build identities have explicit immutable byte arrays in macOS images.
+The CPU layout consumers also retain the fixed root and their compiled revision
+and digest (the worker itself intentionally has no self-digest anchor).
+Runtime string construction
+alone does not promise contiguous bytes after optimization. The shared macro
+uses compiler `used` plus an ordinary Mach-O data section with `no_dead_strip`;
+it contains no pointers, executable code or initializer. This follows the
+[Rust compiler/linker distinction](https://doc.rust-lang.org/reference/abi.html#the-used-attribute),
+[LLVM section attributes](https://github.com/llvm/llvm-project/blob/main/llvm/lib/MC/MCSectionMachO.cpp)
+and [Apple linker retention policy](https://github.com/apple-oss-distributions/ld64/blob/main/src/ld/parsers/macho_relocatable_file.cpp).
+The native regression includes these actual production definitions in inert
+Rust fixtures, with optimization, fat LTO, symbol stripping and linker dead
+stripping. Both thin architectures must contain every complete marker; a second
+revision/digest must replace the previous markers. No fixture is executed.
+These bytes are provenance sanity checks, not signature or admission authority;
+all existing signature, hash, source-context and CPU-only checks remain required.
+Missing-marker errors expose only closed role/architecture labels and zero-based
+marker indices, never marker values, hashes, paths or raw tool diagnostics.
 
 Nonzero native tool exits report a closed operation label and numeric status
 (including signal termination on POSIX), not a command path, argv, environment,

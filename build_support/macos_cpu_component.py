@@ -494,7 +494,12 @@ def check_description(data: bytes, digest: str, revision: str) -> None:
             "fresh writer description does not match frozen inputs")
 
 
-def has_markers(path: Path, markers: list[bytes], maximum: int) -> None:
+def has_markers(path: Path, markers: list[bytes], maximum: int, *,
+                role: str = "artifact", architecture: str = "unspecified") -> None:
+    require(type(role) is str and role in ("artifact", "copied-worker", "writer", "structure"),
+            "unknown marker inspection role")
+    require(type(architecture) is str and architecture in ("unspecified", "arm64", "x86_64"),
+            "unknown marker inspection architecture")
     handle, before = open_regular(path, maximum)
     found = [False] * len(markers)
     overlap = max(map(len, markers), default=1) - 1
@@ -511,7 +516,9 @@ def has_markers(path: Path, markers: list[bytes], maximum: int) -> None:
         require(not handle.read(1), "binary grew during marker inspection")
         require(fingerprint(os.fstat(handle.fileno())) == fingerprint(before),
                 "binary changed during marker inspection")
-    require(all(found), "binary slice does not contain the frozen identities")
+    missing = ",".join(str(index) for index, present in enumerate(found) if not present)
+    require(not missing, "binary slice does not contain the frozen identities "
+            f"(role={role}; architecture={architecture}; marker-indices={missing})")
 
 
 def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum: int,
@@ -523,7 +530,10 @@ def inspect_universal(path: Path, markers: list[bytes], workspace: Path, maximum
                             operation="artifact-architectures").decode("ascii").split()
     require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
     capture(["/usr/bin/codesign", "--verify", "--strict", str(path)], operation=signature_operation)
-    _inspect_universal_slices(path, markers, workspace, maximum)
+    role = {"artifact-signature-verification": "artifact",
+            "copied-worker-signature-verification": "copied-worker",
+            "writer-signature-verification": "writer"}[signature_operation]
+    _inspect_universal_slices(path, markers, workspace, maximum, role=role)
 
 
 def inspect_universal_structure(path: Path, markers: list[bytes], workspace: Path, maximum: int) -> None:
@@ -536,10 +546,13 @@ def inspect_universal_structure(path: Path, markers: list[bytes], workspace: Pat
     architectures = capture(["/usr/bin/lipo", str(path), "-archs"],
                             operation="artifact-architectures").decode("ascii").split()
     require(sorted(architectures) == ["arm64", "x86_64"], "binary must have exactly ARM64 and x64 slices")
-    _inspect_universal_slices(path, markers, workspace, maximum)
+    _inspect_universal_slices(path, markers, workspace, maximum, role="structure")
 
 
-def _inspect_universal_slices(path: Path, markers: list[bytes], workspace: Path, maximum: int) -> None:
+def _inspect_universal_slices(path: Path, markers: list[bytes], workspace: Path, maximum: int,
+                              *, role: str = "artifact") -> None:
+    require(type(role) is str and role in ("artifact", "copied-worker", "writer", "structure"),
+            "unknown marker inspection role")
     for architecture in ("arm64", "x86_64"):
         thin = workspace / (path.name + "-" + architecture)
         require(not os.path.lexists(thin), "slice inspection output already exists")
@@ -558,7 +571,7 @@ def _inspect_universal_slices(path: Path, markers: list[bytes], workspace: Path,
                         "component depends on a non-system native library")
                 require(not any(name in library.lower() for name in ("metal.framework", "cuda", "vulkan")),
                         "component contains a GPU dependency")
-            has_markers(thin, markers, maximum)
+            has_markers(thin, markers, maximum, role=role, architecture=architecture)
         except CleanupUncertain:
             cleanup_confirmed = False
             raise
