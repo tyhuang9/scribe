@@ -175,7 +175,7 @@ jobs:
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc --prepare-protected-cpu-component
           SCRIBE_MACOS_TEST_BUNDLE="$PWD/dist-macos/Scribe.app" bash scripts/test-macos-release-packaging.sh
-      - name: Construct real universal CPU entry without executing or installing it
+      - name: Construct real universal CPU entry and private unsigned package without execution
         timeout-minutes: 50
         env:
           SCRIBE_BUILD_REVISION: ${{ github.sha }}

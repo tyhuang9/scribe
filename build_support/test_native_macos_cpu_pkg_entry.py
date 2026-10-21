@@ -11,11 +11,13 @@ from unittest.mock import patch
 
 import macos_cpu_component as component
 import native_macos_cpu_pkg_entry as native
+from test_macos_cpu_pkg import encode, package_info
 
 REVISION = "source-native-entry-fixture"
 WORKER = b"synthetic frozen worker"
 DIGEST = hashlib.sha256(WORKER).hexdigest()
 IMAGE = b"synthetic universal package entry"
+PACKAGE = b"synthetic unsigned package"
 
 
 class Portable(unittest.TestCase):
@@ -29,6 +31,7 @@ class Portable(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(WORKER if name == native.INPUTS[0] else b"synthetic input")
         self.failure, self.builds, self.workspace, self.verifications = None, 0, None, 0
+        self.packages = 0
 
     @contextmanager
     def fake_workspace(self, parent, prefix):
@@ -40,7 +43,8 @@ class Portable(unittest.TestCase):
     def build(self, app, workspace, digest, revision):
         self.assertEqual((app, digest, revision), (self.app, DIGEST, REVISION))
         self.builds += 1
-        self.workspace = workspace
+        self.workspace = workspace.parent
+        self.assertEqual(workspace.name, "scripts")
         output = workspace / "postinstall"
         if self.builds == 2:
             if self.failure == "uncertain-second":
@@ -70,13 +74,53 @@ class Portable(unittest.TestCase):
                 "0" * 64 if self.failure == "digest" else hashlib.sha256(IMAGE).hexdigest(),
                 len(IMAGE) + (1 if self.failure == "size" else 0))
 
+    def package(self, app, private, before, version, constructed):
+        self.packages += 1
+        self.assertEqual(self.builds, 2)  # one success, then required no-replace rejection
+        self.assertEqual((app, private, version), (self.app, self.workspace, "0.1.0"))
+        self.assertEqual(before[native.INPUTS[0]][0], DIGEST)
+        operation = private / "scripts/postinstall"
+        self.assertEqual(constructed, (operation, hashlib.sha256(IMAGE).hexdigest(), len(IMAGE)))
+        self.assertEqual(operation.read_bytes(), IMAGE)
+        if self.failure in ["package-failure", "package-uncertain"]:
+            error = component.CleanupUncertain if self.failure == "package-uncertain" else component.ComponentError
+            raise error("synthetic packaging failure")
+        candidate = private / "cpu-worker.pkg"
+        candidate.write_bytes(b"" if self.failure == "package-empty" else PACKAGE)
+        if self.failure == "package-linked":
+            os.link(candidate, self.root / "package-alias")
+        if self.failure == "package-directory":
+            candidate.unlink()
+            candidate.mkdir()
+        if self.failure == "package-entry-change":
+            operation.write_bytes(b"changed")
+        if self.failure == "package-entry-replace":
+            replacement = operation.with_name("replacement")
+            replacement.write_bytes(IMAGE)
+            os.replace(replacement, operation)
+        if self.failure == "package-extra-operation":
+            (operation.parent / "preinstall").write_bytes(b"extra")
+        if self.failure == "package-app-change":
+            (app / native.INPUTS[1]).write_bytes(b"changed")
+        return (private / "wrong" if self.failure == "package-path" else candidate,
+                "0" * 64 if self.failure == "package-digest" else hashlib.sha256(PACKAGE).hexdigest(),
+                len(PACKAGE) + (self.failure == "package-size"))
+
     @contextmanager
-    def context(self, *, real_workspace=False):
+    def context(self, *, real_workspace=False, real_tail=False):
         def verify(app):
             self.assertEqual(app, self.app)
             self.verifications += 1
             if self.failure == "app-verification" and self.verifications == 2:
                 raise component.ComponentError("synthetic final app verification failure")
+            if self.failure in ["package-final-change", "package-final-replace"] and self.verifications == 2:
+                candidate = self.workspace / "cpu-worker.pkg"
+                if self.failure == "package-final-change":
+                    candidate.write_bytes(b"changed")
+                else:
+                    replacement = self.workspace / "replacement"
+                    replacement.write_bytes(PACKAGE)
+                    os.replace(replacement, candidate)
             return "0.1.0"
         with ExitStack() as stack:
             stack.enter_context(patch.object(native.sys, "platform", "darwin"))
@@ -85,6 +129,8 @@ class Portable(unittest.TestCase):
             stack.enter_context(patch.object(native.tempfile, "gettempdir", return_value=str(self.root)))
             stack.enter_context(patch.object(component, "verify_cpu_app", side_effect=verify))
             stack.enter_context(patch.object(native.entry, "build_entry", side_effect=self.build))
+            if not real_tail:
+                stack.enter_context(patch.object(native.package, "_package_constructed_entry", side_effect=self.package))
             stack.enter_context(patch.object(native.os, "access", return_value=self.failure != "not-executable"))
             capture = stack.enter_context(patch.object(component, "capture", return_value=
                 b"arm64" if self.failure == "architecture" else b"arm64 x86_64"))
@@ -93,19 +139,22 @@ class Portable(unittest.TestCase):
             yield capture
 
     def run_failure(self, failure, message):
-        self.failure, self.builds, self.verifications = failure, 0, 0
+        self.failure, self.builds, self.verifications, self.packages = failure, 0, 0, 0
         with self.context(), self.assertRaisesRegex(component.ComponentError, message):
             native.run_contract(self.app, DIGEST, REVISION)
         self.assertFalse(list(self.root.glob("scribe-native-cpu-entry-*")))
 
-    def test_real_driver_contract_calls_only_builder_and_read_only_lipo(self):
+    def test_driver_packages_one_retained_entry_without_a_second_successful_build(self):
         with self.context() as capture:
             report = native.run_contract(self.app, DIGEST, REVISION)
         self.assertEqual(self.builds, 2)
         self.assertEqual(self.verifications, 2)
-        capture.assert_called_once_with(["/usr/bin/lipo", str(self.workspace / "postinstall"), "-archs"])
+        self.assertEqual(self.packages, 1)
+        capture.assert_called_once_with(["/usr/bin/lipo", str(self.workspace / "scripts/postinstall"), "-archs"])
         self.assertEqual(report, {"constructed": True, "executed": False, "architectures": ["arm64", "x86_64"],
-                                  "entry_size_bytes": len(IMAGE), "worker_size_bytes": len(WORKER)})
+                                  "entry_size_bytes": len(IMAGE), "worker_size_bytes": len(WORKER),
+                                  "package_constructed": True, "package_executed": False,
+                                  "package_size_bytes": len(PACKAGE)})
         self.assertFalse(self.workspace.exists())
 
     def test_root_and_foreign_hosts_reject_before_input_access(self):
@@ -169,6 +218,63 @@ class Portable(unittest.TestCase):
             self.run_failure(failure, message)
         self.assertEqual(sentinel.read_bytes(), b"unrelated")
 
+    def test_wrong_package_results_or_packaging_failure_are_fatal(self):
+        for failure, message in [("package-failure", "packaging failure"),
+                                 ("package-path", "wrong path"), ("package-digest", "identity mismatch"),
+                                 ("package-size", "identity mismatch"), ("package-empty", "size"),
+                                 ("package-linked", "hard-linked"), ("package-directory", "unexpected node type")]:
+            with self.subTest(failure=failure):
+                self.run_failure(failure, message)
+                self.assertEqual(self.packages, 1)
+
+    def test_packaging_cannot_change_retained_entry_inventory_or_app(self):
+        for failure, message in [("package-entry-change", "retained entry"),
+                                 ("package-entry-replace", "retained entry"),
+                                 ("package-extra-operation", "scripts inventory"),
+                                 ("package-app-change", "application inputs")]:
+            with self.subTest(failure=failure):
+                self.run_failure(failure, message)
+
+    def test_final_admission_cannot_mutate_or_replace_the_package(self):
+        for failure in ["package-final-change", "package-final-replace"]:
+            self.run_failure(failure, "package changed")
+
+    def test_entry_admission_and_repeat_failures_preclude_packaging(self):
+        for failure, message in [("architecture", "exactly universal"),
+                                 ("repeat-reason", "wrong reason"), ("second-success", "replaced")]:
+            self.run_failure(failure, message)
+            self.assertEqual(self.packages, 0)
+
+    def native_tools(self, arguments, **kwargs):
+        if arguments[0] == "/usr/bin/lipo":
+            return b"arm64 x86_64"
+        self.assertEqual(arguments[0], "/usr/bin/pkgbuild")
+        self.assertEqual(kwargs["operation"], "cpu-component-pkg-build")
+        operation = Path(arguments[arguments.index("--scripts") + 1]) / "postinstall"
+        info = package_info()
+        if self.failure == "unsupported-native-metadata":
+            info = info.replace(b"<pkg-info ", b'<pkg-info unqualified="value" ')
+        Path(arguments[-1]).write_bytes(encode(operation.read_bytes(), info=info))
+        return b""
+
+    def test_real_shared_packaging_tail_is_used_with_only_native_tools_mocked(self):
+        with self.context(real_tail=True) as capture:
+            capture.side_effect = self.native_tools
+            report = native.run_contract(self.app, DIGEST, REVISION)
+        self.assertEqual(self.builds, 2)
+        self.assertTrue(report["package_constructed"])
+        self.assertFalse(report["package_executed"])
+        self.assertEqual([call.args[0][0] for call in capture.call_args_list], ["/usr/bin/lipo", "/usr/bin/pkgbuild"])
+        self.assertFalse(self.workspace.exists())
+
+    def test_unsupported_native_metadata_remains_failure_not_skip_or_pass(self):
+        self.failure = "unsupported-native-metadata"
+        with self.context(real_tail=True) as capture, \
+             self.assertRaisesRegex(component.ComponentError, "unsupported PackageInfo"):
+            capture.side_effect = self.native_tools
+            native.run_contract(self.app, DIGEST, REVISION)
+        self.assertFalse(self.workspace.exists())
+
     def test_cli_requires_exact_inputs_and_prints_only_the_path_free_report(self):
         report = {"constructed": True, "executed": False}
         args = ["native-test", "--app", str(self.app), "--worker-sha256", DIGEST, "--build-revision", REVISION]
@@ -198,13 +304,13 @@ class Portable(unittest.TestCase):
 
 class Posix(Portable):
     def test_uncertain_child_cleanup_retains_the_entire_native_fixture(self):
-        for failure in ["uncertain", "uncertain-second"]:
+        for failure in ["uncertain", "uncertain-second", "package-uncertain"]:
             self.failure, self.builds, self.verifications = failure, 0, 0
             with self.subTest(failure=failure), self.context(real_workspace=True), \
                  self.assertRaises(component.CleanupUncertain):
                 native.run_contract(self.app, DIGEST, REVISION)
             self.assertTrue(self.workspace.is_dir())
-            self.assertEqual((self.workspace / "postinstall").exists(), failure == "uncertain-second")
+            self.assertEqual((self.workspace / "scripts/postinstall").exists(), failure != "uncertain")
         # Build and child are mocked; no uncertain process actually exists.
 
 
@@ -212,7 +318,7 @@ def suite():
     result = unittest.TestSuite()
     for cls in [Portable] + ([Posix] if os.name == "posix" else []):
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 13 + (1 if os.name == "posix" else 0)
+    expected = 19 + (1 if os.name == "posix" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"native driver test discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

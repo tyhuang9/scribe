@@ -1234,18 +1234,15 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
     let tests = include_str!("../build_support/test_macos_cpu_pkg.py");
     let workflow = include_str!("../.github/workflows/macos-release.yml");
     let build = &source[source.find("def build_component(").unwrap()..];
+    let tail = &source[source.find("def _package_constructed_entry(").unwrap()
+        ..source.find("def build_component(").unwrap()];
     assert!(build.find("os.geteuid() != 0").unwrap() < build.find("app.is_dir()").unwrap());
     for required in [
         "component.validate_identity(digest, revision)",
         "component.cpu_app_input_snapshot(app)",
         "component.verify_cpu_app(app)",
         "entry.build_entry(app, scripts, digest, revision)",
-        "with os.scandir(scripts) as inventory:",
-        "component.hash_file(operation, entry.MAX_ENTRY) == (sha, size)",
-        "component.fingerprint(operation.lstat()) == identity",
-        "\"/usr/bin/pkgbuild\", \"--nopayload\", \"--scripts\"",
-        "environment={**component.probe_environment(), \"TMPDIR\": str(temporary)}",
-        "_inspect_fresh(candidate, sha, size, version)",
+        "_package_constructed_entry(app, private, before, version, constructed)",
         "component.publish_no_replace(candidate, output)",
     ] {
         assert!(
@@ -1253,7 +1250,31 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author lost {required}"
         );
     }
-    assert_eq!(build.matches("component.capture(").count(), 1);
+    assert!(
+        build.find("entry.build_entry(").unwrap()
+            < build.find("_package_constructed_entry(").unwrap()
+    );
+    assert!(
+        build.find("_package_constructed_entry(").unwrap()
+            < build.find("component.publish_no_replace(").unwrap()
+    );
+    for required in [
+        "with os.scandir(scripts) as inventory:",
+        "component.hash_file(operation, entry.MAX_ENTRY) == (sha, size)",
+        "component.fingerprint(operation.lstat()) == identity",
+        "\"/usr/bin/pkgbuild\", \"--nopayload\", \"--scripts\"",
+        "environment={**component.probe_environment(), \"TMPDIR\": str(temporary)}",
+        "_inspect_fresh(candidate, sha, size, version)",
+    ] {
+        assert!(
+            tail.contains(required),
+            "CPU package construction tail lost {required}"
+        );
+    }
+    assert_eq!(build.matches("component.capture(").count(), 0);
+    assert_eq!(tail.matches("component.capture(").count(), 1);
+    assert!(!tail.contains("entry.build_entry("));
+    assert!(!tail.contains("publish_no_replace"));
     for required in [
         "CHUNK = 65536",
         "decoder.decompress(pending, CHUNK)",
@@ -1307,6 +1328,30 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
     assert!(run.contains("except component.CleanupUncertain:\n            raise"));
     assert_eq!(run.matches("component.capture(").count(), 1);
     assert!(run.contains("[\"/usr/bin/lipo\", str(output), \"-archs\"]"));
+    assert_eq!(
+        run.matches("package._package_constructed_entry(").count(),
+        1
+    );
+    assert!(
+        run.find("native repeated construction changed the entry")
+            .unwrap()
+            < run.find("package._package_constructed_entry(").unwrap()
+    );
+    for required in [
+        "scripts = workspace / \"scripts\"",
+        "entry.build_entry(app, scripts, digest, revision)",
+        "candidate == workspace / \"cpu-worker.pkg\"",
+        "package._package_bound(returned_size)",
+        "component.hash_file(candidate, package_bound) == (package_digest, package_size)",
+        "component.fingerprint(candidate.lstat()) == package_identity",
+        "and _only_postinstall(scripts)",
+        "\"package_constructed\": True, \"package_executed\": False",
+    ] {
+        assert!(
+            run.contains(required),
+            "native CPU package contract lost {required}"
+        );
+    }
     for forbidden in [
         "subprocess",
         "os.system",
@@ -1324,7 +1369,7 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
             "native contract gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 13 + (1 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 19 + (1 if os.name == \"posix\" else 0)"));
     assert!(workflow.contains("python3 -B build_support/test_native_macos_cpu_pkg_entry.py"));
     let native_step = workflow
         .find("- name: Construct real universal CPU entry")
@@ -1341,12 +1386,14 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
             .unwrap()
             + native_step];
     assert!(step.contains("timeout-minutes: 50"));
+    assert!(step.contains("and private unsigned package without execution"));
     assert!(step.contains("shasum -a 256"));
     assert!(step.contains("python3 -B build_support/native_macos_cpu_pkg_entry.py --app"));
     assert!(step.contains(
         "--worker-sha256 \"$worker_sha256\" --build-revision \"$SCRIBE_BUILD_REVISION\""
     ));
     assert!(!step.contains("upload-artifact"));
+    assert!(!step.contains("cpu-worker.pkg"));
 }
 
 #[test]

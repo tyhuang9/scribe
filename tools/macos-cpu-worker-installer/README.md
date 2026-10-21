@@ -272,23 +272,38 @@ lane. The CI step supplies the app's independently measured worker SHA and exact
 build revision. It calls the real two-architecture builder in an owned private
 workspace, requires one regular/single-link/executable `postinstall`, independently
 checks returned hash/size and both architectures, and requires repeat construction
-to reject without changing the entry's bytes or identity. Worker, desktop,
-signature record and app metadata remain unchanged; the app is reverified too.
+to reject without changing the entry's bytes or identity. It then calls the same
+private packaging tail as `build_component`, using **that retained entry**, not
+a second successful build or a caller-supplied prebuilt executable. The actual
+system `pkgbuild --nopayload` output must pass the strict streaming inspector;
+unsupported native metadata is a real failure, never a skip or guessed default.
+The driver independently rehashes the package and checks entry/node/inventory,
+app inputs and the package identity again through final admission. Worker,
+desktop, signature record and app metadata remain unchanged; the app is
+reverified too.
 
-The candidate is never executed, signed, assembled into a PKG or uploaded. It
-stays outside `dist-macos` and is removed only as an owned test fixture after
+Neither the candidate entry nor its unsigned PKG is executed, signed, installed
+or uploaded. The exact `scripts/postinstall` directory contains only that entry;
+package output and scratch remain outside `scripts`. Everything stays outside
+`dist-macos` and is removed only as an owned test fixture after
 confirmed child cleanup. Uncertainty retains the entire fixture, including on
-the repeated-build path. The step has a 50-minute bound; absent inputs, tools or
+the repeated-build and packaging paths. The existing step retains its 50-minute
+bound, dependency gates, permissions and upload paths; absent inputs, tools or
 either target fail rather than skip. Its successful log report contains only
-construction status, expected architectures and byte counts, not local paths
-or hashes. Running the driver on Windows/Linux rejects before input access.
+construction status, expected architectures and byte counts, including package
+constructed/not-executed flags, not local paths or hashes. Its report prefix and
+required CLI inputs are unchanged. Running the driver on Windows/Linux rejects
+before input access.
 
 `python3 -B build_support/test_native_macos_cpu_pkg_entry.py` checks the driver's
-assertions and failure handling using mocked builders/tools: exactly 13 portable
+assertions and failure handling using mocked builders/tools: exactly 19 portable
 and one additional POSIX test. The original fast entry suite remains mocked.
-Actual native construction is not established until the new exact-head jobs
-pass. Even then, this proves construction, not package authenticity, Installer
-execution, installation or release qualification.
+Two cases exercise the real shared packaging tail with only native tools mocked,
+including unsupported metadata rejection. Incorrect helper results, entry/package
+mutation or same-byte replacement, extra operations, phase ordering and uncertain
+packaging cleanup are covered. Actual native entry/package construction is not
+established until the exact-head jobs pass. Even then, this proves construction,
+not package authenticity, Installer execution, installation or release qualification.
 
 ### Native package-format prerequisite
 
@@ -432,9 +447,11 @@ tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,
 range/checksum errors, truncation/tails, links, source replacement, collisions
-and uncertain cleanup. CI adds only this mocked source command and path filters;
-it does not invoke the new real package author or add an artifact. Actual native
-author acceptance, final entry signing/repackaging, package authentication,
+and uncertain cleanup. This fast suite is always mocked. The existing native
+construction contract now calls the same private packaging tail on its retained
+entry, without rebuilding or publishing the package as an artifact. Actual native
+author acceptance is not established until that exact-head contract passes;
+final entry signing/repackaging, package authentication,
 notarization, product composition/order and Installer execution remain unproven.
 
 ## Not yet established

@@ -297,6 +297,39 @@ def _inspect_fresh(package: Path, entry_sha: str, entry_size: int, version: str)
                 and component.fingerprint(package.lstat()) == component.fingerprint(before), "package changed during inspection")
 
 
+def _package_constructed_entry(app: Path, private: Path, before: dict, version: str,
+                               constructed: tuple[Path, str, int]) -> tuple[Path, str, int]:
+    """Private tail for the caller's OWN freshly constructed CPU entry only.
+
+    Both source callers own this private tree, have admitted the CPU-only app,
+    and have just built the entry there. No arbitrary prebuilt-entry interface,
+    callbacks, trust flags or publication authority are provided.
+    """
+    scripts = private / "scripts"
+    operation, sha, size = constructed
+    require(operation == scripts / "postinstall", "entry constructor returned wrong path")
+    with os.scandir(scripts) as inventory:
+        first, second = next(inventory, None), next(inventory, None)
+        require(first is not None and first.name == "postinstall" and second is None,
+                "unexpected operation inventory")
+    require(component.hash_file(operation, entry.MAX_ENTRY) == (sha, size) and os.access(operation, os.X_OK),
+            "entry constructor identity or mode differs")
+    identity = component.fingerprint(operation.lstat())
+    candidate = private / "cpu-worker.pkg"
+    temporary = private / "temp"
+    temporary.mkdir(mode=0o700)
+    component.capture(["/usr/bin/pkgbuild", "--nopayload", "--scripts", str(scripts), "--identifier", IDENTIFIER,
+                       "--version", version, "--install-location", "/", str(candidate)], timeout=120,
+                      environment={**component.probe_environment(), "TMPDIR": str(temporary)},
+                      limit=8192, error_limit=8192, operation="cpu-component-pkg-build")
+    _inspect_fresh(candidate, sha, size, version)
+    require(component.cpu_app_input_snapshot(app) == before
+            and component.hash_file(operation, entry.MAX_ENTRY) == (sha, size)
+            and component.fingerprint(operation.lstat()) == identity, "app or entry changed during packaging")
+    package_sha, package_size = component.hash_file(candidate, _package_bound(size))
+    return candidate, package_sha, package_size
+
+
 def build_component(app: Path, workspace: Path, digest: str, revision: str) -> tuple[Path, str, int]:
     """Construct cpu-worker.pkg; return unsigned/PRE-SIGN path/hash/size only."""
     require(sys.platform == "darwin", "construction requires macOS")
@@ -316,26 +349,7 @@ def build_component(app: Path, workspace: Path, digest: str, revision: str) -> t
     with component.private_workspace(workspace, ".scribe-cpu-pkg-") as private:
         scripts = private / "scripts"
         scripts.mkdir(mode=0o700)
-        operation, sha, size = entry.build_entry(app, scripts, digest, revision)
-        require(operation == scripts / "postinstall", "entry constructor returned wrong path")
-        with os.scandir(scripts) as inventory:
-            first, second = next(inventory, None), next(inventory, None)
-            require(first is not None and first.name == "postinstall" and second is None,
-                    "unexpected operation inventory")
-        require(component.hash_file(operation, entry.MAX_ENTRY) == (sha, size) and os.access(operation, os.X_OK),
-                "entry constructor identity or mode differs")
-        identity = component.fingerprint(operation.lstat())
-        candidate = private / "cpu-worker.pkg"
-        temporary = private / "temp"
-        temporary.mkdir(mode=0o700)
-        component.capture(["/usr/bin/pkgbuild", "--nopayload", "--scripts", str(scripts), "--identifier", IDENTIFIER,
-                           "--version", version, "--install-location", "/", str(candidate)], timeout=120,
-                          environment={**component.probe_environment(), "TMPDIR": str(temporary)},
-                          limit=8192, error_limit=8192, operation="cpu-component-pkg-build")
-        _inspect_fresh(candidate, sha, size, version)
-        require(component.cpu_app_input_snapshot(app) == before
-                and component.hash_file(operation, entry.MAX_ENTRY) == (sha, size)
-                and component.fingerprint(operation.lstat()) == identity, "app or entry changed during packaging")
-        package_sha, package_size = component.hash_file(candidate, _package_bound(size))
+        constructed = entry.build_entry(app, scripts, digest, revision)
+        candidate, package_sha, package_size = _package_constructed_entry(app, private, before, version, constructed)
         component.publish_no_replace(candidate, output)
     return output, package_sha, package_size
