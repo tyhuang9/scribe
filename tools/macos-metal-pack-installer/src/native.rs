@@ -72,12 +72,22 @@ pub(crate) struct NativeOperations<'bytes> {
     copy_hook: Option<CopyHook>,
 }
 
-impl NativeOperations<'_> {
+impl<'bytes> NativeOperations<'bytes> {
+    #[cfg(not(feature = "installer-package-entry"))]
     pub(crate) fn production(candidate: &Path) -> Result<Self> {
         // Must precede candidate access and every protected-root mutation.
         crate::require_installer_root(unsafe { libc::geteuid() })?;
         let source = CopySource::Leased(Box::new(crate::admission::admit_source(candidate)?));
-        Ok(Self {
+        Ok(Self::new(source))
+    }
+    #[cfg(feature = "installer-package-entry")]
+    pub(crate) fn production_embedded() -> Result<Self> {
+        crate::require_installer_root(unsafe { libc::geteuid() })?;
+        let source = CopySource::Embedded(Box::new(crate::package_entry::compiled_source()?));
+        Ok(Self::new(source))
+    }
+    fn new(source: CopySource<'bytes>) -> Self {
+        Self {
             source,
             anchors: vec![],
             store_index: None,
@@ -94,7 +104,7 @@ impl NativeOperations<'_> {
             fixture_uid: 0,
             #[cfg(test)]
             copy_hook: None,
-        })
+        }
     }
 
     fn uid(&self) -> libc::uid_t {

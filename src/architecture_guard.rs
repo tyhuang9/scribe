@@ -1015,7 +1015,9 @@ fn macos_cpu_package_entry_is_compile_time_embedded_and_never_run_by_ci() {
         run.find("validate_invocation(").unwrap() < run.find("production_embedded()?").unwrap()
     );
     assert!(run.contains("libc::geteuid()"));
-    let context = named_function_bodies(&entry, "validate_invocation").join("\n");
+    let invocation = production_source(include_str!("macos_installer_invocation.rs"));
+    assert!(entry.contains("src/macos_installer_invocation.rs"));
+    let context = named_function_bodies(&invocation, "validate_invocation").join("\n");
     assert!(context.find("effective_uid != 0").unwrap() < context.find("arguments.len()").unwrap());
     assert!(context.contains("arguments[1] != \"/\""));
     assert!(context.contains("arguments[2] != \"/\""));
@@ -1539,6 +1541,53 @@ fn macos_metal_installer_copies_only_admitted_content_and_ci_never_installs() {
     assert!(admission.contains("pub(crate) enum CopySource<'bytes>"));
     assert!(admission.contains("verifier.authenticate_metadata(bytes[0], bytes[1])?"));
     assert!(admission.contains("copy.copy_entries() != source.entries"));
+    let package = production_source(include_str!(
+        "../tools/macos-metal-pack-installer/src/package_entry.rs"
+    ));
+    let snapshot = production_source(include_str!(
+        "../tools/macos-metal-pack-installer/src/package_snapshot.rs"
+    ));
+    let build = production_source(include_str!("../tools/macos-metal-pack-installer/build.rs"));
+    let package_run = named_function_bodies(&package, "run").join("\n");
+    assert!(
+        package_run.find("validate_invocation(").unwrap()
+            < package_run.find("production_embedded()?").unwrap()
+    );
+    let embedded_constructor = named_function_bodies(&native, "production_embedded").join("\n");
+    assert!(
+        embedded_constructor
+            .find("require_installer_root(")
+            .unwrap()
+            < embedded_constructor.find("compiled_source()?").unwrap()
+    );
+    assert!(package.contains("src/macos_installer_invocation.rs"));
+    assert!(package.contains("crate::admission::admit_embedded(["));
+    for name in [
+        "package-manifest.json",
+        "package-signature.json",
+        "package-worker.bin",
+    ] {
+        assert!(package.contains(name));
+    }
+    assert!(build.contains("CARGO_CFG_TARGET_ARCH"));
+    assert!(build.contains("package_snapshot::snapshot(&pack, &stage, &digest, &arch)"));
+    assert!(snapshot.contains(".take(expected.len() + 1)"));
+    assert!(snapshot.contains("Metal package snapshot readback mismatch"));
+    assert!(snapshot.contains("Cargo output") || build.contains("Cargo output is trusted"));
+    assert!(check.contains("package_expected=111"));
+    assert!(check.contains("\"$snapshot_count\" == 7"));
+    assert!(entry.contains("let result = package_entry::run();"));
+    for forbidden in [
+        "std::fs",
+        "std::process::Command",
+        "current_exe",
+        "std::env::var",
+        "--source-pack",
+        "--destination",
+        "Keychain",
+    ] {
+        assert!(!package.contains(forbidden));
+    }
     assert!(check.contains("--locked --offline"));
     assert!(check.contains("--all-targets -- -D warnings"));
     assert!(workflow.contains("bash scripts/verify-macos-metal-installer-source.sh"));
