@@ -7,6 +7,37 @@ signs anything, accesses a Keychain, updates security records, activates a pack,
 or changes Auto eligibility. Source checks never invoke the production mutation
 entry or touch the actual protected store.
 
+### Embedded copy-content source
+
+The transaction also supports a private embedded source adapter for the future
+authenticated native package entry. This is **copy-content support**, not an
+enabled package entry: build-time snapshotting, embedding and feature dispatch
+are a dependent source change. The existing filesystem factory remains the only
+current CLI route. There is no new command, path override or user installation
+step, and no bytes are staged into a temporary candidate tree to manufacture a
+filesystem lease.
+
+Both filesystem and embedded admission use the same bounded canonical signature,
+manifest and compatibility check. That check authenticates metadata **only**;
+it cannot prove payload correctness, a protected destination or execution
+authority. Filesystem admission still verifies its exact tree, every payload
+hash, retained handles and launch-time identity. Embedded admission additionally
+requires the compiled native release permit, exactly three nonempty bounded
+slots (manifest, exact signature envelope and worker), the signed worker size
+and hash, same-build compatibility and exact installed byte count. Production
+trust/release inputs are compiled, not supplied by a runtime argument.
+
+A closed leased/embedded source union provides retained file readers or cursors
+over immutable borrowed slices. The entire embedded source stays alive through
+the existing transaction; it grants no launch authority and creates no fake
+root or verified lease. Boundary rechecks hash all three original slots. The
+materialized protected tree is independently verified using the ordinary
+filesystem verifier and must equal every original copy-entry hash, including
+the signature envelope. Another valid, same-size envelope is not interchangeable.
+Protected ancestry, publication, collision, cleanup and confirmation rules are
+unchanged. Native fixtures exercise both sources without executing the
+production entry or writing the actual protected root.
+
 ## Current commands and authority
 
 `describe` validates and reports compiled release metadata. On macOS,
@@ -107,11 +138,12 @@ bash scripts/verify-macos-metal-installer-source.sh
 It checks formatting, strict Clippy, exact discovery, all tests, and release
 compile rejection of missing/malformed revision plus one valid synthetic
 revision. It runs offline, clears ambient release-document overrides, and never
-starts a production installer or worker. Expected totals are 52 on Windows,
-52 on Linux, and 90 on macOS, including 13/17/19 admission tests respectively.
+starts a production installer or worker. Expected totals are 58 on Windows,
+58 on Linux, and 100 on macOS, including 13/17/19 filesystem admission tests
+respectively and exactly six embedded-admission tests on every host.
 These include the reused production verifier/compatibility tests and Mac's
 shared read-only filesystem tests. Native discovery separately requires all
-16 Metal writer tests and eight ancestor-bootstrap tests.
+20 Metal writer tests (four embedded-source contracts) and eight ancestor-bootstrap tests.
 
 Fixtures use only an in-memory test key, private temporary directories, synthetic
 worker bytes and test binaries. Production trust rejects the fixture key. Tests

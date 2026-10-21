@@ -608,22 +608,8 @@ impl<'a> PackVerifier<'a> {
 
         // No inventory-controlled payload path is touched before the bounded
         // exact signed envelope authenticates successfully.
-        let signature: DetachedSignature = parse_canonical_json(&signature_bytes, "signature")?;
-        if signature.schema_version != PACK_SCHEMA_VERSION {
-            return Err(PackVerificationError::UnsupportedSchema);
-        }
-        let public_key = self
-            .trust_root
-            .public_key(&signature.key_id)
-            .ok_or(PackVerificationError::UnknownKey)?;
-        let signature_raw = decode_hex_exact(&signature.signature_hex, 64)
-            .ok_or(PackVerificationError::InvalidSignatureEncoding)?;
-        UnparsedPublicKey::new(&ED25519, public_key)
-            .verify(&manifest_bytes, &signature_raw)
-            .map_err(|_| PackVerificationError::BadSignature)?;
-
-        let manifest: PackManifest = parse_canonical_json(&manifest_bytes, "manifest")?;
-        let frozen_worker_approval = self.validate_manifest_with_approval(&manifest)?;
+        let (manifest, frozen_worker_approval) =
+            self.authenticate_metadata(&manifest_bytes, &signature_bytes)?;
         verify_exact_tree(root, pinned, &manifest.payload)?;
         let mut retained_files = verify_payload(root, pinned, &manifest.payload)?;
         retained_files.push(manifest_file);
@@ -665,6 +651,41 @@ impl<'a> PackVerifier<'a> {
             copy_entries,
             retained_files,
         ))
+    }
+
+    /// Authenticate bounded canonical metadata and compatibility ONLY. This
+    /// neither checks payload bytes nor grants filesystem/execution authority.
+    /// Filesystem admission must still verify its exact tree and retain handles;
+    /// an embedded consumer must independently bind every exact payload byte.
+    pub(crate) fn authenticate_metadata(
+        &self,
+        manifest_bytes: &[u8],
+        signature_bytes: &[u8],
+    ) -> Result<(PackManifest, Option<FrozenWorkerApproval>), PackVerificationError> {
+        if manifest_bytes.is_empty()
+            || manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES
+            || signature_bytes.is_empty()
+            || signature_bytes.len() as u64 > MAX_SIGNATURE_BYTES
+        {
+            return Err(PackVerificationError::EnvelopeTooLarge);
+        }
+        let signature: DetachedSignature = parse_canonical_json(signature_bytes, "signature")?;
+        if signature.schema_version != PACK_SCHEMA_VERSION {
+            return Err(PackVerificationError::UnsupportedSchema);
+        }
+        let public_key = self
+            .trust_root
+            .public_key(&signature.key_id)
+            .ok_or(PackVerificationError::UnknownKey)?;
+        let signature_raw = decode_hex_exact(&signature.signature_hex, 64)
+            .ok_or(PackVerificationError::InvalidSignatureEncoding)?;
+        UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(manifest_bytes, &signature_raw)
+            .map_err(|_| PackVerificationError::BadSignature)?;
+
+        let manifest: PackManifest = parse_canonical_json(manifest_bytes, "manifest")?;
+        let frozen_worker_approval = self.validate_manifest_with_approval(&manifest)?;
+        Ok((manifest, frozen_worker_approval))
     }
 
     /// Re-verifies the complete signed tree immediately before Stage 2's

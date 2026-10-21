@@ -12,15 +12,16 @@ listing="$(cargo test --locked --offline --manifest-path "$manifest" -- --list)"
 count="$(printf '%s\n' "$listing" | awk '/: test$/ { count++ } END { print count+0 }')"
 admission_count="$(printf '%s\n' "$listing" | awk '/^admission::tests::metal_admission_.*: test$/ { count++ } END { print count+0 }')"
 native_count="$(printf '%s\n' "$listing" | awk '/^native::tests::metal_native_.*: test$/ { count++ } END { print count+0 }')"
+embedded_count="$(printf '%s\n' "$listing" | awk '/^admission::tests::metal_embedded_.*: test$/ { count++ } END { print count+0 }')"
 bootstrap_count="$(printf '%s\n' "$listing" | awk '/^installer_bootstrap::tests::.*: test$/ { count++ } END { print count+0 }')"
 native_expected=0; bootstrap_expected=0
 case "$(uname -s)" in
-  Darwin) expected=90; admission_expected=19; native_expected=16; bootstrap_expected=8 ;;
-  Linux) expected=52; admission_expected=17 ;;
-  MINGW*|MSYS*|CYGWIN*) expected=52; admission_expected=13 ;;
+  Darwin) expected=100; admission_expected=19; native_expected=20; bootstrap_expected=8 ;;
+  Linux) expected=58; admission_expected=17 ;;
+  MINGW*|MSYS*|CYGWIN*) expected=58; admission_expected=13 ;;
   *) echo 'Unsupported Metal writer source-check host.' >&2; exit 1 ;;
 esac
-[[ "$count" == "$expected" && "$admission_count" == "$admission_expected" ]] || {
+[[ "$count" == "$expected" && "$admission_count" == "$admission_expected" && "$embedded_count" == 6 ]] || {
   echo "Metal writer test discovery mismatch: $count total, $admission_count admission." >&2
   exit 1
 }

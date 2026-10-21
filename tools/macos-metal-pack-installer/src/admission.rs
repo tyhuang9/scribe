@@ -1,6 +1,8 @@
 //! Content admission only: no filesystem protection or installation authority.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
+use std::io::{self, Cursor, Read};
 
 use crate::manifest::{self, PackBackend, PackVerifier, PinnedPackRoot, VerifiedPackLease};
 #[cfg(any(target_os = "macos", test))]
@@ -139,6 +141,196 @@ impl MetalReleasePermit {
                 .iter()
                 .try_fold(0u64, |sum, file| sum.checked_add(file.size_bytes))
                 == Some(entry.installed_size_bytes)
+    }
+
+    fn matches_embedded(
+        &self,
+        pack: &manifest::PackManifest,
+        files: &[manifest::VerifiedCopyEntry; 3],
+    ) -> bool {
+        let entry = &self.entry;
+        pack.pack_id == entry.pack_id
+            && pack.pack_version == entry.pack_version
+            && pack.pack_digest == entry.pack_digest
+            && pack.security_epoch == entry.security_epoch
+            && pack.runtime_abi_version == entry.runtime_abi_version
+            && pack.backend == entry.backend
+            && pack.provider == entry.provider
+            && pack.target_os == entry.target_os
+            && pack.target_arch == entry.target_arch
+            && pack.worker_path == entry.worker_relative_path
+            && files
+                .iter()
+                .try_fold(0u64, |sum, file| sum.checked_add(file.size_bytes))
+                == Some(entry.installed_size_bytes)
+    }
+}
+
+/// Copy-content authority only. No fabricated filesystem lease, root, temporary
+/// candidate tree or executable authority. References remain immutable/alive
+/// for the complete transaction; all three exact slot identities are retained.
+pub(crate) struct EmbeddedSource<'bytes> {
+    permit: MetalReleasePermit,
+    bytes: [&'bytes [u8]; 3],
+    entries: [manifest::VerifiedCopyEntry; 3],
+    verifier: PackVerifier<'static>,
+}
+
+impl<'bytes> EmbeddedSource<'bytes> {
+    fn admit(
+        permit: MetalReleasePermit,
+        bytes: [&'bytes [u8]; 3],
+        verifier: PackVerifier<'static>,
+    ) -> Result<Self> {
+        // Closed array, before hashing any potentially large worker input.
+        for slot in FileSlot::ALL {
+            validate_embedded_length(slot, bytes[slot.index()].len() as u64)?;
+        }
+        let (pack, approval) = verifier.authenticate_metadata(bytes[0], bytes[1])?;
+        if approval.is_some() || pack.payload.len() != 1 || pack.payload[0].path != WORKER {
+            bail!("embedded Metal requires the exact same-build single-worker inventory");
+        }
+        let entries = FileSlot::ALL.map(|slot| manifest::VerifiedCopyEntry {
+            path: slot.path().to_owned(),
+            size_bytes: bytes[slot.index()].len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes[slot.index()])),
+        });
+        if pack.payload[0].size_bytes != entries[2].size_bytes
+            || pack.payload[0].sha256 != entries[2].sha256
+            || !permit.matches_embedded(&pack, &entries)
+        {
+            bail!("embedded Metal bytes differ from the signed inventory or release permit");
+        }
+        Ok(Self {
+            permit,
+            bytes,
+            entries,
+            verifier,
+        })
+    }
+
+    fn reverify(&self) -> Result<()> {
+        // Immutable Rust slices cannot be replaced through a runtime path. Still
+        // rehash at transaction boundaries, also covering copied metadata bytes.
+        for slot in FileSlot::ALL {
+            let mut input = Cursor::new(self.bytes[slot.index()]);
+            let entry = &self.entries[slot.index()];
+            crate::installer_transaction::verify_bytes(
+                &mut input,
+                entry.size_bytes,
+                &entry.sha256,
+                slot.maximum(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_embedded_length(slot: FileSlot, length: u64) -> Result<()> {
+    if length == 0 || length > slot.maximum() {
+        bail!("embedded Metal slot violates its byte limit");
+    }
+    Ok(())
+}
+
+/// Future compiled-entry caller supplies only its embedded slices. Release and
+/// trust are compiled here, never supplied by a runtime argument/environment.
+#[allow(
+    dead_code,
+    reason = "package-entry embedding/dispatch is a dependent source unit"
+)]
+pub(crate) fn admit_embedded(bytes: [&[u8]; 3]) -> Result<EmbeddedSource<'_>> {
+    let permit = MetalReleasePermit::for_native_release(compiled_release()?)?;
+    EmbeddedSource::admit(
+        permit,
+        bytes,
+        PackVerifier::new(
+            &manifest::ProductionTrustRoot,
+            manifest::Compatibility {
+                target_os: "macos",
+                ..manifest::Compatibility::current(&[PackBackend::Metal])
+            },
+        ),
+    )
+}
+
+/// A closed source union, not a caller-provided reader/trust-policy callback.
+pub(crate) enum CopySource<'bytes> {
+    Leased(Box<AdmittedSource<'static>>),
+    #[allow(
+        dead_code,
+        reason = "constructed by private tests until package-entry dispatch is added"
+    )]
+    Embedded(Box<EmbeddedSource<'bytes>>),
+}
+
+pub(crate) enum CopyReader<'bytes> {
+    File(std::fs::File),
+    Embedded(Cursor<&'bytes [u8]>),
+}
+impl Read for CopyReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buffer),
+            Self::Embedded(bytes) => bytes.read(buffer),
+        }
+    }
+}
+
+impl CopySource<'_> {
+    pub(crate) fn destination_components(&self) -> [&str; 3] {
+        match self {
+            Self::Leased(source) => source.destination_components(),
+            Self::Embedded(source) => {
+                let entry = &source.permit.entry;
+                [
+                    entry.pack_id.as_str(),
+                    entry.pack_version.as_str(),
+                    &entry.pack_digest,
+                ]
+            }
+        }
+    }
+    pub(crate) fn expected(&self, slot: FileSlot) -> Result<&manifest::VerifiedCopyEntry> {
+        match self {
+            Self::Leased(source) => source.expected(slot),
+            Self::Embedded(source) => Ok(&source.entries[slot.index()]),
+        }
+    }
+    pub(crate) fn open_for_copy(
+        &self,
+        slot: FileSlot,
+    ) -> Result<(&manifest::VerifiedCopyEntry, CopyReader<'_>)> {
+        match self {
+            Self::Leased(source) => {
+                let (entry, file) = source.open_for_copy(slot)?;
+                Ok((entry, CopyReader::File(file)))
+            }
+            Self::Embedded(source) => Ok((
+                &source.entries[slot.index()],
+                CopyReader::Embedded(Cursor::new(source.bytes[slot.index()])),
+            )),
+        }
+    }
+    pub(crate) fn reverify(&self) -> Result<()> {
+        match self {
+            Self::Leased(source) => source.reverify(),
+            Self::Embedded(source) => source.reverify(),
+        }
+    }
+    pub(crate) fn verify_materialized(&self, pinned: PinnedPackRoot) -> Result<VerifiedPackLease> {
+        match self {
+            Self::Leased(source) => source.verify_materialized(pinned),
+            Self::Embedded(source) => {
+                source.reverify()?;
+                let copy = source.verifier.verify_pinned(pinned)?;
+                if !source.permit.matches(&copy) || copy.copy_entries() != source.entries {
+                    bail!("materialized Metal copy differs from the exact embedded slots");
+                }
+                source.reverify()?;
+                Ok(copy)
+            }
+        }
     }
 }
 
