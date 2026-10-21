@@ -1229,6 +1229,69 @@ fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
 }
 
 #[test]
+fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entries() {
+    let source = include_str!("../build_support/macos_cpu_pkg.py");
+    let tests = include_str!("../build_support/test_macos_cpu_pkg.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let build = &source[source.find("def build_component(").unwrap()..];
+    assert!(build.find("os.geteuid() != 0").unwrap() < build.find("app.is_dir()").unwrap());
+    for required in [
+        "component.validate_identity(digest, revision)",
+        "component.cpu_app_input_snapshot(app)",
+        "component.verify_cpu_app(app)",
+        "entry.build_entry(app, scripts, digest, revision)",
+        "with os.scandir(scripts) as inventory:",
+        "component.hash_file(operation, entry.MAX_ENTRY) == (sha, size)",
+        "component.fingerprint(operation.lstat()) == identity",
+        "\"/usr/bin/pkgbuild\", \"--nopayload\", \"--scripts\"",
+        "environment={**component.probe_environment(), \"TMPDIR\": str(temporary)}",
+        "_inspect_fresh(candidate, sha, size, version)",
+        "component.publish_no_replace(candidate, output)",
+    ] {
+        assert!(
+            build.contains(required),
+            "CPU package author lost {required}"
+        );
+    }
+    assert_eq!(build.matches("component.capture(").count(), 1);
+    for required in [
+        "CHUNK = 65536",
+        "decoder.decompress(pending, CHUNK)",
+        "digest.hexdigest() == entry_sha",
+        "heap + cursor == before.st_size",
+        "hashlib.sha1(compressed_toc, usedforsecurity=False)",
+        "stored_digest.hexdigest() == archived_sha",
+        "extracted_digest.hexdigest() == extracted_sha",
+    ] {
+        assert!(
+            source.contains(required),
+            "CPU package inspection lost {required}"
+        );
+    }
+    for forbidden in [
+        "__main__",
+        "argparse",
+        "subprocess",
+        "--expand",
+        "--sign",
+        "productbuild",
+        "/usr/sbin/installer",
+        "sudo ",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "CPU package author gained {forbidden}"
+        );
+    }
+    assert!(tests.contains("expected = 27 + (2 if os.name == \"posix\" else 0)"));
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg.py"));
+    assert_eq!(
+        workflow.matches("build_support/*macos_cpu_pkg.py").count(),
+        2
+    );
+}
+
+#[test]
 fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
     let source =
         include_str!("../build_support/native_macos_cpu_pkg_entry.py").replace("\r\n", "\n");
