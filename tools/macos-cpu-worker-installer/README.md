@@ -310,6 +310,18 @@ neither limits queue delay. Two additional job startups and the both-architectur
 barrier can increase total workflow time; this is earlier report availability,
 not a promise of faster full CI or package/installation acceptance.
 
+Both preflight and structural matrices use explicit `macos-15` for Apple Silicon
+and `macos-15-intel` for Intel. The separately gated official job's source also
+uses `macos-15`; changing its runner does not dispatch it or authorize signing.
+GitHub's [macOS 14 retirement notice](https://github.com/actions/runner-images/issues/13518)
+announces retirement on November 2, 2026 and warns of longer queues during
+deprecation. This migration addresses that documented runner dependency, not a
+proven cause of any particular queue delay or a promise of faster scheduling.
+It does not change deployment target 13.0, job dependencies, tests, artifacts,
+permissions or signing gates. Review fresh expanded profiles and full native
+results on the new image; old-image success is historical evidence, not new-image
+acceptance or proof of runtime compatibility on older macOS versions.
+
 Only this freshly generated unsigned fixture is read, entirely in bounded memory.
 The probe has no archive/path/options input and never extracts an archive. It
 reuses the existing private workspace and bounded process/reaping helper, rejects

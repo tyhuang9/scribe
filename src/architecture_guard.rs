@@ -1466,8 +1466,6 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "timeout-minutes: 10",
         "timeout-minutes: 2",
         "fail-fast: false",
-        "runner: macos-15-intel\n            arch: x86_64",
-        "runner: macos-14\n            arch: aarch64",
         "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
         "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
         "python-version: '3.13'",
@@ -1481,6 +1479,20 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         assert!(!profile_job.contains(forbidden));
         assert!(!structural_job.contains(forbidden));
     }
+    for job in [profile_job, structural_job] {
+        assert_eq!(job.matches("- runner:").count(), 2);
+        assert!(job.contains("runner: macos-15-intel\n            arch: x86_64"));
+        assert!(job.contains("runner: macos-15\n            arch: aarch64"));
+        assert_eq!(job.matches("runs-on: ${{ matrix.runner }}").count(), 1);
+    }
+    assert!(!workflow.contains("macos-14"));
+    assert!(!workflow.contains("macos-latest"));
+    assert!(official_job.contains("\n    runs-on: macos-15\n"));
+    assert!(official_job.contains("\n    environment: macos-release\n"));
+    assert!(official_job.contains(
+        "if: github.event_name == 'workflow_dispatch' && inputs.notarize == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+    ));
+    assert!(workflow.contains("MACOSX_DEPLOYMENT_TARGET=13.0"));
     for forbidden in [
         "cargo ",
         "codesign",
