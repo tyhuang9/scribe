@@ -51,6 +51,7 @@ TOOL_OPERATIONS = frozenset({
     "entry-build-arm64", "entry-build-x86_64", "entry-combine",
     "metal-author-build", "metal-content-verification",
     "metal-entry-build-arm64", "metal-entry-build-x86_64", "metal-entry-combine",
+    "cpu-component-pkg-build",
 })
 
 

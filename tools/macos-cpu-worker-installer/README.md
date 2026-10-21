@@ -381,6 +381,62 @@ Installer binary execution and install/update/removal/rollback remain separate
 gates. Portable checks do not establish native observations; review completed
 preflight reports separately from full structural results.
 
+### Internal unsigned CPU component package author
+
+`build_support/macos_cpu_pkg.py` adds an internal, unprivileged constructor for
+the CPU-only app admitted by the existing verifier. It is not a CLI, arbitrary
+archive inspector or installation entry. It calls the existing fresh universal
+CPU entry constructor into a private, exact one-file `scripts/postinstall`
+directory, retains the measured entry SHA-256/size/node identity, then invokes
+only the absolute system `pkgbuild --nopayload` with a source-fixed identifier,
+the verified app version and install location `/`. It never executes that entry
+or a worker, signs anything, installs, accesses keys, or accepts GPU-positive apps
+through the CPU-only verifier.
+
+Both expanded format observations have been reviewed: Intel on `macos-15-intel`
+and Apple Silicon on `macos-15`. They establish the narrow outer members and ODC
+record layout, not every PackageInfo attribute or native author acceptance. The
+constructor's explicit PackageInfo policy therefore rejects unqualified fields,
+references and operations. Its synthetic positive fixtures are not claimed to be
+the full native PackageInfo output. An unsupported native construct must be
+investigated and reviewed before extending that policy; it must not be silently
+accepted as an inferred default. Current-head CI readiness remains a separate
+gate from format-design observations.
+
+The private inspector reads only this invocation's fresh, regular output. The
+package size is bounded relative to the measured entry; all file reads and
+decompressor output calls are at most 64 KiB, without loading the potentially
+over-1-GiB entry into memory. Metadata has independent 64-KiB bounds. It checks
+the XAR header, exact two-member inventory, complete nonoverlapping heap coverage,
+complete bounded compression streams, declared sizes and actual container
+checksums. Apple's [XAR writer](https://github.com/apple-oss-distributions/xar/blob/main/xar/lib/archive.c)
+hashes the **compressed** TOC and stores its SHA-1 in the heap; its
+[member hashing implementation](https://github.com/apple-oss-distributions/xar/blob/main/xar/lib/hash.c)
+distinguishes archived and extracted checksums. These SHA-1 checks establish only
+format integrity, never project or installer trust.
+
+The Scripts member must contain exactly one matching regular `./postinstall`
+ODC record (optional observed `.` directory, exact modes/link counts), one trailer
+and bounded zero padding, with no extra actions, aliases or links. Every entry
+byte is streamed into an independent SHA-256 comparison against the retained
+entry. All compression input is consumed, including after the trailer; truncated,
+concatenated or trailing streams reject. Nothing is extracted. The app snapshot
+and retained entry are rechecked before no-overwrite publication as
+`cpu-worker.pkg`, returning only an **unsigned, pre-sign** path/hash/size. Child
+cleanup uncertainty retains the owned stage; collision or ambiguous publication
+never removes an existing final output. Reviewed source/toolchain and non-hostile
+same-user/root writers remain assumptions, not a new hostile-author sandbox.
+
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 27 portable
+tests and two additional POSIX tests. Native tools and entry construction are
+mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
+chunk/size boundaries, mutations, archive/operation identity, malformed XML,
+range/checksum errors, truncation/tails, links, source replacement, collisions
+and uncertain cleanup. CI adds only this mocked source command and path filters;
+it does not invoke the new real package author or add an artifact. Actual native
+author acceptance, final entry signing/repackaging, package authentication,
+notarization, product composition/order and Installer execution remain unproven.
+
 ## Not yet established
 
 The enclosing installer must authenticate this executable and its compiled
