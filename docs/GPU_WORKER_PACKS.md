@@ -1261,6 +1261,26 @@ protected run, not evidence of Metal hardware or release qualification.
 
 The production authoring CLI accepts `--backend metal --target-os macos
 --target-arch <aarch64|x86_64>` and binds those facts in its signed manifest.
+Its read-only `verify-production-macos-metal --pack-root <path> --target-arch
+<aarch64|x86_64>` command authenticates either architecture's content without
+executing a worker, installer or architecture emulator. It uses only the
+compiled production public trust and ordinary pack verifier: canonical Ed25519
+metadata, protocol/ABI/build compatibility, minimum security epoch, exact tree
+and every payload hash. The requested architecture is mandatory and accepts
+only the two literal values; unknown options (including trust/key/signing,
+provider and output overrides) reject before input access.
+
+This is **point-in-time content evidence**, not a retained lease or authority
+to reopen, execute or install the descriptor's path later. Provider/fixed-layout
+policy, compiled release inclusion, frozen bytes, native Mach-O/code-signature
+inspection and protected installer admission remain independent requirements.
+No release-epoch/Keychain state is read or changed. Future universal-entry
+authoring must reverify the actual frozen inputs, not trust an earlier process
+exit or JSON descriptor. This command is not yet wired into package assembly.
+Its positive source fixtures use test-only trust; the production command rejects
+those keys. They do not establish successful production-signed Metal verification
+or native/hardware qualification. The existing CPU-only app verifier is unchanged.
+
 Non-empty packs still require compatible project signatures and the protected
 release inputs; the default build produces the canonical empty catalog.
 The checked-in macOS Auto manifests are both canonical zero-entry

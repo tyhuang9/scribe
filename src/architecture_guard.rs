@@ -2967,6 +2967,18 @@ fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
     assert!(author_manifest.contains("publish = false"));
     assert!(author_manifest.contains("path = \"src/main.rs\""));
     assert!(author_lock.contains("name = \"scribe-worker-pack-tool\""));
+    let author_production = production_source(author_entrypoint);
+    assert!(author_production.contains("Some(\"verify-production-macos-metal\")"));
+    assert!(
+        author_production
+            .contains("macos_metal_compatibility(required_utf8(options, \"--target-arch\")?)?")
+    );
+    assert!(
+        author_production
+            .contains("require_exact_options(options, &[\"--pack-root\", \"--target-arch\"])?")
+    );
+    assert!(author_production.contains("PackVerifier::new(&ProductionTrustRoot, compatibility)"));
+    assert!(author_production.contains("allowed_backends: &[PackBackend::Metal]"));
     for required in [
         "check-production-key",
         "--fixture-signing",
