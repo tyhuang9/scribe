@@ -1,7 +1,8 @@
-"""Dedicated hosted-Mac construction contract; NEVER execute the resulting entry.
+"""Dedicated hosted-Mac construction contract; NEVER execute the entry or PKG.
 
 This is a test driver, not a release/installer CLI. The completed CI app and
-reviewed toolchain are trusted inputs. No PKG, signing or output upload occurs.
+reviewed toolchain are trusted inputs. The unsigned PKG remains private; no
+signing, installation or output upload occurs.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import sys
 import tempfile
 
 import macos_cpu_component as component
+import macos_cpu_pkg as package
 import macos_cpu_pkg_entry as entry
 
 INPUTS = component.CPU_APP_INPUTS
@@ -22,19 +24,27 @@ def input_snapshot(app: Path) -> dict:
     return component.cpu_app_input_snapshot(app)
 
 
+def _only_postinstall(scripts: Path) -> bool:
+    with os.scandir(scripts) as inventory:
+        first, second = next(inventory, None), next(inventory, None)
+        return first is not None and first.name == "postinstall" and second is None
+
+
 def run_contract(app: Path, digest: str, revision: str) -> dict:
     component.require(sys.platform == "darwin", "native CPU construction contract requires macOS")
     component.require(os.geteuid() != 0, "native CPU construction contract must be unprivileged")
     component.validate_identity(digest, revision)
     component.require(app.is_dir() and not app.is_symlink(), "unsafe native contract app")
     app = app.resolve(strict=True)
-    component.verify_cpu_app(app)
+    version = component.verify_cpu_app(app)
     before = input_snapshot(app)
     component.require(before[INPUTS[0]][0] == digest, "native contract worker differs from frozen anchor")
     with component.private_workspace(Path(tempfile.gettempdir()), "scribe-native-cpu-entry-") as workspace:
-        output, returned_digest, returned_size = entry.build_entry(app, workspace, digest, revision)
-        component.require(output == workspace / "postinstall", "native entry published at the wrong path")
-        component.require(sorted(path.name for path in workspace.iterdir()) == ["postinstall"],
+        scripts = workspace / "scripts"
+        scripts.mkdir(mode=0o700)
+        output, returned_digest, returned_size = entry.build_entry(app, scripts, digest, revision)
+        component.require(output == scripts / "postinstall", "native entry published at the wrong path")
+        component.require(_only_postinstall(scripts),
                           "native construction left unexpected output")
         measured = component.hash_file(output, entry.MAX_ENTRY)
         component.require(measured == (returned_digest, returned_size), "native entry identity mismatch")
@@ -43,7 +53,7 @@ def run_contract(app: Path, digest: str, revision: str) -> dict:
         architectures = component.capture(["/usr/bin/lipo", str(output), "-archs"]).decode("ascii").split()
         component.require(sorted(architectures) == ["arm64", "x86_64"], "native entry is not exactly universal")
         try:
-            entry.build_entry(app, workspace, digest, revision)
+            entry.build_entry(app, scripts, digest, revision)
         except component.CleanupUncertain:
             raise
         except component.ComponentError as error:
@@ -53,10 +63,27 @@ def run_contract(app: Path, digest: str, revision: str) -> dict:
         component.require(component.hash_file(output, entry.MAX_ENTRY) == measured
                           and component.fingerprint(output.lstat()) == identity,
                           "native repeated construction changed the entry")
+        # Exercise the SAME packaging tail as build_component, on this retained
+        # entry. Do not introduce a second successful universal entry build.
+        candidate, package_digest, package_size = package._package_constructed_entry(
+            app, workspace, before, version, (output, returned_digest, returned_size))
+        component.require(candidate == workspace / "cpu-worker.pkg", "native package published at the wrong path")
+        package_bound = package._package_bound(returned_size)
+        component.require(component.hash_file(candidate, package_bound) == (package_digest, package_size),
+                          "native package identity mismatch")
+        package_identity = component.fingerprint(candidate.lstat())
+        component.require(component.hash_file(output, entry.MAX_ENTRY) == measured
+                          and component.fingerprint(output.lstat()) == identity
+                          and _only_postinstall(scripts),
+                          "native packaging changed the retained entry or scripts inventory")
         component.verify_cpu_app(app)
         component.require(input_snapshot(app) == before, "native construction changed application inputs")
+        component.require(component.hash_file(candidate, package_bound) == (package_digest, package_size)
+                          and component.fingerprint(candidate.lstat()) == package_identity,
+                          "native package changed during final admission")
         return {"constructed": True, "executed": False, "architectures": sorted(architectures),
-                "entry_size_bytes": returned_size, "worker_size_bytes": before[INPUTS[0]][1]}
+                "entry_size_bytes": returned_size, "worker_size_bytes": before[INPUTS[0]][1],
+                "package_constructed": True, "package_executed": False, "package_size_bytes": package_size}
 
 
 def main() -> int:
