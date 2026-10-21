@@ -1,0 +1,1 @@
+{"backend":"metal","target_os":"macos","target_arch":"aarch64","worker_path":"worker/scribe-inference-worker","payload":[{"path":"worker/scribe-inference-worker","size_bytes":30,"sha256":"3c20ca257bf8a95638030bd7c8137150eb2dd297dbc44d9063d1d5e814e7f65e"}]}

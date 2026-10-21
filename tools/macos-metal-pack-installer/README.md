@@ -9,12 +9,11 @@ entry or touch the actual protected store.
 
 ### Embedded copy-content source
 
-The transaction also supports a private embedded source adapter for the future
-authenticated native package entry. This is **copy-content support**, not an
-enabled package entry: build-time snapshotting, embedding and feature dispatch
-are a dependent source change. The existing filesystem factory remains the only
-current CLI route. There is no new command, path override or user installation
-step, and no bytes are staged into a temporary candidate tree to manufacture a
+The transaction supports a private embedded source adapter, now consumed by the
+separate default-off native package-entry feature described below. The default
+writer retains its filesystem CLI; package mode compiles that CLI and its
+production path-based source factory out. Neither mode adds an end-user install
+step. No bytes are staged into a temporary candidate tree to manufacture a
 filesystem lease.
 
 Both filesystem and embedded admission use the same bounded canonical signature,
@@ -160,6 +159,71 @@ driver, installed application, actual protected root, or private key is used.
 
 Windows/Linux checks are not native Mac or hardware acceptance. The existing
 Intel/ARM structural CI runs this same command without installing anything.
+
+## Dedicated native package entry (default off)
+
+`installer-package-entry` compiles a different entry mode for the future
+authenticated PKG's native operation executable. It embeds the exact manifest,
+signature envelope and native worker bytes, rather than opening candidate paths
+or launching siblings from a writable extraction tree. It is not assembled into
+a PKG, signed, installed or executed by this source work.
+
+The entry and CPU package entry share the installer-only invocation predicate
+and its four tests. Actual effective UID must be root, the package-context path
+must have the same bounded canonical spelling, and all destination/root arguments
+must be `/`. The context path is never opened. These checks restrict scope but
+**do not authenticate an Installer caller**; the authenticated package, Installer,
+root and reviewed compiler remain trusted. A second actual-UID check precedes
+`admit_embedded`, whose complete production-signature and compiled-release
+checks must pass before any protected-store access.
+
+Release feature compilation requires explicit build-only inputs:
+
+- `SCRIBE_BUILD_REVISION` (existing valid frozen revision).
+- `SCRIBE_GPU_PACK_CATALOG` and `SCRIBE_GPU_PACK_RELEASE_AUTHORITY` (absolute
+  regular inputs, with nonempty/positive-epoch build shape).
+- `SCRIBE_MACOS_METAL_PACKAGE_PACK` (one closed three-file source tree).
+- `SCRIBE_MACOS_METAL_PACKAGE_MANIFEST_SHA256` (independently frozen, lowercase
+  SHA-256 of the exact finalized manifest bytes).
+
+The snapshot helper rejects noncanonical/control-bearing paths, symlink/reparse
+ancestors, hard-linked/special files, Windows stream paths and extra inventory.
+Directory enumeration stops after the expected count plus one. It reads only
+the manifest (256 KiB), signature envelope (4 KiB) and worker (2 GiB) with
+nonempty bounds aligned by tests to the runtime limits. Copies are exclusive,
+synced, closed and independently reopened/hashed. The manifest must match its
+frozen SHA; the worker must match the manifest-declared size/hash. The manifest
+must claim Metal/macOS, one fixed worker path and **Cargo's target architecture**
+(`CARGO_CFG_TARGET_ARCH`, not the build host). Each eventual universal entry
+slice must therefore embed its own architecture's pack.
+
+All snapshots finish before generated outputs are published. Partial publication
+aborts compilation; no old-output fallback is permitted. Failed build stages may
+remain in Cargo's trusted output, never adopted as a successful input. The source
+toolchain/Cargo output and non-hostile same-user/root build assumption remain
+explicit; this is not a hostile same-UID build sandbox or root bootstrap.
+
+These are **structural and frozen-byte build checks only**. The small positive
+release-input shape check deliberately does not mirror runtime canonical release
+validation or authenticate a signature. The future author must independently
+verify finalized inputs before assembly. Runtime still runs the complete compiled
+release permit, production Ed25519 verification, compatibility and exact payload
+checks before touching protected ancestry. Debug source tests may compile empty
+slots, which can never pass that admission. No project trust override is added.
+
+The canonical source check also requires exactly 69 feature tests on
+Windows/Linux or 111 on Mac: four shared invocation tests, seven snapshot tests
+and the empty-compiled-source rejection, alongside existing admission/transaction
+tests. It checks ten invalid release-input cases and one compile-only positive.
+Its tiny checked-in ASCII fixtures are intentionally **not authentic packs**:
+their envelope and release documents cannot pass runtime admission. The positive
+does not execute or link an installer. Both explicit architecture claims are
+tested without mutating the test process environment. Mac's real embedded copy,
+collision and uncertain-cleanup fixtures still run independently.
+
+Actual native feature compilation/fixtures, authenticated package composition,
+Installer invocation, installation and cross-component update/rollback remain
+unverified until their own gates pass. No production entry is run in CI.
 
 ## Remaining boundaries, not implemented here
 

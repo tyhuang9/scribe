@@ -1,4 +1,5 @@
 //! Installer-owned copy-only source. No elevation, activation, or runtime caller.
+#[cfg(any(not(feature = "installer-package-entry"), target_os = "macos", test))]
 use anyhow::{Result, bail};
 
 #[cfg(target_os = "macos")]
@@ -46,12 +47,18 @@ mod admission;
 mod macos_worker_fs;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(feature = "installer-package-entry")]
+mod package_entry;
+#[cfg(all(test, feature = "installer-package-entry"))]
+mod package_snapshot;
 
+#[cfg(not(feature = "installer-package-entry"))]
 fn run() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     run_arguments(&arguments)
 }
 
+#[cfg(not(feature = "installer-package-entry"))]
 fn run_arguments(arguments: &[std::ffi::OsString]) -> Result<()> {
     if arguments == ["describe"] {
         let release = admission::compiled_release()?;
@@ -107,7 +114,11 @@ fn require_installer_root(effective_uid: u32) -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    #[cfg(feature = "installer-package-entry")]
+    let result = package_entry::run();
+    #[cfg(not(feature = "installer-package-entry"))]
+    let result = run();
+    if let Err(error) = result {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
@@ -116,6 +127,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(not(feature = "installer-package-entry"))]
     fn metal_admission_cli_rejects_invalid_install_and_runtime_authority_options() {
         for arguments in [
             vec![],

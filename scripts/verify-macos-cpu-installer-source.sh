@@ -45,7 +45,7 @@ echo 'CPU writer release authority: four rejection cases and valid compile passe
 cargo clippy --locked --offline --manifest-path "$manifest" --all-targets --features installer-package-entry -- -D warnings
 package_listing="$(cargo test --locked --offline --manifest-path "$manifest" --features installer-package-entry -- --list)"
 package_count="$(printf '%s\n' "$package_listing" | awk '/: test$/ { count++ } END { print count+0 }')"
-entry_count="$(printf '%s\n' "$package_listing" | awk '/^package_entry::tests::.*: test$/ { count++ } END { print count+0 }')"
+entry_count="$(printf '%s\n' "$package_listing" | awk '/^package_entry::invocation::tests::.*: test$/ { count++ } END { print count+0 }')"
 native_count="$(printf '%s\n' "$package_listing" | awk '/^native::tests::package_native_.*: test$/ { count++ } END { print count+0 }')"
 native_expected=0
 case "$(uname -s)" in

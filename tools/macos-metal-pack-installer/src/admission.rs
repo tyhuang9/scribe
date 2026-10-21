@@ -1,11 +1,15 @@
 //! Content admission only: no filesystem protection or installation authority.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use anyhow::{Context, Result, bail};
+#[cfg(any(feature = "installer-package-entry", test))]
 use sha2::{Digest, Sha256};
 use std::io::{self, Cursor, Read};
 
 use crate::manifest::{self, PackBackend, PackVerifier, PinnedPackRoot, VerifiedPackLease};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    all(target_os = "macos", not(feature = "installer-package-entry")),
+    test
+))]
 use crate::manifest::{Compatibility, ProductionTrustRoot};
 use crate::release_authority::{
     PackReleaseAuthority, PackReleaseAuthorityEntry, ReleaseBuildIdentity,
@@ -143,6 +147,7 @@ impl MetalReleasePermit {
                 == Some(entry.installed_size_bytes)
     }
 
+    #[cfg(any(feature = "installer-package-entry", test))]
     fn matches_embedded(
         &self,
         pack: &manifest::PackManifest,
@@ -177,6 +182,7 @@ pub(crate) struct EmbeddedSource<'bytes> {
 }
 
 impl<'bytes> EmbeddedSource<'bytes> {
+    #[cfg(any(feature = "installer-package-entry", test))]
     fn admit(
         permit: MetalReleasePermit,
         bytes: [&'bytes [u8]; 3],
@@ -226,6 +232,7 @@ impl<'bytes> EmbeddedSource<'bytes> {
     }
 }
 
+#[cfg(any(feature = "installer-package-entry", test))]
 fn validate_embedded_length(slot: FileSlot, length: u64) -> Result<()> {
     if length == 0 || length > slot.maximum() {
         bail!("embedded Metal slot violates its byte limit");
@@ -235,10 +242,7 @@ fn validate_embedded_length(slot: FileSlot, length: u64) -> Result<()> {
 
 /// Future compiled-entry caller supplies only its embedded slices. Release and
 /// trust are compiled here, never supplied by a runtime argument/environment.
-#[allow(
-    dead_code,
-    reason = "package-entry embedding/dispatch is a dependent source unit"
-)]
+#[cfg(any(feature = "installer-package-entry", test))]
 pub(crate) fn admit_embedded(bytes: [&[u8]; 3]) -> Result<EmbeddedSource<'_>> {
     let permit = MetalReleasePermit::for_native_release(compiled_release()?)?;
     EmbeddedSource::admit(
@@ -256,21 +260,24 @@ pub(crate) fn admit_embedded(bytes: [&[u8]; 3]) -> Result<EmbeddedSource<'_>> {
 
 /// A closed source union, not a caller-provided reader/trust-policy callback.
 pub(crate) enum CopySource<'bytes> {
+    #[cfg(any(not(feature = "installer-package-entry"), test))]
     Leased(Box<AdmittedSource<'static>>),
     #[allow(
         dead_code,
-        reason = "constructed by private tests until package-entry dispatch is added"
+        reason = "only the compiled package entry or private fixtures construct embedded content"
     )]
     Embedded(Box<EmbeddedSource<'bytes>>),
 }
 
 pub(crate) enum CopyReader<'bytes> {
+    #[cfg(any(not(feature = "installer-package-entry"), test))]
     File(std::fs::File),
     Embedded(Cursor<&'bytes [u8]>),
 }
 impl Read for CopyReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
             Self::File(file) => file.read(buffer),
             Self::Embedded(bytes) => bytes.read(buffer),
         }
@@ -280,6 +287,7 @@ impl Read for CopyReader<'_> {
 impl CopySource<'_> {
     pub(crate) fn destination_components(&self) -> [&str; 3] {
         match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
             Self::Leased(source) => source.destination_components(),
             Self::Embedded(source) => {
                 let entry = &source.permit.entry;
@@ -293,6 +301,7 @@ impl CopySource<'_> {
     }
     pub(crate) fn expected(&self, slot: FileSlot) -> Result<&manifest::VerifiedCopyEntry> {
         match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
             Self::Leased(source) => source.expected(slot),
             Self::Embedded(source) => Ok(&source.entries[slot.index()]),
         }
@@ -302,6 +311,7 @@ impl CopySource<'_> {
         slot: FileSlot,
     ) -> Result<(&manifest::VerifiedCopyEntry, CopyReader<'_>)> {
         match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
             Self::Leased(source) => {
                 let (entry, file) = source.open_for_copy(slot)?;
                 Ok((entry, CopyReader::File(file)))
@@ -314,12 +324,14 @@ impl CopySource<'_> {
     }
     pub(crate) fn reverify(&self) -> Result<()> {
         match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
             Self::Leased(source) => source.reverify(),
             Self::Embedded(source) => source.reverify(),
         }
     }
     pub(crate) fn verify_materialized(&self, pinned: PinnedPackRoot) -> Result<VerifiedPackLease> {
         match self {
+            #[cfg(any(not(feature = "installer-package-entry"), test))]
             Self::Leased(source) => source.verify_materialized(pinned),
             Self::Embedded(source) => {
                 source.reverify()?;
@@ -337,12 +349,14 @@ impl CopySource<'_> {
 /// Retained content authority, not a path/boolean or protected launch approval.
 /// Future copying must keep this alive, reverify, copy through lease handles,
 /// hash readback independently, then admit the protected destination separately.
+#[cfg(any(not(feature = "installer-package-entry"), test))]
 pub(crate) struct AdmittedSource<'a> {
     permit: MetalReleasePermit,
     lease: VerifiedPackLease,
     verifier: PackVerifier<'a>,
 }
 
+#[cfg(any(not(feature = "installer-package-entry"), test))]
 impl AdmittedSource<'_> {
     pub(crate) fn destination_components(&self) -> [&str; 3] {
         let entry = &self.permit.entry;
@@ -396,6 +410,7 @@ impl AdmittedSource<'_> {
     }
 }
 
+#[cfg(any(not(feature = "installer-package-entry"), test))]
 fn admit_pinned<'a>(
     permit: MetalReleasePermit,
     pinned: PinnedPackRoot,
@@ -412,7 +427,10 @@ fn admit_pinned<'a>(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(
+    target_os = "macos",
+    any(not(feature = "installer-package-entry"), test)
+))]
 pub(crate) fn admit_source(candidate: &std::path::Path) -> Result<AdmittedSource<'static>> {
     // No candidate opening when the compiled release is empty/default-deny.
     let permit = MetalReleasePermit::for_native_release(compiled_release()?)?;
@@ -427,7 +445,10 @@ pub(crate) fn admit_source(candidate: &std::path::Path) -> Result<AdmittedSource
     admit_pinned(permit, pinned, verifier)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(
+    target_os = "macos",
+    any(not(feature = "installer-package-entry"), test)
+))]
 fn pin_candidate(candidate: &std::path::Path) -> Result<PinnedPackRoot> {
     use crate::macos_worker_fs::{NodeKind, open_absolute_directory, openat_node};
     use std::os::fd::AsRawFd;
