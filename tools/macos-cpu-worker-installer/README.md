@@ -294,7 +294,7 @@ execution, installation or release qualification.
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-18 portable tests, plus one native test on each Mac lane. That native test uses
+28 portable tests, plus one native test on each Mac lane. That native test uses
 the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 `postinstall`, with no interpreter or program content. The file has executable
 mode only to model an operation archive; **nothing executes it**. Neither the
@@ -317,13 +317,38 @@ root, and invokes only absolute system `pkgbuild` and `xar -tf` paths. Its own
 temporary package and source are removed after confirmed child cleanup; uncertain
 cleanup retains that private workspace. Nothing is uploaded as an artifact.
 
-`SCRIBE_NATIVE_CPU_PKG_PROFILE` in completed native CI logs records a path-free
-observation: actual outer member inventory, modes, encodings/checksum labels,
-bounded header/TOC/member sizes, fixed PackageInfo identity/operation reference
-and decoded Scripts prefix. The header layout follows [Apple's XAR source](https://github.com/apple-oss-distributions/xar/blob/main/xar/include/xar.h.in).
-No CPIO dialect, optional Bom/Payload member or native tool compatibility is
-presumed from synthetic fixtures. Review both actual Mac reports before freezing
-the supported PKG profile and implementing full bounded Scripts parsing.
+`SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **2** in completed native CI logs records
+actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
+fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
+The XAR header layout follows [Apple's source](https://github.com/apple-oss-distributions/xar/blob/main/xar/include/xar.h.in).
+Both basic Intel/ARM reports established the ODC prefix; complete native record
+metadata still requires the expanded reports, not synthetic assumptions.
+
+The private ODC decoder follows [Apple's CPIO format documentation](https://github.com/apple-oss-distributions/libarchive/blob/a03e74621efd47371aaf72468d24711aa763323b/libarchive/libarchive/cpio.5):
+76-byte fixed ASCII-octal headers, NUL-inclusive name lengths and **no** name/data
+alignment padding. It bounds the decoded archive to 64 KiB, at most 16 records
+plus one trailer, and each name to 256 bytes including NUL. Every numeric field,
+name terminator and complete data range is checked before slicing. Missing or
+truncated trailers, extra archives and nonzero post-trailer data reject. Terminal
+zero-byte padding is counted without presuming a 512-byte block convention.
+
+A separate fixed-fixture check requires exactly one regular `postinstall` or
+`./postinstall` record containing exactly the inert fixture bytes, optionally
+one empty `.` or `./` directory, with no extras or duplicate aliases. Actual order,
+root spelling, modes, link counts, offsets and trailer metadata are observed.
+Zero/multiple link counts and permission flags are **not** accepted as safe or
+frozen into a shipping profile; no links are resolved and no data is shared or
+extracted. Only closed fixture names/types and bounded numeric observations are
+reported. Raw payload prefixes (which can expose device/inode fields), identities,
+owners, timestamps, data and hashes are omitted. This private report-schema change
+does not change a worker protocol, pack manifest, runtime or installer authority.
+
+Portable fixtures now encode valid ODC independently, with a literal golden
+header, every-field malformed-octal and truncation coverage, odd name/data sizes,
+root/order variants, aliases/types/partial payloads, link metadata, record/length
+bounds and trailer/tail cases. Preserve both actual expanded native reports
+before freezing a real PKG author/validator profile; no optional Bom/Payload
+member or native tool compatibility is inferred from these synthetic fixtures.
 
 Outer member `mode` is observation metadata: an absent field is reported as JSON
 `null`, never defaulted to permissions or treated as safe/executable. A present
@@ -335,9 +360,10 @@ installation authority. Portable fixtures cover missing modes independently and
 together. A native failure at mode lookup alone cannot distinguish missing from
 duplicate/nested metadata; only the corrected native report can establish that.
 
-This probe does not validate checksums, signatures, exact operation inventory or
-package authenticity. It is not a reusable arbitrary-archive inspector, trusted
-installer, installation test or shipping format validator. Actual package entry
+This probe validates only its fixed fixture's Scripts inventory, not checksums,
+signatures, shipping-package operations or package authenticity. It is not a
+reusable arbitrary-archive inspector, trusted installer, installation test or
+shipping format validator. Actual package entry
 composition, full hostile-archive validation, signed-package authenticity,
 Installer binary execution and install/update/removal/rollback remain separate
 gates. Portable checks do not establish native observations; review completed

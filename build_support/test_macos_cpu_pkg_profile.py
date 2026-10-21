@@ -15,12 +15,28 @@ import zlib
 import macos_cpu_pkg_profile as profile
 
 
+def odc_record(name=b"./postinstall", body=profile.FIXTURE, *, mode=0o100755, links=1,
+               dev=1, ino=2, uid=3, gid=4, rdev=0, mtime=5):
+    """Independent test encoder: explicit POSIX ODC widths, not production constants."""
+    numbers = ((dev, 6), (ino, 6), (mode, 6), (uid, 6), (gid, 6), (links, 6), (rdev, 6),
+               (mtime, 11), (len(name) + 1, 6), (len(body), 11))
+    header = b"070707" + b"".join(format(value, f"0{width}o").encode("ascii") for value, width in numbers)
+    if len(header) != 76:
+        raise ValueError("test ODC field does not fit its width")
+    return header + name + b"\0" + body
+
+
+def odc_archive(*records, padding=0):
+    return (b"".join(records or (odc_record(),))
+            + odc_record(b"TRAILER!!!", b"", mode=0) + b"\0" * padding)
+
+
 def synthetic_package(*, encoding="application/octet-stream", inner="gzip", mutate=None, scripts=None):
-    """Synthetic observation bytes, NOT an authentic PKG or a valid CPIO archive."""
+    """Synthetic unsigned XAR envelope containing independently encoded valid ODC."""
     info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
             'install-location="/"><scripts><postinstall file="./postinstall"/>'
             '</scripts></pkg-info>').encode()
-    archive = b"070707synthetic prefix only\0" + profile.FIXTURE if scripts is None else scripts
+    archive = odc_archive() if scripts is None else scripts
     encoded_archive = {"gzip": gzip.compress, "zlib": zlib.compress, "none": lambda value: value}[inner](archive)
     payloads = {"PackageInfo": info, "Scripts": encoded_archive}
     root = ET.Element("xar")
@@ -48,12 +64,144 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["fixture_occurrences"], 1)
-        self.assertEqual(report["scripts_prefix_hex"], b"070707synthetic ".hex())
+        self.assertEqual(report["schema_version"], 2)
+        self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
+        self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
         self.assertEqual(report["postinstall_reference"], "./postinstall")
         self.assertNotIn("synthetic", json.dumps(report))
         self.assertNotIn("trusted", report)
+
+    def test_odc_literal_header_and_unaligned_records(self):
+        # This literal catches a shared encoder/decoder field-layout mistake.
+        header = (b"070707" b"000001" b"000002" b"100755" b"000003" b"000004" b"000001" b"000000"
+                  b"00000000005" b"000016" b"00000000003")
+        self.assertEqual(len(header), 76)
+        self.assertEqual(odc_record(body=b"abc"), header + b"./postinstall\0abc")
+        records, trailer, padding = profile._decode_odc(odc_archive(header + b"./postinstall\0abc"))
+        self.assertEqual((records[0]["name"], records[0]["mode"], records[0]["links"], records[0]["data"]),
+                         (b"./postinstall", 0o100755, 1, b"abc"))
+        self.assertEqual((records[0]["header_offset"], records[0]["data_offset"], records[0]["end_offset"]),
+                         (0, 90, 93))
+        self.assertEqual((trailer["header_offset"], padding), (93, 0))
+        for name, body in [(b"a", b"x"), (b"ab", b"xy"), (b"abc", b"xyz")]:
+            item = odc_record(name, body)
+            entries, end, _ = profile._decode_odc(odc_archive(item))
+            self.assertEqual(entries[0]["data"], body)
+            self.assertEqual(end["header_offset"], len(item))
+
+    def test_odc_every_numeric_field_rejects_non_octal(self):
+        original = odc_archive()
+        for offset, width in [(6, 6), (12, 6), (18, 6), (24, 6), (30, 6), (36, 6),
+                              (42, 6), (48, 11), (59, 6), (65, 11)]:
+            for byte in (b"8", b"9", b"g", b"+", b"-", b" ", b"\0", b"\xff"):
+                for position in (offset, offset + width - 1):
+                    value = original[:position] + byte + original[position + 1:]
+                    with self.subTest(position=position, byte=byte), \
+                         self.assertRaises(profile.component.ComponentError):
+                        profile._decode_odc(value)
+
+    def test_odc_bounds_and_wrong_dialects_reject(self):
+        archive = odc_archive()
+        for value in (None, bytearray(archive), b"", b"x" * (profile.MAX_MEMBER + 1),
+                      b"070701" + archive[6:], b"070702" + archive[6:], b"x" + archive):
+            with self.subTest(kind=type(value).__name__), self.assertRaises(profile.component.ComponentError):
+                profile._decode_odc(value)
+        for offset, width, number in [(59, 6, 0), (59, 6, 1), (59, 6, 257),
+                                      (65, 11, profile.MAX_MEMBER + 1), (65, 11, 0o77777777777)]:
+            value = archive[:offset] + format(number, f"0{width}o").encode() + archive[offset + width:]
+            with self.subTest(offset=offset, number=number), self.assertRaises(profile.component.ComponentError):
+                profile._decode_odc(value)
+        largest = odc_archive(padding=profile.MAX_MEMBER - len(archive))
+        self.assertEqual(len(largest), profile.MAX_MEMBER)
+        self.assertEqual(profile._decode_odc(largest)[2], profile.MAX_MEMBER - len(archive))
+
+    def test_odc_all_truncations_name_terminators_and_entry_padding_reject(self):
+        archive = odc_archive()
+        for length in range(len(archive)):
+            with self.subTest(length=length), self.assertRaises(profile.component.ComponentError):
+                profile._decode_odc(archive[:length])
+        record = odc_record()
+        for value in (archive[:77] + b"\0" + archive[78:], archive[:89] + b"X" + archive[90:],
+                      odc_archive(record + b"\0"), odc_archive(record[:90] + b"\0" + record[90:])):
+            with self.assertRaises(profile.component.ComponentError):
+                profile._decode_odc(value)
+
+    def test_odc_record_count_and_trailer_requirements(self):
+        records = [odc_record(f"record-{index}".encode(), b"") for index in range(17)]
+        self.assertEqual(len(profile._decode_odc(odc_archive(*records[:16]))[0]), 16)
+        for value in (odc_archive(*records), odc_record(), odc_record(b"TRAILER!!!", b"x", mode=0),
+                      odc_archive() + odc_record(b"TRAILER!!!", b"", mode=0), odc_archive() + odc_archive()):
+            with self.assertRaises(profile.component.ComponentError):
+                profile._decode_odc(value)
+        # Name and payload bounds are independent of the fixed-fixture policy.
+        longest = odc_record(b"n" * 255, b"x")
+        self.assertEqual(profile._decode_odc(odc_archive(longest))[0][0]["name_bytes"], 256)
+
+    def test_odc_zero_tail_is_observed_without_alignment_assumptions(self):
+        for padding in (0, 1, 7, 511, 512, 1025):
+            self.assertEqual(profile._decode_odc(odc_archive(padding=padding))[2], padding)
+        for tail in (b"x", b"\0x", b"\0" * 512 + b"070707"):
+            with self.assertRaises(profile.component.ComponentError):
+                profile._decode_odc(odc_archive() + tail)
+
+    def test_fixed_inventory_preserves_root_spelling_and_order(self):
+        for file in (b"postinstall", b"./postinstall"):
+            for root in (None, b".", b"./"):
+                for root_first in (False, True):
+                    records = [odc_record(file)]
+                    if root:
+                        directory = odc_record(root, b"", mode=0o040750, links=2)
+                        records.insert(0 if root_first else 1, directory)
+                    report = profile._observe_scripts_fixture(odc_archive(*records, padding=3))
+                    expected = [file.decode()] if not root else ([root.decode(), file.decode()] if root_first
+                                                                else [file.decode(), root.decode()])
+                    self.assertEqual([item["name"] for item in report["records"]], expected)
+                    self.assertEqual(report["trailing_zero_bytes"], 3)
+                    self.assertTrue(report["fixture_exact_bytes_match"])
+
+    def test_fixed_inventory_rejects_aliases_extra_records_types_and_partial_payloads(self):
+        failures = [odc_archive(odc_record(), odc_record()),
+                    odc_archive(odc_record(b"postinstall"), odc_record()),
+                    odc_archive(odc_record(), odc_record(b".", b"", mode=0o040755),
+                                odc_record(b"./", b"", mode=0o040755)),
+                    odc_archive(odc_record(b".", b"", mode=0o040755)),
+                    odc_archive(odc_record(), odc_record(b".", b"x", mode=0o040755)),
+                    odc_record(b"TRAILER!!!", b"", mode=0)]
+        failures.extend(odc_archive(odc_record(name)) for name in
+                        (b"preinstall", b"Payload", b"../postinstall", b"/postinstall", b"Postinstall",
+                         b"postinstall/child", b"./postinstall/.", b"\xff", b"/private-path-sentinel"))
+        failures.extend(odc_archive(odc_record(mode=mode)) for mode in
+                        (0, 0o040755, 0o120755, 0o010755, 0o020755, 0o060755, 0o140755))
+        failures.extend(odc_archive(odc_record(body=body)) for body in
+                        (b"", b"prefix" + profile.FIXTURE, profile.FIXTURE + b"suffix", profile.FIXTURE * 2))
+        for value in failures:
+            with self.assertRaises(profile.component.ComponentError) as error:
+                profile._observe_scripts_fixture(value)
+            self.assertNotIn("private-path-sentinel", str(error.exception))
+
+    def test_link_counts_and_permissions_are_observations_not_admission(self):
+        for links in (0, 1, 2, 0o777777):
+            for mode in (0o100600, 0o100755, 0o104755):
+                report = profile._observe_scripts_fixture(odc_archive(odc_record(links=links, mode=mode)))
+                self.assertEqual(report["records"][0]["links"], links)
+                self.assertEqual(report["records"][0]["mode_octal"], format(mode, "06o"))
+                self.assertFalse({"safe", "admitted", "authenticated", "trusted"}.intersection(report))
+
+    def test_full_report_omits_payload_prefixes_and_private_numeric_metadata(self):
+        record = odc_record(dev=0o654321, ino=0o765432, uid=0o456123, gid=0o345612,
+                            rdev=0o567123, mtime=0o12345670123)
+        report = profile.observe_generated(synthetic_package(scripts=odc_archive(record)))
+        inventory = report["scripts_inventory"]
+        allowed = {"name", "type", "mode_octal", "links", "data_bytes", "header_offset", "name_bytes",
+                   "data_offset", "end_offset"}
+        self.assertEqual(set(inventory["records"][0]), allowed)
+        self.assertEqual(set(inventory["trailer"]), allowed)
+        encoded = json.dumps(report)
+        for forbidden in ("prefix_hex", '"uid"', '"gid"', '"device"', '"inode"', '"rdev"', '"mtime"',
+                          '"data"', profile.FIXTURE.decode(), str(0o12345670123)):
+            self.assertNotIn(forbidden, encoded)
+        self.assertTrue(report["observation_only"])
 
     def test_outer_zlib_member_is_observed(self):
         for outer in ["application/octet-stream", "application/x-gzip"]:
@@ -282,13 +430,16 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
+        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["scripts_inventory"]["format"], "odc")
+        self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
 
 def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 18 + (1 if sys.platform == "darwin" else 0)
+    expected = 28 + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result
