@@ -1326,10 +1326,33 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
 
 #[test]
 fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
+    fn ordered(workflow: &str) -> bool {
+        let Some((_, structural)) = workflow.split_once("\n  structural:\n") else {
+            return false;
+        };
+        let Some((structural, _)) = structural.split_once("\n  official-sign-notarize:\n") else {
+            return false;
+        };
+        let labels = [
+            "- name: Build ad hoc signed universal structural package",
+            "- name: Run protected CPU worker contract without installation",
+            "- name: Construct real universal CPU entry",
+            "actions/upload-artifact@",
+        ];
+        let Some(positions) = labels
+            .map(|label| structural.find(label))
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        positions.windows(2).all(|pair| pair[0] < pair[1])
+    }
+
     let source =
         include_str!("../build_support/native_macos_cpu_pkg_entry.py").replace("\r\n", "\n");
     let tests = include_str!("../build_support/test_native_macos_cpu_pkg_entry.py");
-    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let workflow = include_str!("../.github/workflows/macos-release.yml").replace("\r\n", "\n");
     let run =
         &source[source.find("def run_contract(").unwrap()..source.find("def main()").unwrap()];
     assert!(run.find("os.geteuid() != 0").unwrap() < run.find("app.is_dir()").unwrap());
@@ -1383,20 +1406,75 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
     }
     assert!(tests.contains("expected = 19 + (1 if os.name == \"posix\" else 0)"));
     assert!(workflow.contains("python3 -B build_support/test_native_macos_cpu_pkg_entry.py"));
-    let native_step = workflow
+    assert!(ordered(&workflow));
+    // A missing structural upload must not match the later official job, and
+    // the guard must detect premature CPU, package, or artifact steps.
+    assert!(!ordered(&workflow.replacen(
+        "actions/upload-artifact@",
+        "not-an-upload@",
+        1
+    )));
+    for (before, premature) in [
+        (
+            "- name: Build ad hoc signed universal structural package",
+            "- name: Run protected CPU worker contract without installation",
+        ),
+        (
+            "- name: Run protected CPU worker contract without installation",
+            "- name: Construct real universal CPU entry",
+        ),
+        (
+            "- name: Run protected CPU worker contract without installation",
+            "actions/upload-artifact@",
+        ),
+    ] {
+        assert!(!ordered(&workflow.replacen(
+            before,
+            &format!("{premature}\n{before}"),
+            1
+        )));
+    }
+    let structural = workflow
+        .split_once("\n  structural:\n")
+        .unwrap()
+        .1
+        .split_once("\n  official-sign-notarize:\n")
+        .unwrap()
+        .0;
+    let native_step = structural
         .find("- name: Construct real universal CPU entry")
         .unwrap();
+    let cpu_step = structural
+        .find("- name: Run protected CPU worker contract without installation")
+        .unwrap();
     assert!(
-        workflow
+        structural
             .find("- name: Build ad hoc signed universal structural package")
             .unwrap()
-            < native_step
+            < cpu_step
     );
-    let step = &workflow[native_step
-        ..workflow[native_step..]
-            .find("- name: Run protected CPU")
-            .unwrap()
-            + native_step];
+    // CPU admission consumes the verified app, never the subsequently built
+    // unsigned package. A package-format failure must not hide this contract.
+    assert!(cpu_step < native_step);
+    let cpu = structural[cpu_step..].split("\n      - ").next().unwrap();
+    assert!(cpu.contains("timeout-minutes: 25"));
+    assert!(cpu.contains("SCRIBE_BUILD_REVISION: ${{ github.sha }}"));
+    assert!(cpu.contains(
+        "run: bash scripts/test-macos-protected-cpu-worker.sh --app \"$PWD/dist-macos/Scribe.app\""
+    ));
+    assert_eq!(
+        workflow
+            .matches("run: bash scripts/test-macos-protected-cpu-worker.sh")
+            .count(),
+        1
+    );
+    for forbidden in ["if:", "always()", "continue-on-error:"] {
+        assert!(!cpu.contains(forbidden));
+    }
+    let step = structural[native_step..]
+        .split("\n      - ")
+        .next()
+        .unwrap();
     assert!(step.contains("timeout-minutes: 50"));
     assert!(step.contains("and private unsigned package without execution"));
     assert!(step.contains("shasum -a 256"));

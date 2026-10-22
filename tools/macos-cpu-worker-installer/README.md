@@ -75,6 +75,26 @@ byte and native filesystem/bootstrap mechanics are installer-only shared source;
 the CPU adapter still enforces literal Scribe/CPU ancestors and its 512-MiB
 compiled-image bound. The desktop and worker do not import these write helpers.
 
+### Native CPU admission before package construction
+
+The structural CI job runs the unchanged protected CPU health/shutdown contract
+immediately after constructing and verifying the universal application, before
+constructing the unsigned CPU entry/package. The contract consumes only that
+app, independently verifies it again, and copies its final CPU image into a
+private unprivileged fixture. It never consumes the unsigned package.
+Exact discovery then runs the two inference/VAD role contracts: authenticated
+CPU identity and Ready, health, cross-role rejection, shutdown and child reaping,
+with no model or audio.
+
+Default success gating remains in force: a failed app build/verification cannot
+start these tests; a CPU contract failure prevents subsequent package work and
+artifact publication. Conversely, a later package-format failure no longer hides
+the preceding CPU result. This changes diagnostic priority, not independence of
+the two contracts or any release/signing gate. Commands, timeouts, permissions
+and fixture cleanup are unchanged. Actual native results are still required;
+passing private fixtures would not establish protected-path installation,
+package authentication, production qualification or Auto eligibility.
+
 ## Non-installing development component
 
 An opt-in source-authoring step now joins the finalized CPU application and a

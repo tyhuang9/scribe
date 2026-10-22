@@ -175,6 +175,11 @@ jobs:
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc --prepare-protected-cpu-component
           SCRIBE_MACOS_TEST_BUNDLE="$PWD/dist-macos/Scribe.app" bash scripts/test-macos-release-packaging.sh
+      - name: Run protected CPU worker contract without installation
+        timeout-minutes: 25
+        env:
+          SCRIBE_BUILD_REVISION: ${{ github.sha }}
+        run: bash scripts/test-macos-protected-cpu-worker.sh --app "$PWD/dist-macos/Scribe.app"
       - name: Construct real universal CPU entry and private unsigned package without execution
         timeout-minutes: 50
         env:
@@ -182,11 +187,6 @@ jobs:
         run: |
           worker_sha256="$(shasum -a 256 "$PWD/dist-macos/Scribe.app/Contents/MacOS/scribe-inference-worker" | awk '{print $1}')"
           python3 -B build_support/native_macos_cpu_pkg_entry.py --app "$PWD/dist-macos/Scribe.app" --worker-sha256 "$worker_sha256" --build-revision "$SCRIBE_BUILD_REVISION"
-      - name: Run protected CPU worker contract without installation
-        timeout-minutes: 25
-        env:
-          SCRIBE_BUILD_REVISION: ${{ github.sha }}
-        run: bash scripts/test-macos-protected-cpu-worker.sh --app "$PWD/dist-macos/Scribe.app"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: macos-${{ matrix.arch }}-structural-evidence
