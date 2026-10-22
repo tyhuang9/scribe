@@ -251,18 +251,20 @@ class Inspection(unittest.TestCase):
                 with self.subTest(tag=tag, value=value):
                     self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, fields=(tag,), **{tag: value})))
 
-    def test_finder_create_time_calendar_and_nanosecond_boundaries(self):
-        for timestamp in ["0001-01-01T00:00:00", "1900-02-28T23:59:59", "2000-02-29T12:34:56",
-                          "9999-12-31T23:59:60"]:
+    def test_finder_create_time_is_opaque_bounded_text_with_bounded_nanoseconds(self):
+        for timestamp in ["x", "x" * 128, "2000-02-29T12:34:56", "2000-02-29T12:34:56Z",
+                          "2000-02-29T12:34:56+01:30", "2000-02-29T12:34:56.123456789Z",
+                          "1900-02-29T24:60:61", "private-time-sentinel", "../../postinstall",
+                          "$(ignored-command)", "<ignored/>", " ",
+                          "".join(chr(value) for value in range(32, 127))]:
             for nanoseconds in ["0", "999999999"]:
-                self.inspect(encode(mutate=lambda toc: source_stat_metadata(
-                    toc, fields=("FinderCreateTime",), timestamp=timestamp, nanoseconds=nanoseconds)))
-        for timestamp in ["0000-01-01T00:00:00", "1900-02-29T00:00:00", "2001-02-29T00:00:00",
-                          "2000-04-31T00:00:00", "2000-00-01T00:00:00", "2000-13-01T00:00:00",
-                          "2000-01-00T00:00:00", "2000-01-32T00:00:00", "2000-01-01T24:00:00",
-                          "2000-01-01T00:60:00", "2000-01-01T00:00:61", "2000-01-01T00:00:00Z",
-                          "2000-01-01T00:00:00.1", "2000-1-1T00:00:00", "private-time-sentinel"]:
-            self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, timestamp=timestamp)))
+                with self.subTest(timestamp=timestamp, nanoseconds=nanoseconds):
+                    self.inspect(encode(mutate=lambda toc: source_stat_metadata(
+                        toc, fields=("FinderCreateTime",), timestamp=timestamp, nanoseconds=nanoseconds)))
+        for timestamp in ["", "x" * 129, "\0", "\x01", "\t", "\n", "\r", "\x1f", "\x7f",
+                          "\u0661", "\u00e9", "\u200b"]:
+            with self.subTest(timestamp=timestamp):
+                self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, timestamp=timestamp)))
         for nanoseconds in ["-1", "+1", "01", "1000000000", "1.0", "", "\u0661"]:
             self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, nanoseconds=nanoseconds)))
 
@@ -297,13 +299,15 @@ class Inspection(unittest.TestCase):
                 self.reject(encode(mutate=mutate))
 
     def test_source_stat_metadata_never_weakens_retained_entry_or_archive_checks(self):
-        self.reject(encode(b"x" * len(ENTRY), mutate=source_stat_metadata))
+        def opaque_metadata(toc):
+            return source_stat_metadata(toc, timestamp="ignored-not-a-date")
+        self.reject(encode(b"x" * len(ENTRY), mutate=opaque_metadata))
         for change in [lambda member: setattr(member.find("type"), "text", "hardlink"),
                        lambda member: member.find("type").set("link", "original"),
                        lambda member: ET.SubElement(member, "link"),
                        lambda member: setattr(member.find("data/archived-checksum"), "text", "0" * 40)]:
             def mutate(toc):
-                change(source_stat_metadata(toc))
+                change(opaque_metadata(toc))
             self.reject(encode(mutate=mutate))
 
     def test_source_stat_metadata_errors_omit_all_scalar_values(self):
@@ -311,7 +315,7 @@ class Inspection(unittest.TestCase):
             def mutate(toc):
                 member = source_stat_metadata(toc)
                 path = "FinderCreateTime/" + field if field in ("time", "nanoseconds") else field
-                member.find(path).text = "private-value-sentinel"
+                member.find(path).text = "private-value-sentinel" * (7 if field == "time" else 1)
             with self.subTest(field=field), self.assertRaises(component.ComponentError) as result:
                 self.inspect(encode(mutate=mutate))
             self.assertNotIn("private-value-sentinel", str(result.exception) + repr(result.exception.args))

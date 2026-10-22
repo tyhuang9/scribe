@@ -1322,7 +1322,7 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
     for required in [
         "test_source_stat_fields_are_optional_scripts_only_and_do_not_bind_identity",
         "test_serialized_stat_integers_use_signed_source_bounds_and_reject_noncanonical_text",
-        "test_finder_create_time_calendar_and_nanosecond_boundaries",
+        "test_finder_create_time_is_opaque_bounded_text_with_bounded_nanoseconds",
         "test_source_stat_metadata_tree_ambiguities_and_unknown_same_shape_reject",
         "test_source_stat_metadata_never_weakens_retained_entry_or_archive_checks",
         "test_source_stat_metadata_errors_omit_all_scalar_values",
@@ -1605,14 +1605,14 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 32 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 35 + (1 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
         "ODC_HEADER_BYTES = 76",
         "ODC_MAX_RECORDS = 16",
         "ODC_MAX_NAME_BYTES = 256",
-        "\"schema_version\": 3",
+        "\"schema_version\": 4",
         "scripts_inventory = _observe_scripts_fixture(scripts)",
         "\"scripts_inventory\": scripts_inventory",
     ] {
@@ -1655,12 +1655,16 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert!(tests.contains("test_absent_mode_is_reported_as_unknown_without_inferred_permissions"));
     assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));
     assert!(source.contains("\"metadata_shapes\": _member_metadata_shapes(file)"));
+    assert!(source.contains("\"source_creation_time\": _source_creation_time_shape(file)"));
     assert!(source.contains("child.tag in METADATA_TAG_LABELS else \"unrecognized\""));
     for required in [
         "test_member_metadata_shapes_use_closed_labels_without_stat_values",
         "test_member_metadata_shapes_preserve_duplicates_and_sort_deterministically",
         "test_unknown_member_metadata_shapes_redact_names_attributes_and_text",
         "test_finder_create_time_label_exposes_shape_without_timestamp_or_nested_names",
+        "test_creation_time_format_masks_characters_and_bounds_without_validating",
+        "test_creation_time_format_ambiguous_or_nonscalar_never_selects_a_value",
+        "test_creation_time_format_full_report_omits_values_and_other_properties",
     ] {
         assert!(tests.contains(required));
     }
