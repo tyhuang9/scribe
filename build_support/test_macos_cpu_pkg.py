@@ -89,6 +89,20 @@ def encode(body=ENTRY, *, info=None, odc=None, compressed_scripts=None, mutate=N
     return struct.pack(">4sHHQQI", b"xar!", 28, 1, len(compressed), len(xml), 1) + compressed + contents
 
 
+def source_stat_metadata(toc, *, member_index=1, fields=("inode", "deviceno", "FinderCreateTime"),
+                         inode="13", deviceno="17", timestamp="2000-02-29T12:34:56", nanoseconds="42"):
+    """Independent documented XAR stat fixture, never actual filesystem values."""
+    member = toc.findall("file")[member_index]
+    for tag, value in [("inode", inode), ("deviceno", deviceno)]:
+        if tag in fields:
+            ET.SubElement(member, tag).text = value
+    if "FinderCreateTime" in fields:
+        created = ET.SubElement(member, "FinderCreateTime")
+        ET.SubElement(created, "time").text = timestamp
+        ET.SubElement(created, "nanoseconds").text = nanoseconds
+    return member
+
+
 class Inspection(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="scribe-pkg-source-")
@@ -208,9 +222,7 @@ class Inspection(unittest.TestCase):
                     ET.SubElement(member, "mtime").text = "private-time-one"
                     ET.SubElement(member, "mtime").text = "private-time-two"
                 if unsupported:
-                    # A documented possible stat field remains UNQUALIFIED for
-                    # this constructor until actual native reports are reviewed.
-                    ET.SubElement(member, "inode").text = "987654321012345"
+                    ET.SubElement(member, "future-stat-field").text = "987654321012345"
                     ET.SubElement(member, "private-tag-sentinel").text = "private-value-sentinel"
             with self.subTest(duplicate=duplicate, unsupported=unsupported), \
                  self.assertRaises(component.ComponentError) as result:
@@ -220,6 +232,89 @@ class Inspection(unittest.TestCase):
                              f"unsupported-fields={2 * int(unsupported)})")
             for sentinel in ("private", "987654321012345", "inode", "mtime"):
                 self.assertNotIn(sentinel, str(result.exception) + repr(result.exception.args))
+
+    def test_source_stat_fields_are_optional_scripts_only_and_do_not_bind_identity(self):
+        for fields in [(), ("inode",), ("deviceno",), ("FinderCreateTime",),
+                       ("inode", "deviceno", "FinderCreateTime")]:
+            with self.subTest(fields=fields):
+                self.inspect(encode(mutate=lambda toc: source_stat_metadata(toc, fields=fields)))
+        for field in ("inode", "deviceno", "FinderCreateTime"):
+            self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, member_index=0, fields=(field,))))
+
+    def test_serialized_stat_integers_use_signed_source_bounds_and_reject_noncanonical_text(self):
+        for tag, low, high in [("inode", -(2**63), 2**63 - 1), ("deviceno", -(2**31), 2**31 - 1)]:
+            for value in [str(low), "-1", "0", str(high)]:
+                with self.subTest(tag=tag, value=value):
+                    self.inspect(encode(mutate=lambda toc: source_stat_metadata(toc, fields=(tag,), **{tag: value})))
+            for value in [str(low - 1), str(high + 1), "+1", "-0", "01", "-01", " 1", "1 ",
+                          "1e1", "1.0", "", "\u0661", "9" * 129]:
+                with self.subTest(tag=tag, value=value):
+                    self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, fields=(tag,), **{tag: value})))
+
+    def test_finder_create_time_calendar_and_nanosecond_boundaries(self):
+        for timestamp in ["0001-01-01T00:00:00", "1900-02-28T23:59:59", "2000-02-29T12:34:56",
+                          "9999-12-31T23:59:60"]:
+            for nanoseconds in ["0", "999999999"]:
+                self.inspect(encode(mutate=lambda toc: source_stat_metadata(
+                    toc, fields=("FinderCreateTime",), timestamp=timestamp, nanoseconds=nanoseconds)))
+        for timestamp in ["0000-01-01T00:00:00", "1900-02-29T00:00:00", "2001-02-29T00:00:00",
+                          "2000-04-31T00:00:00", "2000-00-01T00:00:00", "2000-13-01T00:00:00",
+                          "2000-01-00T00:00:00", "2000-01-32T00:00:00", "2000-01-01T24:00:00",
+                          "2000-01-01T00:60:00", "2000-01-01T00:00:61", "2000-01-01T00:00:00Z",
+                          "2000-01-01T00:00:00.1", "2000-1-1T00:00:00", "private-time-sentinel"]:
+            self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, timestamp=timestamp)))
+        for nanoseconds in ["-1", "+1", "01", "1000000000", "1.0", "", "\u0661"]:
+            self.reject(encode(mutate=lambda toc: source_stat_metadata(toc, nanoseconds=nanoseconds)))
+
+    def test_source_stat_metadata_tree_ambiguities_and_unknown_same_shape_reject(self):
+        def remove(toc, path):
+            parent, name = path.rsplit("/", 1)
+            node = toc.findall("file")[1].find(parent)
+            node.remove(node.find(name))
+        mutations = [lambda toc: setattr(toc.findall("file")[1].find("FinderCreateTime"), "tag", "OtherTime"),
+                     lambda toc: remove(toc, "FinderCreateTime/time"),
+                     lambda toc: remove(toc, "FinderCreateTime/nanoseconds"),
+                     lambda toc: ET.SubElement(toc.findall("file")[1].find("FinderCreateTime"), "extra")]
+        for path in ["inode", "deviceno", "FinderCreateTime", "FinderCreateTime/time",
+                     "FinderCreateTime/nanoseconds"]:
+            mutations.extend([
+                lambda toc, path=path: toc.findall("file")[1].find(path).set("private", "private-attribute"),
+                lambda toc, path=path: ET.SubElement(toc.findall("file")[1].find(path), "private-child"),
+                lambda toc, path=path: setattr(toc.findall("file")[1].find(path), "tail", "private-tail"),
+            ])
+        for path in ["inode", "deviceno", "FinderCreateTime"]:
+            mutations.append(lambda toc, path=path: ET.SubElement(toc.findall("file")[1], path))
+        for path in ["time", "nanoseconds"]:
+            mutations.append(lambda toc, path=path: ET.SubElement(
+                toc.findall("file")[1].find("FinderCreateTime"), path))
+        mutations.append(lambda toc: setattr(toc.findall("file")[1].find("FinderCreateTime"),
+                                             "text", "private-container-text"))
+        for index, change in enumerate(mutations):
+            def mutate(toc):
+                source_stat_metadata(toc)
+                change(toc)
+            with self.subTest(case=index):
+                self.reject(encode(mutate=mutate))
+
+    def test_source_stat_metadata_never_weakens_retained_entry_or_archive_checks(self):
+        self.reject(encode(b"x" * len(ENTRY), mutate=source_stat_metadata))
+        for change in [lambda member: setattr(member.find("type"), "text", "hardlink"),
+                       lambda member: member.find("type").set("link", "original"),
+                       lambda member: ET.SubElement(member, "link"),
+                       lambda member: setattr(member.find("data/archived-checksum"), "text", "0" * 40)]:
+            def mutate(toc):
+                change(source_stat_metadata(toc))
+            self.reject(encode(mutate=mutate))
+
+    def test_source_stat_metadata_errors_omit_all_scalar_values(self):
+        for field in ["inode", "deviceno", "time", "nanoseconds"]:
+            def mutate(toc):
+                member = source_stat_metadata(toc)
+                path = "FinderCreateTime/" + field if field in ("time", "nanoseconds") else field
+                member.find(path).text = "private-value-sentinel"
+            with self.subTest(field=field), self.assertRaises(component.ComponentError) as result:
+                self.inspect(encode(mutate=mutate))
+            self.assertNotIn("private-value-sentinel", str(result.exception) + repr(result.exception.args))
 
     def test_unsupported_xml_and_ambiguous_scalars_reject(self):
         for transform in [lambda xml: b'<!DOCTYPE xar [<!ENTITY x "y">]>' + xml,
@@ -532,7 +627,7 @@ def suite():
     classes = [Inspection, Author] + ([Posix] if os.name == "posix" else [])
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 28 + (2 if os.name == "posix" else 0)
+    expected = 34 + (2 if os.name == "posix" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"CPU component PKG discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

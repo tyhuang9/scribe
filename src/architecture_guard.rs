@@ -1313,10 +1313,22 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 28 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 34 + (2 if os.name == \"posix\" else 0)"));
     assert!(tests.contains(
         "test_member_metadata_diagnostic_separates_duplicates_and_unsupported_fields_without_values"
     ));
+    assert!(source.contains("allowed.update({\"inode\", \"deviceno\", \"FinderCreateTime\"})"));
+    assert!(source.contains("_source_stat_metadata(member)"));
+    for required in [
+        "test_source_stat_fields_are_optional_scripts_only_and_do_not_bind_identity",
+        "test_serialized_stat_integers_use_signed_source_bounds_and_reject_noncanonical_text",
+        "test_finder_create_time_calendar_and_nanosecond_boundaries",
+        "test_source_stat_metadata_tree_ambiguities_and_unknown_same_shape_reject",
+        "test_source_stat_metadata_never_weakens_retained_entry_or_archive_checks",
+        "test_source_stat_metadata_errors_omit_all_scalar_values",
+    ] {
+        assert!(tests.contains(required));
+    }
     assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg.py"));
     assert_eq!(
         workflow.matches("build_support/*macos_cpu_pkg.py").count(),
@@ -1593,7 +1605,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 31 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 32 + (1 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
@@ -1648,6 +1660,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "test_member_metadata_shapes_use_closed_labels_without_stat_values",
         "test_member_metadata_shapes_preserve_duplicates_and_sort_deterministically",
         "test_unknown_member_metadata_shapes_redact_names_attributes_and_text",
+        "test_finder_create_time_label_exposes_shape_without_timestamp_or_nested_names",
     ] {
         assert!(tests.contains(required));
     }

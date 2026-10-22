@@ -348,7 +348,7 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-31 portable tests, plus one native test on each Mac lane. That native test uses
+32 portable tests, plus one native test on each Mac lane. That native test uses
 the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 `postinstall`, with no interpreter or program content. The file has executable
 mode only to model an operation archive; **nothing executes it**. Neither the
@@ -386,8 +386,9 @@ cleanup retains that private workspace. Nothing is uploaded as an artifact.
 After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **3** records
 actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
 fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
-Both schema-3 native reports remain unverified until those hosted jobs complete;
-earlier schema-2 reports do not establish the new field shapes.
+The new `FinderCreateTime` observation label remains unverified until current-head
+native jobs complete; earlier reports redact that nested field's name and do not
+establish its identity.
 The XAR header layout follows [Apple's source](https://github.com/apple-oss-distributions/xar/blob/main/xar/include/xar.h.in).
 Both basic Intel/ARM reports established the ODC prefix; complete native record
 metadata still requires the expanded reports, not synthetic assumptions.
@@ -438,9 +439,30 @@ properties, but cannot supply their values or grant acceptance. Apple's
 can emit `inode` and `deviceno`; that is not evidence that either caused a
 particular native failure. The real constructor's existing unsupported-metadata
 error now distinguishes duplicate and unsupported counts using only a numeric
-member index. Its accepted fields, inventory, types, signatures, checksums and
-byte validation are unchanged. Review both native shape reports and the actual
-construction error before extending any acceptance policy.
+member index. Earlier native profiles established scalar `inode`/`deviceno` and
+one redacted two-child container on Scripts; actual construction then rejected
+three unsupported fields with no duplicates. The container's identity is still
+unproven until the new label and full native construction results establish it.
+
+The fresh-output constructor now permits only three additional optional stat
+properties on **Scripts**, not PackageInfo. `inode` and `deviceno` use canonical
+signed-64 and signed-32 decimal text respectively, matching the serialization in
+[Apple's XAR configuration](https://github.com/apple-oss-distributions/xar/blob/main/xar/configure.ac)
+and macOS's device type, rather than treating a serialized inode as an unsigned
+filesystem identity. Values are never compared with this host, reinterpreted as
+identity, recorded in diagnostics or an identity cache, or used as authority.
+
+Only the literal `FinderCreateTime` container is supported, following
+[Apple's Darwin attribute writer](https://github.com/apple-oss-distributions/xar/blob/main/xar/lib/darwinattr.c):
+exactly `time` and `nanoseconds` leaves, no attributes, nested/extra/duplicate
+children or significant surrounding text. The bounded time spelling is a
+four-digit Gregorian year 0001–9999 with valid calendar date and `HH:MM:SS`, no
+zone/fraction suffix; seconds allow 60 as in `strftime`'s leap-second domain.
+Nanoseconds are canonical decimal 0–999999999. This is source-defined stat-text
+support, not proof of the previously redacted native field or installation
+compatibility. Every other unknown property still rejects even with the same
+two-child shape. Inventory, types/links, signatures, checksums, retained entry
+bytes, complete heap coverage, source binding and cleanup rules are unchanged.
 
 This probe validates only its fixed fixture's Scripts inventory, not checksums,
 signatures, shipping-package operations or package authenticity. It is not a
@@ -497,7 +519,7 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 28 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 34 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,

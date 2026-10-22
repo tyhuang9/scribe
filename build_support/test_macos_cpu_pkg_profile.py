@@ -256,6 +256,18 @@ class Portable(unittest.TestCase):
             {"tag": "unrecognized", "child_count": 1, "attribute_count": 1, "has_text": True}])
         self.assertNotIn("private", json.dumps(report))
 
+    def test_finder_create_time_label_exposes_shape_without_timestamp_or_nested_names(self):
+        def mutate(toc):
+            created = ET.SubElement(toc.findall("file")[1], "FinderCreateTime")
+            ET.SubElement(created, "time").text = "private-time-sentinel"
+            ET.SubElement(created, "nanoseconds").text = "987654321"
+        report = profile.observe_generated(synthetic_package(mutate=mutate))
+        self.assertIn({"tag": "FinderCreateTime", "child_count": 2,
+                       "attribute_count": 0, "has_text": False}, report["members"][1]["metadata_shapes"])
+        for sentinel in ("private-time-sentinel", "987654321", '"time"', '"nanoseconds"'):
+            self.assertNotIn(sentinel, json.dumps(report))
+        self.assertTrue(report["observation_only"])
+
     def test_outer_zlib_member_is_observed(self):
         for outer in ["application/octet-stream", "application/x-gzip"]:
             for inner in ["none", "gzip", "zlib"]:
@@ -492,7 +504,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 31 + (1 if sys.platform == "darwin" else 0)
+    expected = 32 + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result
