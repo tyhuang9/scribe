@@ -1313,7 +1313,10 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 27 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 28 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains(
+        "test_member_metadata_diagnostic_separates_duplicates_and_unsupported_fields_without_values"
+    ));
     assert!(workflow.contains("run: python3 -B build_support/test_macos_cpu_pkg.py"));
     assert_eq!(
         workflow.matches("build_support/*macos_cpu_pkg.py").count(),
@@ -1512,14 +1515,14 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 28 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 31 + (1 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
         "ODC_HEADER_BYTES = 76",
         "ODC_MAX_RECORDS = 16",
         "ODC_MAX_NAME_BYTES = 256",
-        "\"schema_version\": 2",
+        "\"schema_version\": 3",
         "scripts_inventory = _observe_scripts_fixture(scripts)",
         "\"scripts_inventory\": scripts_inventory",
     ] {
@@ -1561,6 +1564,15 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert!(source.contains("\"mode\": observed_mode(file)"));
     assert!(tests.contains("test_absent_mode_is_reported_as_unknown_without_inferred_permissions"));
     assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));
+    assert!(source.contains("\"metadata_shapes\": _member_metadata_shapes(file)"));
+    assert!(source.contains("child.tag in METADATA_TAG_LABELS else \"unrecognized\""));
+    for required in [
+        "test_member_metadata_shapes_use_closed_labels_without_stat_values",
+        "test_member_metadata_shapes_preserve_duplicates_and_sort_deterministically",
+        "test_unknown_member_metadata_shapes_redact_names_attributes_and_text",
+    ] {
+        assert!(tests.contains(required));
+    }
     assert!(tests.contains("test_actual_unsigned_nopayload_format_without_installation"));
     let profile_job = workflow
         .split("\n  package-profile:\n")
