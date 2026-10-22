@@ -64,7 +64,7 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["schema_version"], 4)
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
@@ -267,6 +267,76 @@ class Portable(unittest.TestCase):
         for sentinel in ("private-time-sentinel", "987654321", '"time"', '"nanoseconds"'):
             self.assertNotIn(sentinel, json.dumps(report))
         self.assertTrue(report["observation_only"])
+
+    def creation_time_report(self, text, mutate=None):
+        def change(toc):
+            member = toc.findall("file")[1]
+            created = ET.SubElement(member, "FinderCreateTime")
+            time = ET.SubElement(created, "time")
+            time.text = text
+            ET.SubElement(created, "nanoseconds").text = "975318642"
+            if mutate:
+                mutate(member, created, time)
+        return profile.observe_generated(synthetic_package(mutate=change))
+
+    def test_creation_time_format_masks_characters_and_bounds_without_validating(self):
+        cases = [
+            ("2077-01-02T03:04:05", "dddd-dd-ddTdd:dd:dd"),
+            ("2077-01-02T03:04:05Z", "dddd-dd-ddTdd:dd:ddZ"),
+            ("2077-01-02T03:04:05.123456789+05:30", "dddd-dd-ddTdd:dd:dd.ddddddddd+dd:dd"),
+            ("9999-99-99T99:99:99", "dddd-dd-ddTdd:dd:dd"),
+            ("tz /_\n\t\r\u0661\uff11\u00e9\U0001f600", "?" * 12),
+            ("7" * 64, "d" * 64),
+            ("7" * 65, "d" * 64),
+        ]
+        for text, masked in cases:
+            with self.subTest(text=text):
+                report = self.creation_time_report(text)
+                self.assertEqual(report["members"][1]["source_creation_time"],
+                                 {"status": "observed", "masked": masked, "truncated": len(text) > 64})
+                self.assertTrue(report["observation_only"])
+                self.assertNotIn(text, json.dumps(report))
+                self.assertNotIn("975318642", json.dumps(report))
+        self.assertEqual(profile.observe_generated(synthetic_package())["members"][1]["source_creation_time"],
+                         {"status": "absent"})
+
+    def test_creation_time_format_ambiguous_or_nonscalar_never_selects_a_value(self):
+        changes = [
+            ("absent", lambda member, created, time: setattr(created, "tag", "OtherTime")),
+            ("absent", lambda member, created, time: created.remove(time)),
+            ("ambiguous", lambda member, created, time: ET.SubElement(member, "FinderCreateTime")),
+            ("ambiguous", lambda member, created, time: ET.SubElement(created, "time")),
+            ("non-scalar", lambda member, created, time: created.set("private-name", "private-value")),
+            ("non-scalar", lambda member, created, time: time.set("private-name", "private-value")),
+            ("non-scalar", lambda member, created, time: ET.SubElement(time, "private-child")),
+            ("non-scalar", lambda member, created, time: setattr(time, "text", None)),
+            ("non-scalar", lambda member, created, time: setattr(time, "text", "")),
+            ("non-scalar", lambda member, created, time: setattr(time, "tail", "private-tail")),
+            ("non-scalar", lambda member, created, time: setattr(created, "text", "private-text")),
+            ("non-scalar", lambda member, created, time: setattr(created, "tail", "private-tail")),
+        ]
+        for index, (status, change) in enumerate(changes):
+            with self.subTest(status=status, change=index):
+                report = self.creation_time_report("private-time-sentinel", change)
+                self.assertEqual(report["members"][1]["source_creation_time"], {"status": status})
+                self.assertNotIn("private", json.dumps(report))
+
+    def test_creation_time_format_full_report_omits_values_and_other_properties(self):
+        def unrelated(member, created, time):
+            other = ET.SubElement(member, "OtherTime", {"private-attribute": "private-value"})
+            ET.SubElement(other, "time").text = "private-unrelated-time"
+            ET.SubElement(created, "private-child").text = "private-unrelated-value"
+            created.find("nanoseconds").set("private-attribute", "private-nsec-attribute")
+        first = self.creation_time_report("2077-01-02T03:04:05Z", unrelated)
+        second = self.creation_time_report("1888-09-08T07:06:05Z", unrelated)
+        expected = {"status": "observed", "masked": "dddd-dd-ddTdd:dd:ddZ", "truncated": False}
+        for report in (first, second):
+            self.assertEqual(report["members"][1]["source_creation_time"], expected)
+            self.assertEqual(report["members"][0]["source_creation_time"], {"status": "absent"})
+            encoded = json.dumps(report)
+            for value in ("2077", "1888", "975318642", "private", '"time"', '"nanoseconds"'):
+                self.assertNotIn(value, encoded)
+            self.assertTrue(report["observation_only"])
 
     def test_outer_zlib_member_is_observed(self):
         for outer in ["application/octet-stream", "application/x-gzip"]:
@@ -495,7 +565,7 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["schema_version"], 4)
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
@@ -504,7 +574,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 32 + (1 if sys.platform == "darwin" else 0)
+    expected = 35 + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

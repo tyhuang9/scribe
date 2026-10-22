@@ -108,6 +108,30 @@ def _member_metadata_shapes(node: ET.Element) -> list[dict]:
                                            item["attribute_count"], item["has_text"]))
 
 
+def _source_creation_time_shape(node: ET.Element) -> dict:
+    """Observe only format shape, never raw time or a timestamp-validity claim."""
+    containers = node.findall("FinderCreateTime")
+    if not containers:
+        return {"status": "absent"}
+    if len(containers) != 1:
+        return {"status": "ambiguous"}
+    created = containers[0]
+    times = created.findall("time")
+    if not times:
+        return {"status": "absent"}
+    if len(times) != 1:
+        return {"status": "ambiguous"}
+    time = times[0]
+    if (created.attrib or (created.text or "").strip() or (created.tail or "").strip()
+            or time.attrib or len(time) or not time.text or (time.tail or "").strip()):
+        return {"status": "non-scalar"}
+    # Closed output alphabet. Slice before rendering; Unicode digits, controls,
+    # arbitrary letters, slashes and controls cannot enter the report.
+    masked = "".join("d" if "0" <= char <= "9" else char if char in "TZ-:.+" else "?"
+                     for char in time.text[:64])
+    return {"status": "observed", "masked": masked, "truncated": len(time.text) > 64}
+
+
 def number(node: ET.Element, name: str, maximum: int) -> int:
     text = scalar(node, name)
     require(re.fullmatch(r"0|[1-9][0-9]{0,9}", text) is not None, "invalid numeric scalar")
@@ -242,6 +266,7 @@ def observe_generated(data: bytes) -> dict:
                 styles[tag] = style
         members.append({"name": name, "type": kind, "mode": observed_mode(file),
                         "metadata_shapes": _member_metadata_shapes(file),
+                        "source_creation_time": _source_creation_time_shape(file),
                         "encoding": encoding, "stored_bytes": length,
                         "decoded_bytes": declared,
                         "checksum_styles": styles})
@@ -265,7 +290,7 @@ def observe_generated(data: bytes) -> dict:
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
             "unexpected operation reference")
-    return {"schema_version": 3, "observation_only": True, "package_bytes": len(data),
+    return {"schema_version": 4, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),

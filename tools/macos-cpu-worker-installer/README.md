@@ -348,7 +348,7 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-32 portable tests, plus one native test on each Mac lane. That native test uses
+35 portable tests, plus one native test on each Mac lane. That native test uses
 the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 `postinstall`, with no interpreter or program content. The file has executable
 mode only to model an operation archive; **nothing executes it**. Neither the
@@ -383,12 +383,12 @@ root, and invokes only absolute system `pkgbuild` and `xar -tf` paths. Its own
 temporary package and source are removed after confirmed child cleanup; uncertain
 cleanup retains that private workspace. Nothing is uploaded as an artifact.
 
-After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **3** records
+After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **4** records
 actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
 fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
-The new `FinderCreateTime` observation label remains unverified until current-head
-native jobs complete; earlier reports redact that nested field's name and do not
-establish its identity.
+Earlier schema-3 native reports identified the literal `FinderCreateTime` field
+on both architectures. Full native construction then reached a creation-time
+spelling rejection; those reports did not reveal the spelling itself.
 The XAR header layout follows [Apple's source](https://github.com/apple-oss-distributions/xar/blob/main/xar/include/xar.h.in).
 Both basic Intel/ARM reports established the ODC prefix; complete native record
 metadata still requires the expanded reports, not synthetic assumptions.
@@ -409,7 +409,7 @@ Zero/multiple link counts and permission flags are **not** accepted as safe or
 frozen into a shipping profile; no links are resolved and no data is shared or
 extracted. Only closed fixture names/types and bounded numeric observations are
 reported. Raw payload prefixes (which can expose device/inode fields), identities,
-owners, timestamps, data and hashes are omitted. This private report-schema change
+owners, raw timestamps, data and hashes are omitted. This private report-schema change
 does not change a worker protocol, pack manifest, runtime or installer authority.
 
 Portable fixtures now encode valid ODC independently, with a literal golden
@@ -429,7 +429,7 @@ installation authority. Portable fixtures cover missing modes independently and
 together. A native failure at mode lookup alone cannot distinguish missing from
 duplicate/nested metadata; only the corrected native report can establish that.
 
-Schema 3 also records each outer member's sorted direct-child metadata shapes:
+The report retains schema 3's sorted direct-child metadata shapes for each member:
 a closed tag label, child count, attribute count and text-presence boolean.
 Duplicates remain separate records. Unknown tag names become `unrecognized`;
 no scalar values, attribute names/values, nested names, identities, owners,
@@ -441,8 +441,27 @@ particular native failure. The real constructor's existing unsupported-metadata
 error now distinguishes duplicate and unsupported counts using only a numeric
 member index. Earlier native profiles established scalar `inode`/`deviceno` and
 one redacted two-child container on Scripts; actual construction then rejected
-three unsupported fields with no duplicates. The container's identity is still
-unproven until the new label and full native construction results establish it.
+three unsupported fields with no duplicates. Later schema-3 reports established
+the container's label, but not complete constructor compatibility.
+
+Schema 4 additionally observes the character shape of the exact literal
+`FinderCreateTime/time` leaf. Missing or ambiguous containers/leaves, attributed
+or nested time leaves, empty text and significant surrounding text produce only
+closed status labels. A usable leaf produces at most 64 masked characters and a
+truncation flag: ASCII digits become `d`, only `T`, `Z`, `-`, `:`, `.` and `+`
+remain literal, and every other codepoint becomes `?`. Nanoseconds and other
+properties are not inspected by this observer. The mask intentionally reveals
+bounded character positions and selected separators, not raw date/digit values,
+attribute data, identities, arbitrary names or paths. It describes formatting,
+never timestamp validity, acceptance or authority.
+
+This diagnosis is needed because the public Darwin attribute writer below uses
+bare `%FT%T`, while current native construction rejects the strict bare-time
+grammar. A generic spelling error does not establish a particular suffix or a
+replacement grammar. The existing fast, inert-fixture native check will report
+the masked shape before any acceptance change; full retained-entry/package
+construction must still pass afterward. No workflow lane, input option,
+runtime diagnostic or constructor policy is changed by this report.
 
 The fresh-output constructor now permits only three additional optional stat
 properties on **Scripts**, not PackageInfo. `inode` and `deviceno` use canonical
