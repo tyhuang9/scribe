@@ -35,8 +35,8 @@ METADATA_TAG_LABELS = frozenset({
     "inode", "deviceno", "FinderCreateTime", "link", "flags", "acl",
 })
 # Observation vocabulary, not Apple's schema or the constructor's allowlist.
-# The four candidate control/generator names also occur in Mozilla's own
-# mozpack/apple_pkg/PackageInfo.template. Native presence/semantics are unproven.
+# The four control/generator names also occur in Mozilla's own template. This
+# vocabulary cannot establish native presence/semantics or grant admission.
 PACKAGE_INFO_ATTRIBUTE_LABELS = (
     "auth", "format-version", "generator-version", "identifier", "install-location",
     "overwrite-permissions", "postinstall-action", "relocatable", "version",

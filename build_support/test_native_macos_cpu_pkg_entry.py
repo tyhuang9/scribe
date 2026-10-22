@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import macos_cpu_component as component
 import native_macos_cpu_pkg_entry as native
-from test_macos_cpu_pkg import encode, package_info
+from test_macos_cpu_pkg import OBSERVED_ATTRIBUTES, encode, package_info
 
 REVISION = "source-native-entry-fixture"
 WORKER = b"synthetic frozen worker"
@@ -251,7 +251,7 @@ class Portable(unittest.TestCase):
         self.assertEqual(arguments[0], "/usr/bin/pkgbuild")
         self.assertEqual(kwargs["operation"], "cpu-component-pkg-build")
         operation = Path(arguments[arguments.index("--scripts") + 1]) / "postinstall"
-        info = package_info()
+        info = package_info(OBSERVED_ATTRIBUTES, payload=True)
         if self.failure == "unsupported-native-metadata":
             info = info.replace(b"<pkg-info ", b'<pkg-info unqualified="value" ')
         Path(arguments[-1]).write_bytes(encode(operation.read_bytes(), info=info))

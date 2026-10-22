@@ -487,14 +487,38 @@ and values never enter the report. The fixed record count bounds output even
 when the already bounded XML has many unknown attributes; nothing is truncated
 or selected from unknown fields.
 
-The actual constructor's unsupported-attribute error now adds only sorted
-recognized extra labels and a numeric unrecognized count. Its five-attribute
-allowlist is unchanged: every candidate remains rejected, even a false/none value.
-PackageInfo controls Installer behavior, so neither a zero-payload archive nor
-the retained postinstall bytes prove permission/relocation/postinstall flags inert.
-Review actual native observations and consumer semantics before qualifying any
-additional construction field. This diagnostic does not fix or bypass the
-current native PackageInfo rejection, and never runs Installer or an operation.
+The terminal ARM observation established `overwrite-permissions="true"`,
+`relocatable="false"`, `postinstall-action="none"` and bounded printable generator
+text in the fixed fixture, with no unknown root attributes. The separate real
+constructor rejected the same four extra names; its error did not expose values.
+The private unsigned constructor now permits those three controls only at their
+exact observed literals, optionally absent for legacy minimal metadata. A present
+generator is ignored 1–128-character printable ASCII, never a path, command,
+identity, compatibility decision or diagnostic value. The constructor allowlist
+is explicit and independent of the observation vocabulary. Unknown/namespaced
+attributes still reject and expose only a numeric count.
+
+[Apple's archived component-package guide](https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/SoftwareDistribution4/Component_Packages/Component_Packages.html)
+describes directory-permission overwrite for directories in the component
+hierarchy, not the installation destination itself. Combined with the exact
+physical `PackageInfo` plus `Scripts` inventory (**no Payload or Bom**), this
+supports a narrow no-payload construction inference under the trusted-producer
+assumptions above. An optional payload metadata marker must still be exactly
+zero files/zero KiB; an absent marker remains supported. This legacy guidance
+does **not** establish modern Installer, privileged execution or destination
+permission behavior. Both new-head native construction lanes remain required;
+package authentication, actual installation and release qualification are separate.
+
+The sole exact `./postinstall` operation, retained-entry hash/size, app/source
+binding, archive ranges/checksums, link restrictions and cleanup remain unchanged.
+Other direct-child constructs still reject at the same predicate. Their error
+uses only fixed tag labels (otherwise `unrecognized`), bounded child/attribute
+counts and a text-presence boolean, never arbitrary names, values or nested text.
+Source fixtures cover all optional-field combinations with/without the zero
+marker, opposite/noncanonical controls, generator bounds/redaction, and valid
+controls combined with forbidden authority, payload, operation and archive changes.
+The shared-tail driver fixture exercises the full observed profile. Nothing here
+runs Installer, an operation or a worker, or grants installation/root authority.
 
 The fresh-output constructor now permits only three additional optional stat
 properties on **Scripts**, not PackageInfo. `inode` and `deviceno` use canonical
@@ -575,7 +599,7 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 36 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 40 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,

@@ -1313,12 +1313,17 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 36 + (2 if os.name == \"posix\" else 0)"));
-    assert!(
-        tests.contains(
-            "test_known_extra_package_info_attributes_remain_rejected_with_closed_labels"
-        )
-    );
+    assert!(tests.contains("expected = 40 + (2 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_observed_controls_reject_other_values_without_normalization_or_value_logging",
+        "test_observed_profile_accepts_legacy_individual_and_combined_optional_fields",
+        "test_generator_is_bounded_ignored_printable_text_not_authority",
+        "test_observed_controls_never_weaken_identity_operations_payload_or_archive_integrity",
+        "test_construct_error_exposes_only_closed_shape_not_names_or_values",
+    ] {
+        assert!(tests.contains(required));
+    }
+    assert!(!source.contains("PACKAGE_INFO_ATTRIBUTE_LABELS"));
     assert!(
         tests.contains("test_package_info_error_redacts_unknown_names_namespaces_and_all_values")
     );
