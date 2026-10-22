@@ -1669,13 +1669,100 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         assert!(tests.contains(required));
     }
     assert!(tests.contains("test_actual_unsigned_nopayload_format_without_installation"));
-    let profile_job = workflow
-        .split("\n  package-profile:\n")
-        .nth(1)
-        .unwrap()
-        .split("\n  structural:\n")
-        .next()
-        .unwrap();
+    let profile_step = concat!(
+        "      - name: Observe fixed unsigned PKG fixture format without installation\n",
+        "        timeout-minutes: 2\n",
+        "        run: python3 -B build_support/test_macos_cpu_pkg_profile.py\n",
+    );
+    let rust_step = concat!(
+        "      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27\n",
+        "        with:\n",
+        "          targets: aarch64-apple-darwin,x86_64-apple-darwin\n",
+        "          components: rustfmt, clippy\n",
+    );
+    fn lane_profile_gate(workflow: &str, profile_step: &str) -> bool {
+        let Some((_, jobs)) = workflow.split_once("\n  structural:") else {
+            return false;
+        };
+        let Some((structural, official)) = jobs.split_once("\n  official-sign-notarize:") else {
+            return false;
+        };
+        let Some(profile) = structural.find(profile_step) else {
+            return false;
+        };
+        let Some(rust) = structural.find("      - uses: dtolnay/rust-toolchain@") else {
+            return false;
+        };
+        workflow.matches("\n  structural:\n").count() == 1
+            && workflow.matches("\n  official-sign-notarize:\n").count() == 1
+            && !workflow.contains("\n  package-profile:\n")
+            && !structural.contains("\n    needs:")
+            && workflow.matches(profile_step).count() == 1
+            && workflow
+                .matches("run: python3 -B build_support/test_macos_cpu_pkg_profile.py")
+                .count()
+                == 1
+            && profile + profile_step.len() <= rust
+            && structural[..profile].matches("- uses:").count() == 2
+            && !structural[..profile].contains("run:")
+            && structural[..profile].contains("actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09")
+            && structural[..profile].contains("actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1")
+            && structural[..profile].contains("python-version: '3.13'")
+            && structural.matches("- runner:").count() == 2
+            && structural.contains("runner: macos-15-intel\n            arch: x86_64")
+            && structural.contains("runner: macos-15\n            arch: aarch64")
+            && structural.contains("fail-fast: false")
+            && ![
+                "secrets.",
+                "continue-on-error:",
+                "always()",
+                "\n    if:",
+                "\n        if:",
+                "\n    environment:",
+                "\n    permissions:",
+            ]
+            .iter()
+            .any(|forbidden| structural.contains(forbidden))
+            && official.contains("\n    needs: structural\n")
+            && official.contains("\n    environment: macos-release\n")
+            && official.contains(
+                "if: github.event_name == 'workflow_dispatch' && inputs.notarize == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+            )
+    }
+    assert!(lane_profile_gate(&workflow, profile_step));
+    let without_profile = workflow.replacen(profile_step, "", 1);
+    for (case, changed) in [
+        ("missing profile", without_profile.clone()),
+        (
+            "late profile",
+            without_profile.replacen(rust_step, &format!("{rust_step}{profile_step}"), 1),
+        ),
+        ("duplicate profile", workflow.replacen(profile_step, &profile_step.repeat(2), 1)),
+        ("unbounded profile", workflow.replacen("timeout-minutes: 2", "timeout-minutes: 3", 1)),
+        ("wrong runner pair", workflow.replacen("arch: x86_64", "arch: aarch64", 1)),
+        ("fail-fast cancellation", workflow.replacen("fail-fast: false", "fail-fast: true", 1)),
+        (
+            "structural secret",
+            workflow.replacen(
+                "        run: python3 -B build_support/test_macos_cpu_pkg_profile.py",
+                "        env:\n          FORBIDDEN: ${{ secrets.FORBIDDEN }}\n        run: python3 -B build_support/test_macos_cpu_pkg_profile.py",
+                1,
+            ),
+        ),
+        ("optional profile", workflow.replacen("        timeout-minutes: 2", "        continue-on-error: true\n        timeout-minutes: 2", 1)),
+        ("conditional profile", workflow.replacen("        timeout-minutes: 2", "        if: always()\n        timeout-minutes: 2", 1)),
+        ("cross-architecture barrier", workflow.replacen("\n  structural:\n", "\n  structural:\n    needs: package-profile\n", 1)),
+        ("conditional structural job", workflow.replacen("\n  structural:\n", "\n  structural:\n    if: true\n", 1)),
+        ("privileged structural environment", workflow.replacen("\n  structural:\n", "\n  structural:\n    environment: macos-release\n", 1)),
+        ("structural permission override", workflow.replacen("\n  structural:\n", "\n  structural:\n    permissions: write-all\n", 1)),
+        ("missing official gate", workflow.replacen("\n    needs: structural\n", "\n", 1)),
+        ("missing official boundary", workflow.replacen("\n  official-sign-notarize:\n", "\n  unexpected-job:\n", 1)),
+        ("missing protected environment", workflow.replacen("\n    environment: macos-release\n", "\n", 1)),
+        ("unguarded signing", workflow.replacen("if: github.event_name == 'workflow_dispatch' && inputs.notarize == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", "if: true", 1)),
+    ] {
+        assert_ne!(changed, workflow, "{case} fixture must change the source");
+        assert!(!lane_profile_gate(&changed, profile_step), "accepted {case}");
+    }
     let structural_job = workflow
         .split("\n  structural:\n")
         .nth(1)
@@ -1689,11 +1776,12 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         .unwrap();
     let profile_command = "run: python3 -B build_support/test_macos_cpu_pkg_profile.py";
     assert_eq!(workflow.matches(profile_command).count(), 1);
-    assert!(profile_job.contains(profile_command));
-    assert_eq!(profile_job.matches("- uses:").count(), 2);
-    assert_eq!(profile_job.matches("run:").count(), 1);
+    assert!(structural_job.contains(profile_command));
+    let profile_phase =
+        &structural_job[..structural_job.find(profile_step).unwrap() + profile_step.len()];
+    assert_eq!(profile_phase.matches("- uses:").count(), 2);
+    assert_eq!(profile_phase.matches("run:").count(), 1);
     for required in [
-        "timeout-minutes: 10",
         "timeout-minutes: 2",
         "fail-fast: false",
         "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
@@ -1701,20 +1789,23 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "python-version: '3.13'",
     ] {
         assert!(
-            profile_job.contains(required),
+            profile_phase.contains(required),
             "profile preflight lost {required}"
         );
     }
     for forbidden in ["secrets.", "continue-on-error:", "always()"] {
-        assert!(!profile_job.contains(forbidden));
+        assert!(!profile_phase.contains(forbidden));
         assert!(!structural_job.contains(forbidden));
     }
-    for job in [profile_job, structural_job] {
-        assert_eq!(job.matches("- runner:").count(), 2);
-        assert!(job.contains("runner: macos-15-intel\n            arch: x86_64"));
-        assert!(job.contains("runner: macos-15\n            arch: aarch64"));
-        assert_eq!(job.matches("runs-on: ${{ matrix.runner }}").count(), 1);
-    }
+    assert_eq!(structural_job.matches("- runner:").count(), 2);
+    assert!(structural_job.contains("runner: macos-15-intel\n            arch: x86_64"));
+    assert!(structural_job.contains("runner: macos-15\n            arch: aarch64"));
+    assert_eq!(
+        structural_job
+            .matches("runs-on: ${{ matrix.runner }}")
+            .count(),
+        1
+    );
     assert!(!workflow.contains("macos-14"));
     assert!(!workflow.contains("macos-latest"));
     assert!(official_job.contains("\n    runs-on: macos-15\n"));
@@ -1733,16 +1824,16 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "permissions:",
     ] {
         assert!(
-            !profile_job.contains(forbidden),
+            !profile_phase.contains(forbidden),
             "profile preflight gained {forbidden}"
         );
     }
-    assert!(structural_job.contains("\n    needs: package-profile\n"));
+    assert!(!structural_job.contains("\n    needs:"));
     assert!(official_job.contains("\n    needs: structural\n"));
     let packaging_check = include_str!("../scripts/test-macos-release-packaging.sh");
-    assert!(
-        packaging_check.contains("sed -n '/^  package-profile:/,/^  official-sign-notarize:/p'")
-    );
+    assert!(packaging_check.contains("sed -n '/^  structural:/,/^  official-sign-notarize:/p'"));
+    assert!(packaging_check.contains("grep -c '^  structural:$'"));
+    assert!(packaging_check.contains("grep -c '^  official-sign-notarize:$'"));
     assert!(packaging_check.contains("<<<\"$unprivileged_jobs\""));
     assert_eq!(
         workflow
