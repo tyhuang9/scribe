@@ -348,7 +348,7 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-35 portable tests, plus one native test on each Mac lane. That native test uses
+42 portable tests, plus one native test on each Mac lane. That native test uses
 the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 `postinstall`, with no interpreter or program content. The file has executable
 mode only to model an operation archive; **nothing executes it**. Neither the
@@ -393,7 +393,7 @@ root, and invokes only absolute system `pkgbuild` and `xar -tf` paths. Its own
 temporary package and source are removed after confirmed child cleanup; uncertain
 cleanup retains that private workspace. Nothing is uploaded as an artifact.
 
-After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **4** records
+After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **5** records
 actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
 fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
 Earlier schema-3 native reports identified the literal `FinderCreateTime` field
@@ -472,6 +472,29 @@ remains useful for bounded serialization diagnosis, but does not define the
 constructor's acceptance policy or grant authority. Full retained-entry/package
 construction must still pass independently. The report adds no workflow lane,
 input option or runtime diagnostic.
+
+Schema 5 retains those observations and adds exactly nine fixed PackageInfo
+root-attribute records. The five existing construction labels and four candidates
+(`overwrite-permissions`, `relocatable`, `postinstall-action`, `generator-version`)
+form an observation vocabulary only. The latter names occur in
+[Mozilla's own package template](https://github.com/mozilla-firefox/firefox/blob/main/python/mozbuild/mozpack/apple_pkg/PackageInfo.template),
+which is not Apple's schema or evidence of current native output. Identity,
+version and location values are redacted. Other fields expose only key-specific
+closed classes: absent, expected literal root/2/true/false/none, other, or bounded
+printable generator text (1–128 ASCII characters). No generator text is emitted.
+Unknown and namespaced names contribute only to a numeric count; their names
+and values never enter the report. The fixed record count bounds output even
+when the already bounded XML has many unknown attributes; nothing is truncated
+or selected from unknown fields.
+
+The actual constructor's unsupported-attribute error now adds only sorted
+recognized extra labels and a numeric unrecognized count. Its five-attribute
+allowlist is unchanged: every candidate remains rejected, even a false/none value.
+PackageInfo controls Installer behavior, so neither a zero-payload archive nor
+the retained postinstall bytes prove permission/relocation/postinstall flags inert.
+Review actual native observations and consumer semantics before qualifying any
+additional construction field. This diagnostic does not fix or bypass the
+current native PackageInfo rejection, and never runs Installer or an operation.
 
 The fresh-output constructor now permits only three additional optional stat
 properties on **Scripts**, not PackageInfo. `inode` and `deviceno` use canonical
@@ -552,7 +575,7 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 34 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 36 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,

@@ -12,6 +12,7 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 import zlib
 
+import macos_cpu_component as component
 import macos_cpu_pkg_profile as profile
 
 
@@ -31,9 +32,9 @@ def odc_archive(*records, padding=0):
             + odc_record(b"TRAILER!!!", b"", mode=0) + b"\0" * padding)
 
 
-def synthetic_package(*, encoding="application/octet-stream", inner="gzip", mutate=None, scripts=None):
+def synthetic_package(*, encoding="application/octet-stream", inner="gzip", mutate=None, scripts=None, info=None):
     """Synthetic unsigned XAR envelope containing independently encoded valid ODC."""
-    info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
+    info = info if info is not None else (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
             'install-location="/"><scripts><postinstall file="./postinstall"/>'
             '</scripts></pkg-info>').encode()
     archive = odc_archive() if scripts is None else scripts
@@ -64,13 +65,91 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
         self.assertEqual(report["postinstall_reference"], "./postinstall")
         self.assertNotIn("synthetic", json.dumps(report))
         self.assertNotIn("trusted", report)
+
+    def observe_info(self, attributes):
+        root = ET.Element("pkg-info", {"identifier": profile.IDENTIFIER,
+                                      "version": profile.VERSION, "install-location": "/"})
+        root.attrib.update(attributes)
+        ET.SubElement(ET.SubElement(root, "scripts"), "postinstall", file="./postinstall")
+        return profile.observe_generated(synthetic_package(info=ET.tostring(root)))
+
+    def test_package_info_attributes_use_fixed_records_and_absence_classes(self):
+        shape = self.observe_info({})["package_info_attributes"]
+        self.assertEqual(set(shape), {"fields", "unknown_count"})
+        expected = {"auth": "absent", "format-version": "absent", "generator-version": "absent",
+                    "identifier": "redacted", "install-location": "redacted",
+                    "overwrite-permissions": "absent", "postinstall-action": "absent",
+                    "relocatable": "absent", "version": "redacted"}
+        self.assertEqual(shape["fields"], [{"name": name, "value_class": expected[name]}
+                                          for name in sorted(expected)])
+        self.assertEqual(shape["unknown_count"], 0)
+
+    def test_package_info_control_fields_use_key_specific_closed_value_classes(self):
+        for name, literals in [("auth", ("root",)), ("format-version", ("2",)),
+                               ("overwrite-permissions", ("true", "false")),
+                               ("relocatable", ("true", "false")), ("postinstall-action", ("none",))]:
+            for value in (*literals, "", "True", "private-control-value", "none", "2", "root"):
+                with self.subTest(name=name, value=value):
+                    fields = self.observe_info({name: value})["package_info_attributes"]["fields"]
+                    observed = next(item["value_class"] for item in fields if item["name"] == name)
+                    self.assertEqual(observed, "literal-" + value if value in literals else "other")
+
+    def test_package_info_generator_shape_bounds_and_redacts_without_validation(self):
+        for value in ["x", "x" * 128, " ", "$(private-command); /private/path", "", "x" * 129,
+                      "private\nvalue", "private\tvalue", "private\x7fvalue", "private\u00e9value"]:
+            with self.subTest(length=len(value)):
+                shape = self.observe_info({"generator-version": value})["package_info_attributes"]
+                observed = next(item["value_class"] for item in shape["fields"]
+                                if item["name"] == "generator-version")
+                expected = "bounded-printable" if 0 < len(value) <= 128 and all(32 <= ord(c) < 127 for c in value) else "other"
+                self.assertEqual(observed, expected)
+                self.assertNotIn("private", json.dumps(shape))
+
+    def test_package_info_unknown_and_namespaced_names_only_increment_count(self):
+        attrs = {"private-field-name": "private-field-value",
+                 "{urn:private-namespace}private-name": "private-namespaced-value"}
+        shape = self.observe_info(attrs)["package_info_attributes"]
+        self.assertEqual(shape["unknown_count"], 2)
+        self.assertEqual(len(shape["fields"]), 9)
+        self.assertNotIn("private", json.dumps(shape))
+
+    def test_package_info_shapes_are_deterministic_and_private_value_independent(self):
+        first = {"generator-version": "private-one", "relocatable": "false",
+                 "private-one": "private-alpha", "private-two": "private-beta"}
+        second = {"private-four": "private-delta", "private-three": "private-gamma",
+                  "relocatable": "false", "generator-version": "private-two"}
+        self.assertEqual(self.observe_info(first)["package_info_attributes"],
+                         self.observe_info(second)["package_info_attributes"])
+
+    def test_package_info_report_size_is_fixed_and_oversized_input_still_rejects(self):
+        shape = self.observe_info({f"private-field-{index}": "private-value" for index in range(200)})["package_info_attributes"]
+        self.assertEqual(shape["unknown_count"], 200)
+        self.assertEqual(len(shape["fields"]), 9)
+        self.assertLess(len(json.dumps(shape)), 1024)
+        self.assertNotIn("private", json.dumps(shape))
+        with self.assertRaises(component.ComponentError):
+            self.observe_info({"generator-version": "x" * 65536})
+
+    def test_package_info_observation_keeps_identity_operation_and_duplicate_rejection(self):
+        root = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
+                'install-location="/" relocatable="false"><scripts><postinstall file="./postinstall"/>'
+                '</scripts></pkg-info>').encode()
+        for before, after in [(b'relocatable="false"', b'relocatable="false" relocatable="true"'),
+                              (profile.IDENTIFIER.encode(), b"private-wrong-identifier"),
+                              (b'version="1.0.0"', b'version="9.0.0"'),
+                              (b'location="/"', b'location="/private"'),
+                              (b'file="./postinstall"', b'file="../private"'),
+                              (b"</scripts>", b'<postinstall file="./postinstall"/></scripts>')]:
+            with self.subTest(before=before):
+                with self.assertRaises(component.ComponentError):
+                    profile.observe_generated(synthetic_package(info=root.replace(before, after)))
 
     def test_odc_literal_header_and_unaligned_records(self):
         # This literal catches a shared encoder/decoder field-layout mistake.
@@ -565,7 +644,7 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
@@ -574,7 +653,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 35 + (1 if sys.platform == "darwin" else 0)
+    expected = 42 + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

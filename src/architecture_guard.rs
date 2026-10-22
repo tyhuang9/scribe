@@ -1313,7 +1313,15 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 34 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 36 + (2 if os.name == \"posix\" else 0)"));
+    assert!(
+        tests.contains(
+            "test_known_extra_package_info_attributes_remain_rejected_with_closed_labels"
+        )
+    );
+    assert!(
+        tests.contains("test_package_info_error_redacts_unknown_names_namespaces_and_all_values")
+    );
     assert!(tests.contains(
         "test_member_metadata_diagnostic_separates_duplicates_and_unsupported_fields_without_values"
     ));
@@ -1605,14 +1613,14 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 35 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 42 + (1 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
         "ODC_HEADER_BYTES = 76",
         "ODC_MAX_RECORDS = 16",
         "ODC_MAX_NAME_BYTES = 256",
-        "\"schema_version\": 4",
+        "\"schema_version\": 5",
         "scripts_inventory = _observe_scripts_fixture(scripts)",
         "\"scripts_inventory\": scripts_inventory",
     ] {
@@ -1656,6 +1664,10 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));
     assert!(source.contains("\"metadata_shapes\": _member_metadata_shapes(file)"));
     assert!(source.contains("\"source_creation_time\": _source_creation_time_shape(file)"));
+    assert!(
+        source
+            .contains("\"package_info_attributes\": _package_info_attribute_shapes(package_info)")
+    );
     assert!(source.contains("child.tag in METADATA_TAG_LABELS else \"unrecognized\""));
     for required in [
         "test_member_metadata_shapes_use_closed_labels_without_stat_values",
@@ -1665,6 +1677,13 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "test_creation_time_format_masks_characters_and_bounds_without_validating",
         "test_creation_time_format_ambiguous_or_nonscalar_never_selects_a_value",
         "test_creation_time_format_full_report_omits_values_and_other_properties",
+        "test_package_info_attributes_use_fixed_records_and_absence_classes",
+        "test_package_info_control_fields_use_key_specific_closed_value_classes",
+        "test_package_info_generator_shape_bounds_and_redacts_without_validation",
+        "test_package_info_unknown_and_namespaced_names_only_increment_count",
+        "test_package_info_shapes_are_deterministic_and_private_value_independent",
+        "test_package_info_report_size_is_fixed_and_oversized_input_still_rejects",
+        "test_package_info_observation_keeps_identity_operation_and_duplicate_rejection",
     ] {
         assert!(tests.contains(required));
     }

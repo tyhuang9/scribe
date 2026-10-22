@@ -18,7 +18,7 @@ import zlib
 
 import macos_cpu_component as component
 import macos_cpu_pkg_entry as entry
-from macos_cpu_pkg_profile import xml_tree
+from macos_cpu_pkg_profile import PACKAGE_INFO_ATTRIBUTE_LABELS, xml_tree
 
 IDENTIFIER = "com.scribe.local-transcriber.cpu-worker"
 CHUNK = 65536
@@ -137,8 +137,12 @@ def _package_info(data: bytes, version: str) -> None:
     # Deliberately narrow construction policy, NOT inferred native defaults.
     # Unqualified metadata fails closed; future native acceptance must establish
     # any additional inert fields before extending this profile.
-    require(set(root.attrib) <= {"identifier", "version", "install-location", "format-version", "auth"},
-            "unsupported PackageInfo attribute")
+    extra = set(root.attrib) - {"identifier", "version", "install-location", "format-version", "auth"}
+    # Closed labels diagnose this fresh output; they grant no new acceptance.
+    known = ",".join(sorted(extra.intersection(PACKAGE_INFO_ATTRIBUTE_LABELS))) or "none"
+    unknown = sum(name not in PACKAGE_INFO_ATTRIBUTE_LABELS for name in extra)
+    require(not extra, "unsupported PackageInfo attribute "
+            f"(known-extra={known}, unrecognized={unknown})")
     require(root.get("format-version") in (None, "2") and root.get("auth") in (None, "root"),
             "unsupported PackageInfo format or authorization metadata")
     scripts = root.findall("scripts")

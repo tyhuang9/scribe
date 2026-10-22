@@ -348,6 +348,27 @@ class Inspection(unittest.TestCase):
         self.inspect(encode(info=valid.replace(b"</pkg-info>",
                                               b'<payload installKBytes="0" numberOfFiles="0"/></pkg-info>')))
 
+    def test_known_extra_package_info_attributes_remain_rejected_with_closed_labels(self):
+        for name, value in [("overwrite-permissions", "true"), ("relocatable", "false"),
+                            ("postinstall-action", "none"), ("generator-version", "private-generator")]:
+            root = ET.fromstring(package_info())
+            root.set(name, value)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(component.ComponentError,
+                                            f"known-extra={name}, unrecognized=0"):
+                    self.inspect(encode(info=ET.tostring(root)))
+
+    def test_package_info_error_redacts_unknown_names_namespaces_and_all_values(self):
+        root = ET.fromstring(package_info())
+        root.set("generator-version", "private-generator-value")
+        root.set("private-field-name", "private-field-value")
+        root.set("{urn:private-namespace}private-name", "private-namespaced-value")
+        with self.assertRaises(component.ComponentError) as caught:
+            self.inspect(encode(info=ET.tostring(root)))
+        self.assertEqual(str(caught.exception), "CPU component package: unsupported PackageInfo attribute "
+                         "(known-extra=generator-version, unrecognized=2)")
+        self.assertNotIn("private", str(caught.exception))
+
     def test_odc_types_links_names_duplicates_and_order_reject(self):
         trailer = record(b"TRAILER!!!", b"", 0)
         for content in [record(mode=0o120755) + trailer, record(links=2) + trailer,
@@ -631,7 +652,7 @@ def suite():
     classes = [Inspection, Author] + ([Posix] if os.name == "posix" else [])
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 34 + (2 if os.name == "posix" else 0)
+    expected = 36 + (2 if os.name == "posix" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"CPU component PKG discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

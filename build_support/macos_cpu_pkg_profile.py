@@ -34,6 +34,13 @@ METADATA_TAG_LABELS = frozenset({
     "name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime",
     "inode", "deviceno", "FinderCreateTime", "link", "flags", "acl",
 })
+# Observation vocabulary, not Apple's schema or the constructor's allowlist.
+# The four candidate control/generator names also occur in Mozilla's own
+# mozpack/apple_pkg/PackageInfo.template. Native presence/semantics are unproven.
+PACKAGE_INFO_ATTRIBUTE_LABELS = (
+    "auth", "format-version", "generator-version", "identifier", "install-location",
+    "overwrite-permissions", "postinstall-action", "relocatable", "version",
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -106,6 +113,32 @@ def _member_metadata_shapes(node: ET.Element) -> list[dict]:
                "has_text": bool((child.text or "").strip())} for child in node]
     return sorted(result, key=lambda item: (item["tag"], item["child_count"],
                                            item["attribute_count"], item["has_text"]))
+
+
+def _package_info_attribute_shapes(node: ET.Element) -> dict:
+    """Nine fixed records; never echo unknown names, identities or tool text.
+
+    XML already has a 64-KiB input bound. Unknown multiplicity is a count, not
+    an unbounded record list. These classes never validate or admit a package.
+    """
+    literals = {"auth": ("root",), "format-version": ("2",),
+                "overwrite-permissions": ("true", "false"),
+                "relocatable": ("true", "false"), "postinstall-action": ("none",)}
+    fields = []
+    for name in PACKAGE_INFO_ATTRIBUTE_LABELS:
+        value = node.get(name)
+        if value is None:
+            category = "absent"
+        elif name in ("identifier", "version", "install-location"):
+            category = "redacted"
+        elif name == "generator-version":
+            category = ("bounded-printable" if 0 < len(value) <= 128
+                        and all(32 <= ord(char) < 127 for char in value) else "other")
+        else:
+            category = "literal-" + value if value in literals[name] else "other"
+        fields.append({"name": name, "value_class": category})
+    return {"fields": fields,
+            "unknown_count": sum(name not in PACKAGE_INFO_ATTRIBUTE_LABELS for name in node.attrib)}
 
 
 def _source_creation_time_shape(node: ET.Element) -> dict:
@@ -290,13 +323,14 @@ def observe_generated(data: bytes) -> dict:
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
             "unexpected operation reference")
-    return {"schema_version": 4, "observation_only": True, "package_bytes": len(data),
+    return {"schema_version": 5, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),
             "members": sorted(members, key=lambda member: member["name"]),
             "package_identifier": IDENTIFIER, "package_version": VERSION,
             "install_location": "/", "postinstall_reference": references[0],
+            "package_info_attributes": _package_info_attribute_shapes(package_info),
             "scripts_inner_compression": inner, "scripts_decoded_bytes": len(scripts),
             "scripts_inventory": scripts_inventory}
 
