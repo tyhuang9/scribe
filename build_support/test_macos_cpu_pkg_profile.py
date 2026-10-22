@@ -64,7 +64,7 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["schema_version"], 3)
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
@@ -198,10 +198,63 @@ class Portable(unittest.TestCase):
         self.assertEqual(set(inventory["records"][0]), allowed)
         self.assertEqual(set(inventory["trailer"]), allowed)
         encoded = json.dumps(report)
-        for forbidden in ("prefix_hex", '"uid"', '"gid"', '"device"', '"inode"', '"rdev"', '"mtime"',
-                          '"data"', profile.FIXTURE.decode(), str(0o12345670123)):
+        for member in report["members"]:
+            for shape in member["metadata_shapes"]:
+                self.assertEqual(set(shape), {"tag", "child_count", "attribute_count", "has_text"})
+                self.assertIn(shape["tag"], profile.METADATA_TAG_LABELS | {"unrecognized"})
+        # Closed labels may name stat fields; no value-bearing keys or values
+        # may appear. ODC identities above are never used as report fields.
+        for forbidden in ("prefix_hex", '"uid":', '"gid":', '"device":', '"inode":', '"rdev":', '"mtime":',
+                          '"data":', profile.FIXTURE.decode(), str(0o12345670123)):
             self.assertNotIn(forbidden, encoded)
         self.assertTrue(report["observation_only"])
+
+    def test_member_metadata_shapes_use_closed_labels_without_stat_values(self):
+        values = {"inode": "987654321012345", "deviceno": "876543210123456", "uid": "765432101234567",
+                  "gid": "654321012345678", "user": "private-owner-sentinel",
+                  "group": "private-group-sentinel", "mtime": "private-time-sentinel"}
+        def mutate(toc):
+            for tag, value in values.items():
+                ET.SubElement(toc.findall("file")[1], tag).text = value
+        report = profile.observe_generated(synthetic_package(mutate=mutate))
+        shapes = report["members"][1]["metadata_shapes"]
+        for tag in values:
+            self.assertIn({"tag": tag, "child_count": 0, "attribute_count": 0, "has_text": True}, shapes)
+        for value in values.values():
+            self.assertNotIn(value, json.dumps(report))
+        self.assertTrue(report["observation_only"])
+
+    def test_member_metadata_shapes_preserve_duplicates_and_sort_deterministically(self):
+        def mutate(toc, reverse=False):
+            member = toc.findall("file")[1]
+            ET.SubElement(member, "inode").text = "first-private-inode"
+            field = ET.SubElement(member, "inode", private="private-attribute")
+            ET.SubElement(field, "private-child").text = "private-nested-text"
+            if reverse:
+                member[:] = list(reversed(member))
+        forward = profile.observe_generated(synthetic_package(mutate=mutate))
+        reverse = profile.observe_generated(synthetic_package(mutate=lambda toc: mutate(toc, True)))
+        shapes = forward["members"][1]["metadata_shapes"]
+        self.assertEqual(shapes, reverse["members"][1]["metadata_shapes"])
+        self.assertEqual([shape for shape in shapes if shape["tag"] == "inode"], [
+            {"tag": "inode", "child_count": 0, "attribute_count": 0, "has_text": True},
+            {"tag": "inode", "child_count": 1, "attribute_count": 1, "has_text": False}])
+        for sentinel in ("first-private-inode", "private-attribute", "private-child", "private-nested-text"):
+            self.assertNotIn(sentinel, json.dumps(forward))
+
+    def test_unknown_member_metadata_shapes_redact_names_attributes_and_text(self):
+        def mutate(toc):
+            member = toc.findall("file")[1]
+            field = ET.SubElement(member, "private-tag-sentinel", {"private-attribute-name": "private-value"})
+            field.text = "private-text-sentinel"
+            ET.SubElement(field, "private-child-name").text = "private-child-value"
+            ET.SubElement(member, "another-private-tag").text = "another-private-value"
+        report = profile.observe_generated(synthetic_package(mutate=mutate))
+        unknown = [shape for shape in report["members"][1]["metadata_shapes"] if shape["tag"] == "unrecognized"]
+        self.assertEqual(unknown, [
+            {"tag": "unrecognized", "child_count": 0, "attribute_count": 0, "has_text": True},
+            {"tag": "unrecognized", "child_count": 1, "attribute_count": 1, "has_text": True}])
+        self.assertNotIn("private", json.dumps(report))
 
     def test_outer_zlib_member_is_observed(self):
         for outer in ["application/octet-stream", "application/x-gzip"]:
@@ -430,7 +483,7 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["schema_version"], 3)
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
@@ -439,7 +492,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 28 + (1 if sys.platform == "darwin" else 0)
+    expected = 31 + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

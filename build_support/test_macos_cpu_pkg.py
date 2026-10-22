@@ -200,6 +200,27 @@ class Inspection(unittest.TestCase):
         for mutate in mutations:
             self.reject(encode(mutate=mutate))
 
+    def test_member_metadata_diagnostic_separates_duplicates_and_unsupported_fields_without_values(self):
+        for duplicate, unsupported in [(True, False), (False, True), (True, True)]:
+            def mutate(toc):
+                member = toc.findall("file")[1]
+                if duplicate:
+                    ET.SubElement(member, "mtime").text = "private-time-one"
+                    ET.SubElement(member, "mtime").text = "private-time-two"
+                if unsupported:
+                    # A documented possible stat field remains UNQUALIFIED for
+                    # this constructor until actual native reports are reviewed.
+                    ET.SubElement(member, "inode").text = "987654321012345"
+                    ET.SubElement(member, "private-tag-sentinel").text = "private-value-sentinel"
+            with self.subTest(duplicate=duplicate, unsupported=unsupported), \
+                 self.assertRaises(component.ComponentError) as result:
+                self.inspect(encode(mutate=mutate))
+            self.assertEqual(str(result.exception), "CPU component package: unsupported member metadata "
+                             f"(member-index=1; duplicate-fields={int(duplicate)}; "
+                             f"unsupported-fields={2 * int(unsupported)})")
+            for sentinel in ("private", "987654321012345", "inode", "mtime"):
+                self.assertNotIn(sentinel, str(result.exception) + repr(result.exception.args))
+
     def test_unsupported_xml_and_ambiguous_scalars_reject(self):
         for transform in [lambda xml: b'<!DOCTYPE xar [<!ENTITY x "y">]>' + xml,
                           lambda xml: xml.replace(b"<xar>", b'<xar xmlns="urn:other">'),
@@ -511,7 +532,7 @@ def suite():
     classes = [Inspection, Author] + ([Posix] if os.name == "posix" else [])
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 27 + (2 if os.name == "posix" else 0)
+    expected = 28 + (2 if os.name == "posix" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"CPU component PKG discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

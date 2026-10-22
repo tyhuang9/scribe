@@ -28,6 +28,12 @@ ODC_HEADER_BYTES = 76
 ODC_MAX_RECORDS = 16
 ODC_MAX_NAME_BYTES = 256
 HEADER = struct.Struct(">4sHHQQI")
+# Labels only, never accepted archive properties or authority. Unknown names
+# must not be echoed from generated metadata into a CI report.
+METADATA_TAG_LABELS = frozenset({
+    "name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime",
+    "inode", "deviceno", "link", "flags", "acl",
+})
 
 
 def require(condition: bool, message: str) -> None:
@@ -86,6 +92,20 @@ def observed_mode(node: ET.Element) -> str | None:
     if not node.findall("mode"):
         return None
     return scalar(node, "mode")
+
+
+def _member_metadata_shapes(node: ET.Element) -> list[dict]:
+    """Value-free direct-child shapes from the already bounded XML tree.
+
+    Keep duplicates: the construction reader rejects both duplicate and unknown
+    fields, and presence-only sets would erase which predicate failed. Labels
+    do not grant acceptance; attributes, text and descendants are never logged.
+    """
+    result = [{"tag": child.tag if child.tag in METADATA_TAG_LABELS else "unrecognized",
+               "child_count": len(child), "attribute_count": len(child.attrib),
+               "has_text": bool((child.text or "").strip())} for child in node]
+    return sorted(result, key=lambda item: (item["tag"], item["child_count"],
+                                           item["attribute_count"], item["has_text"]))
 
 
 def number(node: ET.Element, name: str, maximum: int) -> int:
@@ -221,6 +241,7 @@ def observe_generated(data: bytes) -> dict:
                         "unsafe checksum label")
                 styles[tag] = style
         members.append({"name": name, "type": kind, "mode": observed_mode(file),
+                        "metadata_shapes": _member_metadata_shapes(file),
                         "encoding": encoding, "stored_bytes": length,
                         "decoded_bytes": declared,
                         "checksum_styles": styles})
@@ -244,7 +265,7 @@ def observe_generated(data: bytes) -> dict:
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
             "unexpected operation reference")
-    return {"schema_version": 2, "observation_only": True, "package_bytes": len(data),
+    return {"schema_version": 3, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),

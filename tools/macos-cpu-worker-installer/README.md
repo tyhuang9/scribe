@@ -328,7 +328,7 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-28 portable tests, plus one native test on each Mac lane. That native test uses
+31 portable tests, plus one native test on each Mac lane. That native test uses
 the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 `postinstall`, with no interpreter or program content. The file has executable
 mode only to model an operation archive; **nothing executes it**. Neither the
@@ -363,9 +363,11 @@ root, and invokes only absolute system `pkgbuild` and `xar -tf` paths. Its own
 temporary package and source are removed after confirmed child cleanup; uncertain
 cleanup retains that private workspace. Nothing is uploaded as an artifact.
 
-`SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **2** in completed native CI logs records
+After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **3** records
 actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
 fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
+Both schema-3 native reports remain unverified until those hosted jobs complete;
+earlier schema-2 reports do not establish the new field shapes.
 The XAR header layout follows [Apple's source](https://github.com/apple-oss-distributions/xar/blob/main/xar/include/xar.h.in).
 Both basic Intel/ARM reports established the ODC prefix; complete native record
 metadata still requires the expanded reports, not synthetic assumptions.
@@ -405,6 +407,20 @@ member names/types, data bounds or encoding checks, and grants no extraction or
 installation authority. Portable fixtures cover missing modes independently and
 together. A native failure at mode lookup alone cannot distinguish missing from
 duplicate/nested metadata; only the corrected native report can establish that.
+
+Schema 3 also records each outer member's sorted direct-child metadata shapes:
+a closed tag label, child count, attribute count and text-presence boolean.
+Duplicates remain separate records. Unknown tag names become `unrecognized`;
+no scalar values, attribute names/values, nested names, identities, owners,
+timestamps, hashes or payload bytes are included. Closed labels may name stat
+properties, but cannot supply their values or grant acceptance. Apple's
+[XAR stat writer](https://github.com/apple-oss-distributions/xar/blob/main/xar/lib/stat.c)
+can emit `inode` and `deviceno`; that is not evidence that either caused a
+particular native failure. The real constructor's existing unsupported-metadata
+error now distinguishes duplicate and unsupported counts using only a numeric
+member index. Its accepted fields, inventory, types, signatures, checksums and
+byte validation are unchanged. Review both native shape reports and the actual
+construction error before extending any acceptance policy.
 
 This probe validates only its fixed fixture's Scripts inventory, not checksums,
 signatures, shipping-package operations or package authenticity. It is not a
@@ -461,7 +477,7 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 27 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 28 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,

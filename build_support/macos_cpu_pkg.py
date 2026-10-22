@@ -224,7 +224,7 @@ def _inspect_fresh(package: Path, entry_sha: str, entry_size: int, version: str)
         _leaf(toc, "creation-time")
         ranges = [(checksum_offset, checksum_offset + 20)]
         members, identifiers = {}, set()
-        for member in toc.findall("file"):
+        for member_index, member in enumerate(toc.findall("file")):
             require(set(member.attrib) <= {"id"}, "unsupported member attribute")
             if member.attrib:
                 identifier = member.get("id")
@@ -232,9 +232,14 @@ def _inspect_fresh(package: Path, entry_sha: str, entry_size: int, version: str)
                         "ambiguous member identity")
                 identifiers.add(identifier)
             tags = [node.tag for node in member]
-            require(len(tags) == len(set(tags)) and set(tags) <=
-                    {"name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime"},
-                    "unsupported member metadata")
+            duplicate_count = len(tags) - len(set(tags))
+            unsupported_count = sum(tag not in
+                {"name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime"}
+                for tag in tags)
+            require(duplicate_count == 0 and unsupported_count == 0,
+                    "unsupported member metadata "
+                    f"(member-index={member_index}; duplicate-fields={duplicate_count}; "
+                    f"unsupported-fields={unsupported_count})")
             name = _leaf(member, "name")
             require(name in ("PackageInfo", "Scripts") and name not in members and _leaf(member, "type") == "file",
                     "unexpected member, alias or file type")
