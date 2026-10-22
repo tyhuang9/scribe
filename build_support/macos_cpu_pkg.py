@@ -114,14 +114,9 @@ def _source_stat_metadata(member) -> None:
             and not (created.tail or "").strip()
             and sorted(child.tag for child in created) == ["nanoseconds", "time"],
             "unsupported source creation-time structure")
-    timestamp = _leaf(created, "time")
-    require(re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
-                         r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)", timestamp) is not None,
-            "invalid source creation-time spelling")
-    year, month, day = int(timestamp[:4]), int(timestamp[5:7]), int(timestamp[8:10])
-    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-    days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-    require(year > 0 and day <= days[month - 1], "invalid source creation-time calendar")
+    # Like the other archive timestamps, this is ignored bounded printable text.
+    # Date/zone spelling is not an integrity, identity or execution decision.
+    _leaf(created, "time")
     _number(created, "nanoseconds", 999999999)
     require(all(not (child.tail or "").strip() for child in created), "unexpected creation-time scalar tail")
 

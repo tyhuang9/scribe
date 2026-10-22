@@ -1322,7 +1322,7 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
     for required in [
         "test_source_stat_fields_are_optional_scripts_only_and_do_not_bind_identity",
         "test_serialized_stat_integers_use_signed_source_bounds_and_reject_noncanonical_text",
-        "test_finder_create_time_calendar_and_nanosecond_boundaries",
+        "test_finder_create_time_is_opaque_bounded_text_with_bounded_nanoseconds",
         "test_source_stat_metadata_tree_ambiguities_and_unknown_same_shape_reject",
         "test_source_stat_metadata_never_weakens_retained_entry_or_archive_checks",
         "test_source_stat_metadata_errors_omit_all_scalar_values",

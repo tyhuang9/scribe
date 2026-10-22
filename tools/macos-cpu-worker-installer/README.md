@@ -455,13 +455,13 @@ bounded character positions and selected separators, not raw date/digit values,
 attribute data, identities, arbitrary names or paths. It describes formatting,
 never timestamp validity, acceptance or authority.
 
-This diagnosis is needed because the public Darwin attribute writer below uses
-bare `%FT%T`, while current native construction rejects the strict bare-time
-grammar. A generic spelling error does not establish a particular suffix or a
-replacement grammar. The existing fast, inert-fixture native check will report
-the masked shape before any acceptance change; full retained-entry/package
-construction must still pass afterward. No workflow lane, input option,
-runtime diagnostic or constructor policy is changed by this report.
+The public Darwin attribute writer below uses bare `%FT%T`, while native
+construction rejected the former strict bare-time grammar. That generic error
+does not establish a particular suffix or replacement grammar. The observer
+remains useful for bounded serialization diagnosis, but does not define the
+constructor's acceptance policy or grant authority. Full retained-entry/package
+construction must still pass independently. The report adds no workflow lane,
+input option or runtime diagnostic.
 
 The fresh-output constructor now permits only three additional optional stat
 properties on **Scripts**, not PackageInfo. `inode` and `deviceno` use canonical
@@ -474,14 +474,18 @@ identity, recorded in diagnostics or an identity cache, or used as authority.
 Only the literal `FinderCreateTime` container is supported, following
 [Apple's Darwin attribute writer](https://github.com/apple-oss-distributions/xar/blob/main/xar/lib/darwinattr.c):
 exactly `time` and `nanoseconds` leaves, no attributes, nested/extra/duplicate
-children or significant surrounding text. The bounded time spelling is a
-four-digit Gregorian year 0001–9999 with valid calendar date and `HH:MM:SS`, no
-zone/fraction suffix; seconds allow 60 as in `strftime`'s leap-second domain.
-Nanoseconds are canonical decimal 0–999999999. This is source-defined stat-text
-support, not proof of the previously redacted native field or installation
-compatibility. Every other unknown property still rejects even with the same
-two-child shape. Inventory, types/links, signatures, checksums, retained entry
-bytes, complete heap coverage, source binding and cleanup rules are unchanged.
+children or significant surrounding text. The `time` leaf is opaque text:
+1–128 printable ASCII characters, like the other archive timestamps. It is
+discarded, not parsed as a date, compared with this host, used in a path/command,
+recorded in diagnostics or treated as identity, validity or authority. This
+deliberately removes date-format conformance, not a content-integrity check;
+zone/fraction spellings and non-date printable text are equally inert.
+Nanoseconds remain canonical decimal 0–999999999. This narrowly scoped policy
+for this invocation's fresh output is not arbitrary-archive admission or proof
+of native construction/installation compatibility. Every other unknown property
+still rejects even with the same two-child shape. Inventory, types/links,
+signatures, checksums, retained entry bytes, complete heap coverage, source
+binding and cleanup rules are unchanged.
 
 This probe validates only its fixed fixture's Scripts inventory, not checksums,
 signatures, shipping-package operations or package authenticity. It is not a
