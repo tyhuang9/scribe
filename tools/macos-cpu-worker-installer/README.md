@@ -354,24 +354,34 @@ the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
 mode only to model an operation archive; **nothing executes it**. Neither the
 real entry nor any worker/application is built, signed, packaged or launched.
 
-CI runs this command once per architecture in the short `package-profile`
-preflight matrix. The structural matrix requires both preflights to succeed;
-official signing still requires structural success and its unchanged protected
-manual gate. Completed preflight logs can be read independently, before the
-long native builds finish. No secrets or artifacts are added. Each preflight has
-a ten-minute execution bound and the probe step retains its two-minute bound;
-neither limits queue delay. Two additional job startups and the both-architecture
-barrier can increase total workflow time; this is earlier report availability,
-not a promise of faster full CI or package/installation acceptance.
+CI runs this command once in each structural architecture lane, immediately
+after checkout/Python setup and before Rust setup or other heavy work. A failed
+profile prevents that lane's build, CPU/PKG contracts and artifact upload. Its
+peer can proceed independently; the unchanged official job still requires
+**both complete structural lanes** plus its protected manual/default-branch gate.
+No command, permission, secret or artifact destination is added. Profile logs
+remain readable before the long native build finishes.
 
-Both preflight and structural matrices use explicit `macos-15` for Apple Silicon
-and `macos-15-intel` for Intel. The separately gated official job's source also
+This removes two job startups and the cross-architecture profile barrier; it
+does not promise shorter runner queues or total CI time. A healthy lane can now
+do heavy work and upload its existing ad hoc structural-evidence ZIP even if its
+peer profile fails; that is not official signing or release acceptance. The
+separate profile job's ten-minute cap is removed. The profile step retains its
+two-minute deadline and existing process bounds inside the structural job's
+unchanged lifecycle; none of these limits bounds queue delay. The packaging
+source check requires both unique structural/official boundaries inside its
+unprivileged scan before rejecting secrets, so a missing boundary cannot turn
+the scan into an empty success. The former standalone profile check names are
+removed; any external required-check configuration must be reviewed before merge.
+
+The structural matrix uses explicit `macos-15` for Apple Silicon and
+`macos-15-intel` for Intel. The separately gated official job's source also
 uses `macos-15`; changing its runner does not dispatch it or authorize signing.
 GitHub's [macOS 14 retirement notice](https://github.com/actions/runner-images/issues/13518)
 announces retirement on November 2, 2026 and warns of longer queues during
 deprecation. This migration addresses that documented runner dependency, not a
 proven cause of any particular queue delay or a promise of faster scheduling.
-It does not change deployment target 13.0, job dependencies, tests, artifacts,
+That runner migration did not change deployment target 13.0, tests, artifacts,
 permissions or signing gates. Review fresh expanded profiles and full native
 results on the new image; old-image success is historical evidence, not new-image
 acceptance or proof of runtime compatibility on older macOS versions.
