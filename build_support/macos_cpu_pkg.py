@@ -89,6 +89,43 @@ def _number(node, name: str, maximum: int) -> int:
     return result
 
 
+def _source_stat_metadata(member) -> None:
+    """Validate inert Scripts stat text, never identity or extraction authority.
+
+    Apple's xar/configure.ac selects PRId64/PRId32 for the macOS inode/device
+    serialization, regardless of ino_t's logical unsigned type. No value is
+    reinterpreted, compared to this host, retained as identity, or reported.
+    """
+    for tag, bits in (("inode", 64), ("deviceno", 32)):
+        if member.find(tag) is None:
+            continue
+        value = _leaf(member, tag)
+        require(not (member.find(tag).tail or "").strip(), "unexpected stat scalar tail")
+        require(re.fullmatch(r"0|-?[1-9][0-9]{0,18}", value) is not None,
+                "invalid serialized stat integer")
+        require(-(2 ** (bits - 1)) <= int(value) < 2 ** (bits - 1),
+                "serialized stat integer exceeds source bound")
+    created = member.find("FinderCreateTime")
+    if created is None:
+        return
+    # xar/lib/darwinattr.c writes exactly these leaves. This does not admit
+    # arbitrary same-shape containers, attributes, aliases, or extra metadata.
+    require(not created.attrib and not (created.text or "").strip()
+            and not (created.tail or "").strip()
+            and sorted(child.tag for child in created) == ["nanoseconds", "time"],
+            "unsupported source creation-time structure")
+    timestamp = _leaf(created, "time")
+    require(re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+                         r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)", timestamp) is not None,
+            "invalid source creation-time spelling")
+    year, month, day = int(timestamp[:4]), int(timestamp[5:7]), int(timestamp[8:10])
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    require(year > 0 and day <= days[month - 1], "invalid source creation-time calendar")
+    _number(created, "nanoseconds", 999999999)
+    require(all(not (child.tail or "").strip() for child in created), "unexpected creation-time scalar tail")
+
+
 def _checksum(node, name: str) -> str:
     matches = node.findall(name)
     require(len(matches) == 1 and not len(matches[0]) and matches[0].attrib == {"style": "sha1"},
@@ -232,19 +269,22 @@ def _inspect_fresh(package: Path, entry_sha: str, entry_size: int, version: str)
                         "ambiguous member identity")
                 identifiers.add(identifier)
             tags = [node.tag for node in member]
+            name = _leaf(member, "name")
+            allowed = {"name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime"}
+            if name == "Scripts":
+                allowed.update({"inode", "deviceno", "FinderCreateTime"})
             duplicate_count = len(tags) - len(set(tags))
-            unsupported_count = sum(tag not in
-                {"name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime"}
-                for tag in tags)
+            unsupported_count = sum(tag not in allowed for tag in tags)
             require(duplicate_count == 0 and unsupported_count == 0,
                     "unsupported member metadata "
                     f"(member-index={member_index}; duplicate-fields={duplicate_count}; "
                     f"unsupported-fields={unsupported_count})")
-            name = _leaf(member, "name")
             require(name in ("PackageInfo", "Scripts") and name not in members and _leaf(member, "type") == "file",
                     "unexpected member, alias or file type")
-            for tag in set(tags) - {"data"}:
+            for tag in set(tags) - {"data", "inode", "deviceno", "FinderCreateTime"}:
                 _leaf(member, tag)
+            if name == "Scripts":
+                _source_stat_metadata(member)
             mode = _leaf(member, "mode") if "mode" in tags else None
             require(mode == "0644" if name == "Scripts" else mode in (None, "0644"), "unsupported outer member mode")
             nodes = member.findall("data")

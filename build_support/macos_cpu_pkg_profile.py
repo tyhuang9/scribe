@@ -32,7 +32,7 @@ HEADER = struct.Struct(">4sHHQQI")
 # must not be echoed from generated metadata into a CI report.
 METADATA_TAG_LABELS = frozenset({
     "name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime",
-    "inode", "deviceno", "link", "flags", "acl",
+    "inode", "deviceno", "FinderCreateTime", "link", "flags", "acl",
 })
 
 
