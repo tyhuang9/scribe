@@ -348,7 +348,7 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-53 portable tests, plus two native tests on each Mac lane. The native tests use
+57 portable tests, plus two native tests on each Mac lane. The native tests use
 system `pkgbuild --nopayload` separately on a fixed ASCII comment and a fixed
 inert universal Mach-O named `postinstall`. The comment has no interpreter; the
 native fixture is compiled from the constant `int main(void) { return 0; }`
@@ -441,6 +441,23 @@ into this no-bundle package. All other operation, identity, inventory, retained-
 streaming, publication and cleanup checks remain. Actual retained-entry/package
 construction must pass independently on the new head; no installation or runtime
 authority is granted by the fixture or this compatibility rule.
+
+After that correction, the native ARM protected-CPU contract passed but real
+construction stopped at an empty `bundle-version` direct child. That first-error
+diagnostic does not establish the remaining siblings, multiplicity or significant
+tails. Schema 8 therefore adds `package_info_children`: every direct child in
+order, including duplicates, with a closed tag label, child/attribute counts and
+significant-text/tail booleans. Known labels are `scripts`, `payload`, `bundle`,
+`bundle-version`, `upgrade-bundle`, `update-bundle`, `atomic-update-bundle`,
+`strict-identifier` and `relocate`; all other names are `unrecognized`. No arbitrary
+names, attributes, values or recursive subtrees enter this report. Existing XML
+byte/node/depth/fanout bounds remain; the existing paired diagnostics need no new
+workflow, input or tool. These labels are observation vocabulary only, not a
+consumer schema or constructor acceptance. Production parsing remains unchanged
+and continues to reject `bundle-version` until complete native output is reviewed
+and a separate narrow compatibility rule is justified. No Installer execution,
+privileged destination behavior, installation or release readiness is established.
+
 Earlier schema-3 native reports identified the literal `FinderCreateTime` field
 on both architectures. Full native construction then reached a creation-time
 spelling rejection; those reports did not reveal the spelling itself.

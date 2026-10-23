@@ -171,6 +171,21 @@ def _source_creation_time_shape(node: ET.Element) -> dict:
     return {"status": "observed", "masked": masked, "truncated": len(time.text) > 64}
 
 
+def _package_info_child_shapes(root: ET.Element) -> list[dict]:
+    """Every direct child in order, not a schema, default or admission list.
+
+    The caller already bounds XML bytes, nodes, depth and fanout. Keep duplicates
+    and significant tails visible without recursive output or arbitrary names,
+    attributes, identities, references or text. Empty shape is not authority.
+    """
+    labels = ("scripts", "payload", "bundle", "bundle-version", "upgrade-bundle", "update-bundle",
+              "atomic-update-bundle", "strict-identifier", "relocate")
+    return [{"tag": child.tag if child.tag in labels else "unrecognized",
+             "child_count": len(child), "attribute_count": len(child.attrib),
+             "has_text": bool((child.text or "").strip()), "has_tail": bool((child.tail or "").strip())}
+            for child in root]
+
+
 def _operation_shapes(root: ET.Element) -> dict:
     """Closed observations only; no producer schema or operation admission.
 
@@ -378,7 +393,7 @@ def observe_generated(data: bytes, *, expected_fixture: bytes = FIXTURE) -> dict
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
             "unexpected operation reference " + json.dumps(operations, sort_keys=True, separators=(",", ":")))
-    return {"schema_version": 7, "observation_only": True, "package_bytes": len(data),
+    return {"schema_version": 8, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),
@@ -386,6 +401,7 @@ def observe_generated(data: bytes, *, expected_fixture: bytes = FIXTURE) -> dict
             "package_identifier": IDENTIFIER, "package_version": VERSION,
             "install_location": "/", "postinstall_reference": references[0],
             "package_info_attributes": _package_info_attribute_shapes(package_info),
+            "package_info_children": _package_info_child_shapes(package_info),
             "package_info_operations": operations,
             "scripts_inner_compression": inner, "scripts_decoded_bytes": len(scripts),
             "scripts_inventory": scripts_inventory}
@@ -459,7 +475,7 @@ def _probe_owned_fixture(native_binary: bool) -> dict:
 
 
 def probe_pair() -> dict:
-    return {"schema_version": 7, "observation_only": True,
+    return {"schema_version": 8, "observation_only": True,
             "fixtures": [probe(), probe(native_binary=True)]}
 
 

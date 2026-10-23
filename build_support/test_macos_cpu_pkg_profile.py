@@ -66,7 +66,7 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["schema_version"], 8)
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
@@ -151,6 +151,82 @@ class Portable(unittest.TestCase):
             with self.subTest(before=before):
                 with self.assertRaises(component.ComponentError):
                     profile.observe_generated(synthetic_package(info=root.replace(before, after)))
+
+    def test_package_info_children_preserve_every_direct_shape_and_order(self):
+        labels = ("scripts", "payload", "bundle", "bundle-version", "upgrade-bundle", "update-bundle",
+                  "atomic-update-bundle", "strict-identifier", "relocate")
+        root = ET.Element("pkg-info")
+        for label in labels:
+            ET.SubElement(root, label)
+        ET.SubElement(root, "bundle-version")  # duplicates must remain visible
+        self.assertEqual(profile._package_info_child_shapes(root), [
+            {"tag": label, "child_count": 0, "attribute_count": 0, "has_text": False, "has_tail": False}
+            for label in (*labels, "bundle-version")])
+        root[3].set("private-attribute", "private-value")
+        root[3].text, root[3].tail = "private-text", "private-tail"
+        ET.SubElement(root[3], "private-nested-name").text = "private-nested-text"
+        shape = profile._package_info_child_shapes(root)
+        self.assertEqual(shape[3], {"tag": "bundle-version", "child_count": 1, "attribute_count": 1,
+                                   "has_text": True, "has_tail": True})
+        self.assertEqual(len(shape), 10)  # no recursive subtree or duplicate suppression
+        self.assertNotIn("private", json.dumps(shape))
+
+    def test_package_info_children_redact_unknown_names_namespaces_and_values(self):
+        def shapes(sentinel):
+            root = ET.Element("pkg-info")
+            for label in ("Bundle-version", "private-" + sentinel, "{urn:private}" + sentinel):
+                child = ET.SubElement(root, label, **{"private-" + sentinel: sentinel})
+                child.text, child.tail = sentinel, sentinel
+                ET.SubElement(child, "private-" + sentinel)
+            return profile._package_info_child_shapes(root)
+        first, second = shapes("alpha"), shapes("beta")
+        self.assertEqual(first, second)
+        self.assertEqual(first, [{"tag": "unrecognized", "child_count": 1, "attribute_count": 1,
+                                 "has_text": True, "has_tail": True}] * 3)
+        self.assertNotIn("private", json.dumps(first))
+        root = ET.fromstring('<pkg-info><bundle-version> \t\n </bundle-version> \n </pkg-info>')
+        self.assertEqual(profile._package_info_child_shapes(root), [
+            {"tag": "bundle-version", "child_count": 0, "attribute_count": 0,
+             "has_text": False, "has_tail": False}])
+
+    def test_package_info_children_full_report_is_observation_not_constructor_admission(self):
+        root = ET.Element("pkg-info", {"identifier": profile.IDENTIFIER,
+                                      "version": profile.VERSION, "install-location": "/"})
+        ET.SubElement(root, "bundle-version")
+        ET.SubElement(ET.SubElement(root, "scripts"), "postinstall", file="./postinstall")
+        ET.SubElement(root, "private-field", **{"private-name": "private-value"}).text = "private-text"
+        report = profile.observe_generated(synthetic_package(info=ET.tostring(root)))
+        self.assertEqual(report["schema_version"], 8)
+        self.assertTrue(report["observation_only"])
+        self.assertEqual(report["package_info_children"], [
+            {"tag": "bundle-version", "child_count": 0, "attribute_count": 0, "has_text": False, "has_tail": False},
+            {"tag": "scripts", "child_count": 1, "attribute_count": 0, "has_text": False, "has_tail": False},
+            {"tag": "unrecognized", "child_count": 0, "attribute_count": 1, "has_text": True, "has_tail": False}])
+        self.assertNotIn("private", json.dumps(report))
+        # Observation of an empty known tag must not silently change admission.
+        import macos_cpu_pkg as constructor
+        root.set("identifier", constructor.IDENTIFIER)
+        root.remove(root.find("private-field"))  # otherwise this would mask accidental bundle admission
+        with self.assertRaisesRegex(component.ComponentError, "construct \\(tag=bundle-version;"):
+            constructor._package_info(ET.tostring(root), profile.VERSION)
+
+    def test_package_info_children_share_existing_xml_and_output_bounds(self):
+        root = ET.Element("pkg-info", {"identifier": profile.IDENTIFIER,
+                                      "version": profile.VERSION, "install-location": "/"})
+        ET.SubElement(ET.SubElement(root, "scripts"), "postinstall", file="./postinstall")
+        for _ in range(63):
+            ET.SubElement(root, "private-name")
+        report = profile.observe_generated(synthetic_package(info=ET.tostring(root)))
+        shapes = report["package_info_children"]
+        self.assertEqual(len(shapes), 64)
+        self.assertLess(len(json.dumps(shapes)), 9000)
+        ET.SubElement(root, "bundle-version")
+        with self.assertRaisesRegex(component.ComponentError, "XML tree exceeds its bound"):
+            profile.observe_generated(synthetic_package(info=ET.tostring(root)))
+        del root[-1]
+        root[-1].text = "x" * 65536
+        with self.assertRaises(component.ComponentError):
+            profile.observe_generated(synthetic_package(info=ET.tostring(root)))
 
     def test_operation_shapes_classify_each_predicate_without_echoing_values(self):
         root = ET.fromstring('<pkg-info><scripts><postinstall file="./postinstall"/></scripts></pkg-info>')
@@ -833,7 +909,7 @@ class Portable(unittest.TestCase):
         with patch.object(profile, "probe", side_effect=[{"fixture_kind": "inert-text"},
                                                         {"fixture_kind": "universal-macho"}]) as probe:
             report = profile.probe_pair()
-            self.assertEqual(report["schema_version"], 7)
+            self.assertEqual(report["schema_version"], 8)
             self.assertEqual([item["fixture_kind"] for item in report["fixtures"]], ["inert-text", "universal-macho"])
             self.assertEqual(probe.call_args_list, [unittest.mock.call(), unittest.mock.call(native_binary=True)])
         with patch.object(profile, "probe", side_effect=[{}, component.CleanupUncertain("uncertain")]), \
@@ -914,14 +990,14 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["schema_version"], 8)
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
     def test_actual_unsigned_universal_macho_format_without_execution(self):
         report = profile.probe(native_binary=True)
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
-        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["schema_version"], 8)
         self.assertEqual(report["fixture_kind"], "universal-macho")
         self.assertTrue(report["observation_only"])
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
@@ -931,7 +1007,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 53 + (2 if sys.platform == "darwin" else 0)
+    expected = 57 + (2 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result
