@@ -1044,6 +1044,14 @@ entry to an independently reviewed publisher requirement and the package to
 post-sign bytes; checked-in publisher policy remains default-deny. Its mocked
 tests grant no native-signature, production trust, package authentication or
 installation authority. See the CPU writer README for the full boundary.
+A separate inactive Metal finalization owner now wraps only its own fresh Metal
+entry constructor, retaining both packs' Rust production verification and the
+full frozen app/pack inventory. It reuses the same default-deny publisher policy
+and closed signing checks with the distinct Metal identifier, then returns only
+post-sign entry bytes under the Metal size bound. It does not use CPU-only
+admission, construct a PKG, provision trust, invoke Installer or alter release
+selection. Its mocked tests are not native signature or installation evidence;
+see the Metal writer README for its remaining boundaries.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not

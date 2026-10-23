@@ -267,6 +267,41 @@ installation evidence. CI adds only this source suite under the unchanged
 profile/structural gate; it does not build, upload, sign or execute a real Metal
 entry.
 
+## Inactive finalized-entry owner
+
+`build_support/macos_metal_pkg_final.py` adds a separate, internal build-only
+owner for its own freshly constructed Metal entry. It has no CLI, prebuilt-entry
+input, signing callback, caller-selected policy, release switch or installation
+route. The same source-fixed publisher policy as CPU finalization remains
+default-deny and rejects before caller inputs, workspaces or native tools.
+No publisher, production key or signing identity is provisioned by this work.
+
+If separately reviewed policy were activated, the owner would verify the app
+against its independent Apple Developer ID/publisher/application requirement,
+then call the existing full Metal constructor. The constructor still performs
+fresh Rust production pack verification for both native packs; a structural
+snapshot is not crypto admission, and CPU-only admission is never substituted.
+The complete app/pack inventory, frozen release and policy remain bound through
+finalization. The owner's fresh entry alone is signed with the reserved Metal
+identifier, hardened runtime and timestamp request. A public certificate SHA-1
+selector chooses a key but supplies no publisher authority. Both slices must
+meet the independent Metal signature requirement, runtime/timestamp properties,
+empty-entitlement rule and existing non-executing structural checks.
+
+Hash/size are remeasured after signing using the Metal entry bound, not the
+smaller CPU bound. Unchanged source/policy/inventory and final node/bytes are
+required before exclusive publication. The result is only a finalized entry,
+not a PKG, authenticated root input, installed worker or enabled release option.
+The unchanged PRE-SIGN constructor still returns only PRE-SIGN bytes. The CPU
+owner, CPU admission and production trust policies are unchanged.
+
+`python3 -B build_support/test_macos_metal_pkg_final.py` discovers exactly 14
+mock-only tests on Windows and POSIX. They exercise the full owned constructor
+with synthetic signatures/tools, not real key use, native signature acceptance
+or installation. CI runs only this mocked source suite. Actual Metal
+construction/finalization, publisher provisioning, package authentication and
+hardware qualification remain separate gates.
+
 ## Remaining boundaries, not implemented here
 
 The writer is source-tested, not an installed or qualified release. Native Mac
