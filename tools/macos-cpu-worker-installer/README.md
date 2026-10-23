@@ -170,7 +170,7 @@ does not contain the component. Structural CI assembles and inspects it, but
 does not upload it, install it, or invoke the production installer entry.
 
 Run `python3 -B build_support/test_macos_cpu_component.py` for exact-discovery
-source checks: 35 portable, 18 additional POSIX, and six additional Darwin tests.
+source checks: 36 portable, 19 additional POSIX, and six additional Darwin tests.
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
 
@@ -661,6 +661,64 @@ entry, without rebuilding or publishing the package as an artifact. Actual nativ
 author acceptance is not established until that exact-head contract passes;
 final entry signing/repackaging, package authentication,
 notarization, product composition/order and Installer execution remain unproven.
+
+### Inactive finalized-entry authoring boundary
+
+`build_support/macos_cpu_pkg_final.py` is a separate internal owner, not a CLI,
+release option or installer. It preserves the existing PRE-SIGN constructor and
+unsigned development path. The source-fixed
+`runtime-manifests/macos-installer-entry-signing-policy.json` is **default-deny**
+with an empty publisher. It rejects before app/workspace access, construction or
+native tools. No environment, caller-supplied policy, path, signing callback,
+prebuilt entry or displayed certificate identity can provision trust.
+
+A future independently reviewed positive policy must pin a Developer ID
+Application publisher/team. Application, CPU-entry and reserved Metal-entry code
+identifiers are distinct source constants. The fixed requirement combines the
+Apple generic anchor, Developer ID issuer and Application certificate OIDs,
+publisher Team ID and exact role identifier, as described in
+[Apple TN3127](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+The selector is only a canonical public certificate SHA-1 fingerprint, never
+authority or a private key. A wrong publisher, development/ad hoc certificate,
+Installer certificate, role or identifier must fail independent all-architecture
+verification. No production publisher or actual key use is selected here.
+
+The owner verifies the CPU-only app and publisher, constructs its own fresh entry
+in an owned private stage, and requests the fixed identifier, hardened runtime
+and secure timestamp. It then independently verifies the publisher requirement,
+checks both slices' bounded display properties and absent entitlements or one
+exact empty XML plist dictionary (no extra values, attributes or text),
+and reinspects structure and frozen markers. Displayed identity is not a trust
+source. Only the exact codesign property command can return its already-bounded
+stderr to this private in-memory parser; failures still expose only closed
+phase/status. The parser is intentionally fail-closed on unknown required-field
+formats, not a stable Apple metadata schema or native-signature qualification.
+
+The finalized bytes are independently reopened/hashed and retained by node
+identity. App inputs and source policy must remain unchanged. The existing
+streaming package tail receives the **post-sign** digest/size, validates every
+packaged entry byte, and publishes without overwrite. The output remains an
+**unsigned component package**, not authenticated root input. Confirmed failures
+publish nothing; uncertain child cleanup retains the owned stage, and ambiguous
+publication retains the final. Trusted reviewed build tools and non-hostile
+same-user/root writers remain assumptions; signatures plus markers do not prove
+arbitrary transformed code came from this build.
+
+`python3 -B build_support/test_macos_cpu_pkg_final.py` discovers exactly 18 mocked
+tests on every host. Synthetic policy and tools exist only in test-private
+patches/fixtures. They establish default denial, closed orchestration,
+post-sign byte binding, both-slice checks, rejection paths and publication
+behavior—not real signatures, publisher trust or Mac acceptance. CI invokes only
+this mocked suite and checks that the public policy remains unprovisioned.
+No release/signing path, protected environment, key, installation or Auto gate
+is activated. Actual signature/native-tool acceptance, production policy,
+final package authentication and product composition remain separate gates.
+
+Apple distinguishes executable and package signing identities and requires
+signing nested contents before their containers; see
+[creating distribution-signed code](https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac/)
+and [packaging Mac software](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution).
+This CPU-first source stage does not replace the planned Metal installer work.
 
 ## Not yet established
 

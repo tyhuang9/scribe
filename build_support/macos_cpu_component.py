@@ -52,6 +52,7 @@ TOOL_OPERATIONS = frozenset({
     "metal-author-build", "metal-content-verification",
     "metal-entry-build-arm64", "metal-entry-build-x86_64", "metal-entry-combine",
     "cpu-component-pkg-build",
+    "final-entry-signing", "final-entry-signature", "final-entry-properties", "final-entry-entitlements",
 })
 
 
@@ -388,7 +389,7 @@ def require_outside_app(parent: Path, app: Path) -> None:
 
 def capture(arguments: list[str], *, timeout: float = 10, limit: int = 262144,
             error_limit: int = 65536, environment: dict | None = None, cwd: Path | None = None,
-            operation: str = "tool") -> bytes:
+            operation: str = "tool", signature_properties: bool = False) -> bytes:
     """Bound output and time while reserving PID ownership until final reap.
 
     macOS needs Python >=3.13 for waitid/WNOWAIT:
@@ -396,6 +397,16 @@ def capture(arguments: list[str], *, timeout: float = 10, limit: int = 262144,
     Never call poll()/communicate() before a failure's process-group signal.
     """
     validate_tool_operation(operation)
+    # One private parser needs codesign's bounded display stream, not a generic
+    # raw-diagnostic interface. Existing callers still receive stdout only.
+    require(type(signature_properties) is bool, "invalid signature property stream")
+    require(not signature_properties or (operation == "final-entry-properties" and len(arguments) == 6
+            and arguments[:4] == ["/usr/bin/codesign", "--display", "--verbose=4", "--arch"]
+            and arguments[4] in ("arm64", "x86_64") and type(arguments[5]) is str
+            and Path(arguments[5]).is_absolute()),
+            "invalid signature property command")
+    require(operation != "final-entry-properties" or signature_properties,
+            "signature property operation requires its fixed display command")
     require(all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WEXITED", "P_PID")),
             "metadata process checks require waitid/WNOWAIT (Python 3.13+ on macOS)")
     require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL,
@@ -440,7 +451,7 @@ def capture(arguments: list[str], *, timeout: float = 10, limit: int = 262144,
                         raise CleanupUncertain("process group remains after leader exit")
                     if status != 0:
                         raise ToolExitError(operation, status)
-                    return bytes(output[0])
+                    return bytes(output[1 if signature_properties else 0])
                 for key, _ in selector.select(min(remaining, 0.05)):
                     index = key.data
                     maximum = limit if index == 0 else error_limit

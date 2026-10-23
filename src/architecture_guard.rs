@@ -1587,7 +1587,7 @@ fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
     for phase in ["entry-build-arm64", "entry-build-x86_64", "entry-combine"] {
         assert!(entry.contains(phase));
     }
-    assert!(tests.contains("expected = 35 + (18 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 36 + (19 if os.name == \"posix\" else 0)"));
     assert!(tests.contains("(6 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_actual_bundle_context_preserves_signed_input_binding_without_execution",
@@ -1604,6 +1604,76 @@ fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
     assert!(tests.contains(
         "test_tool_exit_diagnostic_redacts_real_child_arguments_environment_and_streams"
     ));
+}
+
+#[test]
+fn macos_cpu_finalization_is_default_denied_and_binds_only_own_postsign_bytes() {
+    let source = include_str!("../build_support/macos_cpu_pkg_final.py");
+    let shared = include_str!("../build_support/macos_cpu_component.py");
+    let tests = include_str!("../build_support/test_macos_cpu_pkg_final.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let policy: serde_json::Value = serde_json::from_str(include_str!(
+        "../runtime-manifests/macos-installer-entry-signing-policy.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        policy,
+        serde_json::json!({"schema_version":1,"mode":"default_deny","publisher_team_id":""})
+    );
+    let owner = &source[source.find("def build_component(").unwrap()..];
+    assert!(owner.find("_publisher()").unwrap() < owner.find("app.is_absolute()").unwrap());
+    assert!(
+        owner.find("entry.build_entry(").unwrap() < owner.find("\"final-entry-signing\"").unwrap()
+    );
+    assert!(
+        owner.find("finalized = component.hash_file(").unwrap()
+            < owner.find("_signature(candidate,").unwrap()
+    );
+    assert!(
+        owner.find("_signature(candidate,").unwrap()
+            < owner.find("package._package_constructed_entry(").unwrap()
+    );
+    assert!(owner.contains("(candidate, *finalized)"));
+    for required in [
+        "--all-architectures",
+        "--test-requirement",
+        "anchor apple generic",
+        "certificate leaf[subject.OU]",
+        "CODE_IDENTIFIERS",
+        "_entitlements(",
+        "_only_entry(",
+    ] {
+        assert!(source.contains(required));
+    }
+    for forbidden in [
+        "argparse",
+        "os.environ",
+        "getenv(",
+        "signing_callback",
+        "subprocess.",
+        "--deep",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "finalization gained {forbidden}"
+        );
+    }
+    assert!(shared.contains("operation == \"final-entry-properties\" and len(arguments) == 6"));
+    assert!(tests.contains("expected = 18"));
+    assert!(workflow.contains("python3 -B build_support/test_macos_cpu_pkg_final.py"));
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_cpu_pkg_final.py")
+            .count(),
+        2
+    );
+    assert_eq!(
+        workflow
+            .matches("runtime-manifests/macos-installer-entry-signing-policy.json")
+            .count(),
+        2
+    );
+    assert!(!workflow.contains("python3 -B build_support/macos_cpu_pkg_final.py"));
 }
 
 #[test]

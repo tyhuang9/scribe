@@ -354,7 +354,7 @@ def _package_constructed_entry(app: Path, private: Path, before: dict, version: 
                                constructed: tuple[Path, str, int]) -> tuple[Path, str, int]:
     """Private tail for the caller's OWN freshly constructed CPU entry only.
 
-    Both source callers own this private tree, have admitted the CPU-only app,
+    Each source caller owns this private tree, has admitted the CPU-only app,
     and have just built the entry there. No arbitrary prebuilt-entry interface,
     callbacks, trust flags or publication authority are provided.
     """
