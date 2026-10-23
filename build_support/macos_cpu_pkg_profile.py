@@ -1,7 +1,7 @@
 """Observe native pkgbuild's fixed, unsigned source-test fixture; never install.
 
 This has no archive/path input and is NOT a package inspector or trust decision.
-Only the freshly generated tiny fixture is read. No archive is extracted, no
+Only freshly generated fixed fixtures are read. No archive is extracted, no
 operation is executed, and no real worker, application or signing key is used.
 """
 from __future__ import annotations
@@ -21,9 +21,14 @@ import macos_cpu_component as component
 IDENTIFIER = "com.scribe.source-test.cpu-package-profile"
 VERSION = "1.0.0"
 FIXTURE = b"# Scribe package-format fixture; intentionally no interpreter.\n"
+COMPILED_SOURCE = b"int main(void) { return 0; }\n"
 MAX_PACKAGE = 1024 * 1024
 MAX_TOC = 64 * 1024
 MAX_MEMBER = 64 * 1024
+MAX_COMPILED_FIXTURE = 256 * 1024
+MAX_COMPILED_SCRIPTS = MAX_COMPILED_FIXTURE + 8192
+# Observation/output bound ONLY, never a constructor or Installer policy.
+MAX_OBSERVED_OPERATION_TIMEOUT = 86400
 ODC_HEADER_BYTES = 76
 ODC_MAX_RECORDS = 16
 ODC_MAX_NAME_BYTES = 256
@@ -34,16 +39,24 @@ METADATA_TAG_LABELS = frozenset({
     "name", "type", "mode", "data", "uid", "gid", "user", "group", "mtime", "atime", "ctime",
     "inode", "deviceno", "FinderCreateTime", "link", "flags", "acl",
 })
+# Observation vocabulary, not Apple's schema or the constructor's allowlist.
+# The four control/generator names also occur in Mozilla's own template. This
+# vocabulary cannot establish native presence/semantics or grant admission.
+PACKAGE_INFO_ATTRIBUTE_LABELS = (
+    "auth", "format-version", "generator-version", "identifier", "install-location",
+    "overwrite-permissions", "postinstall-action", "relocatable", "version",
+)
 
 
 def require(condition: bool, message: str) -> None:
     component.require(condition, "package profile: " + message)
 
 
-def inflate(data: bytes, maximum: int) -> bytes:
+def inflate(data: bytes, maximum: int, *, ceiling: int = MAX_TOC) -> bytes:
     # Accept one complete zlib/gzip stream only. No unbounded flush, recursion,
     # concatenated members or allocating from a claimed expanded length.
-    require(0 < len(data) <= MAX_PACKAGE and 0 < maximum <= MAX_TOC,
+    require(ceiling in (MAX_TOC, MAX_COMPILED_SCRIPTS)
+            and 0 < len(data) <= MAX_PACKAGE and 0 < maximum <= ceiling,
             "invalid compression bounds")
     decoder = zlib.decompressobj(47)
     try:
@@ -108,6 +121,32 @@ def _member_metadata_shapes(node: ET.Element) -> list[dict]:
                                            item["attribute_count"], item["has_text"]))
 
 
+def _package_info_attribute_shapes(node: ET.Element) -> dict:
+    """Nine fixed records; never echo unknown names, identities or tool text.
+
+    XML already has a 64-KiB input bound. Unknown multiplicity is a count, not
+    an unbounded record list. These classes never validate or admit a package.
+    """
+    literals = {"auth": ("root",), "format-version": ("2",),
+                "overwrite-permissions": ("true", "false"),
+                "relocatable": ("true", "false"), "postinstall-action": ("none",)}
+    fields = []
+    for name in PACKAGE_INFO_ATTRIBUTE_LABELS:
+        value = node.get(name)
+        if value is None:
+            category = "absent"
+        elif name in ("identifier", "version", "install-location"):
+            category = "redacted"
+        elif name == "generator-version":
+            category = ("bounded-printable" if 0 < len(value) <= 128
+                        and all(32 <= ord(char) < 127 for char in value) else "other")
+        else:
+            category = "literal-" + value if value in literals[name] else "other"
+        fields.append({"name": name, "value_class": category})
+    return {"fields": fields,
+            "unknown_count": sum(name not in PACKAGE_INFO_ATTRIBUTE_LABELS for name in node.attrib)}
+
+
 def _source_creation_time_shape(node: ET.Element) -> dict:
     """Observe only format shape, never raw time or a timestamp-validity claim."""
     containers = node.findall("FinderCreateTime")
@@ -132,6 +171,44 @@ def _source_creation_time_shape(node: ET.Element) -> dict:
     return {"status": "observed", "masked": masked, "truncated": len(time.text) > 64}
 
 
+def _operation_shapes(root: ET.Element) -> dict:
+    """Closed observations only; no producer schema or operation admission.
+
+    Preserve order, duplicates and direct/global counts from bounded XML.
+    Candidate attribute/value labels cannot authorize their consumer semantics.
+    Unknown metadata contributes counts/other, never raw names or values.
+    """
+    labels = ("file", "type", "timeout", "component-id")
+    values = {"file": {"./postinstall": "exact-dot-postinstall", "postinstall": "exact-basename"},
+              "type": {"binary": "literal-binary", "shell": "literal-shell"},
+              "timeout": {"0": "literal-0"},
+              "component-id": {IDENTIFIER: "exact-fixture-identifier"}}
+    def tag(node):
+        return node.tag if node.tag in ("scripts", "postinstall", "preinstall") else "unrecognized"
+    def field(node, name):
+        value = node.get(name)
+        result = {"name": name, "value_class": "absent" if value is None else values[name].get(value, "other")}
+        if (node.tag == "postinstall" and name == "timeout" and value is not None
+                and re.fullmatch(r"[1-9][0-9]{0,4}", value) is not None
+                and int(value) <= MAX_OBSERVED_OPERATION_TIMEOUT):
+            result.update(value_class="bounded-positive-decimal", numeric_value=int(value))
+        return result
+    def shape(node):
+        return {"tag": tag(node),
+                "attribute_count": len(node.attrib), "child_count": len(node),
+                "unknown_attribute_count": sum(name not in labels for name in node.attrib),
+                "has_text": bool((node.text or "").strip()), "has_tail": bool((node.tail or "").strip()),
+                "fields": [field(node, name) for name in labels],
+                "child_tags": [tag(child) for child in node]}
+    direct = root.findall("scripts")
+    containers = list(root.iter("scripts"))
+    return {"direct_scripts_count": len(direct), "global_scripts_count": len(containers),
+            "global_postinstall_count": len(list(root.iter("postinstall"))),
+            "containers": [{"is_direct": node in direct,
+                            "tree": {**shape(node), "children": [shape(child) for child in node]}}
+                           for node in containers]}
+
+
 def number(node: ET.Element, name: str, maximum: int) -> int:
     text = scalar(node, name)
     require(re.fullmatch(r"0|[1-9][0-9]{0,9}", text) is not None, "invalid numeric scalar")
@@ -140,14 +217,15 @@ def number(node: ET.Element, name: str, maximum: int) -> int:
     return value
 
 
-def _decode_odc(data: bytes) -> tuple[list[dict], dict, int]:
+def _decode_odc(data: bytes, *, maximum: int = MAX_MEMBER) -> tuple[list[dict], dict, int]:
     """Decode the bounded generated fixture, without extraction or admission.
 
     Apple's libarchive cpio.5 defines the 76-byte octal header and no name/data
     alignment. Raw identities/times are validated but never returned or logged.
     This decoder is private; the CLI still accepts no archive or path input.
     """
-    require(type(data) is bytes and 0 < len(data) <= MAX_MEMBER, "ODC archive exceeds its bound")
+    require(maximum in (MAX_MEMBER, MAX_COMPILED_SCRIPTS)
+            and type(data) is bytes and 0 < len(data) <= maximum, "ODC archive exceeds its bound")
     records, offset = [], 0
     fields = (("device", 6), ("inode", 6), ("mode", 6), ("uid", 6), ("gid", 6),
               ("links", 6), ("rdev", 6), ("mtime", 11), ("name_bytes", 6), ("data_bytes", 11))
@@ -161,7 +239,7 @@ def _decode_odc(data: bytes) -> tuple[list[dict], dict, int]:
             values[key] = int(field, 8)
             cursor += width
         require(2 <= values["name_bytes"] <= ODC_MAX_NAME_BYTES
-                and values["data_bytes"] <= MAX_MEMBER, "ODC name/data exceeds its bound")
+                and values["data_bytes"] <= maximum, "ODC name/data exceeds its bound")
         name_end = cursor + values["name_bytes"]
         end = name_end + values["data_bytes"]
         require(end <= len(data), "truncated ODC name/data")
@@ -180,8 +258,14 @@ def _decode_odc(data: bytes) -> tuple[list[dict], dict, int]:
         offset = end
 
 
-def _observe_scripts_fixture(data: bytes) -> dict:
-    records, trailer, padding = _decode_odc(data)
+def _fixture_bound(expected_fixture: bytes) -> int:
+    require(type(expected_fixture) is bytes and 0 < len(expected_fixture) <= MAX_COMPILED_FIXTURE,
+            "invalid owned fixture bytes")
+    return MAX_MEMBER if expected_fixture == FIXTURE else MAX_COMPILED_SCRIPTS
+
+
+def _observe_scripts_fixture(data: bytes, expected_fixture: bytes = FIXTURE) -> dict:
+    records, trailer, padding = _decode_odc(data, maximum=_fixture_bound(expected_fixture))
     names = {b".": ".", b"./": "./", b"postinstall": "postinstall", b"./postinstall": "./postinstall"}
     seen, report = set(), []
     for record in records:
@@ -192,7 +276,7 @@ def _observe_scripts_fixture(data: bytes) -> dict:
         require(identity not in seen, "duplicate or aliased fixed-fixture ODC record")
         seen.add(identity)
         require((root and kind == 0o040000 and not record["data"])
-                or (not root and kind == 0o100000 and record["data"] == FIXTURE),
+                or (not root and kind == 0o100000 and record["data"] == expected_fixture),
                 "fixed-fixture ODC type/content mismatch")
         report.append(_odc_report_record(record, names[name], "directory" if root else "regular-file"))
     require("postinstall" in seen, "missing fixed-fixture ODC postinstall")
@@ -210,12 +294,13 @@ def _odc_report_record(record: dict, name: str, kind: str) -> dict:
             "data_offset": record["data_offset"], "end_offset": record["end_offset"]}
 
 
-def observe_generated(data: bytes) -> dict:
+def observe_generated(data: bytes, *, expected_fixture: bytes = FIXTURE) -> dict:
     """Private probe decoding, not reusable admission of arbitrary archives.
 
     XAR header layout: Apple's xar/include/xar.h.in. Bounded decoding here
     records observed encodings; it does not verify checksums or authenticity.
     """
+    scripts_maximum = _fixture_bound(expected_fixture)
     require(HEADER.size < len(data) <= MAX_PACKAGE, "package size exceeds bound")
     magic, size, version, compressed, expanded, checksum = HEADER.unpack(data[:HEADER.size])
     require(magic == b"xar!" and size == HEADER.size and version == 1, "unsupported XAR header")
@@ -239,8 +324,9 @@ def observe_generated(data: bytes) -> dict:
         require(len(records) == 1, "ambiguous member data")
         record = records[0]
         offset = number(record, "offset", MAX_PACKAGE)
-        length = number(record, "length", MAX_MEMBER)
-        declared = number(record, "size", MAX_MEMBER)
+        member_maximum = scripts_maximum if name == "Scripts" else MAX_MEMBER
+        length = number(record, "length", member_maximum)
+        declared = number(record, "size", member_maximum)
         begin, end = heap + offset, heap + offset + length
         require(length > 0 and begin >= heap and end <= len(data)
                 and all(end <= a or begin >= b for a, b in ranges), "invalid member range")
@@ -252,7 +338,8 @@ def observe_generated(data: bytes) -> dict:
         require(encoding in ("application/octet-stream", "application/x-gzip"),
                 "unobserved member encoding; review the native tool output")
         raw = data[begin:end]
-        decoded = inflate(raw, MAX_MEMBER) if encoding == "application/x-gzip" else raw
+        decoded = (inflate(raw, member_maximum, ceiling=MAX_COMPILED_SCRIPTS if name == "Scripts" else MAX_TOC)
+                   if encoding == "application/x-gzip" else raw)
         require(len(decoded) == declared, "member size differs from TOC")
         contents[name] = decoded
         styles = {}
@@ -285,31 +372,74 @@ def observe_generated(data: bytes) -> dict:
             and int.from_bytes(scripts[:2], "big") % 31 == 0:
         inner = "zlib"
     if inner != "none":
-        scripts = inflate(scripts, MAX_MEMBER)
-    scripts_inventory = _observe_scripts_fixture(scripts)
+        scripts = inflate(scripts, scripts_maximum, ceiling=MAX_COMPILED_SCRIPTS)
+    scripts_inventory = _observe_scripts_fixture(scripts, expected_fixture)
+    operations = _operation_shapes(package_info)
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
-            "unexpected operation reference")
-    return {"schema_version": 4, "observation_only": True, "package_bytes": len(data),
+            "unexpected operation reference " + json.dumps(operations, sort_keys=True, separators=(",", ":")))
+    return {"schema_version": 7, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),
             "members": sorted(members, key=lambda member: member["name"]),
             "package_identifier": IDENTIFIER, "package_version": VERSION,
             "install_location": "/", "postinstall_reference": references[0],
+            "package_info_attributes": _package_info_attribute_shapes(package_info),
+            "package_info_operations": operations,
             "scripts_inner_compression": inner, "scripts_decoded_bytes": len(scripts),
             "scripts_inventory": scripts_inventory}
 
 
-def probe() -> dict:
+def _compile_fixture(workspace: Path, environment: dict) -> bytes:
+    source = workspace / "fixture.c"
+    with source.open("xb") as handle:
+        handle.write(COMPILED_SOURCE)
+        handle.flush()
+        os.fsync(handle.fileno())
+    slices = []
+    for architecture in ("arm64", "x86_64"):
+        thin = workspace / architecture
+        component.capture(["/usr/bin/xcrun", "--sdk", "macosx", "clang", "-arch", architecture,
+                           "-mmacosx-version-min=13.0", str(source), "-o", str(thin)],
+                          timeout=30, limit=8192, error_limit=8192, environment=environment, cwd=workspace)
+        component.read_bounded(thin, MAX_COMPILED_FIXTURE)
+        slices.append(str(thin))
+    universal = workspace / "universal"
+    component.capture(["/usr/bin/lipo", "-create", *slices, "-output", str(universal)],
+                      timeout=10, limit=8192, error_limit=8192, environment=environment, cwd=workspace)
+    retained = component.read_bounded(universal, MAX_COMPILED_FIXTURE)
+    architectures = component.capture(["/usr/bin/lipo", str(universal), "-archs"],
+                                     timeout=5, limit=1024, error_limit=8192,
+                                     environment=environment, cwd=workspace)
+    require(sorted(architectures.split()) == [b"arm64", b"x86_64"], "compiled fixture architectures differ")
+    require(retained, "empty compiled fixture")
+    return retained
+
+
+def probe(*, native_binary: bool = False) -> dict:
     require(sys.platform == "darwin", "native observation requires macOS")
     require(os.geteuid() != 0, "native observation must be unprivileged")
+    require(type(native_binary) is bool, "invalid fixed fixture kind")
+    try:
+        return _probe_owned_fixture(native_binary)
+    except OSError:
+        # Do not leak private fixture paths through filesystem/tool errors.
+        # CleanupUncertain is a separate ComponentError and must propagate.
+        raise component.ComponentError("package profile: fixed fixture filesystem operation failed") from None
+
+
+def _probe_owned_fixture(native_binary: bool) -> dict:
     with component.private_workspace(Path(tempfile.gettempdir()), "scribe-pkg-profile-") as workspace:
+        temporary = workspace / "tmp"
+        temporary.mkdir(mode=0o700)
+        environment = {**component.probe_environment(), "TMPDIR": str(temporary)}
+        expected = _compile_fixture(workspace, environment) if native_binary else FIXTURE
         scripts = workspace / "scripts"
         scripts.mkdir(mode=0o700)
         fixture = scripts / "postinstall"
         with fixture.open("xb") as handle:
-            handle.write(FIXTURE)
+            handle.write(expected)
             handle.flush()
             os.fchmod(handle.fileno(), 0o755)
             os.fsync(handle.fileno())
@@ -317,17 +447,25 @@ def probe() -> dict:
         # No signing, resources, payload root, script execution or Installer.
         component.capture(["/usr/bin/pkgbuild", "--nopayload", "--scripts", str(scripts),
                            "--identifier", IDENTIFIER, "--version", VERSION,
-                           "--install-location", "/", str(package)], timeout=30, limit=8192)
-        report = observe_generated(component.read_bounded(package, MAX_PACKAGE))
-        listing = component.capture(["/usr/bin/xar", "-tf", str(package)], timeout=5, limit=1024)
+                           "--install-location", "/", str(package)], timeout=30, limit=8192,
+                          error_limit=8192, environment=environment, cwd=workspace)
+        report = observe_generated(component.read_bounded(package, MAX_PACKAGE), expected_fixture=expected)
+        report["fixture_kind"] = "universal-macho" if native_binary else "inert-text"
+        listing = component.capture(["/usr/bin/xar", "-tf", str(package)], timeout=5, limit=1024,
+                                    error_limit=8192, environment=environment, cwd=workspace)
         require(sorted(listing.decode("ascii").splitlines()) ==
                 [member["name"] for member in report["members"]], "tool listing differs from TOC")
         return report
 
 
+def probe_pair() -> dict:
+    return {"schema_version": 7, "observation_only": True,
+            "fixtures": [probe(), probe(native_binary=True)]}
+
+
 def main() -> None:
     require(len(sys.argv) == 1, "this fixed fixture accepts no archive, path or options")
-    print(json.dumps(probe(), sort_keys=True, separators=(",", ":")))
+    print(json.dumps(probe_pair(), sort_keys=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":

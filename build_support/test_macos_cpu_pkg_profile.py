@@ -7,11 +7,13 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import traceback
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 import zlib
 
+import macos_cpu_component as component
 import macos_cpu_pkg_profile as profile
 
 
@@ -31,9 +33,9 @@ def odc_archive(*records, padding=0):
             + odc_record(b"TRAILER!!!", b"", mode=0) + b"\0" * padding)
 
 
-def synthetic_package(*, encoding="application/octet-stream", inner="gzip", mutate=None, scripts=None):
+def synthetic_package(*, encoding="application/octet-stream", inner="gzip", mutate=None, scripts=None, info=None):
     """Synthetic unsigned XAR envelope containing independently encoded valid ODC."""
-    info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
+    info = info if info is not None else (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
             'install-location="/"><scripts><postinstall file="./postinstall"/>'
             '</scripts></pkg-info>').encode()
     archive = odc_archive() if scripts is None else scripts
@@ -64,13 +66,261 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 7)
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
         self.assertEqual(report["postinstall_reference"], "./postinstall")
         self.assertNotIn("synthetic", json.dumps(report))
         self.assertNotIn("trusted", report)
+
+    def observe_info(self, attributes):
+        root = ET.Element("pkg-info", {"identifier": profile.IDENTIFIER,
+                                      "version": profile.VERSION, "install-location": "/"})
+        root.attrib.update(attributes)
+        ET.SubElement(ET.SubElement(root, "scripts"), "postinstall", file="./postinstall")
+        return profile.observe_generated(synthetic_package(info=ET.tostring(root)))
+
+    def test_package_info_attributes_use_fixed_records_and_absence_classes(self):
+        shape = self.observe_info({})["package_info_attributes"]
+        self.assertEqual(set(shape), {"fields", "unknown_count"})
+        expected = {"auth": "absent", "format-version": "absent", "generator-version": "absent",
+                    "identifier": "redacted", "install-location": "redacted",
+                    "overwrite-permissions": "absent", "postinstall-action": "absent",
+                    "relocatable": "absent", "version": "redacted"}
+        self.assertEqual(shape["fields"], [{"name": name, "value_class": expected[name]}
+                                          for name in sorted(expected)])
+        self.assertEqual(shape["unknown_count"], 0)
+
+    def test_package_info_control_fields_use_key_specific_closed_value_classes(self):
+        for name, literals in [("auth", ("root",)), ("format-version", ("2",)),
+                               ("overwrite-permissions", ("true", "false")),
+                               ("relocatable", ("true", "false")), ("postinstall-action", ("none",))]:
+            for value in (*literals, "", "True", "private-control-value", "none", "2", "root"):
+                with self.subTest(name=name, value=value):
+                    fields = self.observe_info({name: value})["package_info_attributes"]["fields"]
+                    observed = next(item["value_class"] for item in fields if item["name"] == name)
+                    self.assertEqual(observed, "literal-" + value if value in literals else "other")
+
+    def test_package_info_generator_shape_bounds_and_redacts_without_validation(self):
+        for value in ["x", "x" * 128, " ", "$(private-command); /private/path", "", "x" * 129,
+                      "private\nvalue", "private\tvalue", "private\x7fvalue", "private\u00e9value"]:
+            with self.subTest(length=len(value)):
+                shape = self.observe_info({"generator-version": value})["package_info_attributes"]
+                observed = next(item["value_class"] for item in shape["fields"]
+                                if item["name"] == "generator-version")
+                expected = "bounded-printable" if 0 < len(value) <= 128 and all(32 <= ord(c) < 127 for c in value) else "other"
+                self.assertEqual(observed, expected)
+                self.assertNotIn("private", json.dumps(shape))
+
+    def test_package_info_unknown_and_namespaced_names_only_increment_count(self):
+        attrs = {"private-field-name": "private-field-value",
+                 "{urn:private-namespace}private-name": "private-namespaced-value"}
+        shape = self.observe_info(attrs)["package_info_attributes"]
+        self.assertEqual(shape["unknown_count"], 2)
+        self.assertEqual(len(shape["fields"]), 9)
+        self.assertNotIn("private", json.dumps(shape))
+
+    def test_package_info_shapes_are_deterministic_and_private_value_independent(self):
+        first = {"generator-version": "private-one", "relocatable": "false",
+                 "private-one": "private-alpha", "private-two": "private-beta"}
+        second = {"private-four": "private-delta", "private-three": "private-gamma",
+                  "relocatable": "false", "generator-version": "private-two"}
+        self.assertEqual(self.observe_info(first)["package_info_attributes"],
+                         self.observe_info(second)["package_info_attributes"])
+
+    def test_package_info_report_size_is_fixed_and_oversized_input_still_rejects(self):
+        shape = self.observe_info({f"private-field-{index}": "private-value" for index in range(200)})["package_info_attributes"]
+        self.assertEqual(shape["unknown_count"], 200)
+        self.assertEqual(len(shape["fields"]), 9)
+        self.assertLess(len(json.dumps(shape)), 1024)
+        self.assertNotIn("private", json.dumps(shape))
+        with self.assertRaises(component.ComponentError):
+            self.observe_info({"generator-version": "x" * 65536})
+
+    def test_package_info_observation_keeps_identity_operation_and_duplicate_rejection(self):
+        root = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" '
+                'install-location="/" relocatable="false"><scripts><postinstall file="./postinstall"/>'
+                '</scripts></pkg-info>').encode()
+        for before, after in [(b'relocatable="false"', b'relocatable="false" relocatable="true"'),
+                              (profile.IDENTIFIER.encode(), b"private-wrong-identifier"),
+                              (b'version="1.0.0"', b'version="9.0.0"'),
+                              (b'location="/"', b'location="/private"'),
+                              (b'file="./postinstall"', b'file="../private"'),
+                              (b"</scripts>", b'<postinstall file="./postinstall"/></scripts>')]:
+            with self.subTest(before=before):
+                with self.assertRaises(component.ComponentError):
+                    profile.observe_generated(synthetic_package(info=root.replace(before, after)))
+
+    def test_operation_shapes_classify_each_predicate_without_echoing_values(self):
+        root = ET.fromstring('<pkg-info><scripts><postinstall file="./postinstall"/></scripts></pkg-info>')
+        shape = profile._operation_shapes(root)
+        self.assertEqual((shape["direct_scripts_count"], shape["global_scripts_count"],
+                          shape["global_postinstall_count"]), (1, 1, 1))
+        container = shape["containers"][0]
+        self.assertTrue(container["is_direct"])
+        operation = container["tree"]["children"][0]
+        self.assertEqual((operation["tag"], operation["attribute_count"], operation["child_count"],
+                          operation["has_text"], operation["has_tail"]), ("postinstall", 1, 0, False, False))
+        self.assertEqual(operation["fields"][0], {"name": "file", "value_class": "exact-dot-postinstall"})
+
+    def test_operation_shapes_preserve_ambiguity_nesting_and_closed_unknown_counts(self):
+        root = ET.fromstring('<pkg-info><scripts private-name="private-value"><preinstall/>'
+                            '<postinstall file="postinstall" type="binary" timeout="0" '
+                            'component-id="private-id"><private-tag private-name="private-value">'
+                            'private-text</private-tag></postinstall></scripts><private-container>'
+                            '<scripts><postinstall file="private-file"/></scripts></private-container></pkg-info>')
+        shape = profile._operation_shapes(root)
+        self.assertEqual((shape["direct_scripts_count"], shape["global_scripts_count"],
+                          shape["global_postinstall_count"]), (1, 2, 2))
+        self.assertEqual([item["is_direct"] for item in shape["containers"]], [True, False])
+        container = shape["containers"][0]["tree"]
+        self.assertEqual(container["unknown_attribute_count"], 1)
+        operation = container["children"][1]
+        self.assertEqual(operation["child_count"], 1)
+        self.assertEqual(operation["child_tags"], ["unrecognized"])
+        self.assertEqual([item["value_class"] for item in operation["fields"]],
+                         ["exact-basename", "literal-binary", "literal-0", "other"])
+        self.assertNotIn("private", json.dumps(shape))
+
+    def test_operation_value_classes_are_key_specific_and_bounded(self):
+        for key in ("file", "type", "timeout", "component-id"):
+            for value in ("", "./postinstall", "postinstall", "binary", "shell", "0", profile.IDENTIFIER,
+                          "private-value", "x" * 4096):
+                root = ET.Element("pkg-info")
+                op = ET.SubElement(ET.SubElement(root, "scripts"), "postinstall", {key: value})
+                op.text, op.tail = "private-text", "private-tail"
+                shape = profile._operation_shapes(root)
+                observed = shape["containers"][0]["tree"]["children"][0]
+                self.assertTrue(observed["has_text"] and observed["has_tail"])
+                fields = {item["name"]: item["value_class"] for item in observed["fields"]}
+                expected = {"file": {"./postinstall": "exact-dot-postinstall", "postinstall": "exact-basename"},
+                            "type": {"binary": "literal-binary", "shell": "literal-shell"},
+                            "timeout": {"0": "literal-0"},
+                            "component-id": {profile.IDENTIFIER: "exact-fixture-identifier"}}
+                self.assertEqual(fields[key], expected[key].get(value, "other"))
+                self.assertTrue(all(fields[name] == "absent" for name in fields if name != key))
+                self.assertNotIn("private", json.dumps(shape))
+
+    def test_compiled_fixture_bound_is_separate_from_metadata_and_text_bound(self):
+        body = b"inert-compiled-fixture" * 5000
+        archive = odc_archive(odc_record(body=body))
+        report = profile.observe_generated(synthetic_package(scripts=archive), expected_fixture=body)
+        self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
+        with self.assertRaises(component.ComponentError):
+            profile.observe_generated(synthetic_package(scripts=archive))
+        for expected in (b"", b"x" * (profile.MAX_COMPILED_FIXTURE + 1), bytearray(body)):
+            with self.assertRaises(component.ComponentError):
+                profile.observe_generated(synthetic_package(scripts=archive), expected_fixture=expected)
+        with self.assertRaises(component.ComponentError):
+            profile.observe_generated(synthetic_package(scripts=archive, info=b"x" * (profile.MAX_TOC + 1)),
+                                      expected_fixture=body)
+        for wrong in (body + b"x", body[:-1], b"y" * len(body), profile.FIXTURE):
+            with self.assertRaises(component.ComponentError):
+                profile.observe_generated(synthetic_package(scripts=odc_archive(odc_record(body=wrong))),
+                                          expected_fixture=body)
+
+    def test_operation_timeout_observes_only_bounded_canonical_postinstall_numbers(self):
+        cases = [(None, "absent", None), ("0", "literal-0", None),
+                 ("1", "bounded-positive-decimal", 1), ("600", "bounded-positive-decimal", 600),
+                 ("86400", "bounded-positive-decimal", 86400)]
+        cases += [(value, "other", None) for value in ("", "00", "01", "0600", "86401", "99999", "100000",
+                  "-1", "+600", " 600", "600 ", "600\t", "600\n", "600.0", "6e2", "\u0666\u0660\u0660",
+                  "\uff16\uff10\uff10", "private-timeout-sentinel", "9" * 65536)]
+        for value, category, number in cases:
+            with self.subTest(value=value[:24] if value else value):
+                root = ET.fromstring('<pkg-info><scripts><postinstall file="./postinstall"/></scripts></pkg-info>')
+                if value is not None:
+                    root.find("scripts/postinstall").set("timeout", value)
+                shape = profile._operation_shapes(root)
+                field = shape["containers"][0]["tree"]["children"][0]["fields"][2]
+                expected = {"name": "timeout", "value_class": category}
+                if number is not None:
+                    expected["numeric_value"] = number
+                self.assertEqual(field, expected)
+                self.assertNotIn("private", json.dumps(shape))
+        self.assertEqual(profile.MAX_OBSERVED_OPERATION_TIMEOUT, 86400)
+        info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" install-location="/">'
+                '<scripts><postinstall file="./postinstall" timeout="600"/></scripts></pkg-info>').encode()
+        report = profile.observe_generated(synthetic_package(info=info))
+        self.assertEqual(report["package_info_operations"]["containers"][0]["tree"]["children"][0]["fields"][2],
+                         {"name": "timeout", "value_class": "bounded-positive-decimal", "numeric_value": 600})
+        root = ET.fromstring('<pkg-info xmlns:p="urn:private"><scripts timeout="600">'
+                            '<postinstall p:timeout="600"/><preinstall timeout="600"/>'
+                            '<postinstall timeout="7"/><postinstall timeout="600"/></scripts></pkg-info>')
+        shape = profile._operation_shapes(root)
+        self.assertNotIn("numeric_value", shape["containers"][0]["tree"]["fields"][2])
+        fields = [item["fields"][2] for item in shape["containers"][0]["tree"]["children"]]
+        self.assertEqual(fields[:2], [{"name": "timeout", "value_class": "absent"},
+                                     {"name": "timeout", "value_class": "other"}])
+        self.assertEqual([item["numeric_value"] for item in fields[2:]], [7, 600])
+        self.assertEqual(shape["global_postinstall_count"], 3)
+        self.assertNotIn("private", json.dumps(shape))
+
+    def test_operation_shapes_keep_empty_duplicate_nested_and_unknown_names(self):
+        for xml, counts in [('<pkg-info/>', (0, 0, 0)),
+                            ('<pkg-info><scripts/></pkg-info>', (1, 1, 0)),
+                            ('<pkg-info><scripts/><scripts/></pkg-info>', (2, 2, 0)),
+                            ('<pkg-info><scripts><scripts><postinstall/></scripts></scripts></pkg-info>', (1, 2, 1)),
+                            ('<pkg-info><scripts><postinstall/><postinstall/></scripts></pkg-info>', (1, 1, 2))]:
+            shape = profile._operation_shapes(ET.fromstring(xml))
+            self.assertEqual((shape["direct_scripts_count"], shape["global_scripts_count"],
+                              shape["global_postinstall_count"]), counts)
+        root = ET.fromstring('<pkg-info xmlns:p="urn:private"><scripts><postinstall p:file="private" '
+                            'File="private" p:type="private"/></scripts></pkg-info>')
+        shape = profile._operation_shapes(root)
+        operation = shape["containers"][0]["tree"]["children"][0]
+        self.assertEqual(operation["unknown_attribute_count"], 3)
+        self.assertTrue(all(item["value_class"] == "absent" for item in operation["fields"]))
+        self.assertNotIn("private", json.dumps(shape))
+        # No recursive subtree duplication: bounded shallow container/operation
+        # records even for deeply nested containers.
+        root = profile.xml_tree(b"<pkg-info>" + b"<scripts>" * 7 + b"<preinstall/>" * 32
+                                + b"</scripts>" * 7 + b"</pkg-info>")
+        self.assertLess(len(json.dumps(profile._operation_shapes(root))), 24000)
+
+    def test_operation_reference_failure_retains_only_closed_diagnostics(self):
+        info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" install-location="/">'
+                '<scripts><postinstall file="private-file" private-name="private-value"/></scripts></pkg-info>').encode()
+        with self.assertRaises(component.ComponentError) as caught:
+            profile.observe_generated(synthetic_package(info=info))
+        self.assertIn('"global_postinstall_count":1', str(caught.exception))
+        self.assertIn('"unknown_attribute_count":1', str(caught.exception))
+        self.assertNotIn("private", str(caught.exception))
+
+    def test_compiled_scripts_compression_and_overflow_do_not_widen_metadata_limits(self):
+        largest_body = b"x" * profile.MAX_COMPILED_FIXTURE
+        largest_archive = odc_archive(odc_record(body=largest_body))
+        largest_archive += b"\0" * (profile.MAX_COMPILED_SCRIPTS - len(largest_archive))
+        self.assertTrue(profile.observe_generated(synthetic_package(scripts=largest_archive),
+                                                 expected_fixture=largest_body)["observation_only"])
+        with self.assertRaises(component.ComponentError):
+            profile.observe_generated(synthetic_package(scripts=largest_archive + b"\0"), expected_fixture=largest_body)
+        valid_info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" install-location="/" '
+                      'padding=""><scripts><postinstall file="./postinstall"/></scripts></pkg-info>').encode()
+        valid_info = valid_info.replace(b'padding=""', b'padding="' + b"x" * (profile.MAX_TOC - len(valid_info)) + b'"')
+        self.assertEqual(len(valid_info), profile.MAX_TOC)
+        compiled_archive = odc_archive(odc_record(body=largest_body))
+        self.assertTrue(profile.observe_generated(synthetic_package(info=valid_info, scripts=compiled_archive),
+                                                 expected_fixture=largest_body)["observation_only"])
+        with self.assertRaises(component.ComponentError):
+            profile.observe_generated(synthetic_package(info=valid_info.replace(b'padding="', b'padding="x', 1),
+                                                       scripts=compiled_archive),
+                                      expected_fixture=largest_body)
+        body = b"inert-compiled-fixture" * 5000
+        for encoding in ("application/octet-stream", "application/x-gzip"):
+            for inner in ("none", "gzip", "zlib"):
+                archive = odc_archive(odc_record(body=body))
+                report = profile.observe_generated(synthetic_package(scripts=archive, encoding=encoding, inner=inner),
+                                                   expected_fixture=body)
+                self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
+                for malformed in (archive + b"x", b"x" * (profile.MAX_COMPILED_SCRIPTS + 1)):
+                    with self.assertRaises(component.ComponentError):
+                        profile.observe_generated(synthetic_package(scripts=malformed, encoding=encoding, inner=inner),
+                                                  expected_fixture=body)
+                with self.assertRaises(component.ComponentError):
+                    profile.observe_generated(synthetic_package(info=b"x" * (profile.MAX_TOC + 1),
+                                                               encoding=encoding, inner=inner), expected_fixture=body)
 
     def test_odc_literal_header_and_unaligned_records(self):
         # This literal catches a shared encoder/decoder field-layout mistake.
@@ -494,10 +744,101 @@ class Portable(unittest.TestCase):
                 patch.object(profile.component, "private_workspace", side_effect=private),
                 patch.object(profile.component, "capture", side_effect=execute))
 
-    def run_mocked_probe(self, workspace, execute):
+    def run_mocked_probe(self, workspace, execute, **kwargs):
         platform, uid, chmod, private, capture = self.mocked_probe(workspace, execute)
         with platform, uid, chmod, private, capture:
-            return profile.probe()
+            return profile.probe(**kwargs)
+
+    def compiled_probe_executor(self, workspace, calls, failure=None):
+        body = b"inert-compiled-fixture" * 5000
+        def execute(arguments, **kwargs):
+            calls.append(arguments)
+            self.assertEqual(kwargs["environment"], {**component.probe_environment(), "TMPDIR": str(workspace / "tmp")})
+            self.assertEqual(kwargs["cwd"], workspace)
+            self.assertLessEqual(kwargs["timeout"], 30)
+            self.assertLessEqual(kwargs["error_limit"], 8192)
+            self.assertTrue((workspace / "tmp").is_dir())
+            if failure == "os-error":
+                raise OSError("private-error-value", str(workspace / "private-file-sentinel"))
+            if failure == len(calls):
+                raise component.CleanupUncertain("owned process retirement uncertain")
+            if arguments[0] == "/usr/bin/xcrun":
+                architecture = ("arm64", "x86_64")[len(calls) - 1]
+                self.assertEqual(arguments, ["/usr/bin/xcrun", "--sdk", "macosx", "clang", "-arch", architecture,
+                                             "-mmacosx-version-min=13.0", str(workspace / "fixture.c"),
+                                             "-o", str(workspace / architecture)])
+                self.assertEqual((workspace / "fixture.c").read_bytes(), profile.COMPILED_SOURCE)
+                if failure != "missing":
+                    Path(arguments[-1]).write_bytes(b"thin")
+                return b""
+            if arguments[0] == "/usr/bin/lipo":
+                if "-create" in arguments:
+                    self.assertEqual(arguments, ["/usr/bin/lipo", "-create", str(workspace / "arm64"),
+                                                 str(workspace / "x86_64"), "-output", str(workspace / "universal")])
+                    Path(arguments[-1]).write_bytes(body if failure != "oversized" else b"x" * (profile.MAX_COMPILED_FIXTURE + 1))
+                    return b""
+                self.assertEqual(arguments, ["/usr/bin/lipo", str(workspace / "universal"), "-archs"])
+                return b"arm64\n" if failure == "architecture" else b"x86_64 arm64\n"
+            if arguments[0] == "/usr/bin/pkgbuild":
+                self.assertEqual(sorted(item.name for item in (workspace / "scripts").iterdir()), ["postinstall"])
+                self.assertEqual((workspace / "scripts/postinstall").read_bytes(), body)
+                (workspace / "fixture.pkg").write_bytes(synthetic_package(scripts=odc_archive(odc_record(body=body))))
+                return b""
+            self.assertEqual(arguments, ["/usr/bin/xar", "-tf", str(workspace / "fixture.pkg")])
+            return b"Scripts\nScripts\n" if failure == "listing" else b"PackageInfo\nScripts\n"
+        return execute
+
+    def test_compiled_probe_only_compiles_packages_lists_and_binds_retained_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace, calls = Path(temporary), []
+            report = self.run_mocked_probe(workspace, self.compiled_probe_executor(workspace, calls), native_binary=True)
+            self.assertEqual(len(calls), 6)
+            self.assertEqual(report["fixture_kind"], "universal-macho")
+            self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
+
+    def test_compiled_probe_failures_stop_and_preserve_uncertain_cleanup(self):
+        for failure in (1, 2, 3, 4, 5, 6, "missing", "os-error", "oversized", "architecture", "listing"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                workspace, calls = Path(temporary), []
+                expected = component.CleanupUncertain if type(failure) is int else component.ComponentError
+                with self.assertRaises(expected) as caught:
+                    self.run_mocked_probe(workspace, self.compiled_probe_executor(workspace, calls, failure), native_binary=True)
+                if type(failure) is int:
+                    self.assertEqual(len(calls), failure)
+                if failure in ("missing", "os-error"):
+                    rendered = "".join(traceback.format_exception(caught.exception))
+                    self.assertIn("fixed fixture filesystem operation failed", rendered)
+                    for private in (str(workspace), "private-file-sentinel", "private-error-value"):
+                        self.assertNotIn(private, rendered)
+        if os.name == "posix":
+            # Exercise the real descriptor-safe context, not the bare-yield
+            # mock above. No child exists: uncertainty is injected by capture.
+            uid = os.geteuid() or 501
+            with tempfile.TemporaryDirectory() as temporary:
+                owned = []
+                def uncertain(_arguments, **kwargs):
+                    owned.append(kwargs["cwd"])
+                    raise component.CleanupUncertain("synthetic retirement uncertainty")
+                with patch.object(profile.sys, "platform", "darwin"), \
+                     patch.object(profile.os, "geteuid", return_value=uid), \
+                     patch.object(profile.tempfile, "gettempdir", return_value=temporary), \
+                     patch.object(profile.component, "capture", side_effect=uncertain), \
+                     self.assertRaises(component.CleanupUncertain):
+                    profile.probe(native_binary=True)
+                self.assertEqual(len(owned), 1)
+                self.assertTrue(owned[0].is_dir())
+                self.assertEqual((owned[0] / "fixture.c").read_bytes(), profile.COMPILED_SOURCE)
+
+    def test_pair_runs_both_fixed_probes_and_never_reports_partial_success(self):
+        with patch.object(profile, "probe", side_effect=[{"fixture_kind": "inert-text"},
+                                                        {"fixture_kind": "universal-macho"}]) as probe:
+            report = profile.probe_pair()
+            self.assertEqual(report["schema_version"], 7)
+            self.assertEqual([item["fixture_kind"] for item in report["fixtures"]], ["inert-text", "universal-macho"])
+            self.assertEqual(probe.call_args_list, [unittest.mock.call(), unittest.mock.call(native_binary=True)])
+        with patch.object(profile, "probe", side_effect=[{}, component.CleanupUncertain("uncertain")]), \
+             self.assertRaises(component.CleanupUncertain):
+            profile.probe_pair()
 
     def test_probe_invokes_only_exact_metadata_tools_and_never_entry(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -544,15 +885,23 @@ class Portable(unittest.TestCase):
                 profile.probe()
             private.assert_not_called()
             execute.assert_not_called()
+        with patch.object(profile.sys, "platform", "darwin"), \
+             patch.object(profile.os, "geteuid", return_value=0, create=True), \
+             patch.object(profile.component, "private_workspace") as private, \
+             patch.object(profile.component, "capture") as execute, \
+             self.assertRaises(component.ComponentError):
+            profile.probe(native_binary=True)
+        private.assert_not_called()
+        execute.assert_not_called()
 
     def test_main_accepts_no_external_archive_path_or_override(self):
         for arguments in [["probe", "candidate.pkg"], ["probe", "--root", "/"], ["probe", "--help"]]:
             with self.subTest(arguments=arguments), patch.object(profile.sys, "argv", arguments), \
-                 patch.object(profile, "probe") as probe, self.assertRaises(profile.component.ComponentError):
+                 patch.object(profile, "probe_pair") as probe, self.assertRaises(profile.component.ComponentError):
                 profile.main()
             probe.assert_not_called()
         with patch.object(profile.sys, "argv", ["probe"]), \
-             patch.object(profile, "probe", return_value={"observation_only": True}), \
+             patch.object(profile, "probe_pair", return_value={"observation_only": True}), \
              patch("sys.stdout", new_callable=io.StringIO) as output:
             profile.main()
         self.assertEqual(json.loads(output.getvalue()), {"observation_only": True})
@@ -565,8 +914,16 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 7)
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
+        self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
+
+    def test_actual_unsigned_universal_macho_format_without_execution(self):
+        report = profile.probe(native_binary=True)
+        print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
+        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["fixture_kind"], "universal-macho")
+        self.assertTrue(report["observation_only"])
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
 
@@ -574,7 +931,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 35 + (1 if sys.platform == "darwin" else 0)
+    expected = 53 + (2 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

@@ -1313,7 +1313,36 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 34 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 42 + (2 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_observed_controls_reject_other_values_without_normalization_or_value_logging",
+        "test_observed_profile_accepts_legacy_individual_and_combined_optional_fields",
+        "test_generator_is_bounded_ignored_printable_text_not_authority",
+        "test_observed_controls_never_weaken_identity_operations_payload_or_archive_integrity",
+        "test_construct_error_exposes_only_closed_shape_not_names_or_values",
+        "test_observed_postinstall_timeout_is_optional_exact_literal",
+        "test_timeout_never_normalizes_values_or_weakens_operation_shape",
+    ] {
+        assert!(tests.contains(required));
+    }
+    assert!(!source.contains("PACKAGE_INFO_ATTRIBUTE_LABELS"));
+    assert!(!source.contains("MAX_OBSERVED_OPERATION_TIMEOUT"));
+    assert!(source.contains("{\"file\": \"./postinstall\", \"timeout\": \"600\"}"));
+    let profile_imports = source
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            (line.starts_with("import ") || line.starts_with("from "))
+                && line.contains("macos_cpu_pkg_profile")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        profile_imports,
+        ["from macos_cpu_pkg_profile import xml_tree"]
+    );
+    assert!(
+        tests.contains("test_package_info_error_redacts_unknown_names_namespaces_and_all_values")
+    );
     assert!(tests.contains(
         "test_member_metadata_diagnostic_separates_duplicates_and_unsupported_fields_without_values"
     ));
@@ -1417,6 +1446,7 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
         );
     }
     assert!(tests.contains("expected = 19 + (1 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("package_info(OBSERVED_ATTRIBUTES, payload=True, timeout=\"600\")"));
     assert!(workflow.contains("python3 -B build_support/test_native_macos_cpu_pkg_entry.py"));
     assert!(ordered(&workflow));
     // A missing structural upload must not match the later official job, and
@@ -1581,7 +1611,8 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
     let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");
     let workflow = include_str!("../.github/workflows/macos-release.yml").replace("\r\n", "\n");
-    let probe = &source[source.find("def probe()").unwrap()..source.find("def main()").unwrap()];
+    let probe =
+        &source[source.find("def probe(*").unwrap()..source.find("def probe_pair()").unwrap()];
     assert!(probe.find("os.geteuid() != 0").unwrap() < probe.find("private_workspace(").unwrap());
     assert!(probe.contains("fixture.open(\"xb\")"));
     assert_eq!(probe.matches("component.capture(").count(), 2);
@@ -1605,15 +1636,19 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 35 + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 53 + (2 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
         "ODC_HEADER_BYTES = 76",
         "ODC_MAX_RECORDS = 16",
         "ODC_MAX_NAME_BYTES = 256",
-        "\"schema_version\": 4",
-        "scripts_inventory = _observe_scripts_fixture(scripts)",
+        "\"schema_version\": 7",
+        "MAX_OBSERVED_OPERATION_TIMEOUT = 86400",
+        "MAX_COMPILED_FIXTURE = 256 * 1024",
+        "MAX_TOC = 64 * 1024",
+        "MAX_MEMBER = 64 * 1024",
+        "scripts_inventory = _observe_scripts_fixture(scripts, expected_fixture)",
         "\"scripts_inventory\": scripts_inventory",
     ] {
         assert!(
@@ -1626,7 +1661,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "end <= len(data)",
         "len(records) < ODC_MAX_RECORDS",
         "not any(data[end:])",
-        "record[\"data\"] == FIXTURE",
+        "record[\"data\"] == expected_fixture",
         "identity not in seen",
     ] {
         assert!(decoder.contains(required));
@@ -1656,6 +1691,10 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert!(tests.contains("test_present_mode_keeps_strict_scalar_validation"));
     assert!(source.contains("\"metadata_shapes\": _member_metadata_shapes(file)"));
     assert!(source.contains("\"source_creation_time\": _source_creation_time_shape(file)"));
+    assert!(
+        source
+            .contains("\"package_info_attributes\": _package_info_attribute_shapes(package_info)")
+    );
     assert!(source.contains("child.tag in METADATA_TAG_LABELS else \"unrecognized\""));
     for required in [
         "test_member_metadata_shapes_use_closed_labels_without_stat_values",
@@ -1665,13 +1704,45 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "test_creation_time_format_masks_characters_and_bounds_without_validating",
         "test_creation_time_format_ambiguous_or_nonscalar_never_selects_a_value",
         "test_creation_time_format_full_report_omits_values_and_other_properties",
+        "test_package_info_attributes_use_fixed_records_and_absence_classes",
+        "test_package_info_control_fields_use_key_specific_closed_value_classes",
+        "test_package_info_generator_shape_bounds_and_redacts_without_validation",
+        "test_package_info_unknown_and_namespaced_names_only_increment_count",
+        "test_package_info_shapes_are_deterministic_and_private_value_independent",
+        "test_package_info_report_size_is_fixed_and_oversized_input_still_rejects",
+        "test_package_info_observation_keeps_identity_operation_and_duplicate_rejection",
+        "test_operation_shapes_classify_each_predicate_without_echoing_values",
+        "test_operation_timeout_observes_only_bounded_canonical_postinstall_numbers",
+        "test_operation_shapes_keep_empty_duplicate_nested_and_unknown_names",
+        "test_operation_reference_failure_retains_only_closed_diagnostics",
+        "test_compiled_scripts_compression_and_overflow_do_not_widen_metadata_limits",
+        "test_compiled_probe_only_compiles_packages_lists_and_binds_retained_bytes",
+        "test_compiled_probe_failures_stop_and_preserve_uncertain_cleanup",
+        "test_pair_runs_both_fixed_probes_and_never_reports_partial_success",
     ] {
         assert!(tests.contains(required));
     }
     assert!(tests.contains("test_actual_unsigned_nopayload_format_without_installation"));
+    assert!(tests.contains("test_actual_unsigned_universal_macho_format_without_execution"));
+    let compiler =
+        &source[source.find("def _compile_fixture(").unwrap()..source.find("def probe(*").unwrap()];
+    for required in [
+        "[\"/usr/bin/xcrun\", \"--sdk\", \"macosx\", \"clang\", \"-arch\", architecture",
+        "for architecture in (\"arm64\", \"x86_64\")",
+        "[\"/usr/bin/lipo\", \"-create\"",
+        "[\"/usr/bin/lipo\", str(universal), \"-archs\"]",
+        "sorted(architectures.split()) == [b\"arm64\", b\"x86_64\"]",
+        "component.read_bounded(universal, MAX_COMPILED_FIXTURE)",
+        "environment=environment, cwd=workspace",
+    ] {
+        assert!(
+            compiler.contains(required),
+            "compiled fixture lost {required}"
+        );
+    }
     let profile_step = concat!(
         "      - name: Observe fixed unsigned PKG fixture format without installation\n",
-        "        timeout-minutes: 2\n",
+        "        timeout-minutes: 4\n",
         "        run: python3 -B build_support/test_macos_cpu_pkg_profile.py\n",
     );
     let rust_step = concat!(
@@ -1684,7 +1755,11 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         let Some((_, jobs)) = workflow.split_once("\n  structural:") else {
             return false;
         };
-        let Some((structural, official)) = jobs.split_once("\n  official-sign-notarize:") else {
+        let Some((unprivileged, official)) = jobs.split_once("\n  official-sign-notarize:") else {
+            return false;
+        };
+        let Some((structural, diagnostics)) = unprivileged.split_once("\n  package-diagnostics:")
+        else {
             return false;
         };
         let Some(profile) = structural.find(profile_step) else {
@@ -1693,8 +1768,9 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         let Some(rust) = structural.find("      - uses: dtolnay/rust-toolchain@") else {
             return false;
         };
-        workflow.matches("\n  structural:\n").count() == 1
-            && workflow.matches("\n  official-sign-notarize:\n").count() == 1
+        workflow.lines().filter(|line| *line == "  structural:").count() == 1
+            && workflow.lines().filter(|line| *line == "  official-sign-notarize:").count() == 1
+            && workflow.lines().filter(|line| *line == "  package-diagnostics:").count() == 1
             && !workflow.contains("\n  package-profile:\n")
             && !structural.contains("\n    needs:")
             && workflow.matches(profile_step).count() == 1
@@ -1723,6 +1799,22 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             ]
             .iter()
             .any(|forbidden| structural.contains(forbidden))
+            && diagnostics.contains("timeout-minutes: 10")
+            && diagnostics.contains("timeout-minutes: 4")
+            && diagnostics.matches("run:").count() == 1
+            && diagnostics.matches("- uses:").count() == 2
+            && diagnostics.matches("- runner:").count() == 2
+            && diagnostics.contains("runner: macos-15-intel\n            arch: x86_64")
+            && diagnostics.contains("runner: macos-15\n            arch: aarch64")
+            && diagnostics.contains("fail-fast: false")
+            && diagnostics.contains("actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09")
+            && diagnostics.contains("actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1")
+            && diagnostics.contains("python-version: '3.13'")
+            && diagnostics.contains("runs-on: ${{ matrix.runner }}")
+            && diagnostics.matches("run: python3 -B build_support/macos_cpu_pkg_profile.py").count() == 1
+            && !["needs:", "secrets.", "continue-on-error:", "if:", "environment:", "permissions:",
+                 "upload-artifact", "cargo ", "codesign", "notarytool", "sudo ", "env:"].iter()
+                .any(|forbidden| diagnostics.contains(forbidden))
             && official.contains("\n    needs: structural\n")
             && official.contains("\n    environment: macos-release\n")
             && official.contains(
@@ -1738,7 +1830,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             without_profile.replacen(rust_step, &format!("{rust_step}{profile_step}"), 1),
         ),
         ("duplicate profile", workflow.replacen(profile_step, &profile_step.repeat(2), 1)),
-        ("unbounded profile", workflow.replacen("timeout-minutes: 2", "timeout-minutes: 3", 1)),
+        ("unbounded profile", workflow.replacen("timeout-minutes: 4", "timeout-minutes: 5", 1)),
         ("wrong runner pair", workflow.replacen("arch: x86_64", "arch: aarch64", 1)),
         ("fail-fast cancellation", workflow.replacen("fail-fast: false", "fail-fast: true", 1)),
         (
@@ -1749,8 +1841,17 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
                 1,
             ),
         ),
-        ("optional profile", workflow.replacen("        timeout-minutes: 2", "        continue-on-error: true\n        timeout-minutes: 2", 1)),
-        ("conditional profile", workflow.replacen("        timeout-minutes: 2", "        if: always()\n        timeout-minutes: 2", 1)),
+        ("optional profile", workflow.replacen("        timeout-minutes: 4", "        continue-on-error: true\n        timeout-minutes: 4", 1)),
+        ("conditional profile", workflow.replacen("        timeout-minutes: 4", "        if: always()\n        timeout-minutes: 4", 1)),
+        ("dependent diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  package-diagnostics:\n    needs: structural\n", 1)),
+        ("privileged diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  package-diagnostics:\n    environment: macos-release\n", 1)),
+        ("diagnostic permission override", workflow.replacen("\n  package-diagnostics:\n", "\n  package-diagnostics:\n    permissions: write-all\n", 1)),
+        ("conditional diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  package-diagnostics:\n    if: true\n", 1)),
+        ("duplicate diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  package-diagnostics:\n  package-diagnostics:\n", 1)),
+        ("duplicate structural job", workflow.replacen("\n  structural:\n", "\n  structural:\n  structural:\n", 1)),
+        ("duplicate official job", workflow.replacen("\n  official-sign-notarize:\n", "\n  official-sign-notarize:\n  official-sign-notarize:\n", 1)),
+        ("unbounded diagnostic job", workflow.replacen("    timeout-minutes: 10", "    timeout-minutes: 20", 1)),
+        ("missing diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  unexpected-job:\n", 1)),
         ("cross-architecture barrier", workflow.replacen("\n  structural:\n", "\n  structural:\n    needs: package-profile\n", 1)),
         ("conditional structural job", workflow.replacen("\n  structural:\n", "\n  structural:\n    if: true\n", 1)),
         ("privileged structural environment", workflow.replacen("\n  structural:\n", "\n  structural:\n    environment: macos-release\n", 1)),
@@ -1767,7 +1868,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         .split("\n  structural:\n")
         .nth(1)
         .unwrap()
-        .split("\n  official-sign-notarize:\n")
+        .split("\n  package-diagnostics:\n")
         .next()
         .unwrap();
     let official_job = workflow
@@ -1782,7 +1883,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert_eq!(profile_phase.matches("- uses:").count(), 2);
     assert_eq!(profile_phase.matches("run:").count(), 1);
     for required in [
-        "timeout-minutes: 2",
+        "timeout-minutes: 4",
         "fail-fast: false",
         "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
         "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
@@ -1834,6 +1935,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     assert!(packaging_check.contains("sed -n '/^  structural:/,/^  official-sign-notarize:/p'"));
     assert!(packaging_check.contains("grep -c '^  structural:$'"));
     assert!(packaging_check.contains("grep -c '^  official-sign-notarize:$'"));
+    assert!(packaging_check.contains("grep -c '^  package-diagnostics:$'"));
     assert!(packaging_check.contains("<<<\"$unprivileged_jobs\""));
     assert_eq!(
         workflow

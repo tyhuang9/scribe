@@ -19,6 +19,9 @@ REVISION = "cpu-component-source-fixture"
 WORKER = b"synthetic CPU worker"
 DIGEST = hashlib.sha256(WORKER).hexdigest()
 ENTRY = b"synthetic universal installer entry; never execute"
+OBSERVED_ATTRIBUTES = {"auth": "root", "format-version": "2", "overwrite-permissions": "true",
+                       "relocatable": "false", "postinstall-action": "none",
+                       "generator-version": "synthetic-generator"}
 
 
 def sha1(data):
@@ -39,13 +42,22 @@ def archive(body=ENTRY, *, root=True, padding=0):
             + record(b"TRAILER!!!", b"", 0) + b"\0" * padding)
 
 
-def package_info():
-    return (f'<pkg-info identifier="{pkg.IDENTIFIER}" version="{VERSION}" install-location="/">'
+def package_info(attributes=None, *, payload=False, timeout=None):
+    data = (f'<pkg-info identifier="{pkg.IDENTIFIER}" version="{VERSION}" install-location="/">'
             '<scripts><postinstall file="./postinstall"/></scripts></pkg-info>').encode()
+    if attributes is None and not payload and timeout is None:
+        return data
+    root = ET.fromstring(data)
+    root.attrib.update(attributes or {})
+    if timeout is not None:
+        root.find("scripts/postinstall").set("timeout", timeout)
+    if payload:
+        ET.SubElement(root, "payload", installKBytes="0", numberOfFiles="0")
+    return ET.tostring(root)
 
 
 def encode(body=ENTRY, *, info=None, odc=None, compressed_scripts=None, mutate=None,
-           toc_transform=None, heap_transform=None):
+           toc_transform=None, heap_transform=None, extra_members=()):
     """Independent XAR writer with actual compressed-TOC/member SHA1 checksums.
 
     This encodes a narrow SOURCE fixture, not claimed native PackageInfo output.
@@ -56,6 +68,7 @@ def encode(body=ENTRY, *, info=None, odc=None, compressed_scripts=None, mutate=N
     scripts = gzip.compress(odc, mtime=0) if compressed_scripts is None else compressed_scripts
     items = [("PackageInfo", zlib.compress(info), info, "application/x-gzip"),
              ("Scripts", scripts, scripts, "application/octet-stream")]
+    items.extend(extra_members)
     root = ET.Element("xar")
     toc = ET.SubElement(root, "toc")
     checksum = ET.SubElement(toc, "checksum", style="sha1")
@@ -348,6 +361,139 @@ class Inspection(unittest.TestCase):
         self.inspect(encode(info=valid.replace(b"</pkg-info>",
                                               b'<payload installKBytes="0" numberOfFiles="0"/></pkg-info>')))
 
+    def test_observed_controls_reject_other_values_without_normalization_or_value_logging(self):
+        for name, expected, opposite in [("overwrite-permissions", "true", "false"),
+                                          ("relocatable", "false", "true"),
+                                          ("postinstall-action", "none", "restart")]:
+            for value in [opposite, "", expected.upper(), " " + expected, expected + " ",
+                          "private-control-value"]:
+                attributes = {**OBSERVED_ATTRIBUTES, name: value}
+                with self.subTest(name=name, value=value), self.assertRaises(component.ComponentError) as caught:
+                    self.inspect(encode(info=package_info(attributes)))
+                self.assertEqual(str(caught.exception), "CPU component package: unsupported PackageInfo control " + name)
+
+    def test_observed_profile_accepts_legacy_individual_and_combined_optional_fields(self):
+        items = list(OBSERVED_ATTRIBUTES.items())
+        for mask in range(1 << len(items)):
+            attributes = {name: value for index, (name, value) in enumerate(items) if mask & (1 << index)}
+            for payload in [False, True]:
+                with self.subTest(mask=mask, payload=payload):
+                    self.inspect(encode(info=package_info(attributes, payload=payload)))
+
+    def test_observed_postinstall_timeout_is_optional_exact_literal(self):
+        for timeout in (None, "600"):
+            for attributes in (None, OBSERVED_ATTRIBUTES):
+                for payload in (False, True):
+                    with self.subTest(timeout=timeout, full=bool(attributes), payload=payload):
+                        self.inspect(encode(info=package_info(attributes, payload=payload, timeout=timeout)))
+
+    def test_timeout_never_normalizes_values_or_weakens_operation_shape(self):
+        for value in ("", "0", "1", "599", "601", "86400", "0600", "600.0", "6e2", "+600", "-600",
+                      " 600", "600 ", "600\t", "600\n", "\u0666\u0660\u0660", "\uff16\uff10\uff10",
+                      "private-timeout-sentinel", "9" * 8192):
+            with self.subTest(value=value[:24]), self.assertRaises(component.ComponentError) as caught:
+                self.inspect(encode(info=package_info(timeout=value)))
+            self.assertEqual(str(caught.exception), "CPU component package: unexpected package operation")
+        mutations = [lambda root, op: op.attrib.pop("file"),
+                     lambda root, op: op.set("file", "postinstall"),
+                     lambda root, op: op.set("file", "../private-operation"),
+                     lambda root, op: op.set("file", "./POSTINSTALL"),
+                     lambda root, op: op.set("type", "binary"),
+                     lambda root, op: op.set("private-name", "private-value"),
+                     lambda root, op: op.set("{urn:private}timeout", "600"),
+                     lambda root, op: op.set("Timeout", "600"),
+                     lambda root, op: root.set("timeout", "600"),
+                     lambda root, op: root.find("scripts").set("timeout", "600"),
+                     lambda root, op: setattr(op, "tag", "preinstall"),
+                     lambda root, op: setattr(op, "text", "private-text"),
+                     lambda root, op: ET.SubElement(op, "postinstall", file="./postinstall", timeout="600"),
+                     lambda root, op: ET.SubElement(root.find("scripts"), "postinstall", file="./postinstall", timeout="600"),
+                     lambda root, op: ET.SubElement(root.find("scripts"), "preinstall", file="./private-operation"),
+                     lambda root, op: ET.SubElement(root, "scripts")]
+        for index, mutate in enumerate(mutations):
+            root = ET.fromstring(package_info(OBSERVED_ATTRIBUTES, timeout="600"))
+            mutate(root, root.find("scripts/postinstall"))
+            with self.subTest(mutation=index), self.assertRaises(component.ComponentError) as caught:
+                self.inspect(encode(info=ET.tostring(root)))
+            self.assertNotIn("private", str(caught.exception))
+        valid = package_info(timeout="600")
+        duplicate = valid.replace(b'timeout="600"', b'timeout="600" timeout="600"')
+        self.assertNotEqual(duplicate, valid)
+        self.reject(encode(info=duplicate))
+
+    def test_generator_is_bounded_ignored_printable_text_not_authority(self):
+        for value in ["x", " " * 128, "private-generator", "/private/path; $(never-run) <opaque>"]:
+            self.inspect(encode(info=package_info({**OBSERVED_ATTRIBUTES, "generator-version": value})))
+        for value in ["", "x" * 129, "private\tvalue", "private\nvalue", "private\rvalue",
+                      "private\x7fvalue", "private\u00e9value"]:
+            with self.subTest(length=len(value)), self.assertRaises(component.ComponentError) as caught:
+                self.inspect(encode(info=package_info({**OBSERVED_ATTRIBUTES, "generator-version": value})))
+            self.assertEqual(str(caught.exception), "CPU component package: unsupported PackageInfo generator metadata")
+
+    def test_observed_controls_never_weaken_identity_operations_payload_or_archive_integrity(self):
+        for timeout in (None, "600"):
+            with self.subTest(timeout=timeout):
+                self.assert_control_integrity(package_info(OBSERVED_ATTRIBUTES, payload=True, timeout=timeout))
+
+    def assert_control_integrity(self, valid):
+        for name, value, error in [("identifier", "other", "identity differs"),
+                                    ("version", "9.9.9", "identity differs"),
+                                    ("install-location", "/private", "identity differs"),
+                                    ("auth", "none", "authorization metadata"),
+                                    ("format-version", "3", "authorization metadata"),
+                                    ("{urn:private}relocatable", "false", "unsupported PackageInfo attribute")]:
+            root = ET.fromstring(valid)
+            root.set(name, value)
+            with self.subTest(name=name), self.assertRaisesRegex(component.ComponentError, error):
+                self.inspect(encode(info=ET.tostring(root)))
+        for tag in ["preinstall", "postinstall"]:
+            root = ET.fromstring(valid)
+            ET.SubElement(root.find("scripts"), tag, file="./private-operation")
+            with self.assertRaisesRegex(component.ComponentError, "unexpected package operation"):
+                self.inspect(encode(info=ET.tostring(root)))
+        for field in ["installKBytes", "numberOfFiles"]:
+            root = ET.fromstring(valid)
+            root.find("payload").set(field, "1")
+            with self.assertRaisesRegex(component.ComponentError, "unsupported PackageInfo construct"):
+                self.inspect(encode(info=ET.tostring(root)))
+        for name in ["Payload", "Bom"]:
+            extra = [(name, b"private payload", b"private payload", "application/octet-stream")]
+            with self.assertRaisesRegex(component.ComponentError, "unexpected XAR member or signature"):
+                self.inspect(encode(info=valid, extra_members=extra))
+        with self.assertRaisesRegex(component.ComponentError, "unexpected ODC file, alias, link or operation"):
+            self.inspect(encode(info=valid, odc=record(links=2) + record(b"TRAILER!!!", b"", 0)))
+        with self.assertRaisesRegex(component.ComponentError, "packaged entry differs"):
+            self.inspect(encode(b"x" * len(ENTRY), info=valid))
+        for index in [0, 1]:
+            for tag in ["archived-checksum", "extracted-checksum"]:
+                def mutate(toc, index=index, tag=tag):
+                    toc.findall("file")[index].find("data/" + tag).text = "0" * 40
+                with self.assertRaisesRegex(component.ComponentError, "member size or checksum differs"):
+                    self.inspect(encode(info=valid, mutate=mutate))
+
+    def test_construct_error_exposes_only_closed_shape_not_names_or_values(self):
+        for tag, label in [("payload", "payload"), ("bundle", "bundle"), ("private-tag", "unrecognized")]:
+            root = ET.fromstring(package_info(OBSERVED_ATTRIBUTES))
+            child = ET.SubElement(root, tag, **{"private-attribute": "private-value"})
+            child.text = "private-text"
+            ET.SubElement(child, "private-child").text = "private-nested-text"
+            with self.assertRaises(component.ComponentError) as caught:
+                self.inspect(encode(info=ET.tostring(root)))
+            self.assertEqual(str(caught.exception), "CPU component package: unsupported PackageInfo construct "
+                             f"(tag={label}; children=1; attributes=1; has-text=True)")
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_package_info_error_redacts_unknown_names_namespaces_and_all_values(self):
+        root = ET.fromstring(package_info())
+        root.set("generator-version", "private-generator-value")
+        root.set("private-field-name", "private-field-value")
+        root.set("{urn:private-namespace}private-name", "private-namespaced-value")
+        with self.assertRaises(component.ComponentError) as caught:
+            self.inspect(encode(info=ET.tostring(root)))
+        self.assertEqual(str(caught.exception), "CPU component package: unsupported PackageInfo attribute "
+                         "(unrecognized=2)")
+        self.assertNotIn("private", str(caught.exception))
+
     def test_odc_types_links_names_duplicates_and_order_reject(self):
         trailer = record(b"TRAILER!!!", b"", 0)
         for content in [record(mode=0o120755) + trailer, record(links=2) + trailer,
@@ -469,7 +615,8 @@ class Author(unittest.TestCase):
         scripts = Path(arguments[arguments.index("--scripts") + 1])
         body = (scripts / "postinstall").read_bytes()
         Path(arguments[-1]).write_bytes(encode(b"x" * len(body) if self.failure == "wrong-body" else body,
-                                              info=b"<wrong/>" if self.failure == "wrong-info" else None))
+                                              info=b"<wrong/>" if self.failure == "wrong-info" else
+                                              package_info(timeout=getattr(self, "operation_timeout", None))))
         if self.failure == "app-change":
             (self.app / component.CPU_APP_INPUTS[1]).write_bytes(b"changed")
         if self.failure in ["entry-change", "entry-replace"]:
@@ -573,12 +720,17 @@ class Author(unittest.TestCase):
                 self.assertFalse((self.workspace / "cpu-worker.pkg").exists())
 
     def test_app_entry_mutation_or_same_byte_replacement_reject(self):
-        for failure in ["entry-change", "entry-replace", "app-change"]:
-            with self.subTest(failure=failure):
-                self.failure = failure
-                with self.assertRaises(component.ComponentError):
-                    self.build()
-                self.assertFalse((self.workspace / "cpu-worker.pkg").exists())
+        desktop = self.app / component.CPU_APP_INPUTS[1]
+        original = desktop.read_bytes()
+        for timeout in (None, "600"):
+            self.operation_timeout = timeout
+            for failure in ["entry-change", "entry-replace", "app-change"]:
+                with self.subTest(timeout=timeout, failure=failure):
+                    desktop.write_bytes(original)
+                    self.failure = failure
+                    with self.assertRaisesRegex(component.ComponentError, "app or entry changed during packaging"):
+                        self.build()
+                    self.assertFalse((self.workspace / "cpu-worker.pkg").exists())
 
     def test_publication_collision_and_postrename_ambiguity_preserve_final(self):
         for failure in ["collision", "publish-uncertain"]:
@@ -631,7 +783,7 @@ def suite():
     classes = [Inspection, Author] + ([Posix] if os.name == "posix" else [])
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 34 + (2 if os.name == "posix" else 0)
+    expected = 42 + (2 if os.name == "posix" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"CPU component PKG discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

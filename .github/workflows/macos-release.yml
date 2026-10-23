@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: '3.13'
       - name: Observe fixed unsigned PKG fixture format without installation
-        timeout-minutes: 2
+        timeout-minutes: 4
         run: python3 -B build_support/test_macos_cpu_pkg_profile.py
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
@@ -173,6 +173,27 @@ jobs:
           name: macos-${{ matrix.arch }}-structural-evidence
           path: dist-macos/Scribe-macos-universal.zip
           if-no-files-found: error
+
+  package-diagnostics:
+    name: macOS ${{ matrix.arch }} fixed package diagnostics
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6; Python is authoring-only
+        with:
+          python-version: '3.13'
+      - name: Observe paired inert text and universal Mach-O package metadata
+        timeout-minutes: 4
+        run: python3 -B build_support/macos_cpu_pkg_profile.py
 
   official-sign-notarize:
     name: Protected official macOS signing and notarization

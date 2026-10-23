@@ -348,31 +348,36 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-35 portable tests, plus one native test on each Mac lane. That native test uses
-the system `pkgbuild --nopayload` on one fixed, tiny ASCII comment file named
-`postinstall`, with no interpreter or program content. The file has executable
-mode only to model an operation archive; **nothing executes it**. Neither the
-real entry nor any worker/application is built, signed, packaged or launched.
+53 portable tests, plus two native tests on each Mac lane. The native tests use
+system `pkgbuild --nopayload` separately on a fixed ASCII comment and a fixed
+inert universal Mach-O named `postinstall`. The comment has no interpreter; the
+native fixture is compiled from the constant `int main(void) { return 0; }`
+for exactly arm64 and x86_64 using absolute system `xcrun`/`lipo` paths. Source
+and intermediate outputs stay outside the sole-file scripts directory. Both
+fixtures have executable mode to model the archive; **neither is executed**.
+No real worker/application, signing tool, key or Installer is used by this probe.
 
 CI runs this command once in each structural architecture lane, immediately
 after checkout/Python setup and before Rust setup or other heavy work. A failed
 profile prevents that lane's build, CPU/PKG contracts and artifact upload. Its
 peer can proceed independently; the unchanged official job still requires
 **both complete structural lanes** plus its protected manual/default-branch gate.
-No command, permission, secret or artifact destination is added. Profile logs
-remain readable before the long native build finishes.
-
-This removes two job startups and the cross-architecture profile barrier; it
-does not promise shorter runner queues or total CI time. A healthy lane can now
-do heavy work and upload its existing ad hoc structural-evidence ZIP even if its
+The structural probe remains mandatory and lane-local, with no cross-architecture
+profile barrier. A healthy lane can do heavy work and upload its existing ad hoc
+structural-evidence ZIP even if its
 peer profile fails; that is not official signing or release acceptance. The
-separate profile job's ten-minute cap is removed. The profile step retains its
-two-minute deadline and existing process bounds inside the structural job's
-unchanged lifecycle; none of these limits bounds queue delay. The packaging
-source check requires both unique structural/official boundaries inside its
-unprivileged scan before rejecting secrets, so a missing boundary cannot turn
-the scan into an empty success. The former standalone profile check names are
-removed; any external required-check configuration must be reviewed before merge.
+profile step has a four-minute deadline to include bounded native compilation.
+An independent `package-diagnostics` matrix runs the same paired probe through
+`python3 -B build_support/macos_cpu_pkg_profile.py`, without Rust or an app build,
+so its terminal logs can be read independently of the full structural job. It
+has a ten-minute job/four-minute step cap, no dependency edges, no uploads and
+no environment, secrets or permission override. Official signing still needs
+only the complete structural matrix and its existing protected gate. These two
+extra runner starts may compete for queue capacity; no faster scheduling or
+total CI time is promised. Deadlines do not bound queue delay. The packaging
+source check requires unique structural, diagnostic and official boundaries
+inside its unprivileged secret scan; missing boundaries cannot become empty
+successes. External required-check configuration needs review before merge.
 
 The structural matrix uses explicit `macos-15` for Apple Silicon and
 `macos-15-intel` for Intel. The separately gated official job's source also
@@ -386,16 +391,56 @@ permissions or signing gates. Review fresh expanded profiles and full native
 results on the new image; old-image success is historical evidence, not new-image
 acceptance or proof of runtime compatibility on older macOS versions.
 
-Only this freshly generated unsigned fixture is read, entirely in bounded memory.
+Only these freshly generated unsigned packages are read in bounded memory.
 The probe has no archive/path/options input and never extracts an archive. It
 reuses the existing private workspace and bounded process/reaping helper, rejects
-root, and invokes only absolute system `pkgbuild` and `xar -tf` paths. Its own
-temporary package and source are removed after confirmed child cleanup; uncertain
+root, and invokes only absolute system compilation and metadata-tool paths. Every
+tool has bounded time/output and receives the sanitized system-only environment
+plus a private TMPDIR and working directory. Its own temporary package and source
+are removed after confirmed child cleanup; uncertain
 cleanup retains that private workspace. Nothing is uploaded as an artifact.
 
-After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **4** records
+After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **7** records
 actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
 fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
+The paired CLI emits the same two reports in a fixed envelope. Each report labels
+its fixture kind and includes closed operation shapes: direct/global scripts and
+postinstall counts, shallow container/operation records with order and duplicates,
+child tags/counts, text/tail presence, attribute counts and fixed value classes.
+Only `file`, `type` (binary/shell), `timeout` and `component-id` (the fixed fixture
+identity) have observation labels; other names are counts and other values are
+`other`. The literal postinstall timeout is reported as an integer only for
+canonical positive ASCII decimal text in 1–86400; zero retains its separate
+closed class. Signs, leading zeros, whitespace, Unicode digits, fractions,
+exponents and out-of-bound values remain `other`, without a numeric value.
+The neutral `numeric_value` field makes no unit or consumer-semantics claim.
+This cap only bounds observation/output: it is not constructor acceptance or an
+Installer execution limit. These labels are not Apple's schema or an allowlist.
+Invalid reference errors retain only the same closed diagnostic. The
+schema-six paired native reports from both architectures isolate the extra
+literal `timeout` attribute in both fixtures. Every report has exactly one
+postinstall referencing `./postinstall`, two attributes (file and timeout), no
+children/text/tail, and no unknown attributes. The timeout was classified `other`,
+which proves only that its spelling is not exactly `0`, not that it is numeric
+or positive. The text/native-binary hypothesis is not supported by a difference.
+Both real retained-entry constructors still failed the operation predicate.
+The subsequent schema-seven reports establish canonical `600` in all four
+text/universal-Mach-O fixtures across both architectures. Independently of the
+observer, the private constructor now accepts only the legacy attribute set
+`{file: ./postinstall}` or that exact set plus `timeout="600"`. No other value,
+numeric range, normalization, attribute, operation or observer import is added.
+
+The [vendor pkgbuild manual, reproduced in the Xcode man-page mirror](https://keith.github.io/xcode-man-pages/pkgbuild.1.html)
+describes named preinstall/postinstall files under `--scripts` as top-level
+operations, and directs scripts needing more than ten minutes to component-specific
+configuration. Together with the observed literal, that supports this narrow
+trusted-producer construction inference. It is not a modern flat-PackageInfo
+schema or proof of units, timeout enforcement, cancellation, rollback or completion
+on supported Installer versions. Bundle-specific timeout keys are not imported
+into this no-bundle package. All other operation, identity, inventory, retained-byte,
+streaming, publication and cleanup checks remain. Actual retained-entry/package
+construction must pass independently on the new head; no installation or runtime
+authority is granted by the fixture or this compatibility rule.
 Earlier schema-3 native reports identified the literal `FinderCreateTime` field
 on both architectures. Full native construction then reached a creation-time
 spelling rejection; those reports did not reveal the spelling itself.
@@ -405,14 +450,16 @@ metadata still requires the expanded reports, not synthetic assumptions.
 
 The private ODC decoder follows [Apple's CPIO format documentation](https://github.com/apple-oss-distributions/libarchive/blob/a03e74621efd47371aaf72468d24711aa763323b/libarchive/libarchive/cpio.5):
 76-byte fixed ASCII-octal headers, NUL-inclusive name lengths and **no** name/data
-alignment padding. It bounds the decoded archive to 64 KiB, at most 16 records
+alignment padding. The text-fixture archive remains bounded to 64 KiB; the native
+fixture has a separate 256-KiB body cap and 8-KiB archive-overhead allowance. TOC,
+PackageInfo and other metadata remain bounded to 64 KiB. Both archives have at most 16 records
 plus one trailer, and each name to 256 bytes including NUL. Every numeric field,
 name terminator and complete data range is checked before slicing. Missing or
 truncated trailers, extra archives and nonzero post-trailer data reject. Terminal
 zero-byte padding is counted without presuming a 512-byte block convention.
 
 A separate fixed-fixture check requires exactly one regular `postinstall` or
-`./postinstall` record containing exactly the inert fixture bytes, optionally
+`./postinstall` record containing exactly its own retained fixture bytes, optionally
 one empty `.` or `./` directory, with no extras or duplicate aliases. Actual order,
 root spelling, modes, link counts, offsets and trailer metadata are observed.
 Zero/multiple link counts and permission flags are **not** accepted as safe or
@@ -472,6 +519,53 @@ remains useful for bounded serialization diagnosis, but does not define the
 constructor's acceptance policy or grant authority. Full retained-entry/package
 construction must still pass independently. The report adds no workflow lane,
 input option or runtime diagnostic.
+
+Schema 5 retains those observations and adds exactly nine fixed PackageInfo
+root-attribute records. The five existing construction labels and four candidates
+(`overwrite-permissions`, `relocatable`, `postinstall-action`, `generator-version`)
+form an observation vocabulary only. The latter names occur in
+[Mozilla's own package template](https://github.com/mozilla-firefox/firefox/blob/main/python/mozbuild/mozpack/apple_pkg/PackageInfo.template),
+which is not Apple's schema or evidence of current native output. Identity,
+version and location values are redacted. Other fields expose only key-specific
+closed classes: absent, expected literal root/2/true/false/none, other, or bounded
+printable generator text (1–128 ASCII characters). No generator text is emitted.
+Unknown and namespaced names contribute only to a numeric count; their names
+and values never enter the report. The fixed record count bounds output even
+when the already bounded XML has many unknown attributes; nothing is truncated
+or selected from unknown fields.
+
+The terminal ARM observation established `overwrite-permissions="true"`,
+`relocatable="false"`, `postinstall-action="none"` and bounded printable generator
+text in the fixed fixture, with no unknown root attributes. The separate real
+constructor rejected the same four extra names; its error did not expose values.
+The private unsigned constructor now permits those three controls only at their
+exact observed literals, optionally absent for legacy minimal metadata. A present
+generator is ignored 1–128-character printable ASCII, never a path, command,
+identity, compatibility decision or diagnostic value. The constructor allowlist
+is explicit and independent of the observation vocabulary. Unknown/namespaced
+attributes still reject and expose only a numeric count.
+
+[Apple's archived component-package guide](https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/SoftwareDistribution4/Component_Packages/Component_Packages.html)
+describes directory-permission overwrite for directories in the component
+hierarchy, not the installation destination itself. Combined with the exact
+physical `PackageInfo` plus `Scripts` inventory (**no Payload or Bom**), this
+supports a narrow no-payload construction inference under the trusted-producer
+assumptions above. An optional payload metadata marker must still be exactly
+zero files/zero KiB; an absent marker remains supported. This legacy guidance
+does **not** establish modern Installer, privileged execution or destination
+permission behavior. Both new-head native construction lanes remain required;
+package authentication, actual installation and release qualification are separate.
+
+The sole exact `./postinstall` operation, retained-entry hash/size, app/source
+binding, archive ranges/checksums, link restrictions and cleanup remain unchanged.
+Other direct-child constructs still reject at the same predicate. Their error
+uses only fixed tag labels (otherwise `unrecognized`), bounded child/attribute
+counts and a text-presence boolean, never arbitrary names, values or nested text.
+Source fixtures cover all optional-field combinations with/without the zero
+marker, opposite/noncanonical controls, generator bounds/redaction, and valid
+controls combined with forbidden authority, payload, operation and archive changes.
+The shared-tail driver fixture exercises the full observed profile. Nothing here
+runs Installer, an operation or a worker, or grants installation/root authority.
 
 The fresh-output constructor now permits only three additional optional stat
 properties on **Scripts**, not PackageInfo. `inode` and `deviceno` use canonical
@@ -552,12 +646,16 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 34 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 42 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,
 range/checksum errors, truncation/tails, links, source replacement, collisions
-and uncertain cleanup. This fast suite is always mocked. The existing native
+and uncertain cleanup. Exact timeout tests cover absence/600, noncanonical and
+other values, unknown/namespaced keys, missing/wrong file references and extra or
+nested operations. Existing payload, entry, link/checksum and source-mutation
+negatives run with and without the permitted timeout. This fast suite is always
+mocked. The existing native
 construction contract now calls the same private packaging tail on its retained
 entry, without rebuilding or publishing the package as an artifact. Actual native
 author acceptance is not established until that exact-head contract passes;

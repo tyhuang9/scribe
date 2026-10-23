@@ -134,19 +134,28 @@ def _package_info(data: bytes, version: str) -> None:
     root = xml_tree(data)
     require(root.tag == "pkg-info" and root.get("identifier") == IDENTIFIER
             and root.get("version") == version and root.get("install-location") == "/", "package identity differs")
-    # Deliberately narrow construction policy, NOT inferred native defaults.
-    # Unqualified metadata fails closed; future native acceptance must establish
-    # any additional inert fields before extending this profile.
-    require(set(root.attrib) <= {"identifier", "version", "install-location", "format-version", "auth"},
-            "unsupported PackageInfo attribute")
+    # Exact native-observed controls for this private no-payload construction,
+    # not Installer/root qualification or an observation-driven allowlist.
+    controls = {"overwrite-permissions": "true", "relocatable": "false", "postinstall-action": "none"}
+    allowed = {"identifier", "version", "install-location", "format-version", "auth", "generator-version"}
+    extra = set(root.attrib) - (allowed | set(controls))
+    require(not extra, f"unsupported PackageInfo attribute (unrecognized={len(extra)})")
     require(root.get("format-version") in (None, "2") and root.get("auth") in (None, "root"),
             "unsupported PackageInfo format or authorization metadata")
+    for name, expected in controls.items():
+        require(root.get(name) in (None, expected), "unsupported PackageInfo control " + name)
+    generator = root.get("generator-version")
+    require(generator is None or (0 < len(generator) <= 128 and all(32 <= ord(c) < 127 for c in generator)),
+            "unsupported PackageInfo generator metadata")
     scripts = root.findall("scripts")
     require(len(scripts) == 1 and len(list(root.iter("scripts"))) == 1 and not scripts[0].attrib,
             "ambiguous operation container")
     operations = list(scripts[0])
+    # Exact native-observed top-level timeout only; not the observer's numeric
+    # domain or proof that Installer enforces this duration. No normalization.
     require(len(operations) == 1 and operations[0].tag == "postinstall" and not len(operations[0])
-            and operations[0].attrib == {"file": "./postinstall"}
+            and operations[0].attrib in ({"file": "./postinstall"},
+                                        {"file": "./postinstall", "timeout": "600"})
             and not (operations[0].text or "").strip()
             and len(list(root.iter("postinstall"))) == 1, "unexpected package operation")
     for child in root:
@@ -154,9 +163,13 @@ def _package_info(data: bytes, version: str) -> None:
             continue
         # No payload exists in a nopayload component. Do not admit bundles,
         # references, relocation rules or other unobserved executable constructs.
+        # Closed diagnostic vocabulary is deliberately NOT an admission list.
+        label = child.tag if child.tag in {"payload", "bundle", "bundle-version", "upgrade-bundle",
+            "update-bundle", "atomic-update-bundle", "strict-identifier", "relocate"} else "unrecognized"
         require(child.tag == "payload" and not len(child) and not (child.text or "").strip()
                 and child.attrib == {"installKBytes": "0", "numberOfFiles": "0"},
-                "unsupported PackageInfo construct")
+                f"unsupported PackageInfo construct (tag={label}; children={len(child)}; "
+                f"attributes={len(child.attrib)}; has-text={bool((child.text or '').strip())})")
     require(len(root.findall("payload")) <= 1, "duplicate payload metadata")
 
 
