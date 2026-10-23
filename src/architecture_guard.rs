@@ -1313,7 +1313,7 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
             "CPU package author gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 42 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 46 + (2 if os.name == \"posix\" else 0)"));
     for required in [
         "test_observed_controls_reject_other_values_without_normalization_or_value_logging",
         "test_observed_profile_accepts_legacy_individual_and_combined_optional_fields",
@@ -1322,11 +1322,18 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
         "test_construct_error_exposes_only_closed_shape_not_names_or_values",
         "test_observed_postinstall_timeout_is_optional_exact_literal",
         "test_timeout_never_normalizes_values_or_weakens_operation_shape",
+        "test_complete_empty_controls_and_legacy_absence_preserve_optional_profiles",
+        "test_empty_control_profile_rejects_every_partial_subset_and_duplicate",
+        "test_empty_controls_reject_populated_aliased_nested_and_unknown_shapes_without_values",
+        "test_empty_controls_never_weaken_existing_operation_payload_or_archive_integrity",
     ] {
         assert!(tests.contains(required));
     }
     assert!(!source.contains("PACKAGE_INFO_ATTRIBUTE_LABELS"));
     assert!(!source.contains("MAX_OBSERVED_OPERATION_TIMEOUT"));
+    assert!(!source.contains("_package_info_child_shapes"));
+    assert!(source.contains("child.tag not in seen_empty"));
+    assert!(source.contains("not seen_empty or seen_empty == empty_controls"));
     assert!(source.contains("{\"file\": \"./postinstall\", \"timeout\": \"600\"}"));
     let profile_imports = source
         .lines()
@@ -1446,7 +1453,9 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
         );
     }
     assert!(tests.contains("expected = 19 + (1 if os.name == \"posix\" else 0)"));
-    assert!(tests.contains("package_info(OBSERVED_ATTRIBUTES, payload=True, timeout=\"600\")"));
+    assert!(tests.contains(
+        "package_info(OBSERVED_ATTRIBUTES, payload=True, timeout=\"600\", empty_controls=True)"
+    ));
     assert!(workflow.contains("python3 -B build_support/test_native_macos_cpu_pkg_entry.py"));
     assert!(ordered(&workflow));
     // A missing structural upload must not match the later official job, and

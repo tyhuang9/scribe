@@ -453,10 +453,31 @@ significant-text/tail booleans. Known labels are `scripts`, `payload`, `bundle`,
 names, attributes, values or recursive subtrees enter this report. Existing XML
 byte/node/depth/fanout bounds remain; the existing paired diagnostics need no new
 workflow, input or tool. These labels are observation vocabulary only, not a
-consumer schema or constructor acceptance. Production parsing remains unchanged
-and continues to reject `bundle-version` until complete native output is reviewed
-and a separate narrow compatibility rule is justified. No Installer execution,
+consumer schema or constructor acceptance. That diagnostic-only change left
+production parsing unchanged. No Installer execution,
 privileged destination behavior, installation or release readiness is established.
+
+The completed schema-8 Intel and ARM text/universal-Mach-O pairs report all six literal
+controls once, in the order `bundle-version`, `upgrade-bundle`, `update-bundle`,
+`atomic-update-bundle`, `strict-identifier`, `relocate`, followed by the sole
+scripts container. Every control has zero attributes/children and false
+significant-text/tail observations. The separate source compatibility rule now
+supports either legacy absence or exactly one of **each** of those six empty
+controls. Partial groups, duplicates, populated/nested controls, unknown same-shape
+tags, case/namespace aliases and bundle references still reject. The literal set
+is defined independently in the constructor, not imported from the observer.
+
+Only ASCII XML whitespace (`space`, `tab`, `CR`, `LF`) is permitted in the new
+controls' text/tails. The observer's generic whitespace booleans do **not** prove
+that stricter spelling; new-head real construction must independently confirm it.
+Control order is intentionally not an authority decision in this private profile;
+source tests exercise permutations without claiming Installer-order equivalence.
+The all-or-none grouping is our narrow compatibility policy, not an Apple schema
+requirement. Both new-head real constructors remain separate pending native gates.
+No arbitrary archive/root admission is added: the
+fixed no-payload invocation, exact physical inventory, sole operation, retained
+entry bytes, checksums, source binding, publication and cleanup rules still apply.
+No consumer, installation, authentication or release qualification is inferred.
 
 Earlier schema-3 native reports identified the literal `FinderCreateTime` field
 on both architectures. Full native construction then reached a creation-time
@@ -663,7 +684,7 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 42 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 46 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,
