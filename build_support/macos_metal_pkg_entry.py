@@ -135,6 +135,15 @@ def verify_pack(tool: Path, root: Path, arch: str, pack: dict, release: dict, ve
                       == pack["installed_size_bytes"], "Metal installed size differs from release")
 
 
+def input_files(packs: dict) -> dict[str, int]:
+    """Closed inventory from release_inputs; a snapshot layout, not admission."""
+    files = {name: component.MAX_WORKER for name in component.CPU_APP_INPUTS}
+    files.update({CATALOG: MAX_DOCUMENT, AUTHORITY: MAX_DOCUMENT, "Contents/embedded.provisionprofile": MAX_DOCUMENT})
+    for pack, _ in packs.values():
+        files.update({f"Contents/Resources/{pack['root']}/{name}": maximum for name, maximum in PACK_FILES.items()})
+    return files
+
+
 def build_entry(app: Path, workspace: Path, frozen: FrozenInputs) -> tuple[Path, str, int]:
     """Return only the candidate path and PRE-SIGN hash/size, never authority."""
     component.require(sys.platform == "darwin", "Metal entry construction requires macOS")
@@ -153,10 +162,7 @@ def build_entry(app: Path, workspace: Path, frozen: FrozenInputs) -> tuple[Path,
     output = workspace / "postinstall"
     component.require(not os.path.lexists(output), "Metal entry output already exists")
     packs, _ = release_inputs(app, frozen)
-    files = {name: component.MAX_WORKER for name in component.CPU_APP_INPUTS}
-    files.update({CATALOG: MAX_DOCUMENT, AUTHORITY: MAX_DOCUMENT, "Contents/embedded.provisionprofile": MAX_DOCUMENT})
-    for pack, _ in packs.values():
-        files.update({f"Contents/Resources/{pack['root']}/{name}": maximum for name, maximum in PACK_FILES.items()})
+    files = input_files(packs)
     before = snapshot(app, files)
     for name, digest in ((component.CPU_APP_INPUTS[0], frozen.cpu_worker_sha256),
                          (CATALOG, frozen.catalog_sha256), (AUTHORITY, frozen.authority_sha256)):

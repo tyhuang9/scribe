@@ -1686,6 +1686,71 @@ fn macos_cpu_finalization_is_default_denied_and_binds_only_own_postsign_bytes() 
 }
 
 #[test]
+fn macos_metal_finalization_is_default_denied_and_owns_only_fresh_metal_entries() {
+    let source = include_str!("../build_support/macos_metal_pkg_final.py");
+    let tests = include_str!("../build_support/test_macos_metal_pkg_final.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let owner = &source[source.find("def build_entry(").unwrap()..];
+    assert!(owner.find("signing._publisher()").unwrap() < owner.find("app.is_absolute()").unwrap());
+    assert!(
+        owner.find("entry.build_entry(").unwrap() < owner.find("\"final-entry-signing\"").unwrap()
+    );
+    assert!(
+        owner.find("finalized = component.hash_file(").unwrap()
+            < owner.find("signing._signature(candidate,").unwrap()
+    );
+    assert!(
+        owner.rfind("component.hash_file(candidate,").unwrap()
+            < owner.find("component.publish_no_replace(").unwrap()
+    );
+    for required in [
+        "entry.input_files(packs)",
+        "entry.snapshot(app,",
+        "entry.MAX_ENTRY",
+        "entry.METAL_ROOT",
+        "signing.CODE_IDENTIFIERS[\"metal\"]",
+        "signing._signature(candidate, publisher, \"metal\")",
+        "signing._entitlements(",
+        "signing._unchanged_policy(policy_before)",
+        "return output, *finalized",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing Metal contract {required}"
+        );
+    }
+    for forbidden in [
+        "verify_cpu_app",
+        "argparse",
+        "os.environ",
+        "getenv(",
+        "signing_callback",
+        "subprocess.",
+        "--deep",
+        "pkgbuild",
+        "productbuild",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Metal finalization gained {forbidden}"
+        );
+    }
+    assert!(tests.contains("expected = 14"));
+    assert!(tests.contains("test_owned_fresh_full_metal_construction_returns_only_postsign_entry"));
+    assert!(
+        tests.contains("test_full_source_inventory_content_and_same_byte_replacement_remain_bound")
+    );
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_metal_pkg_final.py"));
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_metal_pkg_final.py")
+            .count(),
+        2
+    );
+    assert!(!workflow.contains("python3 -B build_support/macos_metal_pkg_final.py"));
+}
+
+#[test]
 fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
     let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");
