@@ -63,6 +63,7 @@ sign_line="$(grep -Fn 'codesign "${codesign_args[@]}" --entitlements "$desktop_e
 [[ "$embed_line" =~ ^[0-9]+$ && "$sign_line" =~ ^[0-9]+$ && "$embed_line" -lt "$sign_line" ]] || { echo 'provisioning profile must be embedded before final app signing.' >&2; exit 1; }
 unprivileged_jobs="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
 [[ "$(grep -c '^  structural:$' <<<"$unprivileged_jobs")" == 1 && "$(grep -c '^  official-sign-notarize:$' <<<"$unprivileged_jobs")" == 1 ]] || { echo 'unprivileged CI scope must contain both unique job boundaries.' >&2; exit 1; }
+[[ "$(grep -c '^  package-diagnostics:$' <<<"$unprivileged_jobs")" == 1 ]] || { echo 'unprivileged CI scope must include the unique diagnostic job.' >&2; exit 1; }
 ! grep -F 'secrets.' <<<"$unprivileged_jobs" >/dev/null || { echo 'pull-request preflight and structural jobs must not receive production secrets.' >&2; exit 1; }
 grep -F 'lipo "$worker" -verify_arch "$pack_lipo_arch"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
 grep -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
