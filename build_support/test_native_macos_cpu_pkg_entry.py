@@ -251,7 +251,7 @@ class Portable(unittest.TestCase):
         self.assertEqual(arguments[0], "/usr/bin/pkgbuild")
         self.assertEqual(kwargs["operation"], "cpu-component-pkg-build")
         operation = Path(arguments[arguments.index("--scripts") + 1]) / "postinstall"
-        info = package_info(OBSERVED_ATTRIBUTES, payload=True)
+        info = package_info(OBSERVED_ATTRIBUTES, payload=True, timeout="600")
         if self.failure == "unsupported-native-metadata":
             info = info.replace(b"<pkg-info ", b'<pkg-info unqualified="value" ')
         Path(arguments[-1]).write_bytes(encode(operation.read_bytes(), info=info))

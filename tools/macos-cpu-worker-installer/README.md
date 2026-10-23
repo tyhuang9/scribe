@@ -416,8 +416,7 @@ exponents and out-of-bound values remain `other`, without a numeric value.
 The neutral `numeric_value` field makes no unit or consumer-semantics claim.
 This cap only bounds observation/output: it is not constructor acceptance or an
 Installer execution limit. These labels are not Apple's schema or an allowlist.
-Invalid reference errors retain only the same closed diagnostic. The actual
-retained-entry constructor's operation predicate remains unchanged. The
+Invalid reference errors retain only the same closed diagnostic. The
 schema-six paired native reports from both architectures isolate the extra
 literal `timeout` attribute in both fixtures. Every report has exactly one
 postinstall referencing `./postinstall`, two attributes (file and timeout), no
@@ -425,9 +424,23 @@ children/text/tail, and no unknown attributes. The timeout was classified `other
 which proves only that its spelling is not exactly `0`, not that it is numeric
 or positive. The text/native-binary hypothesis is not supported by a difference.
 Both real retained-entry constructors still failed the operation predicate.
-Schema seven must establish the native numeric value before an exact timeout
-policy is qualified against applicable top-level-script consumer documentation.
-Neither observations nor synthetic tests grant operation acceptance.
+The subsequent schema-seven reports establish canonical `600` in all four
+text/universal-Mach-O fixtures across both architectures. Independently of the
+observer, the private constructor now accepts only the legacy attribute set
+`{file: ./postinstall}` or that exact set plus `timeout="600"`. No other value,
+numeric range, normalization, attribute, operation or observer import is added.
+
+The [vendor pkgbuild manual, reproduced in the Xcode man-page mirror](https://keith.github.io/xcode-man-pages/pkgbuild.1.html)
+describes named preinstall/postinstall files under `--scripts` as top-level
+operations, and directs scripts needing more than ten minutes to component-specific
+configuration. Together with the observed literal, that supports this narrow
+trusted-producer construction inference. It is not a modern flat-PackageInfo
+schema or proof of units, timeout enforcement, cancellation, rollback or completion
+on supported Installer versions. Bundle-specific timeout keys are not imported
+into this no-bundle package. All other operation, identity, inventory, retained-byte,
+streaming, publication and cleanup checks remain. Actual retained-entry/package
+construction must pass independently on the new head; no installation or runtime
+authority is granted by the fixture or this compatibility rule.
 Earlier schema-3 native reports identified the literal `FinderCreateTime` field
 on both architectures. Full native construction then reached a creation-time
 spelling rejection; those reports did not reveal the spelling itself.
@@ -633,12 +646,16 @@ cleanup uncertainty retains the owned stage; collision or ambiguous publication
 never removes an existing final output. Reviewed source/toolchain and non-hostile
 same-user/root writers remain assumptions, not a new hostile-author sandbox.
 
-`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 40 portable
+`python3 -B build_support/test_macos_cpu_pkg.py` discovers exactly 42 portable
 tests and two additional POSIX tests. Native tools and entry construction are
 mocked; an independent XAR/ODC encoder supplies actual checksums. Cases include
 chunk/size boundaries, mutations, archive/operation identity, malformed XML,
 range/checksum errors, truncation/tails, links, source replacement, collisions
-and uncertain cleanup. This fast suite is always mocked. The existing native
+and uncertain cleanup. Exact timeout tests cover absence/600, noncanonical and
+other values, unknown/namespaced keys, missing/wrong file references and extra or
+nested operations. Existing payload, entry, link/checksum and source-mutation
+negatives run with and without the permitted timeout. This fast suite is always
+mocked. The existing native
 construction contract now calls the same private packaging tail on its retained
 entry, without rebuilding or publishing the package as an artifact. Actual native
 author acceptance is not established until that exact-head contract passes;

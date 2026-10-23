@@ -151,8 +151,11 @@ def _package_info(data: bytes, version: str) -> None:
     require(len(scripts) == 1 and len(list(root.iter("scripts"))) == 1 and not scripts[0].attrib,
             "ambiguous operation container")
     operations = list(scripts[0])
+    # Exact native-observed top-level timeout only; not the observer's numeric
+    # domain or proof that Installer enforces this duration. No normalization.
     require(len(operations) == 1 and operations[0].tag == "postinstall" and not len(operations[0])
-            and operations[0].attrib == {"file": "./postinstall"}
+            and operations[0].attrib in ({"file": "./postinstall"},
+                                        {"file": "./postinstall", "timeout": "600"})
             and not (operations[0].text or "").strip()
             and len(list(root.iter("postinstall"))) == 1, "unexpected package operation")
     for child in root:
