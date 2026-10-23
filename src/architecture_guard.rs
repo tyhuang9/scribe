@@ -1706,14 +1706,14 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 53 + (2 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 57 + (2 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
         "ODC_HEADER_BYTES = 76",
         "ODC_MAX_RECORDS = 16",
         "ODC_MAX_NAME_BYTES = 256",
-        "\"schema_version\": 7",
+        "\"schema_version\": 8",
         "MAX_OBSERVED_OPERATION_TIMEOUT = 86400",
         "MAX_COMPILED_FIXTURE = 256 * 1024",
         "MAX_TOC = 64 * 1024",
@@ -1766,6 +1766,21 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             .contains("\"package_info_attributes\": _package_info_attribute_shapes(package_info)")
     );
     assert!(source.contains("child.tag in METADATA_TAG_LABELS else \"unrecognized\""));
+    assert!(source.contains("\"package_info_children\": _package_info_child_shapes(package_info)"));
+    let children = &source[source.find("def _package_info_child_shapes(").unwrap()
+        ..source.find("def _operation_shapes(").unwrap()];
+    for forbidden in [
+        "component.capture(",
+        "Path(",
+        "open(",
+        "os.",
+        "sorted(",
+        "set(",
+    ] {
+        assert!(!children.contains(forbidden));
+    }
+    assert!(children.contains("child.tag in labels else \"unrecognized\""));
+    assert!(children.contains("for child in root]"));
     for required in [
         "test_member_metadata_shapes_use_closed_labels_without_stat_values",
         "test_member_metadata_shapes_preserve_duplicates_and_sort_deterministically",
@@ -1781,6 +1796,10 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "test_package_info_shapes_are_deterministic_and_private_value_independent",
         "test_package_info_report_size_is_fixed_and_oversized_input_still_rejects",
         "test_package_info_observation_keeps_identity_operation_and_duplicate_rejection",
+        "test_package_info_children_preserve_every_direct_shape_and_order",
+        "test_package_info_children_redact_unknown_names_namespaces_and_values",
+        "test_package_info_children_full_report_is_observation_not_constructor_admission",
+        "test_package_info_children_share_existing_xml_and_output_bounds",
         "test_operation_shapes_classify_each_predicate_without_echoing_values",
         "test_operation_timeout_observes_only_bounded_canonical_postinstall_numbers",
         "test_operation_shapes_keep_empty_duplicate_nested_and_unknown_names",
