@@ -207,7 +207,7 @@ class Portable(unittest.TestCase):
         import macos_cpu_pkg as constructor
         root.set("identifier", constructor.IDENTIFIER)
         root.remove(root.find("private-field"))  # otherwise this would mask accidental bundle admission
-        with self.assertRaisesRegex(component.ComponentError, "construct \\(tag=bundle-version;"):
+        with self.assertRaisesRegex(component.ComponentError, "incomplete empty control metadata"):
             constructor._package_info(ET.tostring(root), profile.VERSION)
 
     def test_package_info_children_share_existing_xml_and_output_bounds(self):

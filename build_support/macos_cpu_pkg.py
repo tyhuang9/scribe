@@ -158,19 +158,33 @@ def _package_info(data: bytes, version: str) -> None:
                                         {"file": "./postinstall", "timeout": "600"})
             and not (operations[0].text or "").strip()
             and len(list(root.iter("postinstall"))) == 1, "unexpected package operation")
+    # This invocation's observed no-payload producer emits these six EMPTY
+    # controls together. Explicit source profile, never diagnostic vocabulary,
+    # arbitrary bundle/reference admission or an Installer semantics claim.
+    empty_controls = {"bundle-version", "upgrade-bundle", "update-bundle", "atomic-update-bundle",
+                      "strict-identifier", "relocate"}
+    seen_empty = set()
     for child in root:
         if child is scripts[0]:
             continue
-        # No payload exists in a nopayload component. Do not admit bundles,
-        # references, relocation rules or other unobserved executable constructs.
+        # No payload exists in a nopayload component. Do not admit populated
+        # bundles, references, relocation rules or unobserved constructs.
         # Closed diagnostic vocabulary is deliberately NOT an admission list.
         label = child.tag if child.tag in {"payload", "bundle", "bundle-version", "upgrade-bundle",
             "update-bundle", "atomic-update-bundle", "strict-identifier", "relocate"} else "unrecognized"
-        require(child.tag == "payload" and not len(child) and not (child.text or "").strip()
-                and child.attrib == {"installKBytes": "0", "numberOfFiles": "0"},
+        if child.tag in empty_controls:
+            require(child.tag not in seen_empty, "duplicate empty control metadata")
+            seen_empty.add(child.tag)
+            valid = (not child.attrib and not len(child) and not (child.text or "").strip(" \t\r\n")
+                     and not (child.tail or "").strip(" \t\r\n"))
+        else:
+            valid = (child.tag == "payload" and not len(child) and not (child.text or "").strip()
+                     and child.attrib == {"installKBytes": "0", "numberOfFiles": "0"})
+        require(valid,
                 f"unsupported PackageInfo construct (tag={label}; children={len(child)}; "
                 f"attributes={len(child.attrib)}; has-text={bool((child.text or '').strip())})")
     require(len(root.findall("payload")) <= 1, "duplicate payload metadata")
+    require(not seen_empty or seen_empty == empty_controls, "incomplete empty control metadata")
 
 
 class _Stream:

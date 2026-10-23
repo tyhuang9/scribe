@@ -22,6 +22,8 @@ ENTRY = b"synthetic universal installer entry; never execute"
 OBSERVED_ATTRIBUTES = {"auth": "root", "format-version": "2", "overwrite-permissions": "true",
                        "relocatable": "false", "postinstall-action": "none",
                        "generator-version": "synthetic-generator"}
+EMPTY_CONTROL_TAGS = ("bundle-version", "upgrade-bundle", "update-bundle", "atomic-update-bundle",
+                      "strict-identifier", "relocate")
 
 
 def sha1(data):
@@ -42,10 +44,10 @@ def archive(body=ENTRY, *, root=True, padding=0):
             + record(b"TRAILER!!!", b"", 0) + b"\0" * padding)
 
 
-def package_info(attributes=None, *, payload=False, timeout=None):
+def package_info(attributes=None, *, payload=False, timeout=None, empty_controls=False):
     data = (f'<pkg-info identifier="{pkg.IDENTIFIER}" version="{VERSION}" install-location="/">'
             '<scripts><postinstall file="./postinstall"/></scripts></pkg-info>').encode()
-    if attributes is None and not payload and timeout is None:
+    if attributes is None and not payload and timeout is None and not empty_controls:
         return data
     root = ET.fromstring(data)
     root.attrib.update(attributes or {})
@@ -53,6 +55,9 @@ def package_info(attributes=None, *, payload=False, timeout=None):
         root.find("scripts/postinstall").set("timeout", timeout)
     if payload:
         ET.SubElement(root, "payload", installKBytes="0", numberOfFiles="0")
+    if empty_controls:
+        for index, tag in enumerate(EMPTY_CONTROL_TAGS):
+            root.insert(index, ET.Element(tag))
     return ET.tostring(root)
 
 
@@ -421,6 +426,82 @@ class Inspection(unittest.TestCase):
         self.assertNotEqual(duplicate, valid)
         self.reject(encode(info=duplicate))
 
+    def test_complete_empty_controls_and_legacy_absence_preserve_optional_profiles(self):
+        for controls in (False, True):
+            for attributes in (None, OBSERVED_ATTRIBUTES):
+                for payload in (False, True):
+                    for timeout in (None, "600"):
+                        with self.subTest(controls=controls, full=bool(attributes), payload=payload, timeout=timeout):
+                            self.inspect(encode(info=package_info(attributes, payload=payload, timeout=timeout,
+                                                                 empty_controls=controls)))
+        root = ET.fromstring(package_info(OBSERVED_ATTRIBUTES, timeout="600", empty_controls=True))
+        nodes = list(root)[:6]
+        for node in nodes:
+            root.remove(node)
+            node.text, node.tail = " \t\r\n", " \t\r\n"
+        # Ordering is deliberately not an authority decision for these empty markers.
+        for order in [nodes[index:] + nodes[:index] for index in range(6)] + [list(reversed(nodes))]:
+            candidate = ET.fromstring(ET.tostring(root))
+            candidate.extend(order)
+            self.inspect(encode(info=ET.tostring(candidate)))
+
+    def test_empty_control_profile_rejects_every_partial_subset_and_duplicate(self):
+        for mask in range(1, 63):
+            root = ET.fromstring(package_info(empty_controls=True))
+            for index, tag in enumerate(EMPTY_CONTROL_TAGS):
+                if not mask & (1 << index):
+                    root.remove(root.find(tag))
+            with self.subTest(mask=mask), self.assertRaisesRegex(component.ComponentError, "incomplete empty control"):
+                self.inspect(encode(info=ET.tostring(root)))
+        for tag in EMPTY_CONTROL_TAGS:
+            for remove_other in (False, True):
+                root = ET.fromstring(package_info(empty_controls=True))
+                if remove_other:
+                    root.remove(root.find(next(other for other in EMPTY_CONTROL_TAGS if other != tag)))
+                ET.SubElement(root, tag)
+                with self.subTest(tag=tag, same_count=remove_other), \
+                     self.assertRaisesRegex(component.ComponentError, "duplicate empty control"):
+                    self.inspect(encode(info=ET.tostring(root)))
+
+    def test_empty_controls_reject_populated_aliased_nested_and_unknown_shapes_without_values(self):
+        for tag in EMPTY_CONTROL_TAGS:
+            mutations = [lambda root, node: node.set("private-name", "private-value"),
+                         lambda root, node: ET.SubElement(node, "bundle", id="private-reference"),
+                         lambda root, node: setattr(node, "text", "private-text"),
+                         lambda root, node: setattr(node, "tail", "private-tail"),
+                         lambda root, node: setattr(node, "text", "\u00a0"),
+                         lambda root, node: setattr(node, "tail", "\u2003"),
+                         lambda root, node: setattr(node, "tag", tag.upper()),
+                         lambda root, node: setattr(node, "tag", "{urn:private}" + tag),
+                         lambda root, node: setattr(node, "tag", "private-unknown"),
+                         lambda root, node: ET.SubElement(root.find("scripts"), tag),
+                         lambda root, node: ET.SubElement(root.find("payload"), tag),
+                         lambda root, node: ET.SubElement(root.find(next(other for other in EMPTY_CONTROL_TAGS
+                                                                        if other != tag)), tag)]
+            for index, mutate in enumerate(mutations):
+                root = ET.fromstring(package_info(OBSERVED_ATTRIBUTES, payload=True, timeout="600", empty_controls=True))
+                mutate(root, root.find(tag))
+                with self.subTest(tag=tag, mutation=index), self.assertRaises(component.ComponentError) as caught:
+                    self.inspect(encode(info=ET.tostring(root)))
+                self.assertNotIn("private", str(caught.exception))
+        for tag in ("bundle", "private-unknown", "Bundle-version"):
+            root = ET.fromstring(package_info(empty_controls=True))
+            ET.SubElement(root, tag)
+            with self.subTest(extra=tag), self.assertRaises(component.ComponentError) as caught:
+                self.inspect(encode(info=ET.tostring(root)))
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_empty_controls_never_weaken_existing_operation_payload_or_archive_integrity(self):
+        for timeout in (None, "600"):
+            valid = package_info(OBSERVED_ATTRIBUTES, payload=True, timeout=timeout, empty_controls=True)
+            self.inspect(encode(info=valid))  # prove negatives cannot be masked by profile rejection
+            self.assert_control_integrity(valid)
+            for name, value in (("timeout", "601"), ("file", "../private-operation"), ("type", "binary")):
+                root = ET.fromstring(valid)
+                root.find("scripts/postinstall").set(name, value)
+                with self.subTest(name=name), self.assertRaisesRegex(component.ComponentError, "unexpected package operation"):
+                    self.inspect(encode(info=ET.tostring(root)))
+
     def test_generator_is_bounded_ignored_printable_text_not_authority(self):
         for value in ["x", " " * 128, "private-generator", "/private/path; $(never-run) <opaque>"]:
             self.inspect(encode(info=package_info({**OBSERVED_ATTRIBUTES, "generator-version": value})))
@@ -616,7 +697,8 @@ class Author(unittest.TestCase):
         body = (scripts / "postinstall").read_bytes()
         Path(arguments[-1]).write_bytes(encode(b"x" * len(body) if self.failure == "wrong-body" else body,
                                               info=b"<wrong/>" if self.failure == "wrong-info" else
-                                              package_info(timeout=getattr(self, "operation_timeout", None))))
+                                              package_info(timeout=getattr(self, "operation_timeout", None),
+                                                           empty_controls=getattr(self, "empty_controls", False))))
         if self.failure == "app-change":
             (self.app / component.CPU_APP_INPUTS[1]).write_bytes(b"changed")
         if self.failure in ["entry-change", "entry-replace"]:
@@ -722,26 +804,31 @@ class Author(unittest.TestCase):
     def test_app_entry_mutation_or_same_byte_replacement_reject(self):
         desktop = self.app / component.CPU_APP_INPUTS[1]
         original = desktop.read_bytes()
-        for timeout in (None, "600"):
-            self.operation_timeout = timeout
-            for failure in ["entry-change", "entry-replace", "app-change"]:
-                with self.subTest(timeout=timeout, failure=failure):
-                    desktop.write_bytes(original)
-                    self.failure = failure
-                    with self.assertRaisesRegex(component.ComponentError, "app or entry changed during packaging"):
-                        self.build()
-                    self.assertFalse((self.workspace / "cpu-worker.pkg").exists())
+        for controls in (False, True):
+            self.empty_controls = controls
+            for timeout in (None, "600"):
+                self.operation_timeout = timeout
+                for failure in ["entry-change", "entry-replace", "app-change"]:
+                    with self.subTest(controls=controls, timeout=timeout, failure=failure):
+                        desktop.write_bytes(original)
+                        self.failure = failure
+                        with self.assertRaisesRegex(component.ComponentError, "app or entry changed during packaging"):
+                            self.build()
+                        self.assertFalse((self.workspace / "cpu-worker.pkg").exists())
 
     def test_publication_collision_and_postrename_ambiguity_preserve_final(self):
-        for failure in ["collision", "publish-uncertain"]:
-            with tempfile.TemporaryDirectory(dir=self.root) as directory:
-                self.workspace = Path(directory)
-                self.failure = failure
-                with self.assertRaises(OSError):
-                    self.build()
-                final = self.workspace / "cpu-worker.pkg"
-                self.assertTrue(final.exists())
-                self.assertEqual(final.read_bytes(), b"retain concurrent output" if failure == "collision" else encode())
+        for controls in (False, True):
+            self.empty_controls = controls
+            for failure in ["collision", "publish-uncertain"]:
+                with tempfile.TemporaryDirectory(dir=self.root) as directory:
+                    self.workspace = Path(directory)
+                    self.failure = failure
+                    with self.assertRaises(OSError):
+                        self.build()
+                    final = self.workspace / "cpu-worker.pkg"
+                    self.assertTrue(final.exists())
+                    self.assertEqual(final.read_bytes(), b"retain concurrent output" if failure == "collision" else
+                                     encode(info=package_info(empty_controls=controls)))
 
     def test_ambient_compiler_loader_backend_and_signing_overrides_are_absent(self):
         overrides = {name: "untrusted" for name in ["DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "RUSTFLAGS",
@@ -783,7 +870,7 @@ def suite():
     classes = [Inspection, Author] + ([Posix] if os.name == "posix" else [])
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 42 + (2 if os.name == "posix" else 0)
+    expected = 46 + (2 if os.name == "posix" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"CPU component PKG discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result
