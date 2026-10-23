@@ -348,7 +348,7 @@ not package authenticity, Installer execution, installation or release qualifica
 
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
-52 portable tests, plus two native tests on each Mac lane. The native tests use
+53 portable tests, plus two native tests on each Mac lane. The native tests use
 system `pkgbuild --nopayload` separately on a fixed ASCII comment and a fixed
 inert universal Mach-O named `postinstall`. The comment has no interpreter; the
 native fixture is compiled from the constant `int main(void) { return 0; }`
@@ -400,20 +400,34 @@ plus a private TMPDIR and working directory. Its own temporary package and sourc
 are removed after confirmed child cleanup; uncertain
 cleanup retains that private workspace. Nothing is uploaded as an artifact.
 
-After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **6** records
+After a native run completes, `SCRIBE_NATIVE_CPU_PKG_PROFILE` schema **7** records
 actual outer member inventory, modes, encodings/checksum labels, bounded sizes,
 fixed PackageInfo identity/operation reference, and a sanitized Scripts inventory.
 The paired CLI emits the same two reports in a fixed envelope. Each report labels
 its fixture kind and includes closed operation shapes: direct/global scripts and
 postinstall counts, shallow container/operation records with order and duplicates,
 child tags/counts, text/tail presence, attribute counts and fixed value classes.
-Only `file`, `type` (binary/shell), `timeout` (zero) and `component-id` (the fixed
-fixture identity) have observation labels; other names are counts and other
-values are `other`. These labels are not Apple's schema or an admission allowlist.
+Only `file`, `type` (binary/shell), `timeout` and `component-id` (the fixed fixture
+identity) have observation labels; other names are counts and other values are
+`other`. The literal postinstall timeout is reported as an integer only for
+canonical positive ASCII decimal text in 1–86400; zero retains its separate
+closed class. Signs, leading zeros, whitespace, Unicode digits, fractions,
+exponents and out-of-bound values remain `other`, without a numeric value.
+The neutral `numeric_value` field makes no unit or consumer-semantics claim.
+This cap only bounds observation/output: it is not constructor acceptance or an
+Installer execution limit. These labels are not Apple's schema or an allowlist.
 Invalid reference errors retain only the same closed diagnostic. The actual
-retained-entry constructor's operation predicate remains unchanged. Its current
-`unexpected package operation` failure does not establish which term failed or
-that native-file metadata is the cause; paired observations test that hypothesis.
+retained-entry constructor's operation predicate remains unchanged. The
+schema-six paired native reports from both architectures isolate the extra
+literal `timeout` attribute in both fixtures. Every report has exactly one
+postinstall referencing `./postinstall`, two attributes (file and timeout), no
+children/text/tail, and no unknown attributes. The timeout was classified `other`,
+which proves only that its spelling is not exactly `0`, not that it is numeric
+or positive. The text/native-binary hypothesis is not supported by a difference.
+Both real retained-entry constructors still failed the operation predicate.
+Schema seven must establish the native numeric value before an exact timeout
+policy is qualified against applicable top-level-script consumer documentation.
+Neither observations nor synthetic tests grant operation acceptance.
 Earlier schema-3 native reports identified the literal `FinderCreateTime` field
 on both architectures. Full native construction then reached a creation-time
 spelling rejection; those reports did not reveal the spelling itself.

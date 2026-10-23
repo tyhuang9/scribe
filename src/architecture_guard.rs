@@ -1324,6 +1324,19 @@ fn macos_cpu_component_pkg_author_is_presign_streaming_and_never_executes_entrie
         assert!(tests.contains(required));
     }
     assert!(!source.contains("PACKAGE_INFO_ATTRIBUTE_LABELS"));
+    assert!(!source.contains("MAX_OBSERVED_OPERATION_TIMEOUT"));
+    let profile_imports = source
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            (line.starts_with("import ") || line.starts_with("from "))
+                && line.contains("macos_cpu_pkg_profile")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        profile_imports,
+        ["from macos_cpu_pkg_profile import xml_tree"]
+    );
     assert!(
         tests.contains("test_package_info_error_redacts_unknown_names_namespaces_and_all_values")
     );
@@ -1619,14 +1632,15 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             "format probe gained {forbidden}"
         );
     }
-    assert!(tests.contains("expected = 52 + (2 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 53 + (2 if sys.platform == \"darwin\" else 0)"));
     let decoder = &source
         [source.find("def _decode_odc(").unwrap()..source.find("def observe_generated(").unwrap()];
     for required in [
         "ODC_HEADER_BYTES = 76",
         "ODC_MAX_RECORDS = 16",
         "ODC_MAX_NAME_BYTES = 256",
-        "\"schema_version\": 6",
+        "\"schema_version\": 7",
+        "MAX_OBSERVED_OPERATION_TIMEOUT = 86400",
         "MAX_COMPILED_FIXTURE = 256 * 1024",
         "MAX_TOC = 64 * 1024",
         "MAX_MEMBER = 64 * 1024",
@@ -1694,6 +1708,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         "test_package_info_report_size_is_fixed_and_oversized_input_still_rejects",
         "test_package_info_observation_keeps_identity_operation_and_duplicate_rejection",
         "test_operation_shapes_classify_each_predicate_without_echoing_values",
+        "test_operation_timeout_observes_only_bounded_canonical_postinstall_numbers",
         "test_operation_shapes_keep_empty_duplicate_nested_and_unknown_names",
         "test_operation_reference_failure_retains_only_closed_diagnostics",
         "test_compiled_scripts_compression_and_overflow_do_not_widen_metadata_limits",

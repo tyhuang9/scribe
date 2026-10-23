@@ -66,7 +66,7 @@ class Portable(unittest.TestCase):
     def test_observation_is_sanitized_and_not_authentication(self):
         report = profile.observe_generated(synthetic_package())
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 6)
+        self.assertEqual(report["schema_version"], 7)
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertEqual([member["name"] for member in report["members"]], ["PackageInfo", "Scripts"])
@@ -219,6 +219,43 @@ class Portable(unittest.TestCase):
             with self.assertRaises(component.ComponentError):
                 profile.observe_generated(synthetic_package(scripts=odc_archive(odc_record(body=wrong))),
                                           expected_fixture=body)
+
+    def test_operation_timeout_observes_only_bounded_canonical_postinstall_numbers(self):
+        cases = [(None, "absent", None), ("0", "literal-0", None),
+                 ("1", "bounded-positive-decimal", 1), ("600", "bounded-positive-decimal", 600),
+                 ("86400", "bounded-positive-decimal", 86400)]
+        cases += [(value, "other", None) for value in ("", "00", "01", "0600", "86401", "99999", "100000",
+                  "-1", "+600", " 600", "600 ", "600\t", "600\n", "600.0", "6e2", "\u0666\u0660\u0660",
+                  "\uff16\uff10\uff10", "private-timeout-sentinel", "9" * 65536)]
+        for value, category, number in cases:
+            with self.subTest(value=value[:24] if value else value):
+                root = ET.fromstring('<pkg-info><scripts><postinstall file="./postinstall"/></scripts></pkg-info>')
+                if value is not None:
+                    root.find("scripts/postinstall").set("timeout", value)
+                shape = profile._operation_shapes(root)
+                field = shape["containers"][0]["tree"]["children"][0]["fields"][2]
+                expected = {"name": "timeout", "value_class": category}
+                if number is not None:
+                    expected["numeric_value"] = number
+                self.assertEqual(field, expected)
+                self.assertNotIn("private", json.dumps(shape))
+        self.assertEqual(profile.MAX_OBSERVED_OPERATION_TIMEOUT, 86400)
+        info = (f'<pkg-info identifier="{profile.IDENTIFIER}" version="{profile.VERSION}" install-location="/">'
+                '<scripts><postinstall file="./postinstall" timeout="600"/></scripts></pkg-info>').encode()
+        report = profile.observe_generated(synthetic_package(info=info))
+        self.assertEqual(report["package_info_operations"]["containers"][0]["tree"]["children"][0]["fields"][2],
+                         {"name": "timeout", "value_class": "bounded-positive-decimal", "numeric_value": 600})
+        root = ET.fromstring('<pkg-info xmlns:p="urn:private"><scripts timeout="600">'
+                            '<postinstall p:timeout="600"/><preinstall timeout="600"/>'
+                            '<postinstall timeout="7"/><postinstall timeout="600"/></scripts></pkg-info>')
+        shape = profile._operation_shapes(root)
+        self.assertNotIn("numeric_value", shape["containers"][0]["tree"]["fields"][2])
+        fields = [item["fields"][2] for item in shape["containers"][0]["tree"]["children"]]
+        self.assertEqual(fields[:2], [{"name": "timeout", "value_class": "absent"},
+                                     {"name": "timeout", "value_class": "other"}])
+        self.assertEqual([item["numeric_value"] for item in fields[2:]], [7, 600])
+        self.assertEqual(shape["global_postinstall_count"], 3)
+        self.assertNotIn("private", json.dumps(shape))
 
     def test_operation_shapes_keep_empty_duplicate_nested_and_unknown_names(self):
         for xml, counts in [('<pkg-info/>', (0, 0, 0)),
@@ -796,6 +833,7 @@ class Portable(unittest.TestCase):
         with patch.object(profile, "probe", side_effect=[{"fixture_kind": "inert-text"},
                                                         {"fixture_kind": "universal-macho"}]) as probe:
             report = profile.probe_pair()
+            self.assertEqual(report["schema_version"], 7)
             self.assertEqual([item["fixture_kind"] for item in report["fixtures"]], ["inert-text", "universal-macho"])
             self.assertEqual(probe.call_args_list, [unittest.mock.call(), unittest.mock.call(native_binary=True)])
         with patch.object(profile, "probe", side_effect=[{}, component.CleanupUncertain("uncertain")]), \
@@ -876,14 +914,14 @@ class NativeMac(unittest.TestCase):
         # a frozen accepted profile or authenticated installation evidence.
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
         self.assertTrue(report["observation_only"])
-        self.assertEqual(report["schema_version"], 6)
+        self.assertEqual(report["schema_version"], 7)
         self.assertEqual(report["scripts_inventory"]["format"], "odc")
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
 
     def test_actual_unsigned_universal_macho_format_without_execution(self):
         report = profile.probe(native_binary=True)
         print("SCRIBE_NATIVE_CPU_PKG_PROFILE=" + json.dumps(report, sort_keys=True), flush=True)
-        self.assertEqual(report["schema_version"], 6)
+        self.assertEqual(report["schema_version"], 7)
         self.assertEqual(report["fixture_kind"], "universal-macho")
         self.assertTrue(report["observation_only"])
         self.assertTrue(report["scripts_inventory"]["fixture_exact_bytes_match"])
@@ -893,7 +931,7 @@ def suite():
     result = unittest.defaultTestLoader.loadTestsFromTestCase(Portable)
     if sys.platform == "darwin":
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeMac))
-    expected = 52 + (2 if sys.platform == "darwin" else 0)
+    expected = 53 + (2 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"PKG profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

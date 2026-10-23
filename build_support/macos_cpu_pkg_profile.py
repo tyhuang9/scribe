@@ -27,6 +27,8 @@ MAX_TOC = 64 * 1024
 MAX_MEMBER = 64 * 1024
 MAX_COMPILED_FIXTURE = 256 * 1024
 MAX_COMPILED_SCRIPTS = MAX_COMPILED_FIXTURE + 8192
+# Observation/output bound ONLY, never a constructor or Installer policy.
+MAX_OBSERVED_OPERATION_TIMEOUT = 86400
 ODC_HEADER_BYTES = 76
 ODC_MAX_RECORDS = 16
 ODC_MAX_NAME_BYTES = 256
@@ -183,13 +185,20 @@ def _operation_shapes(root: ET.Element) -> dict:
               "component-id": {IDENTIFIER: "exact-fixture-identifier"}}
     def tag(node):
         return node.tag if node.tag in ("scripts", "postinstall", "preinstall") else "unrecognized"
+    def field(node, name):
+        value = node.get(name)
+        result = {"name": name, "value_class": "absent" if value is None else values[name].get(value, "other")}
+        if (node.tag == "postinstall" and name == "timeout" and value is not None
+                and re.fullmatch(r"[1-9][0-9]{0,4}", value) is not None
+                and int(value) <= MAX_OBSERVED_OPERATION_TIMEOUT):
+            result.update(value_class="bounded-positive-decimal", numeric_value=int(value))
+        return result
     def shape(node):
         return {"tag": tag(node),
                 "attribute_count": len(node.attrib), "child_count": len(node),
                 "unknown_attribute_count": sum(name not in labels for name in node.attrib),
                 "has_text": bool((node.text or "").strip()), "has_tail": bool((node.tail or "").strip()),
-                "fields": [{"name": name, "value_class": "absent" if name not in node.attrib
-                            else values[name].get(node.get(name), "other")} for name in labels],
+                "fields": [field(node, name) for name in labels],
                 "child_tags": [tag(child) for child in node]}
     direct = root.findall("scripts")
     containers = list(root.iter("scripts"))
@@ -369,7 +378,7 @@ def observe_generated(data: bytes, *, expected_fixture: bytes = FIXTURE) -> dict
     references = [node.get("file", "") for node in package_info.iter("postinstall")]
     require(len(references) == 1 and references[0] in ("postinstall", "./postinstall"),
             "unexpected operation reference " + json.dumps(operations, sort_keys=True, separators=(",", ":")))
-    return {"schema_version": 6, "observation_only": True, "package_bytes": len(data),
+    return {"schema_version": 7, "observation_only": True, "package_bytes": len(data),
             "xar_header_bytes": size, "xar_version": version, "toc_checksum_algorithm": checksum,
             "toc_compressed_bytes": compressed, "toc_expanded_bytes": expanded,
             "toc_child_tags": sorted(child.tag for child in toc),
@@ -450,7 +459,7 @@ def _probe_owned_fixture(native_binary: bool) -> dict:
 
 
 def probe_pair() -> dict:
-    return {"schema_version": 6, "observation_only": True,
+    return {"schema_version": 7, "observation_only": True,
             "fixtures": [probe(), probe(native_binary=True)]}
 
 
