@@ -1035,9 +1035,15 @@ pre-sign hash is not installation authority. Mocked source tests cover bounded
 construction and exclusive publication; actual native construction remains
 unverified. A separate hosted-Mac contract now exercises actual construction
 after the finalized universal app build, including output readback, repeat
-no-replace and unchanged-input checks, without ever executing/signing/packaging
-or uploading the candidate. Native acceptance remains pending those exact-head
-jobs. This does not add a PKG author, shipping release option or installer.
+no-replace and unchanged-input checks. Its private unsigned CPU component author
+packages the retained entry with bounded streaming integrity checks, without
+executing/signing it or uploading the entry/package. Native acceptance remains
+pending the exact-head construction jobs. This is not a shipping release option
+or installer. A separate inactive finalization owner now binds its own fresh
+entry to an independently reviewed publisher requirement and the package to
+post-sign bytes; checked-in publisher policy remains default-deny. Its mocked
+tests grant no native-signature, production trust, package authentication or
+installation authority. See the CPU writer README for the full boundary.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not

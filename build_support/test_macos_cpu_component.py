@@ -277,6 +277,21 @@ class Portable(unittest.TestCase):
         with self.assertRaisesRegex(component.ComponentError, "unknown bounded tool operation"):
             component.ToolExitError("private-path-or-secret", 1)
 
+    def test_signature_property_stream_is_fixed_command_only_before_spawn(self):
+        valid = ["/usr/bin/codesign", "--display", "--verbose=4", "--arch", "arm64", "/owned/postinstall"]
+        cases = [(valid, "tool", True), (valid, "final-entry-properties", False),
+                 (valid, "final-entry-properties", "private-value")]
+        for position, value in [(0, "/private/tool"), (1, "--sign"), (2, "--verbose=6"),
+                                (3, "--all-architectures"), (4, "all"), (5, "relative"), (5, None)]:
+            changed = valid.copy()
+            changed[position] = value
+            cases.append((changed, "final-entry-properties", True))
+        for arguments, operation, flag in cases:
+            with patch.object(component.subprocess, "Popen") as spawn, self.assertRaises(component.ComponentError) as caught:
+                component.capture(arguments, operation=operation, signature_properties=flag)
+            spawn.assert_not_called()
+            self.assertNotIn("private", str(caught.exception))
+
     def test_slice_inspection_retains_thin_after_uncertain_child_cleanup(self):
         binary = self.root / "binary"
         binary.write_bytes(b"fixture")
@@ -501,6 +516,29 @@ class Posix(Portable):
         data = component.capture([sys.executable, "-I", "-S", "-c",
                                   "import sys; assert sys.stdin.read() == ''; print('bounded')"])
         self.assertEqual(data, b"bounded\n")
+
+    def test_signature_property_stream_keeps_both_bounds_and_returns_only_stderr(self):
+        original = component.subprocess.Popen
+        status = 0
+        def synthetic(_arguments, **kwargs):
+            return original([sys.executable, "-I", "-S", "-c",
+                             "import sys; print('stdout-must-not-be-returned'); print('bounded-properties', file=sys.stderr); "
+                             f"sys.exit({status})"],
+                            **kwargs)
+        arguments = ["/usr/bin/codesign", "--display", "--verbose=4", "--arch", "x86_64", "/owned/postinstall"]
+        with patch.object(component.subprocess, "Popen", side_effect=synthetic):
+            self.assertEqual(component.capture(arguments, operation="final-entry-properties", signature_properties=True),
+                             b"bounded-properties\n")
+            for limit, error_limit in [(4, 128), (128, 4)]:
+                with self.assertRaisesRegex(component.ComponentError, "output bound"):
+                    component.capture(arguments, operation="final-entry-properties", signature_properties=True,
+                                      limit=limit, error_limit=error_limit)
+            status = 17
+            with self.assertRaises(component.ToolExitError) as caught:
+                component.capture(arguments, operation="final-entry-properties", signature_properties=True)
+            self.assertEqual((caught.exception.operation, caught.exception.status), ("final-entry-properties", 17))
+            self.assertNotIn("bounded-properties", str(caught.exception))
+            self.assertNotIn("stdout-must-not-be-returned", str(caught.exception))
 
     def test_capture_nonzero(self):
         with self.assertRaises(component.ComponentError):
@@ -850,7 +888,7 @@ def suite():
         classes.append(Posix)
     if sys.platform == "darwin":
         classes.append(NativeMac)
-    expected = 35 + (18 if os.name == "posix" else 0) + (6 if sys.platform == "darwin" else 0)
+    expected = 36 + (19 if os.name == "posix" else 0) + (6 if sys.platform == "darwin" else 0)
     for cls in classes:
         for name in sorted(cls.__dict__):
             if name.startswith("test_"):
