@@ -414,6 +414,20 @@ class Codec(unittest.TestCase):
             change(root)
             self.reject(self.outer(changes={"Distribution": ET.tostring(root)}))
 
+    def test_update_space_profile_is_exact_zero_for_every_own_reference(self):
+        source = ET.fromstring(self.source)
+        self.assertEqual([node.get("updateKBytes") for node in source.findall("pkg-ref")], ["0"] * 3)
+        self.inspect(self.outer())
+        for index in range(3):
+            for value in (None, "1", "00", "+0", "-0", "0.0", " 0", "0 ", "", "\u0660", "1" * 1000):
+                root = ET.fromstring(self.distribution)
+                references = [node for node in root.findall("pkg-ref") if not len(node)]
+                if value is None:
+                    references[index].attrib.pop("updateKBytes")
+                else:
+                    references[index].set("updateKBytes", value)
+                self.reject(self.outer(changes={"Distribution": ET.tostring(root, encoding="utf-8")}))
+
     def test_large_aggregate_bound_and_all_reads_remain_bounded(self):
         self.assertGreater(codec._product_bound((2**32, 2**32, 2**32)), 3 * 2**32)
         for sizes in ((), (True, 1, 1), (0, 1, 1), (1.0, 1, 1), [1, 1, 1]):
@@ -984,12 +998,14 @@ class NativeRecipe(unittest.TestCase):
                 ("1.0", "other", False), ("PrivateSentinelValue", "other", False),
                 ("1" * 1000, "other", False), ("\u0661", "other", False)):
             root = ET.fromstring(baseline)
-            if value is not None:
+            if value is None:
+                root.find("pkg-ref").attrib.pop("updateKBytes")
+            else:
                 root.find("pkg-ref").set("updateKBytes", value)
             report = native_distribution_diagnostic(ET.tostring(root, encoding="utf-8"), source, infos)
             row = report["references"][0]  # The app has a nonzero independent space hint.
             self.assertEqual((row["update_space_class"], row["update_space_matches"]), (classification, matches))
-            self.assertEqual(row["known_extra_attributes"], [] if value is None else ["updateKBytes"])
+            self.assertEqual(row["known_extra_attributes"], [])  # Fixed source already authors this field.
             self.assertEqual(row["unknown_extra_attribute_count"], 0)
             self.assertNotIn("PrivateSentinel", json.dumps(report))
         mutations = {
@@ -1128,7 +1144,7 @@ def suite():
         + ((NativeMac,) if sys.platform == "darwin" else ())
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 30 + (2 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
+    expected = 31 + (2 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"Product source discovery mismatch: expected {expected}")
     return result

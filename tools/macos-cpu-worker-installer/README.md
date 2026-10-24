@@ -1074,13 +1074,16 @@ No second payload extraction or BOM interpretation is introduced.
 documents producer-generated bundle/version/size metadata. Readback compares
 the fixed source semantic tree, permitting only exact local `#filename` URL
 rewrites and independently checked bundle-version additions derived from each
-own PackageInfo. Versions and space hints remain role-specific; unknown
-attributes or opaque subtrees reject. Two unidentified attributes seen only as
-redacted counts in the earlier inert observation are **not** accepted here.
-Native compatibility therefore remains unqualified, not inferred from mocks.
+own PackageInfo. Versions and space hints remain role-specific. The private
+construction profile explicitly authors `updateKBytes="0"`, following an
+unmodified native fixture observation of literal zero for all three roles.
+Readback still requires exact source attribute equality: missing, nonzero or
+noncanonical values and all unknown attributes or opaque subtrees reject.
+This is an evidence-bound own-output profile, not a general interpretation of
+that undocumented field or qualified Installer disk-space behavior.
 
-`python3 -B build_support/test_macos_product_pkg.py` discovers 30 portable tests,
-two additional POSIX cleanup tests and one additional native Mac test (33 on
+`python3 -B build_support/test_macos_product_pkg.py` discovers 31 portable tests,
+two additional POSIX cleanup tests and one additional native Mac test (34 on
 Mac). The owner tests run all three real source owners with mocked
 tool/signature/pack verification; no production entry is executed. Tests
 cover every embedded member/checksum, semantically valid exact/+1 metadata and
@@ -1105,11 +1108,13 @@ mock these four native calls and cover their exact recipe and failure seams.
 
 The earlier observation uses `productbuild --synthesize`; its two unidentified
 reference attributes do not prove they are introduced into this owner's fixed
-Distribution. The new test does not synthesize, strip unknown attributes or
-relax production acceptance. Both architectures identify exactly one extra
+Distribution. The new test does not synthesize or strip unknown attributes.
+Both architectures identified exactly one extra
 `updateKBytes` attribute per reference; versions, space hints and local URLs match.
-Apple's archived reference does not document that field. Its value or Installer
-semantics have not yet been established. Failure-only
+Apple's archived reference does not document that field. Subsequent unchanged
+Intel and ARM fixtures classified it as literal zero for every role; the
+explicit-profile native roundtrip remains pending. Installer
+semantics are not inferred. Failure-only
 test instrumentation calls the
 original predicate exactly once and preserves rejection. After the fixture
 scope exits, it emits only bounded ordered role/count/equality flags, fixed
@@ -1118,11 +1123,11 @@ channel was removed after identification. The observer never reveals raw names,
 values, paths, identities or XML. For the fixed `updateKBytes` label it reports
 only absent/literal-zero/canonical-positive/other and equality to the independent
 role space hint; canonical positives are bounded to signed 64-bit integers.
-The source Distribution is unchanged so this observes the native producer's
-choice, not a source-authored value it might merely copy. This is not a general
-archive diagnostic or an acceptance rule.
+The zero observation preceded adding the field to our source Distribution, so
+it was not merely a source-authored value copied by the native producer. This is
+not a general archive diagnostic or a permissive attribute-normalization rule.
 Diagnostic failure cannot mask the original exception or
-cleanup uncertainty. Production acceptance remains unchanged. Any eventual pass
+cleanup uncertainty. Exact source comparison remains mandatory. Any eventual pass
 establishes only **fixed inert native codec compatibility**, not full-app or
 publisher authentication, real installer operation or execution order. CI bounds
 this source/native suite to four minutes and never runs the inactive author.

@@ -185,7 +185,9 @@ def _distribution_source(version: str, infos: dict) -> bytes:
         choice = ET.SubElement(root, "choice", id=identifier, title="Scribe", description="Required Scribe component",
                                visible="false", enabled="false", selected="true")
         ET.SubElement(choice, "pkg-ref", id=identifier)
-        ET.SubElement(root, "pkg-ref", id=identifier, version=version, installKBytes=str(space)).text = name
+        # Private construction profile: unmodified native output was observed
+        # to add literal zero. This is not a general Installer space calculation.
+        ET.SubElement(root, "pkg-ref", id=identifier, version=version, installKBytes=str(space), updateKBytes="0").text = name
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
@@ -195,10 +197,11 @@ def _semantic(node) -> tuple:
 
 
 def _distribution(data: bytes, source: bytes, infos: dict) -> None:
-    """Permit ONLY documented and independently checked producer additions.
+    """Permit ONLY checked producer additions and exact authored controls.
 
-    Unknown output attributes remain rejected, including unqualified attributes
-    seen only as redacted counts in the inert observer. No opaque XML is removed.
+    updateKBytes is authored as literal zero in the fixed private construction
+    profile, not normalized or accepted with arbitrary values. Unknown output
+    attributes remain rejected. No opaque XML is removed.
     """
     root, expected = app.xml_tree(data), app.xml_tree(source)
     by_id = {value[0]: (name, value) for name, value in infos.items()}
