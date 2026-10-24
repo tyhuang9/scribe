@@ -911,6 +911,53 @@ signing nested contents before their containers; see
 and [packaging Mac software](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution).
 This CPU-first source stage does not replace the planned Metal installer work.
 
+### Configured inert application payload contract
+
+`python3 -B build_support/test_macos_app_pkg_profile.py` discovers 14 portable
+tests, one additional POSIX cleanup test, and one additional native Mac test.
+The input-free probe creates only a tiny inert application in a private stage:
+directories `0755`, data `0644`, and a comment-only executable `0755`, including
+a fixed resource path over 256 bytes. The containing workspace remains private.
+It never copies a real app, runs payload code, signs, installs, or accepts an
+external archive. Existing production CPU admission and package codecs do not
+import this observation code or change their limits.
+
+The requested configuration is explicit: recommended archived ownership, legacy
+compression, `/Applications`, no relocation, no version-based bundle skipping,
+strict identifier, and `upgrade` replacement. These are **requests**, not proof
+of Installer effects. The intent is to keep app/worker release pairs together
+even at the same app version and avoid retaining obsolete app files. Product
+downgrade policy, ordering and transactional replacement remain separate work.
+The vendor-authored [pkgbuild manual](https://keith.github.io/xcode-man-pages/pkgbuild.1.html)
+describes these controls; this is a mirror, and native CI is needed to establish
+the format actually produced on each supported architecture.
+
+Only the owned fresh package's bounded Bom metadata is materialized privately;
+no CPIO payload is extracted. Absolute system `lsbom -p fmugsc` requests an
+unfiltered inventory with modes, numeric ownership, sizes and checksums. The
+vendor-authored [lsbom manual](https://keith.github.io/xcode-man-pages/lsbom.8.html)
+defines those columns. Every root/directory/file row and unfamiliar field count
+remains visible through closed classes, never raw paths, owners or CRC values.
+Checksums are compared to the source files' system `cksum` results as an
+**observation**, not an assertion that both tools use the same CRC variant.
+Mismatch never selects an alternate algorithm to obtain agreement.
+
+An independent bounded ODC observation records modes, ownership classes, link
+counts and device-field classes, exact source-byte comparisons, all expected
+directories and the root marker. PackageInfo controls/counts are reported with
+their multiplicity. Input files, controls, directory inventories, original PKG
+and bounded Bom are node/content-bound around each native call. Tool failures
+remain redacted and uncertain process cleanup retains its private stage.
+
+This is **not full BOM validation or app-package admission**. The
+[vendor BOM manual](https://keith.github.io/xcode-man-pages/bom.5.html) describes
+additional metadata, including hard-link information, outside these requested
+columns. Flags, ACLs/xattrs, hard-link tables, large files, root-marker Installer
+effects, same-version replacement, obsolete-file removal, actual installation,
+rollback and production signing remain unqualified. Source success cannot
+establish them. Both existing unprivileged Mac CI lanes run this observation;
+no release route, key, production trust, installation or Auto gate is activated.
+
 ## Not yet established
 
 The enclosing installer must authenticate this executable and its compiled
