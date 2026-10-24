@@ -169,7 +169,11 @@ def _package_info(data: bytes) -> dict:
         controls.append({"tag": tag, "container_count": len(nodes),
                          "bundle_count": len(bundles),
                          "identifiers_match": all(item.get("id") == IDENTIFIER for item in bundles) if bundles else None,
-                         "paths_match": all(node.get("path") == APP for node in nodes) if tag == "bundle" and nodes else None})
+                         "paths_match": all(node.get("path") == APP for node in nodes) if tag == "bundle" and nodes else None,
+                         "path_classes": [{APP: "exact-relative-bundle", "./" + APP: "exact-dot-relative-bundle",
+                             "/Applications/" + APP: "exact-install-bundle"}.get(node.get("path"),
+                                 "absent" if node.get("path") is None else "other") for node in nodes]
+                             if tag == "bundle" else []})
     return {"shapes": product._xml_shapes(data), "root_fields": cpu._package_info_attribute_shapes(root),
             "root_identity_matches": root.tag == "pkg-info" and root.get("identifier") == IDENTIFIER
                 and root.get("version") == VERSION and root.get("install-location") == "/Applications",
@@ -181,6 +185,23 @@ def _package_info(data: bytes) -> dict:
 def _identity(path: Path) -> tuple:
     info = path.lstat()
     return (*product._identity(path), info.st_uid, info.st_gid) if hasattr(info, "st_uid") else product._identity(path)
+
+
+def _member_metadata(data: bytes) -> list[dict]:
+    # Only after _xar has checked this same owned, bounded byte string. Preserve
+    # every direct field's shape; names, values and nested contents stay private.
+    _, size, _, compressed, expanded, _ = cpu.HEADER.unpack(data[:cpu.HEADER.size])
+    root = product._xml(product._inflate(data[size:size + compressed], expanded))
+    result = []
+    for node in root.find("toc").findall("file"):
+        name = cpu.scalar(node, "name")
+        modes = node.findall("mode")
+        category = ("absent" if not modes else "ambiguous" if len(modes) != 1
+                    or len(modes[0]) or modes[0].attrib else
+                    "regular-0644" if modes[0].text == "0644" else "other")
+        result.append({"member": name if name in ("PackageInfo", "Payload", "Bom") else "unrecognized",
+                       "fields": cpu._member_metadata_shapes(node), "mode_class": category})
+    return result
 
 
 def _owned_probe() -> dict:
@@ -222,7 +243,8 @@ def _owned_probe() -> dict:
              "--ownership", "recommended", "--compression", "legacy", "--identifier", IDENTIFIER,
              "--version", VERSION, "--install-location", "/Applications", str(target)])
         files[target] = _identity(target)
-        tree = product._xar(component.read_bounded(target, product.MAX_PACKAGE))
+        package_data = component.read_bounded(target, product.MAX_PACKAGE)
+        tree = product._xar(package_data)
         members = tree["members"]
         require(set(members) == {"PackageInfo", "Payload", "Bom"}
                 and all(item["decoded"] is not None for item in members.values()), "fixture member format")
@@ -249,6 +271,7 @@ def _owned_probe() -> dict:
                   "source_entry_count": len(_inventory()), "source_file_bytes": sum(map(len, FILES.values())),
                   "source_long_path_over_256": len(LONG_PATH) > 256,
                   "members": product._tree_shapes(tree), "payload_compression": compression,
+                  "member_metadata": _member_metadata(package_data),
                   "package_info": _package_info(members["PackageInfo"]["decoded"]),
                   "payload": payload_report, "bom_listing": _bom_listing(listing, checksums)}
         unchanged()

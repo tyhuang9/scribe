@@ -12,6 +12,7 @@ import tempfile
 import traceback
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import macos_app_pkg_profile as profile
 import macos_cpu_component as component
@@ -114,6 +115,8 @@ class Portable(unittest.TestCase):
         self.assertEqual(report["installer_effects"], "unobserved")
         self.assertEqual(report["payload_compression"], "gzip")
         self.assertEqual({row["name_class"] for row in report["members"]}, {"PackageInfo", "Payload", "Bom"})
+        self.assertEqual({row["member"] for row in report["member_metadata"]}, {"PackageInfo", "Payload", "Bom"})
+        self.assertTrue(all(row["mode_class"] == "absent" for row in report["member_metadata"]))
         self.assertEqual(report["bom_listing"]["flags_acl_xattrs_hardlink_tables"], "unobserved")
         self.assertFalse(list(self.root.iterdir()))
         self.assertNotIn(str(self.root), json.dumps(report))
@@ -226,6 +229,47 @@ class Portable(unittest.TestCase):
         self.assertFalse(row["identifiers_match"])
         self.assertFalse(row["paths_match"])
         self.assertNotIn("PrivateSentinel", json.dumps(report))
+        for path, category in ((profile.APP, "exact-relative-bundle"), ("./" + profile.APP, "exact-dot-relative-bundle"),
+                               ("/Applications/" + profile.APP, "exact-install-bundle"),
+                               ("/PrivateSentinel", "other")):
+            report = profile._package_info(f'<pkg-info><bundle path="{path}"/></pkg-info>'.encode())
+            row = next(row for row in report["controls"] if row["tag"] == "bundle")
+            self.assertEqual(row["path_classes"], [category])
+            self.assertEqual(row["paths_match"], path == profile.APP)
+            self.assertNotIn("PrivateSentinel", json.dumps(report))
+        report = profile._package_info(b'<pkg-info><bundle/><bundle path="PrivateSentinel"/></pkg-info>')
+        self.assertEqual(report["controls"][0]["path_classes"], ["absent", "other"])
+        def unknown_metadata(toc):
+            node = toc.find("file")
+            ET.SubElement(node, "PrivateSentinel", secret="PrivateSentinel").text = "/PrivateSentinel"
+            ET.SubElement(node, "mode").text = "PrivateSentinel"
+        data = xar({"PackageInfo": b"fixed"}, mutate=unknown_metadata)
+        profile.product._xar(data)
+        metadata = profile._member_metadata(data)
+        self.assertEqual(metadata[0]["mode_class"], "other")
+        self.assertTrue(any(row["tag"] == "unrecognized" for row in metadata[0]["fields"]))
+        self.assertNotIn("PrivateSentinel", json.dumps(metadata))
+        data = xar({"PackageInfo": b"fixed"}, mutate=lambda toc: setattr(
+            ET.SubElement(toc.find("file"), "mode"), "text", "0644"))
+        profile.product._xar(data)
+        self.assertEqual(profile._member_metadata(data)[0]["mode_class"], "regular-0644")
+        for mutation in ("attribute", "child", "duplicate"):
+            def changed(toc):
+                mode = ET.SubElement(toc.find("file"), "mode")
+                mode.text = "0644"
+                if mutation == "attribute":
+                    mode.set("PrivateSentinel", "private")
+                elif mutation == "child":
+                    ET.SubElement(mode, "PrivateSentinel")
+                else:
+                    ET.SubElement(toc.find("file"), "mode").text = "0644"
+            data = xar({"PackageInfo": b"fixed"}, mutate=changed)
+            profile.product._xar(data)
+            metadata = profile._member_metadata(data)
+            self.assertEqual(metadata[0]["mode_class"], "ambiguous")
+            self.assertEqual(sum(row["tag"] == "mode" for row in metadata[0]["fields"]),
+                             2 if mutation == "duplicate" else 1)
+            self.assertNotIn("PrivateSentinel", json.dumps(metadata))
 
     def test_source_inventory_package_and_bom_replacement_reject(self):
         for failure in ("source-mutation", "inventory-mutation", "bom-mutation", "package-replace"):
