@@ -222,6 +222,43 @@ class Portable(unittest.TestCase):
         for files in ({"Scripts": b"a", "scripts": b"b"}, {"app.pkg/Payload": b"a", "APP.pkg/PackageInfo": b"b"}):
             with self.assertRaises(component.ComponentError):
                 profile._xar(xar(files))
+        for files, selector, depth, ordinal in (({"Scripts": b"x"}, "file", 0, 1),
+                                                ({"cpu.pkg/Scripts": b"x"}, "file/file", 1, 2)):
+            for field in ("name", "type"):
+                for mutation in ("missing", "duplicate", "nested", "mixed"):
+                    with self.subTest(depth=depth, field=field, mutation=mutation):
+                        def mutate(toc):
+                            node = toc.find(selector)
+                            target = node.find(field)
+                            target.text = "/PrivateSentinel/value"
+                            target.set("PrivateSentinel", "/PrivateSentinel/attribute")
+                            if mutation == "missing":
+                                node.remove(target)
+                            elif mutation in ("duplicate", "mixed"):
+                                target = ET.SubElement(node, field, PrivateSentinel="private")
+                                target.text = "/PrivateSentinel/duplicate"
+                            if mutation in ("nested", "mixed"):
+                                ET.SubElement(target, "PrivateSentinel", secret="private").text = "private"
+                        with self.assertRaises(component.ComponentError) as caught:
+                            profile._xar(xar(files, mutate=mutate))
+                        message = str(caught.exception)
+                        self.assertNotIn("PrivateSentinel", message)
+                        prefix = "product profile: ambiguous member scalar "
+                        self.assertTrue(message.startswith(prefix))
+                        self.assertLess(len(message), 1024)
+                        shape = json.loads(message.removeprefix(prefix))
+                        self.assertEqual(set(shape), {"field", "depth", "member_ordinal", "direct_data_count",
+                                                     "direct_file_count", "type_class", "scalars"})
+                        self.assertEqual((shape["field"], shape["depth"], shape["member_ordinal"]),
+                                         (field, depth, ordinal))
+                        self.assertEqual((shape["direct_data_count"], shape["direct_file_count"]), (1, 0))
+                        self.assertEqual(shape["type_class"], "file" if field == "name" else
+                                         "missing" if mutation == "missing" else "ambiguous")
+                        observed = next(item for item in shape["scalars"] if item["field"] == field)
+                        count = 0 if mutation == "missing" else 2 if mutation in ("duplicate", "mixed") else 1
+                        children = int(mutation in ("nested", "mixed"))
+                        self.assertEqual(observed, {"field": field, "match_count": count, "nonleaf_count": children,
+                                                    "child_count": children, "attribute_count": count, "text_count": count})
 
     def test_nested_depth_count_and_non_regular_member_types_are_bounded(self):
         self.assertEqual(len(profile._xar(xar({"a/b/c/d": b"x"}))["members"]), 4)

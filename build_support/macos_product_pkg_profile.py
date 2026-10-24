@@ -112,6 +112,25 @@ def _xar(data: bytes) -> dict:
     while pending:
         node, parent, depth = pending.pop()
         require(len(members) < MAX_MEMBERS and depth <= 3, "member count or depth exceeds bound")
+        for field in ("name", "type"):
+            matches = node.findall(field)
+            if len(matches) != 1 or len(matches[0]) != 0:
+                # Failure-only shape evidence. Do not select, synthesize or
+                # normalize a scalar; the shared strict predicate is unchanged.
+                types = node.findall("type")
+                kind = "missing" if not types else "ambiguous" if len(types) != 1 or len(types[0]) else (
+                    types[0].text if types[0].text in ("file", "directory") else "other")
+                shape = {"field": field, "depth": depth, "member_ordinal": len(members) + 1,
+                         "direct_data_count": len(node.findall("data")),
+                         "direct_file_count": len(node.findall("file")), "type_class": kind,
+                         "scalars": [{"field": key, "match_count": len(values),
+                                      "nonleaf_count": sum(bool(len(value)) for value in values),
+                                      "child_count": sum(len(value) for value in values),
+                                      "attribute_count": sum(len(value.attrib) for value in values),
+                                      "text_count": sum(bool((value.text or "").strip()) for value in values)}
+                                     for key in ("name", "type") for values in (node.findall(key),)]}
+                raise component.ComponentError("product profile: ambiguous member scalar " +
+                    json.dumps(shape, sort_keys=True, separators=(",", ":"))) from None
         name, kind = cpu_profile.scalar(node, "name"), cpu_profile.scalar(node, "type")
         require(re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,63}", name) is not None
                 and name not in (".", ".."), "unsafe member name")
