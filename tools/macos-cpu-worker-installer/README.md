@@ -5,6 +5,10 @@ service, runtime download mechanism, or permission to install it. The desktop
 never starts it. It installs only the shared CPU inference/VAD worker image, not
 the application or Metal workers, and does not change Auto eligibility.
 
+The proposed [Mac installer authentication and publication contract](../../docs/MACOS_INSTALLER_RELEASE_HANDOFF.md)
+defines the next release boundary. It does not activate this source tool or
+qualify a signed installer.
+
 ## Authority and transaction
 
 Release compilation requires `SCRIBE_BUNDLED_WORKER_SHA256` (the existing desktop
