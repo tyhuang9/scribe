@@ -1,11 +1,14 @@
-"""Owned-product source fixtures: never real signing, native build or installation."""
-from contextlib import contextmanager
+"""Mocked owners plus a fixed inert native codec fixture; never installation."""
+from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import struct
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -24,6 +27,215 @@ from test_macos_cpu_pkg_final import PROPERTIES, SELECTOR, TEAM
 from test_macos_full_release_cpu_entry import IMAGE as CPU_IMAGE
 from test_macos_metal_pkg import metal_info
 from test_macos_metal_pkg_entry import IMAGE as METAL_IMAGE
+
+NATIVE_VERSION = "1.0.0"
+NATIVE_APP = "ScribeSourceFixture.app"
+NATIVE_IDS = {name: "com.scribe.source-test.native-product." + role
+              for name, role in zip(codec.NAMES, ("cpu", "metal", "app"))}
+NATIVE_MAX = 2 * 1024 * 1024
+
+
+def native_product_fixture():
+    """No arguments/results: exercise ONLY fresh fixed inert native output.
+
+    This test never admits a full app or patches production role identities.
+    It tests the real source Distribution/readback, not synthesized controls.
+    """
+    component.require(sys.platform == "darwin" and os.geteuid() != 0,
+                      "native product fixture: requires an unprivileged Mac")
+    try:
+        with component.private_workspace(Path(tempfile.gettempdir()).resolve(), "scribe-native-product-") as workspace:
+            packages, temporary = workspace / "packages", workspace / "tmp"
+            packages.mkdir(mode=0o700)
+            temporary.mkdir(mode=0o700)
+            environment = {**component.probe_environment(), "TMPDIR": str(temporary)}
+            inputs, directories, records = {}, {}, {}
+
+            def identity(path):
+                return (*component.hash_file(path, NATIVE_MAX), component.fingerprint(path.lstat()))
+
+            def write(path, data, mode):
+                with path.open("xb") as handle:
+                    component.require(handle.write(data) == len(data), "native product fixture: short write")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    path.chmod(mode)
+                    inputs[path] = (digest(data), len(data), component.fingerprint(os.fstat(handle.fileno())))
+
+            def directory(path):
+                component.check_node(path.lstat(), True)
+                with os.scandir(path) as entries:
+                    names = []
+                    for entry in entries:
+                        names.append(entry.name)
+                        component.require(len(names) <= 8, "native product fixture: directory bound")
+                return component.fingerprint(path.lstat()), tuple(sorted(names))
+
+            payload = workspace / "payload"
+            for path in (payload, payload / NATIVE_APP, payload / NATIVE_APP / "Contents",
+                         payload / NATIVE_APP / "Contents/MacOS"):
+                path.mkdir(mode=0o755)
+                path.chmod(0o755)
+            write(payload / NATIVE_APP / "Contents/Info.plist", plistlib.dumps({
+                "CFBundleIdentifier": NATIVE_IDS["app.pkg"], "CFBundleName": "Scribe Source Fixture",
+                "CFBundlePackageType": "APPL", "CFBundleExecutable": "fixture",
+                "CFBundleVersion": NATIVE_VERSION, "CFBundleShortVersionString": NATIVE_VERSION}), 0o644)
+            write(payload / NATIVE_APP / "Contents/MacOS/fixture", b"# Inert app fixture; no interpreter.\n", 0o755)
+            controls = workspace / "components.plist"
+            write(controls, plistlib.dumps([{**author.app_component.CONTROLS[0],
+                "RootRelativeBundlePath": NATIVE_APP}]), 0o600)
+            for role in ("cpu", "metal"):
+                scripts = workspace / (role + "-scripts")
+                scripts.mkdir(mode=0o700)
+                write(scripts / "postinstall", ("# Inert " + role + " fixture; no interpreter.\n").encode(), 0o755)
+            for path in inputs:
+                parent = path.parent
+                while parent != workspace:
+                    directories[parent] = directory(parent)
+                    parent = parent.parent
+
+            def unchanged():
+                component.require(all(identity(path) == saved for path, saved in inputs.items())
+                    and all(directory(path) == saved for path, saved in directories.items()),
+                    "native product fixture: retained input changed")
+                with os.scandir(packages) as entries:
+                    names = []
+                    for entry in entries:
+                        names.append(entry.name)
+                        component.require(len(names) <= len(codec.NAMES), "native product fixture: package bound")
+                component.require(len(names) == len(records) and set(names) == set(records),
+                                  "native product fixture: component inventory changed")
+
+            for name, role in zip(codec.NAMES, ("cpu", "metal", "app")):
+                unchanged()
+                args = ["/usr/bin/pkgbuild"] + (["--root", str(payload), "--component-plist", str(controls),
+                    "--ownership", "recommended", "--compression", "legacy"] if role == "app" else
+                    ["--nopayload", "--scripts", str(workspace / (role + "-scripts"))])
+                target = packages / name
+                component.capture([*args, "--identifier", NATIVE_IDS[name], "--version", NATIVE_VERSION,
+                    "--install-location", "/Applications" if role == "app" else "/", str(target)],
+                    timeout=30, limit=8192, error_limit=8192, environment=environment, cwd=workspace,
+                    operation=role + "-component-pkg-build")
+                sha, size, node = identity(target)
+                records[name] = (target, NATIVE_MAX, sha, size, node)
+                inputs[target] = sha, size, node
+                unchanged()
+            members, infos = {}, {}
+            for name in codec.NAMES:
+                identities, metadata = codec._index(packages / name, NATIVE_MAX, codec._file_layout(name, NATIVE_MAX))
+                info = author.app_codec.xml_tree(metadata["PackageInfo"])
+                component.require(info.tag == "pkg-info" and info.get("identifier") == NATIVE_IDS[name]
+                    and info.get("version") == NATIVE_VERSION
+                    and info.get("install-location") == ("/Applications" if name == "app.pkg" else "/"),
+                    "native product fixture: component identity differs")
+                payloads, bundles = info.findall("payload"), info.findall("bundle")
+                if name == "app.pkg":
+                    component.require(len(payloads) == 1 and len(bundles) == 1
+                        and bundles[0].get("id") == NATIVE_IDS[name]
+                        and bundles[0].get("path") == "./" + NATIVE_APP
+                        and bundles[0].get("CFBundleVersion") == NATIVE_VERSION
+                        and bundles[0].get("CFBundleShortVersionString") == NATIVE_VERSION,
+                        "native product fixture: app metadata differs")
+                    space = author.app_codec._decimal(payloads[0].get("installKBytes"), 2**63 - 1)
+                    component.require(space > 0, "native product fixture: invalid app space")
+                else:
+                    component.require(not bundles and (not payloads or len(payloads) == 1
+                        and payloads[0].attrib == {"installKBytes": "0", "numberOfFiles": "0"}),
+                        "native product fixture: worker metadata differs")
+                    space = 0
+                installed = []
+                for bundle in bundles:
+                    expected_bundle = author.app_codec.xml_tree(ET.tostring(bundle))
+                    expected_bundle.set("path", NATIVE_APP)
+                    installed.append(ET.tostring(expected_bundle))
+                infos[name] = NATIVE_IDS[name], space, tuple(installed)
+                members.update({name + "/" + leaf: value for leaf, value in identities.items()})
+                unchanged()
+            distribution = codec._distribution_source(NATIVE_VERSION, infos)
+            source = workspace / "Distribution.xml"
+            write(source, distribution, 0o644)
+            unchanged()
+            output = workspace / "product.pkg"
+            component.capture(["/usr/bin/productbuild", "--distribution", str(source),
+                "--package-path", str(packages), str(output)], timeout=30, limit=8192, error_limit=8192,
+                environment=environment, cwd=workspace, operation="product-component-pkg-build")
+            original = identity(output)
+            unchanged()
+            codec._inspect_product(output, records, members, infos, distribution)
+            unchanged()
+            component.require(identity(output) == original, "native product fixture: product changed")
+        # Success is observable only AFTER the owned scope's successful cleanup.
+    except component.CleanupUncertain as error:
+        raise error from None
+    except OSError:
+        raise component.ComponentError("native product fixture: filesystem operation failed") from None
+
+
+def native_distribution_diagnostic(data, source, infos):
+    """Failure-only closed comparisons, NEVER acceptance or raw XML output."""
+    root, expected = author.app_codec.xml_tree(data), author.app_codec.xml_tree(source)
+    references = [node for node in root.findall("pkg-ref") if not len(node)]
+    if len(references) > 8:
+        return {"schema_version": 1, "status": "reference-bound", "reference_count": len(references)}
+    roles = {value[0]: (name, value[1]) for name, value in infos.items() if name in codec.NAMES}
+    labels = dict(zip(codec.NAMES, ("cpu", "metal", "app")))
+    known = ("auth", "onConclusion", "active", "onConclusionScript", "archiveKBytes", "packageIdentifier", "updateKBytes")
+    rows, seen = [], set()
+    for node in references:
+        identifier = node.get("id")
+        role = roles.get(identifier)
+        originals = [value for value in expected.findall("pkg-ref") if value.get("id") == identifier]
+        original = originals[0] if len(originals) == 1 else None
+        wanted = original.attrib if original is not None else {}
+        extra = set(node.attrib) - set(wanted)
+        name, space = role if role is not None else ("", None)
+        update = node.get("updateKBytes")
+        update_class = "absent" if update is None else "literal-zero" if update == "0" else \
+            "canonical-positive" if re.fullmatch(r"[1-9][0-9]{0,18}", update) is not None \
+                and int(update) <= 2**63 - 1 else "other"
+        rows.append({"role": labels.get(name, "unknown"), "duplicate": identifier in seen,
+            "identifier_known": role is not None, "source_reference_count": len(originals),
+            "attributes_match": original is not None and node.attrib == wanted,
+            "extra_attribute_count": len(extra), "missing_attribute_count": len(set(wanted) - set(node.attrib)),
+            "known_extra_attributes": [key for key in known if key in extra],
+            "unknown_extra_attribute_count": len(extra - set(known)),
+            "version_matches": original is not None and node.get("version") == original.get("version"),
+            "space_matches": role is not None and node.get("installKBytes") == str(space),
+            "update_space_class": update_class,
+            "update_space_matches": role is not None and update == str(space),
+            "url_class": "absent" if not node.text else "bare-filename" if role and node.text == name else
+                "hash-filename" if role and node.text == "#" + name else "other",
+            "auth_class": node.get("auth") if node.get("auth") in ("root", "none") else
+                "absent" if "auth" not in node.attrib else "other",
+            "conclusion_class": node.get("onConclusion") if node.get("onConclusion") in
+                ("None", "none", "RequireLogout", "RequireRestart", "RequireShutdown") else
+                "absent" if "onConclusion" not in node.attrib else "other"})
+        seen.add(identifier)
+    bundle_report = {"status": "shape-differs"}
+    app_info = infos.get("app.pkg")
+    if app_info is not None and len(app_info[2]) == 1:
+        generated = [node for node in root.findall("pkg-ref") if node.get("id") == app_info[0] and len(node)]
+        if len(generated) == 1 and len(generated[0]) == 1 and generated[0][0].tag == "bundle-version" \
+                and len(generated[0][0]) == 1 and generated[0][0][0].tag == "bundle":
+            actual, wanted = generated[0][0][0], author.app_codec.xml_tree(app_info[2][0])
+            path, expected_path = actual.get("path"), wanted.get("path")
+            path_class = "absent" if path is None else "expected" if path == expected_path else \
+                "volume-relative" if expected_path and path == "Applications/" + expected_path else \
+                "component-relative" if expected_path and path == "./" + expected_path else \
+                "absolute" if expected_path and path == "/Applications/" + expected_path else "other"
+            bundle_report = {"status": "observed", "path_class": path_class,
+                "field_sets_match": set(actual.attrib) == set(wanted.attrib),
+                "other_fields_match": {key: value for key, value in actual.attrib.items() if key != "path"}
+                    == {key: value for key, value in wanted.attrib.items() if key != "path"},
+                "id_matches": actual.get("id") == wanted.get("id"),
+                "build_version_matches": actual.get("CFBundleVersion") == wanted.get("CFBundleVersion"),
+                "short_version_matches": actual.get("CFBundleShortVersionString") == wanted.get("CFBundleShortVersionString")}
+    report = {"schema_version": 1, "status": "observed", "reference_count": len(references),
+              "generated_reference_count": sum(bool(len(node)) for node in root.findall("pkg-ref")),
+              "references": rows, "app_bundle": bundle_report}
+    if len(json.dumps(report, sort_keys=True, separators=(",", ":")).encode()) > 8192:
+        return {"schema_version": 1, "status": "report-bound"}
+    return report
 
 
 def tree_xar(files, *, mutate=None, heap_transform=None, toc_transform=None):
@@ -226,6 +438,41 @@ class Codec(unittest.TestCase):
             root = ET.fromstring(self.distribution)
             change(root)
             self.reject(self.outer(changes={"Distribution": ET.tostring(root)}))
+
+    def test_update_space_profile_is_exact_zero_for_every_own_reference(self):
+        source = ET.fromstring(self.source)
+        self.assertEqual([node.get("updateKBytes") for node in source.findall("pkg-ref")], ["0"] * 3)
+        self.inspect(self.outer())
+        for index in range(3):
+            for value in (None, "1", "00", "+0", "-0", "0.0", " 0", "0 ", "", "\u0660", "1" * 1000):
+                root = ET.fromstring(self.distribution)
+                references = [node for node in root.findall("pkg-ref") if not len(node)]
+                if value is None:
+                    references[index].attrib.pop("updateKBytes")
+                else:
+                    references[index].set("updateKBytes", value)
+                self.reject(self.outer(changes={"Distribution": ET.tostring(root, encoding="utf-8")}))
+
+    def test_bundle_versions_bind_exact_installed_path_without_changing_other_fields(self):
+        (data,) = self.infos["app.pkg"][2]
+        self.assertEqual(ET.fromstring(data).attrib, {"id": "com.scribe.local-transcriber",
+            "path": "Scribe.app", "CFBundleVersion": "0.1.0", "CFBundleShortVersionString": "0.1.0"})
+        self.inspect(self.outer())
+        for path in ("./Scribe.app", "Applications/Scribe.app", "/Applications/Scribe.app", "applications/Scribe.app",
+                "scribe.app", "../Scribe.app", "Applications/../Scribe.app", "Applications/Other.app"):
+            root = ET.fromstring(self.distribution)
+            root.find("pkg-ref/bundle-version/bundle").set("path", path)
+            self.reject(self.outer(changes={"Distribution": ET.tostring(root)}))
+        expected, bodies = fixture()
+        original = decode_fixture(self.files["app.pkg"])["PackageInfo"]
+        for field, value in (("install-location", "/"), ("install-location", "/Applications/"),
+                ("install-location", "/applications"), ("path", "Scribe.app"), ("path", "/Scribe.app"),
+                ("path", "./../Scribe.app"), ("path", "./scribe.app")):
+            info = ET.fromstring(original)
+            (info if field == "install-location" else info.find("bundle")).set(field, value)
+            self.records["app.pkg"][0].write_bytes(app_xar(expected, bodies, info=ET.tostring(info)))
+            with self.assertRaisesRegex(component.ComponentError, "app bundle installation path differs"):
+                codec._components(self.records, "0.1.0")
 
     def test_large_aggregate_bound_and_all_reads_remain_bounded(self):
         self.assertGreater(codec._product_bound((2**32, 2**32, 2**32)), 3 * 2**32)
@@ -619,12 +866,364 @@ class PosixOwner(Owner):
         self.assertFalse((self.workspace / "Scribe.pkg").exists())
 
 
+class NativeRecipe(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="scribe-native-product-source-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.calls, self.failure, self.workspace = [], None, None
+
+    def execute(self, args, **kwargs):
+        self.calls.append(list(args))
+        self.workspace = workspace = kwargs["cwd"]
+        component.validate_tool_operation(kwargs["operation"])
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual((kwargs["limit"], kwargs["error_limit"]), (8192, 8192))
+        self.assertEqual(kwargs["environment"], {**component.probe_environment(), "TMPDIR": str(workspace / "tmp")})
+        if self.failure == "uncertain":
+            error = component.CleanupUncertain("synthetic native recipe uncertainty")
+            self.uncertain = error
+            cause = OSError("PrivateSentinel tool argument")
+            raise error from cause
+        if self.failure == "tool":
+            raise component.ToolExitError(kwargs["operation"], 1)
+        if self.failure == "filesystem":
+            raise OSError("PrivateSentinel local path")
+        packages = workspace / "packages"
+        if args[0] == "/usr/bin/pkgbuild":
+            name = Path(args[-1]).name
+            role = {"cpu-worker.pkg": "cpu", "metal-worker.pkg": "metal", "app.pkg": "app"}[name]
+            prefix = ["/usr/bin/pkgbuild"] + (["--root", str(workspace / "payload"), "--component-plist",
+                str(workspace / "components.plist"), "--ownership", "recommended", "--compression", "legacy"]
+                if role == "app" else ["--nopayload", "--scripts", str(workspace / (role + "-scripts"))])
+            self.assertEqual(args, [*prefix, "--identifier", NATIVE_IDS[name], "--version", NATIVE_VERSION,
+                "--install-location", "/Applications" if role == "app" else "/", str(packages / name)])
+            self.assertEqual(plistlib.loads((workspace / "components.plist").read_bytes()),
+                [{"RootRelativeBundlePath": NATIVE_APP, "BundleIsRelocatable": False,
+                  "BundleIsVersionChecked": False, "BundleHasStrictIdentifier": True, "BundleOverwriteAction": "upgrade"}])
+            inert = workspace / ("payload/" + NATIVE_APP + "/Contents/MacOS/fixture" if role == "app" else role + "-scripts/postinstall")
+            self.assertTrue(inert.read_bytes().startswith(b"# "))
+            self.assertNotIn(b"#!", inert.read_bytes())
+            if os.name == "posix":
+                self.assertEqual(inert.stat().st_mode & 0o777, 0o755)
+            info = ET.Element("pkg-info", identifier=NATIVE_IDS[name], version=NATIVE_VERSION,
+                              **{"install-location": "/Applications" if role == "app" else "/"})
+            ET.SubElement(info, "payload", installKBytes="1" if role == "app" else "0", numberOfFiles="5" if role == "app" else "0")
+            if role == "app":
+                ET.SubElement(info, "bundle", id=NATIVE_IDS[name], path="./" + NATIVE_APP,
+                              CFBundleVersion=NATIVE_VERSION, CFBundleShortVersionString=NATIVE_VERSION)
+            if self.failure in ("identifier", "version", "install-location"):
+                info.set(self.failure, "different")
+            if role == "app" and self.failure in ("bundle-id", "bundle-path", "bundle-version", "bundle-short", "space"):
+                if self.failure == "space":
+                    info.find("payload").set("installKBytes", "0")
+                else:
+                    field = {"bundle-id": "id", "bundle-path": "path", "bundle-version": "CFBundleVersion",
+                             "bundle-short": "CFBundleShortVersionString"}[self.failure]
+                    info.find("bundle").set(field, "different")
+            leaves = {"PackageInfo": ET.tostring(info)}
+            leaves.update({"Payload": b"opaque own native payload", "Bom": b"opaque own Bom"} if role == "app"
+                          else {"Scripts": inert.read_bytes()})
+            Path(args[-1]).write_bytes(tree_xar(leaves))
+            if len(self.calls) == 1 and self.failure in ("source-bytes", "source-node", "source-inventory"):
+                if self.failure == "source-inventory":
+                    (inert.parent / "unexpected").write_bytes(b"extra")
+                else:
+                    alternate = workspace / "replaced-input"
+                    alternate.write_bytes(inert.read_bytes() + (b"changed" if self.failure == "source-bytes" else b""))
+                    os.replace(alternate, inert)
+            if len(self.calls) == 2 and self.failure == "retained-component":
+                (packages / "cpu-worker.pkg").write_bytes(b"changed component")
+            return b""
+        self.assertEqual(args, ["/usr/bin/productbuild", "--distribution", str(workspace / "Distribution.xml"),
+                              "--package-path", str(packages), str(workspace / "product.pkg")])
+        controls = (workspace / "Distribution.xml").read_bytes()
+        infos, members = {}, {}
+        for name in codec.NAMES:
+            values = decode_fixture((packages / name).read_bytes())
+            info = ET.fromstring(values["PackageInfo"])
+            for bundle in info.findall("bundle"):
+                bundle.set("path", "ScribeSourceFixture.app")  # Independent fixed producer recipe.
+            infos[name] = (NATIVE_IDS[name], 1 if name == "app.pkg" else 0,
+                           tuple(ET.tostring(bundle) for bundle in info.findall("bundle")))
+            members.update({name + "/" + key: value for key, value in values.items()})
+        members["Distribution"] = generated_distribution(controls, infos)
+        Path(args[-1]).write_bytes(tree_xar(members))
+        if self.failure == "distribution":
+            (workspace / "Distribution.xml").write_bytes(b"changed controls")
+        if self.failure == "extra-component":
+            (packages / "unexpected.pkg").write_bytes(b"extra")
+        return b""
+
+    def run_fixture(self, *, real_workspace=False):
+        @contextmanager
+        def private(*_args):
+            with tempfile.TemporaryDirectory(prefix="scribe-native-product-", dir=self.root) as value:
+                yield Path(value)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sys, "platform", "darwin"))
+            stack.enter_context(patch.object(os, "geteuid", return_value=getattr(os, "geteuid", lambda: 501)() or 501, create=True))
+            stack.enter_context(patch.object(tempfile, "gettempdir", return_value=str(self.root)))
+            stack.enter_context(patch.object(component, "capture", side_effect=self.execute))
+            stack.enter_context(patch.object(signing, "_publisher", side_effect=AssertionError("native fixture must not use publisher")))
+            if not real_workspace:
+                stack.enter_context(patch.object(component, "private_workspace", side_effect=private))
+            return native_product_fixture()
+
+    def test_fixed_native_recipe_uses_real_codec_and_only_four_system_commands(self):
+        self.assertIsNone(self.run_fixture())
+        self.assertEqual([args[0] for args in self.calls], ["/usr/bin/pkgbuild"] * 3 + ["/usr/bin/productbuild"])
+        self.assertFalse(list(self.root.iterdir()))
+        for args in self.calls:
+            self.assertFalse({"--sign", "--synthesize", "--expand", "--expand-full", "/usr/sbin/installer"}.intersection(args))
+
+    def test_native_recipe_source_controls_components_and_inventory_mutations_reject(self):
+        for failure, count in (("source-bytes", 1), ("source-node", 1), ("source-inventory", 1),
+                               ("retained-component", 2), ("distribution", 4), ("extra-component", 4)):
+            self.failure = failure
+            self.calls.clear()
+            with patch.object(codec, "_inspect_product") as inspect, self.assertRaises(component.ComponentError):
+                self.run_fixture()
+            self.assertEqual(len(self.calls), count)
+            inspect.assert_not_called()
+            self.assertFalse(list(self.root.iterdir()))
+
+    def test_native_recipe_checks_fixture_role_metadata_without_overriding_production_ids(self):
+        for failure in ("identifier", "version", "install-location", "bundle-id", "bundle-path",
+                        "bundle-version", "bundle-short", "space"):
+            self.failure = failure
+            self.calls.clear()
+            with self.assertRaisesRegex(component.ComponentError, "native product fixture:"):
+                self.run_fixture()
+            self.assertEqual(len(self.calls), 3)
+            self.assertFalse(list(self.root.iterdir()))
+
+    def test_native_recipe_late_product_replacement_and_closed_failures_do_not_succeed(self):
+        inspect = codec._inspect_product
+        reached = []
+        def changed(path, *args):
+            inspect(path, *args)
+            alternate = path.parent / "replacement"
+            alternate.write_bytes(path.read_bytes())
+            os.replace(alternate, path)
+            reached.append(True)
+        with patch.object(codec, "_inspect_product", side_effect=changed), self.assertRaisesRegex(
+                component.ComponentError, "native product fixture: product changed"):
+            self.run_fixture()
+        self.assertEqual(reached, [True])
+        for failure in ("tool", "filesystem", "uncertain"):
+            self.failure = failure
+            with self.assertRaises(component.ComponentError) as caught:
+                self.run_fixture()
+            self.assertNotIn("PrivateSentinel", str(caught.exception))
+            if failure == "uncertain":
+                self.assertIs(caught.exception, self.uncertain)
+            if failure in ("filesystem", "uncertain"):
+                self.assertTrue(caught.exception.__suppress_context__)
+            self.assertFalse(list(self.root.iterdir()))
+
+    def test_native_recipe_platform_and_root_reject_before_inputs_or_tools(self):
+        for platform, uid in (("win32", 501), ("linux", 501), ("darwin", 0)):
+            with patch.object(sys, "platform", platform), patch.object(os, "geteuid", return_value=uid, create=True), \
+                 patch.object(component, "private_workspace") as workspace, patch.object(component, "capture") as tool, \
+                 self.assertRaises(component.ComponentError):
+                native_product_fixture()
+            workspace.assert_not_called()
+            tool.assert_not_called()
+
+    def test_native_failure_diagnostics_compare_each_predicate_and_redact_values(self):
+        infos = {name: (NATIVE_IDS[name], 1 if name == "app.pkg" else 0, ()) for name in codec.NAMES}
+        source = codec._distribution_source(NATIVE_VERSION, infos)
+        baseline = generated_distribution(source, infos, additions=False)
+        observed = native_distribution_diagnostic(baseline, source, infos)
+        self.assertEqual(observed["reference_count"], 3)
+        self.assertTrue(all(row["attributes_match"] and row["version_matches"] and row["space_matches"]
+            and row["url_class"] == "hash-filename" for row in observed["references"]))
+        for value, classification, matches in ((None, "absent", False), ("0", "literal-zero", False),
+                ("1", "canonical-positive", True), ("2", "canonical-positive", False),
+                (str(2**63 - 1), "canonical-positive", False), (str(2**63), "other", False),
+                ("00", "other", False), ("+0", "other", False), ("-1", "other", False),
+                ("1.0", "other", False), ("PrivateSentinelValue", "other", False),
+                ("1" * 1000, "other", False), ("\u0661", "other", False)):
+            root = ET.fromstring(baseline)
+            if value is None:
+                root.find("pkg-ref").attrib.pop("updateKBytes")
+            else:
+                root.find("pkg-ref").set("updateKBytes", value)
+            report = native_distribution_diagnostic(ET.tostring(root, encoding="utf-8"), source, infos)
+            row = report["references"][0]  # The app has a nonzero independent space hint.
+            self.assertEqual((row["update_space_class"], row["update_space_matches"]), (classification, matches))
+            self.assertEqual(row["known_extra_attributes"], [])  # Fixed source already authors this field.
+            self.assertEqual(row["unknown_extra_attribute_count"], 0)
+            self.assertNotIn("PrivateSentinel", json.dumps(report))
+        mutations = {
+            "attributes_match": lambda node: node.set("PrivateSentinelName", "PrivateSentinelValue"),
+            "version_matches": lambda node: node.set("version", "PrivateSentinelVersion"),
+            "space_matches": lambda node: node.set("installKBytes", "PrivateSentinelSpace"),
+            "url_class": lambda node: setattr(node, "text", "/PrivateSentinelPath"),
+        }
+        for predicate, mutate in mutations.items():
+            root = ET.fromstring(baseline)
+            mutate(root.find("pkg-ref"))
+            report = native_distribution_diagnostic(ET.tostring(root), source, infos)
+            row = report["references"][0]
+            self.assertEqual(row[predicate], "other" if predicate == "url_class" else False)
+            for independent in ("version_matches", "space_matches", "url_class"):
+                if independent != predicate:
+                    self.assertEqual(row[independent], "hash-filename" if independent == "url_class" else True)
+            self.assertNotIn("PrivateSentinel", json.dumps(report))
+        root = ET.fromstring(baseline)
+        node = root.find("pkg-ref")
+        node.set("auth", "root")
+        node.set("onConclusion", "None")
+        node.set("active", "PrivateSentinelCode")
+        node.set("PrivateSentinelName", "private")
+        root.append(ET.fromstring(ET.tostring(node)))
+        report = native_distribution_diagnostic(ET.tostring(root), source, infos)
+        self.assertEqual(report["references"][0]["known_extra_attributes"], ["auth", "onConclusion", "active"])
+        self.assertEqual(report["references"][0]["unknown_extra_attribute_count"], 1)
+        self.assertTrue(report["references"][-1]["duplicate"])
+        self.assertNotIn("PrivateSentinel", json.dumps(report))
+        self.assertEqual(report, native_distribution_diagnostic(ET.tostring(root), source, infos))
+        node.set("id", "PrivateSentinelIdentifier")
+        node.set("auth", "PrivateSentinelAuth")
+        node.set("onConclusion", "PrivateSentinelConclusion")
+        unknown = native_distribution_diagnostic(ET.tostring(root), source, infos)
+        self.assertEqual(unknown["references"][0]["role"], "unknown")
+        self.assertNotIn("PrivateSentinel", json.dumps(unknown))
+        for _ in range(4):
+            root.append(ET.fromstring(ET.tostring(node)))
+        exact = native_distribution_diagnostic(ET.tostring(root), source, infos)
+        self.assertEqual((exact["status"], exact["reference_count"], len(exact["references"])), ("observed", 8, 8))
+        self.assertLessEqual(len(json.dumps(exact, sort_keys=True, separators=(",", ":")).encode()), 8192)
+        root.append(ET.fromstring(ET.tostring(node)))
+        self.assertEqual(native_distribution_diagnostic(ET.tostring(root), source, infos)["status"], "reference-bound")
+        bundle = ET.Element("bundle", id="PrivateSentinelId", path="Scribe.app",
+                            CFBundleVersion="PrivateSentinelVersion", CFBundleShortVersionString="PrivateSentinelShort")
+        metadata = {**infos, "app.pkg": (infos["app.pkg"][0], 1, (ET.tostring(bundle),))}
+        generated = generated_distribution(source, metadata)
+        for path, classification in (("Scribe.app", "expected"), ("Applications/Scribe.app", "volume-relative"),
+                ("./Scribe.app", "component-relative"), ("/Applications/Scribe.app", "absolute"),
+                ("PrivateSentinelPath", "other"), (None, "absent")):
+            root = ET.fromstring(generated)
+            node = root.find("pkg-ref/bundle-version/bundle")
+            if path is None:
+                node.attrib.pop("path")
+            else:
+                node.set("path", path)
+            report = native_distribution_diagnostic(ET.tostring(root), source, metadata)
+            self.assertEqual(report["app_bundle"]["path_class"], classification)
+            self.assertTrue(report["app_bundle"]["other_fields_match"])
+            self.assertNotIn("PrivateSentinel", json.dumps(report))
+        for field, predicate in (("id", "id_matches"), ("CFBundleVersion", "build_version_matches"),
+                ("CFBundleShortVersionString", "short_version_matches")):
+            root = ET.fromstring(generated)
+            root.find("pkg-ref/bundle-version/bundle").set(field, "PrivateSentinelChanged")
+            report = native_distribution_diagnostic(ET.tostring(root), source, metadata)
+            self.assertFalse(report["app_bundle"][predicate])
+            self.assertFalse(report["app_bundle"]["other_fields_match"])
+            self.assertEqual(report["app_bundle"]["path_class"], "expected")
+            self.assertNotIn("PrivateSentinel", json.dumps(report))
+        root = ET.fromstring(generated)
+        app_reference = next(node for node in root.findall("pkg-ref") if node.get("id") == metadata["app.pkg"][0] and len(node))
+        app_reference.find("bundle-version").append(ET.fromstring(ET.tostring(bundle)))
+        self.assertEqual(native_distribution_diagnostic(ET.tostring(root), source, metadata)["app_bundle"],
+                         {"status": "shape-differs"})
+
+    def test_native_failure_report_preserves_exception_and_emits_only_after_scope_exit(self):
+        infos = {name: (NATIVE_IDS[name], 1 if name == "app.pkg" else 0, ()) for name in codec.NAMES}
+        source = codec._distribution_source(NATIVE_VERSION, infos)
+        data = generated_distribution(source, infos, additions=False).replace(b'installKBytes="1"', b'installKBytes="2"')
+        active, failures = [], []
+        mode, cleanup_error = None, component.CleanupUncertain("synthetic cleanup uncertainty")
+        def fixture():
+            active.append(True)
+            try:
+                codec._distribution(data, source, infos)
+            except component.ComponentError as error:
+                failures.append(error)
+                raise
+            finally:
+                active.pop()
+                if mode in ("cleanup-uncertain", "cleanup-emission-broken"):
+                    raise cleanup_error
+        case = NativeMac("test_fixed_inert_native_product_matches_exact_source_distribution_and_readback")
+        for mode in ("normal", "diagnostic-broken", "cleanup-uncertain", "emission-broken",
+                     "cleanup-emission-broken", "encoding-broken"):
+            lines = []
+            def emitted(*args, **_kwargs):
+                self.assertFalse(active)
+                if mode in ("emission-broken", "cleanup-emission-broken"):
+                    raise OSError("PrivateSentinel output failure")
+                lines.append(args[0])
+            with ExitStack() as stack:
+                called = stack.enter_context(patch.object(codec, "_distribution", wraps=codec._distribution))
+                stack.enter_context(patch(__name__ + ".native_product_fixture", side_effect=fixture))
+                stack.enter_context(patch("builtins.print", side_effect=emitted))
+                if mode == "diagnostic-broken":
+                    stack.enter_context(patch(__name__ + ".native_distribution_diagnostic", side_effect=OSError("PrivateSentinel")))
+                if mode == "encoding-broken":
+                    stack.enter_context(patch(__name__ + ".native_distribution_diagnostic", return_value={"value": object()}))
+                with self.assertRaises(component.ComponentError) as caught:
+                    case.test_fixed_inert_native_product_matches_exact_source_distribution_and_readback()
+            called.assert_called_once()
+            self.assertIs(caught.exception, cleanup_error if mode in ("cleanup-uncertain", "cleanup-emission-broken") else failures[-1])
+            if mode in ("emission-broken", "cleanup-emission-broken", "encoding-broken"):
+                self.assertEqual(lines, [])
+                continue
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("SCRIBE_NATIVE_SOURCE_DISTRIBUTION_REJECT="))
+            self.assertNotIn("PrivateSentinel", lines[0])
+            self.assertNotIn("READBACK_PASS", lines[0])
+            self.assertEqual(json.loads(lines[0].split("=", 1)[1])["status"], "unavailable" if mode == "diagnostic-broken" else "observed")
+
+
+class PosixNativeRecipe(NativeRecipe):
+    def test_native_recipe_uncertain_process_retains_its_owned_private_scope(self):
+        self.root.chmod(0o700)
+        self.failure = "uncertain"
+        with self.assertRaises(component.CleanupUncertain) as caught:
+            self.run_fixture(real_workspace=True)
+        self.assertIs(caught.exception, self.uncertain)
+        retained = list(self.root.glob("scribe-native-product-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertTrue((retained[0] / "cpu-scripts/postinstall").is_file())
+        # All children mocked: enclosing TemporaryDirectory may safely clean it.
+
+
+class NativeMac(unittest.TestCase):
+    def test_fixed_inert_native_product_matches_exact_source_distribution_and_readback(self):
+        original, report = codec._distribution, None
+        def inspected(data, source, infos):
+            nonlocal report
+            try:
+                original(data, source, infos)
+            except component.ComponentError:
+                try:
+                    report = native_distribution_diagnostic(data, source, infos)
+                except Exception:
+                    report = {"schema_version": 1, "status": "unavailable"}
+                raise
+        try:
+            with patch.object(codec, "_distribution", side_effect=inspected):
+                native_product_fixture()
+        except component.ComponentError:
+            if report is not None:
+                try:
+                    print("SCRIBE_NATIVE_SOURCE_DISTRIBUTION_REJECT=" + json.dumps(report, sort_keys=True, separators=(",", ":")), flush=True)
+                except Exception:
+                    pass  # Best-effort failure diagnostics never replace the current error.
+            raise
+        print("SCRIBE_NATIVE_SOURCE_PRODUCT_READBACK_PASS", flush=True)
+
+
 def suite():
     result = unittest.TestSuite()
-    classes = (Codec, Owner) + ((PosixOwner,) if os.name == "posix" else ())
+    classes = (Codec, Owner, NativeRecipe) + ((PosixOwner, PosixNativeRecipe) if os.name == "posix" else ()) \
+        + ((NativeMac,) if sys.platform == "darwin" else ())
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 23 + (1 if os.name == "posix" else 0)
+    expected = 32 + (2 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"Product source discovery mismatch: expected {expected}")
     return result
