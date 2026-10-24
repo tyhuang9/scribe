@@ -9,6 +9,7 @@ on:
       - 'build.rs'
       - 'build_support/build_revision.rs'
       - 'build_support/*macos_cpu_component.py'
+      - 'build_support/*macos_worker_contract.py'
       - 'build_support/*macos_cpu_pkg_entry.py'
       - 'build_support/*macos_cpu_pkg.py'
       - 'build_support/*macos_cpu_pkg_final.py'
@@ -42,6 +43,7 @@ on:
       - 'build.rs'
       - 'build_support/build_revision.rs'
       - 'build_support/*macos_cpu_component.py'
+      - 'build_support/*macos_worker_contract.py'
       - 'build_support/*macos_cpu_pkg_entry.py'
       - 'build_support/*macos_cpu_pkg.py'
       - 'build_support/*macos_cpu_pkg_final.py'
@@ -106,6 +108,8 @@ jobs:
       - name: Verify product source and fixed inert native readback without installation
         timeout-minutes: 4
         run: python3 -B build_support/test_macos_product_pkg.py
+      - name: Verify native worker supervision source without native execution
+        run: python3 -B build_support/test_native_macos_worker_contract.py
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin

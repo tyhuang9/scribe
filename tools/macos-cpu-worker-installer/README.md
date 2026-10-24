@@ -95,6 +95,37 @@ and fixture cleanup are unchanged. Actual native results are still required;
 passing private fixtures would not establish protected-path installation,
 package authentication, production qualification or Auto eligibility.
 
+The CPU and Metal metadata shell entrypoints now delegate their entire fixture
+lifetime to `build_support/native_macos_worker_contract.py`. It reuses the
+reviewed descriptor-bound private workspace and bounded process capture; there
+is no competing recursive shell EXIT cleanup. Existing native commands, exact
+test discovery, release profile, locked/offline choices and per-command deadlines
+remain. CPU app/signature verification is now bounded to 60 seconds and Rust
+host inspection to 30 seconds, rather than previously unbounded preparation.
+Both tool streams are privately bounded to 8 MiB each, not streamed into CI logs;
+success emits a fixed marker only after scope cleanup. Failures are categorized
+without raw commands, output or local paths. Shared capture uses its existing
+bounded immediate-KILL cleanup, not the old five-second TERM grace.
+
+Worker processes deliberately have a separate process group from Cargo. Any
+abnormal actual test invocation or missing single-test success evidence retains
+the entire fixture, even when Cargo's group is confirmed gone. Only the existing
+Rust contract's shutdown/settlement/reaping assertions establish worker exit.
+Discovery failures cannot execute workers. All failures from the owned contract body,
+including preparation and interrupted retirement cleanup, conservatively retain
+the fixture even when no worker is known to have started. Cooperative SIGTERM
+and SIGINT follow the same failure path; SIGKILL cannot run cleanup. This is not
+arbitrary descendant containment and adds no stale-PID worker signalling.
+Failed/uncertain fixtures are retained for runner disposal, not swept by later
+invocations. Successful fixtures are still removed.
+
+`python3 -B build_support/test_native_macos_worker_contract.py` runs exactly 19
+portable tests plus one POSIX lifetime test. Native commands/workers/signing are
+mocked; the POSIX test uses only its own unprivileged directory. Existing shared
+capture tests cover bounded reap, lost ownership and denied/positive group probes.
+Both real Mac lanes must separately validate the changed harness; source tests
+do not establish native acceptance or production installation.
+
 ## Non-installing development component
 
 An opt-in source-authoring step now joins the finalized CPU application and a

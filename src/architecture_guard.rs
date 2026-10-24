@@ -723,7 +723,8 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
     let cpu_identity = production_source(include_str!("macos_cpu_identity.rs"));
     let retained_marker = production_source(include_str!("macos_retained_marker.rs"));
     let launcher = production_source(include_str!("macos_worker_launch.rs"));
-    let contract = include_str!("../scripts/test-macos-protected-cpu-worker.sh");
+    let contract = include_str!("../build_support/native_macos_worker_contract.py");
+    let entry = include_str!("../scripts/test-macos-protected-cpu-worker.sh");
     let resolver = named_function_bodies(&worker, "resolve_protected_macos_cpu_worker").join("\n");
     assert!(resolver.contains("embedded_cpu_digest()?"));
     assert!(resolver.contains("authority.recheck()?"));
@@ -762,9 +763,24 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
     assert!(cpu_launch.contains("LaunchAuthority::Cpu(authority)"));
     assert!(cpu_launch.contains("role.flag()"));
     assert!(cpu_launch.contains("&[]"));
-    assert!(contract.contains("verify-macos-release-package.sh"));
-    assert!(contract.contains("--ignored --exact"));
-    assert!(contract.contains("[[ \"$count\" == 1 ]]"));
+    assert!(entry.contains("native_macos_worker_contract.py\" cpu --app"));
+    assert!(!entry.contains("rm -rf"));
+    assert!(!entry.contains("trap "));
+    assert!(contract.contains("scripts/verify-macos-release-package.sh"));
+    assert!(!contract.contains("component.verify_cpu_app(app)"));
+    assert!(contract.contains("\"--ignored\", \"--exact\""));
+    assert!(contract.contains("listing if line.endswith(\": test\")] == [name + \": test\"]"));
+    assert!(contract.contains("with component.private_workspace(parent,"));
+    assert!(contract.contains("component.capture(arguments, timeout=seconds"));
+    assert!(contract.contains("except BaseException:"));
+    assert!(contract.contains("raise component.CleanupUncertain(\"native worker retirement unconfirmed; retaining fixture\") from None"));
+    let cpu_recipe = contract
+        .split_once("def _cpu(")
+        .unwrap()
+        .1
+        .split_once("def _metal(")
+        .unwrap()
+        .0;
     for forbidden in [
         "sudo ",
         "installer -",
@@ -772,7 +788,7 @@ fn macos_protected_cpu_admission_is_compile_anchored_and_model_free() {
         "cargo build",
         "--features metal-acceleration",
     ] {
-        assert!(!contract.contains(forbidden));
+        assert!(!cpu_recipe.contains(forbidden));
     }
 }
 
@@ -818,7 +834,7 @@ fn macos_protected_cpu_vad_gate_is_binary_local_and_role_isolated() {
                 .find("take_parent_control_reader_from_env()")
                 .unwrap()
     );
-    let contract = include_str!("../scripts/test-macos-protected-cpu-worker.sh");
+    let contract = include_str!("../build_support/native_macos_worker_contract.py");
     assert!(
         contract.contains("macos_native_protected_cpu_vad_authenticates_health_shutdown_and_reap")
     );
