@@ -356,6 +356,50 @@ packaging cleanup are covered. Actual native entry/package construction is not
 established until the exact-head jobs pass. Even then, this proves construction,
 not package authenticity, Installer execution, installation or release qualification.
 
+### PRE-SIGN CPU entry from the complete GPU-enabled release
+
+`build_support/macos_full_release_cpu_entry.py` is a distinct internal constructor
+for the CPU entry from the **same full app** used by Metal construction. The old
+CPU-only constructor, development component and finalization APIs still require
+an empty catalog/default-deny authority; they are not relaxed or given an
+`allow_gpu` mode. Stripping GPU resources into a second app is not same-release
+admission.
+
+Both fixed constructors now open their own `macos_full_release.owned_release`
+scope. It owns the exact bounded full-tree copy, frozen hashes/node identities,
+original app/bundle-context verification and a freshly built native Rust verifier.
+Both production packs and their app/build/protocol/size joins must verify before
+any entry compilation. `FrozenInputs` remains import-compatible through the
+Metal entry module. A yielded private lexical workspace is never accepted by a
+public constructor as a caller-supplied receipt, callback or trust boolean.
+
+The new CPU path uses only its exact private universal CPU worker and the same
+fixed CPU compilation tail, CPU size bounds, identifiers/markers and non-GPU
+dependency checks as the old path. It receives no Metal payload build variables.
+After compilation, full source/private inventories, bytes, nodes and verifier
+identity must remain unchanged before candidate byte/node checks and exclusive
+publication. Retained snapshot baselines are immutable tuples, not refreshed
+from current files. Normal scope completion rechecks again; failure after
+publication reports failure and retains the final output, not atomic rollback.
+An exceptional body exit never runs that normal check and cannot mask a
+`CleanupUncertain` error or permit deletion of a possibly live workspace.
+
+`python3 -B build_support/test_macos_full_release_cpu_entry.py` discovers exactly
+11 portable tests plus one POSIX cleanup test. All native children are mocked.
+They cover verification ordering/either-pack failure, every retained original
+and private file's mutation/same-byte replacement, unchanged CPU-only denial,
+CPU bounds/environment, publication ambiguity and cleanup-error preservation.
+These are source orchestration tests, not authentic pack/signature admission or
+native CPU-from-full-release construction evidence.
+
+This result is PRE-SIGN path/hash/size only. The existing CPU finalizer/package
+owner is still CPU-only and does not consume this new output. A later full-release
+CPU component owner must construct/finalize it itself. Eventual product
+composition must retain one complete app baseline across both component builds:
+`FrozenInputs` alone does not pin every desktop/Info/profile byte across separate
+calls. No publisher activation, package signing/authentication, product assembly,
+Installer invocation, installation or Auto enablement is added here.
+
 ### Native package-format prerequisite
 
 Before implementing a real PKG author/validator, run the same source command as

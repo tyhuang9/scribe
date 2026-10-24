@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import macos_cpu_component as component
+import macos_full_release as full
 import macos_metal_pkg_entry as entry
 
 REVISION = "source-metal-construction-fixture"
@@ -91,11 +92,11 @@ class Portable(unittest.TestCase):
     @contextmanager
     def context(self, *, real_workspace=False):
         with ExitStack() as stack:
-            stack.enter_context(patch.object(entry.sys, "platform", "darwin"))
-            stack.enter_context(patch.object(entry.os, "geteuid", return_value=getattr(os, "geteuid", lambda: 501)() or 501,
+            stack.enter_context(patch.object(full.sys, "platform", "darwin"))
+            stack.enter_context(patch.object(full.os, "geteuid", return_value=getattr(os, "geteuid", lambda: 501)() or 501,
                                              create=True))
-            stack.enter_context(patch.object(entry.platform, "machine", return_value="arm64"))
-            stack.enter_context(patch.object(entry.shutil, "which", return_value=self.cargo))
+            stack.enter_context(patch.object(full.platform, "machine", return_value="arm64"))
+            stack.enter_context(patch.object(full.shutil, "which", return_value=self.cargo))
             stack.enter_context(patch.object(component, "capture", side_effect=self.execute))
             if not real_workspace:
                 stack.enter_context(patch.object(component, "private_workspace", side_effect=self.fake_private))
@@ -200,10 +201,10 @@ class Portable(unittest.TestCase):
         with self.assertRaises((component.ComponentError, OSError)):
             self.build()
         self.assertFalse((self.workspace / "postinstall").exists())
-        self.assertFalse(list(self.workspace.glob(".scribe-metal-pkg-entry-*")))
+        self.assertFalse(list(self.workspace.glob(".scribe-full-release-entry-*")))
 
     def test_intel_host_builds_a_fresh_native_x64_verifier(self):
-        with self.context(), patch.object(entry.platform, "machine", return_value="x86_64"), \
+        with self.context(), patch.object(full.platform, "machine", return_value="x86_64"), \
              patch.object(component, "publish_no_replace", side_effect=lambda source, output: source.rename(output)):
             entry.build_entry(self.app, self.workspace, self.frozen)
         args, _ = self.builds[0]
@@ -237,14 +238,14 @@ class Portable(unittest.TestCase):
         self.assertEqual(len(signed), 2)
         self.assertEqual(signed[0], str(self.app / component.CPU_APP_INPUTS[1]))
         self.assertFalse(list(self.workspace.iterdir()) == [])
-        self.assertFalse(list(self.workspace.glob(".scribe-metal-pkg-entry-*")))
+        self.assertEqual(list(self.workspace.iterdir()), [output])
 
     def test_foreign_root_and_unknown_host_reject_before_tools(self):
         for host, uid in [("linux", 501), ("win32", 501), ("darwin", 0)]:
-            with self.subTest(host=host), self.context(), patch.object(entry.sys, "platform", host), \
-                 patch.object(entry.os, "geteuid", return_value=uid), self.assertRaises(component.ComponentError):
+            with self.subTest(host=host), self.context(), patch.object(full.sys, "platform", host), \
+                 patch.object(full.os, "geteuid", return_value=uid), self.assertRaises(component.ComponentError):
                 entry.build_entry(self.app, self.workspace, self.frozen)
-        with self.context(), patch.object(entry.platform, "machine", return_value="arm64e"), self.assertRaises(component.ComponentError):
+        with self.context(), patch.object(full.platform, "machine", return_value="arm64e"), self.assertRaises(component.ComponentError):
             entry.build_entry(self.app, self.workspace, self.frozen)
         self.assertEqual(self.calls, [])
 
@@ -373,7 +374,7 @@ class Portable(unittest.TestCase):
             self.verifications.clear()
             self.reject()
             self.assertEqual(len(self.builds), 3 if failure == "missing-universal" else 2 if failure.startswith("entry-") else 1)
-            self.assertEqual(len(self.verifications), 2 if failure == "missing-universal" else 1 if failure.startswith("entry-") else 0)
+            self.assertEqual(len(self.verifications), 2 if failure == "missing-universal" or failure.startswith("entry-") else 0)
 
     def test_missing_hardlinked_and_oversized_outputs_reject(self):
         for failure in ["missing", "hardlink"]:
@@ -397,7 +398,7 @@ class Portable(unittest.TestCase):
         for failure in ["build", "entry-build", "deadline", "combine", "uncertain"]:
             self.failure = failure
             self.reject()
-        with self.context(), patch.object(entry.shutil, "which", return_value=None), self.assertRaises(component.ComponentError):
+        with self.context(), patch.object(full.shutil, "which", return_value=None), self.assertRaises(component.ComponentError):
             entry.build_entry(self.app, self.workspace, self.frozen)
 
     def test_publication_collision_and_ambiguous_rename_retain_final(self):
@@ -444,7 +445,7 @@ class Posix(Portable):
         self.failure = "uncertain"
         with self.context(real_workspace=True), self.assertRaises(component.CleanupUncertain):
             entry.build_entry(self.app, self.workspace, self.frozen)
-        retained = list(self.workspace.glob(".scribe-metal-pkg-entry-*"))
+        retained = list(self.workspace.glob(".scribe-full-release-entry-*"))
         self.assertEqual(len(retained), 1)
         self.assertTrue((retained[0] / "app" / entry.CATALOG).is_file())
         self.assertFalse((self.workspace / "postinstall").exists())

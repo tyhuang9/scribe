@@ -269,6 +269,16 @@ entry.
 
 ## Inactive finalized-entry owner
 
+Full-release admission is shared with the separate CPU-from-full-release
+PRE-SIGN constructor through `build_support/macos_full_release.py`. Each fixed
+constructor opens its own owned copy/verifier scope and verifies both native
+packs before compiling any entry; no caller-supplied verified receipt is accepted.
+The exact full source/private inventory remains bound through compilation and
+publication. The old CPU-only APIs remain strict and separate. A normal
+post-publication recheck failure reports an error and retains the final; it is
+not a cross-component transaction. See the CPU writer README for this source
+prerequisite and its remaining native/component integration gates.
+
 `build_support/macos_metal_pkg_final.py` adds a separate, internal build-only
 owner for its own freshly constructed Metal entry. It has no CLI, prebuilt-entry
 input, signing callback, caller-selected policy, release switch or installation

@@ -15,6 +15,7 @@ on:
       - 'build_support/*macos_metal_pkg_entry.py'
       - 'build_support/*macos_metal_pkg_final.py'
       - 'build_support/*macos_metal_pkg.py'
+      - 'build_support/*macos_full_release*.py'
       - 'build_support/*macos_cpu_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
@@ -41,6 +42,7 @@ on:
       - 'build_support/*macos_metal_pkg_entry.py'
       - 'build_support/*macos_metal_pkg_final.py'
       - 'build_support/*macos_metal_pkg.py'
+      - 'build_support/*macos_full_release*.py'
       - 'build_support/*macos_cpu_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
@@ -104,6 +106,8 @@ jobs:
           python3 -B build_support/test_native_macos_cpu_pkg_entry.py
       - name: Verify Metal package-entry construction with mocked native tools
         run: python3 -B build_support/test_macos_metal_pkg_entry.py
+      - name: Verify same-release CPU entry construction with mocked native tools
+        run: python3 -B build_support/test_macos_full_release_cpu_entry.py
       - name: Verify CPU component PKG construction with mocked native tools
         run: python3 -B build_support/test_macos_cpu_pkg.py
       - name: Verify inactive CPU entry finalization with mocked signing tools

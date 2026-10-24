@@ -43,35 +43,44 @@ def build_entry(app: Path, workspace: Path, digest: str, revision: str) -> tuple
         worker = private / "scribe-inference-worker"
         desktop = private / "Scribe"
         component.snapshot_cpu_app_inputs(app, worker, desktop, private, digest, revision)
-        environment = component.build_environment(digest, revision)
-        environment["SCRIBE_MACOS_CPU_PACKAGE_WORKER"] = str(worker)
-        cargo = shutil.which("cargo")
-        component.require(cargo is not None, "reviewed Rust toolchain is required")
-        slices = []
-        for target in component.TARGETS:
-            directory = private / ("build-" + target)
-            environment["CARGO_TARGET_DIR"] = str(directory)
-            component.capture([cargo, "build", "--locked", "--offline", "--release", "--target", target,
-                               "--manifest-path", str(component.REPO / "tools/macos-cpu-worker-installer/Cargo.toml"),
-                               "--bin", "scribe-macos-cpu-worker-installer", "--no-default-features",
-                               "--features", "installer-package-entry"],
-                              environment=environment, cwd=component.REPO, timeout=1200,
-                              limit=4 * 1024 * 1024, error_limit=4 * 1024 * 1024,
-                              operation="entry-build-arm64" if target == "aarch64-apple-darwin" else "entry-build-x86_64")
-            binary = directory / target / "release/scribe-macos-cpu-worker-installer"
-            component.hash_file(binary, MAX_SLICE)
-            expected = "arm64" if target == "aarch64-apple-darwin" else "x86_64"
-            actual = component.capture(["/usr/bin/lipo", str(binary), "-archs"],
-                                       operation="artifact-architectures").decode("ascii").split()
-            component.require(actual == [expected], "fresh CPU entry slice has the wrong architecture")
-            slices.append(str(binary))
-        candidate = private / "postinstall"
-        component.capture(["/usr/bin/lipo", "-create", "-output", str(candidate), *slices], timeout=60,
-                          operation="entry-combine")
-        component.inspect_universal_structure(candidate, [digest.encode(), revision.encode(), component.CPU_ROOT.encode()],
-                                              private, MAX_ENTRY)
-        component.require(component.hash_file(worker, component.MAX_WORKER)[0] == digest,
-                          "frozen worker changed during entry construction")
-        entry_digest, entry_size = component.hash_file(candidate, MAX_ENTRY)
+        candidate, entry_digest, entry_size = _compile_owned_worker(worker, private, digest, revision)
         component.publish_no_replace(candidate, output)
     return output, entry_digest, entry_size
+
+
+def _compile_owned_worker(worker: Path, private: Path, digest: str, revision: str) -> tuple[Path, str, int]:
+    """Fixed compilation tail for this caller's own freshly admitted CPU copy.
+
+    Private source callers must own the enclosing verification/workspace scope.
+    This is not an alternate public worker admission or prebuilt-image API.
+    """
+    environment = component.build_environment(digest, revision)
+    environment["SCRIBE_MACOS_CPU_PACKAGE_WORKER"] = str(worker)
+    cargo = shutil.which("cargo")
+    component.require(cargo is not None, "reviewed Rust toolchain is required")
+    slices = []
+    for target in component.TARGETS:
+        directory = private / ("build-" + target)
+        environment["CARGO_TARGET_DIR"] = str(directory)
+        component.capture([cargo, "build", "--locked", "--offline", "--release", "--target", target,
+                           "--manifest-path", str(component.REPO / "tools/macos-cpu-worker-installer/Cargo.toml"),
+                           "--bin", "scribe-macos-cpu-worker-installer", "--no-default-features",
+                           "--features", "installer-package-entry"],
+                          environment=environment, cwd=component.REPO, timeout=1200,
+                          limit=4 * 1024 * 1024, error_limit=4 * 1024 * 1024,
+                          operation="entry-build-arm64" if target == "aarch64-apple-darwin" else "entry-build-x86_64")
+        binary = directory / target / "release/scribe-macos-cpu-worker-installer"
+        component.hash_file(binary, MAX_SLICE)
+        expected = "arm64" if target == "aarch64-apple-darwin" else "x86_64"
+        actual = component.capture(["/usr/bin/lipo", str(binary), "-archs"],
+                                   operation="artifact-architectures").decode("ascii").split()
+        component.require(actual == [expected], "fresh CPU entry slice has the wrong architecture")
+        slices.append(str(binary))
+    candidate = private / "postinstall"
+    component.capture(["/usr/bin/lipo", "-create", "-output", str(candidate), *slices], timeout=60,
+                      operation="entry-combine")
+    component.inspect_universal_structure(candidate, [digest.encode(), revision.encode(), component.CPU_ROOT.encode()],
+                                          private, MAX_ENTRY)
+    component.require(component.hash_file(worker, component.MAX_WORKER)[0] == digest,
+                      "frozen worker changed during entry construction")
+    return candidate, *component.hash_file(candidate, MAX_ENTRY)
