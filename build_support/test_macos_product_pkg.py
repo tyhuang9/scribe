@@ -146,7 +146,7 @@ def native_product_fixture():
                 installed = []
                 for bundle in bundles:
                     expected_bundle = author.app_codec.xml_tree(ET.tostring(bundle))
-                    expected_bundle.set("path", "Applications/" + NATIVE_APP)
+                    expected_bundle.set("path", NATIVE_APP)
                     installed.append(ET.tostring(expected_bundle))
                 infos[name] = NATIVE_IDS[name], space, tuple(installed)
                 members.update({name + "/" + leaf: value for leaf, value in identities.items()})
@@ -219,10 +219,10 @@ def native_distribution_diagnostic(data, source, infos):
                 and len(generated[0][0]) == 1 and generated[0][0][0].tag == "bundle":
             actual, wanted = generated[0][0][0], author.app_codec.xml_tree(app_info[2][0])
             path, expected_path = actual.get("path"), wanted.get("path")
-            leaf = expected_path.removeprefix("Applications/") if expected_path and expected_path.startswith("Applications/") else None
             path_class = "absent" if path is None else "expected" if path == expected_path else \
-                "package-relative" if leaf and path == leaf else "component-relative" if leaf and path == "./" + leaf else \
-                "absolute" if expected_path and path == "/" + expected_path else "other"
+                "volume-relative" if expected_path and path == "Applications/" + expected_path else \
+                "component-relative" if expected_path and path == "./" + expected_path else \
+                "absolute" if expected_path and path == "/Applications/" + expected_path else "other"
             bundle_report = {"status": "observed", "path_class": path_class,
                 "field_sets_match": set(actual.attrib) == set(wanted.attrib),
                 "other_fields_match": {key: value for key, value in actual.attrib.items() if key != "path"}
@@ -456,10 +456,10 @@ class Codec(unittest.TestCase):
     def test_bundle_versions_bind_exact_installed_path_without_changing_other_fields(self):
         (data,) = self.infos["app.pkg"][2]
         self.assertEqual(ET.fromstring(data).attrib, {"id": "com.scribe.local-transcriber",
-            "path": "Applications/Scribe.app", "CFBundleVersion": "0.1.0", "CFBundleShortVersionString": "0.1.0"})
+            "path": "Scribe.app", "CFBundleVersion": "0.1.0", "CFBundleShortVersionString": "0.1.0"})
         self.inspect(self.outer())
-        for path in ("./Scribe.app", "Scribe.app", "/Applications/Scribe.app", "applications/Scribe.app",
-                "Applications/../Scribe.app", "Applications/Other.app"):
+        for path in ("./Scribe.app", "Applications/Scribe.app", "/Applications/Scribe.app", "applications/Scribe.app",
+                "scribe.app", "../Scribe.app", "Applications/../Scribe.app", "Applications/Other.app"):
             root = ET.fromstring(self.distribution)
             root.find("pkg-ref/bundle-version/bundle").set("path", path)
             self.reject(self.outer(changes={"Distribution": ET.tostring(root)}))
@@ -943,7 +943,7 @@ class NativeRecipe(unittest.TestCase):
             values = decode_fixture((packages / name).read_bytes())
             info = ET.fromstring(values["PackageInfo"])
             for bundle in info.findall("bundle"):
-                bundle.set("path", "Applications/ScribeSourceFixture.app")  # Independent fixed producer recipe.
+                bundle.set("path", "ScribeSourceFixture.app")  # Independent fixed producer recipe.
             infos[name] = (NATIVE_IDS[name], 1 if name == "app.pkg" else 0,
                            tuple(ET.tostring(bundle) for bundle in info.findall("bundle")))
             members.update({name + "/" + key: value for key, value in values.items()})
@@ -1098,11 +1098,11 @@ class NativeRecipe(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(exact, sort_keys=True, separators=(",", ":")).encode()), 8192)
         root.append(ET.fromstring(ET.tostring(node)))
         self.assertEqual(native_distribution_diagnostic(ET.tostring(root), source, infos)["status"], "reference-bound")
-        bundle = ET.Element("bundle", id="PrivateSentinelId", path="Applications/Scribe.app",
+        bundle = ET.Element("bundle", id="PrivateSentinelId", path="Scribe.app",
                             CFBundleVersion="PrivateSentinelVersion", CFBundleShortVersionString="PrivateSentinelShort")
         metadata = {**infos, "app.pkg": (infos["app.pkg"][0], 1, (ET.tostring(bundle),))}
         generated = generated_distribution(source, metadata)
-        for path, classification in (("Applications/Scribe.app", "expected"), ("Scribe.app", "package-relative"),
+        for path, classification in (("Scribe.app", "expected"), ("Applications/Scribe.app", "volume-relative"),
                 ("./Scribe.app", "component-relative"), ("/Applications/Scribe.app", "absolute"),
                 ("PrivateSentinelPath", "other"), (None, "absent")):
             root = ET.fromstring(generated)

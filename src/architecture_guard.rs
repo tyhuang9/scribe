@@ -1962,7 +1962,7 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
         "node.attrib == original.attrib",
         "updateKBytes=\"0\"",
         "bundle.get(\"path\") == app.BUNDLE_PATH",
-        "installed.set(\"path\", \"Applications/Scribe.app\")",
+        "installed.set(\"path\", \"Scribe.app\")",
         "node.text == \"#\" + name",
         "generated bundle versions differ from own component",
         "_semantic(root) == _semantic(expected)",

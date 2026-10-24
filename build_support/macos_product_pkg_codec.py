@@ -171,7 +171,7 @@ def _components(records: dict, version: str) -> tuple[dict, dict]:
             require(name == "app.pkg" and info.get("install-location") == "/Applications"
                     and bundle.get("path") == app.BUNDLE_PATH, "app bundle installation path differs")
             installed = app.xml_tree(ET.tostring(bundle))
-            installed.set("path", "Applications/Scribe.app")
+            installed.set("path", "Scribe.app")
             bundles.append(ET.tostring(installed))
         members.update({name + "/" + leaf: identity for leaf, identity in identities.items()})
         infos[name] = (identifier, space, tuple(bundles))

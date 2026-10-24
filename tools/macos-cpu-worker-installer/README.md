@@ -1075,8 +1075,10 @@ documents producer-generated bundle/version/size metadata. Readback compares
 the fixed source semantic tree, permitting only exact local `#filename` URL
 rewrites and independently checked bundle-version additions derived from each
 own PackageInfo. The app requires exact `/Applications` installation and
-`./Scribe.app` payload paths before deriving its expected installed bundle path
-as literal `Applications/Scribe.app`. All other bundle metadata remains exact;
+`./Scribe.app` payload paths before deriving its expected package-relative bundle
+path as literal `Scribe.app`. Unchanged native fixtures on both Intel and ARM
+identified this package-relative spelling with all other fields matching; the
+volume-relative `Applications/Scribe.app` hypothesis was rejected. All other bundle metadata remains exact;
 component bytes are not modified and arbitrary paths are never joined or
 normalized. The native fixture independently tests this representation mapping;
 portable mocks alone do not establish it. Versions and space hints remain role-specific. The private
