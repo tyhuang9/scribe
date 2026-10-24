@@ -1978,7 +1978,7 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
     ] {
         assert!(!source.contains(forbidden) && !codec.contains(forbidden));
     }
-    assert!(tests.contains("expected = 28 + (2 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 30 + (2 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_real_source_owners_share_one_retained_baseline_and_publish_unsigned_product",
         "test_mutation_between_each_real_child_owner_rejects_original_baseline",
@@ -2011,7 +2011,7 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
     );
     assert!(!workflow.contains("python3 -B build_support/macos_product_pkg.py"));
     let native = &tests[tests.find("def native_product_fixture():").unwrap()
-        ..tests.find("def tree_xar(").unwrap()];
+        ..tests.find("def native_distribution_diagnostic(").unwrap()];
     for required in [
         "sys.platform == \"darwin\" and os.geteuid() != 0",
         "component.private_workspace(",

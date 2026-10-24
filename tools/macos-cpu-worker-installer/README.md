@@ -1079,8 +1079,8 @@ attributes or opaque subtrees reject. Two unidentified attributes seen only as
 redacted counts in the earlier inert observation are **not** accepted here.
 Native compatibility therefore remains unqualified, not inferred from mocks.
 
-`python3 -B build_support/test_macos_product_pkg.py` discovers 28 portable tests,
-two additional POSIX cleanup tests and one additional native Mac test (31 on
+`python3 -B build_support/test_macos_product_pkg.py` discovers 30 portable tests,
+two additional POSIX cleanup tests and one additional native Mac test (33 on
 Mac). The owner tests run all three real source owners with mocked
 tool/signature/pack verification; no production entry is executed. Tests
 cover every embedded member/checksum, semantically valid exact/+1 metadata and
@@ -1106,7 +1106,14 @@ mock these four native calls and cover their exact recipe and failure seams.
 The earlier observation uses `productbuild --synthesize`; its two unidentified
 reference attributes do not prove they are introduced into this owner's fixed
 Distribution. The new test does not synthesize, strip unknown attributes or
-relax production acceptance. Its first native result remains pending. Any pass
+relax production acceptance. The first native runs on both architectures rejected a package
+reference's attributes/version/size/URL comparison; the exact mismatching
+predicate remains unestablished. Failure-only test instrumentation calls the
+original predicate exactly once and preserves rejection. After the fixture
+scope exits, it emits only bounded ordered role/count/equality flags, fixed
+known-attribute labels and URL/value classes, never raw names, values, paths,
+identities or XML. Diagnostic failure cannot mask the original exception or
+cleanup uncertainty. Production acceptance remains unchanged. Any eventual pass
 establishes only **fixed inert native codec compatibility**, not full-app or
 publisher authentication, real installer operation or execution order. CI bounds
 this source/native suite to four minutes and never runs the inactive author.

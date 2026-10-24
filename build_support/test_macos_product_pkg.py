@@ -2,6 +2,7 @@
 from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -162,6 +163,47 @@ def native_product_fixture():
         raise error from None
     except OSError:
         raise component.ComponentError("native product fixture: filesystem operation failed") from None
+
+
+def native_distribution_diagnostic(data, source, infos):
+    """Failure-only closed comparisons, NEVER acceptance or raw XML output."""
+    root, expected = author.app_codec.xml_tree(data), author.app_codec.xml_tree(source)
+    references = [node for node in root.findall("pkg-ref") if not len(node)]
+    if len(references) > 8:
+        return {"schema_version": 1, "status": "reference-bound", "reference_count": len(references)}
+    roles = {value[0]: (name, value[1]) for name, value in infos.items() if name in codec.NAMES}
+    labels = dict(zip(codec.NAMES, ("cpu", "metal", "app")))
+    known = ("auth", "onConclusion", "active", "onConclusionScript", "archiveKBytes", "packageIdentifier")
+    rows, seen = [], set()
+    for node in references:
+        identifier = node.get("id")
+        role = roles.get(identifier)
+        originals = [value for value in expected.findall("pkg-ref") if value.get("id") == identifier]
+        original = originals[0] if len(originals) == 1 else None
+        wanted = original.attrib if original is not None else {}
+        extra = set(node.attrib) - set(wanted)
+        name, space = role if role is not None else ("", None)
+        rows.append({"role": labels.get(name, "unknown"), "duplicate": identifier in seen,
+            "identifier_known": role is not None, "source_reference_count": len(originals),
+            "attributes_match": original is not None and node.attrib == wanted,
+            "extra_attribute_count": len(extra), "missing_attribute_count": len(set(wanted) - set(node.attrib)),
+            "known_extra_attributes": [key for key in known if key in extra],
+            "unknown_extra_attribute_count": len(extra - set(known)),
+            "version_matches": original is not None and node.get("version") == original.get("version"),
+            "space_matches": role is not None and node.get("installKBytes") == str(space),
+            "url_class": "absent" if not node.text else "bare-filename" if role and node.text == name else
+                "hash-filename" if role and node.text == "#" + name else "other",
+            "auth_class": node.get("auth") if node.get("auth") in ("root", "none") else
+                "absent" if "auth" not in node.attrib else "other",
+            "conclusion_class": node.get("onConclusion") if node.get("onConclusion") in
+                ("None", "none", "RequireLogout", "RequireRestart", "RequireShutdown") else
+                "absent" if "onConclusion" not in node.attrib else "other"})
+        seen.add(identifier)
+    report = {"schema_version": 1, "status": "observed", "reference_count": len(references),
+              "generated_reference_count": sum(bool(len(node)) for node in root.findall("pkg-ref")), "references": rows}
+    if len(json.dumps(report, sort_keys=True, separators=(",", ":")).encode()) > 8192:
+        return {"schema_version": 1, "status": "report-bound"}
+    return report
 
 
 def tree_xar(files, *, mutate=None, heap_transform=None, toc_transform=None):
@@ -920,6 +962,104 @@ class NativeRecipe(unittest.TestCase):
             workspace.assert_not_called()
             tool.assert_not_called()
 
+    def test_native_failure_diagnostics_compare_each_predicate_and_redact_values(self):
+        infos = {name: (NATIVE_IDS[name], 1 if name == "app.pkg" else 0, ()) for name in codec.NAMES}
+        source = codec._distribution_source(NATIVE_VERSION, infos)
+        baseline = generated_distribution(source, infos, additions=False)
+        observed = native_distribution_diagnostic(baseline, source, infos)
+        self.assertEqual(observed["reference_count"], 3)
+        self.assertTrue(all(row["attributes_match"] and row["version_matches"] and row["space_matches"]
+            and row["url_class"] == "hash-filename" for row in observed["references"]))
+        mutations = {
+            "attributes_match": lambda node: node.set("PrivateSentinelName", "PrivateSentinelValue"),
+            "version_matches": lambda node: node.set("version", "PrivateSentinelVersion"),
+            "space_matches": lambda node: node.set("installKBytes", "PrivateSentinelSpace"),
+            "url_class": lambda node: setattr(node, "text", "/PrivateSentinelPath"),
+        }
+        for predicate, mutate in mutations.items():
+            root = ET.fromstring(baseline)
+            mutate(root.find("pkg-ref"))
+            report = native_distribution_diagnostic(ET.tostring(root), source, infos)
+            row = report["references"][0]
+            self.assertEqual(row[predicate], "other" if predicate == "url_class" else False)
+            for independent in ("version_matches", "space_matches", "url_class"):
+                if independent != predicate:
+                    self.assertEqual(row[independent], "hash-filename" if independent == "url_class" else True)
+            self.assertNotIn("PrivateSentinel", json.dumps(report))
+        root = ET.fromstring(baseline)
+        node = root.find("pkg-ref")
+        node.set("auth", "root")
+        node.set("onConclusion", "None")
+        node.set("active", "PrivateSentinelCode")
+        node.set("PrivateSentinelName", "private")
+        root.append(ET.fromstring(ET.tostring(node)))
+        report = native_distribution_diagnostic(ET.tostring(root), source, infos)
+        self.assertEqual(report["references"][0]["known_extra_attributes"], ["auth", "onConclusion", "active"])
+        self.assertEqual(report["references"][0]["unknown_extra_attribute_count"], 1)
+        self.assertTrue(report["references"][-1]["duplicate"])
+        self.assertNotIn("PrivateSentinel", json.dumps(report))
+        self.assertEqual(report, native_distribution_diagnostic(ET.tostring(root), source, infos))
+        node.set("id", "PrivateSentinelIdentifier")
+        node.set("auth", "PrivateSentinelAuth")
+        node.set("onConclusion", "PrivateSentinelConclusion")
+        unknown = native_distribution_diagnostic(ET.tostring(root), source, infos)
+        self.assertEqual(unknown["references"][0]["role"], "unknown")
+        self.assertNotIn("PrivateSentinel", json.dumps(unknown))
+        for _ in range(4):
+            root.append(ET.fromstring(ET.tostring(node)))
+        exact = native_distribution_diagnostic(ET.tostring(root), source, infos)
+        self.assertEqual((exact["status"], exact["reference_count"], len(exact["references"])), ("observed", 8, 8))
+        self.assertLessEqual(len(json.dumps(exact, sort_keys=True, separators=(",", ":")).encode()), 8192)
+        root.append(ET.fromstring(ET.tostring(node)))
+        self.assertEqual(native_distribution_diagnostic(ET.tostring(root), source, infos)["status"], "reference-bound")
+
+    def test_native_failure_report_preserves_exception_and_emits_only_after_scope_exit(self):
+        infos = {name: (NATIVE_IDS[name], 1 if name == "app.pkg" else 0, ()) for name in codec.NAMES}
+        source = codec._distribution_source(NATIVE_VERSION, infos)
+        data = generated_distribution(source, infos, additions=False).replace(b'installKBytes="1"', b'installKBytes="2"')
+        active, failures = [], []
+        mode, cleanup_error = None, component.CleanupUncertain("synthetic cleanup uncertainty")
+        def fixture():
+            active.append(True)
+            try:
+                codec._distribution(data, source, infos)
+            except component.ComponentError as error:
+                failures.append(error)
+                raise
+            finally:
+                active.pop()
+                if mode in ("cleanup-uncertain", "cleanup-emission-broken"):
+                    raise cleanup_error
+        case = NativeMac("test_fixed_inert_native_product_matches_exact_source_distribution_and_readback")
+        for mode in ("normal", "diagnostic-broken", "cleanup-uncertain", "emission-broken",
+                     "cleanup-emission-broken", "encoding-broken"):
+            lines = []
+            def emitted(*args, **_kwargs):
+                self.assertFalse(active)
+                if mode in ("emission-broken", "cleanup-emission-broken"):
+                    raise OSError("PrivateSentinel output failure")
+                lines.append(args[0])
+            with ExitStack() as stack:
+                called = stack.enter_context(patch.object(codec, "_distribution", wraps=codec._distribution))
+                stack.enter_context(patch(__name__ + ".native_product_fixture", side_effect=fixture))
+                stack.enter_context(patch("builtins.print", side_effect=emitted))
+                if mode == "diagnostic-broken":
+                    stack.enter_context(patch(__name__ + ".native_distribution_diagnostic", side_effect=OSError("PrivateSentinel")))
+                if mode == "encoding-broken":
+                    stack.enter_context(patch(__name__ + ".native_distribution_diagnostic", return_value={"value": object()}))
+                with self.assertRaises(component.ComponentError) as caught:
+                    case.test_fixed_inert_native_product_matches_exact_source_distribution_and_readback()
+            called.assert_called_once()
+            self.assertIs(caught.exception, cleanup_error if mode in ("cleanup-uncertain", "cleanup-emission-broken") else failures[-1])
+            if mode in ("emission-broken", "cleanup-emission-broken", "encoding-broken"):
+                self.assertEqual(lines, [])
+                continue
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("SCRIBE_NATIVE_SOURCE_DISTRIBUTION_REJECT="))
+            self.assertNotIn("PrivateSentinel", lines[0])
+            self.assertNotIn("READBACK_PASS", lines[0])
+            self.assertEqual(json.loads(lines[0].split("=", 1)[1])["status"], "unavailable" if mode == "diagnostic-broken" else "observed")
+
 
 class PosixNativeRecipe(NativeRecipe):
     def test_native_recipe_uncertain_process_retains_its_owned_private_scope(self):
@@ -936,7 +1076,27 @@ class PosixNativeRecipe(NativeRecipe):
 
 class NativeMac(unittest.TestCase):
     def test_fixed_inert_native_product_matches_exact_source_distribution_and_readback(self):
-        native_product_fixture()
+        original, report = codec._distribution, None
+        def inspected(data, source, infos):
+            nonlocal report
+            try:
+                original(data, source, infos)
+            except component.ComponentError:
+                try:
+                    report = native_distribution_diagnostic(data, source, infos)
+                except Exception:
+                    report = {"schema_version": 1, "status": "unavailable"}
+                raise
+        try:
+            with patch.object(codec, "_distribution", side_effect=inspected):
+                native_product_fixture()
+        except component.ComponentError:
+            if report is not None:
+                try:
+                    print("SCRIBE_NATIVE_SOURCE_DISTRIBUTION_REJECT=" + json.dumps(report, sort_keys=True, separators=(",", ":")), flush=True)
+                except Exception:
+                    pass  # Best-effort failure diagnostics never replace the current error.
+            raise
         print("SCRIBE_NATIVE_SOURCE_PRODUCT_READBACK_PASS", flush=True)
 
 
@@ -946,7 +1106,7 @@ def suite():
         + ((NativeMac,) if sys.platform == "darwin" else ())
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 28 + (2 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
+    expected = 30 + (2 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"Product source discovery mismatch: expected {expected}")
     return result
