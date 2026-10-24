@@ -1905,6 +1905,107 @@ fn macos_app_component_owns_full_admission_staging_and_streamed_package() {
 }
 
 #[test]
+fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readback() {
+    let source = include_str!("../build_support/macos_product_pkg.py");
+    let codec = include_str!("../build_support/macos_product_pkg_codec.py");
+    let tests = include_str!("../build_support/test_macos_product_pkg.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let owner = &source[source.find("def build_product(").unwrap()..];
+    let stages = [
+        "signing._publisher()",
+        "before = full.snapshot(app, files)",
+        "with full.owned_release(app, admission, frozen)",
+        "cpu_component.build_component(app, packages, frozen, signing_identity_sha1)",
+        "metal_component.build_component(app, packages, frozen, signing_identity_sha1)",
+        "app_component.build_component(app, packages, frozen)",
+        "codec._components(records, owned.version)",
+        "codec._distribution_source(owned.version, infos)",
+        "\"/usr/bin/productbuild\", \"--distribution\"",
+        "codec._inspect_product(",
+        "component.publish_no_replace(",
+    ];
+    for pair in stages.windows(2) {
+        assert!(owner.find(pair[0]).unwrap() < owner.find(pair[1]).unwrap());
+    }
+    for required in [
+        "full.snapshot(app, files) == before",
+        "signing._unchanged_policy(policy)",
+        "owned.check_unchanged()",
+        "set(names) == set(records)",
+        "path == packages / name",
+        "component.fingerprint(path.lstat()) == identity",
+        "component.fingerprint(os.fstat(handle.fileno()))",
+        "controls_unchanged()",
+        "product changed before publication",
+    ] {
+        assert!(source.contains(required), "product owner lost {required}");
+    }
+    assert_eq!(
+        owner.matches("before = full.snapshot(app, files)").count(),
+        1
+    );
+    assert!(
+        owner.rfind("source_unchanged()").unwrap()
+            < owner.find("component.publish_no_replace(").unwrap()
+    );
+    for required in [
+        "NAMES = (\"cpu-worker.pkg\", \"metal-worker.pkg\", \"app.pkg\")",
+        "wanted_names = 2 if parent else 1",
+        "len({value.text for value in names}) == 1",
+        "heap + cursor == before.st_size",
+        "stored.hexdigest() == stored_sha and decoded.hexdigest() == decoded_sha",
+        "== members",
+        "customize=\"never\"",
+        "\"require-scripts\": \"false\"",
+        "\"allow-external-scripts\": \"false\"",
+        "enable_localSystem=\"true\", enable_currentUserHome=\"false\", enable_anywhere=\"false\"",
+        "node.attrib == original.attrib",
+        "node.text == \"#\" + name",
+        "generated bundle versions differ from own component",
+        "_semantic(root) == _semantic(expected)",
+    ] {
+        assert!(codec.contains(required), "product codec lost {required}");
+    }
+    for forbidden in [
+        "argparse",
+        "__main__",
+        "subprocess.",
+        "signing_callback",
+        "--synthesize",
+        "/usr/sbin/installer",
+        "macos_product_pkg_profile",
+        "macos_app_pkg_profile",
+    ] {
+        assert!(!source.contains(forbidden) && !codec.contains(forbidden));
+    }
+    assert!(tests.contains("expected = 23 + (1 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_real_source_owners_share_one_retained_baseline_and_publish_unsigned_product",
+        "test_mutation_between_each_real_child_owner_rejects_original_baseline",
+        "test_post_top_admission_exit_mutations_reject_before_publication",
+        "test_product_mutation_after_actual_readback_before_measurement_rejects",
+        "test_oversized_decoded_metadata_and_bom_reject_before_materializing",
+        "test_uncertain_outer_process_retains_full_admission_and_all_components",
+    ] {
+        assert!(tests.contains(required));
+    }
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_product_pkg.py")
+            .count(),
+        2
+    );
+    assert_eq!(
+        workflow
+            .matches("build_support/macos_product_pkg_codec.py")
+            .count(),
+        2
+    );
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_product_pkg.py"));
+    assert!(!workflow.contains("python3 -B build_support/macos_product_pkg.py"));
+}
+
+#[test]
 fn macos_author_cleanup_confirmation_requires_reap_and_absent_group() {
     let source = include_str!("../build_support/macos_cpu_component.py");
     let tests = include_str!("../build_support/test_macos_cpu_component.py");

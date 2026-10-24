@@ -1,7 +1,6 @@
 """Owned-product source fixtures: never real signing, native build or installation."""
 from contextlib import contextmanager
 from dataclasses import replace
-import gzip
 import hashlib
 import os
 from pathlib import Path
@@ -19,7 +18,7 @@ import macos_cpu_pkg_final as signing
 import macos_full_release as full
 import macos_product_pkg as author
 import macos_product_pkg_codec as codec
-from test_macos_app_pkg import FullOwner as AppFixture, app_info, app_xar, digest, fixture
+from test_macos_app_pkg import FullOwner as AppFixture, app_xar, digest, fixture
 from test_macos_cpu_pkg import encode, package_info
 from test_macos_cpu_pkg_final import PROPERTIES, SELECTOR, TEAM
 from test_macos_full_release_cpu_entry import IMAGE as CPU_IMAGE
@@ -181,8 +180,14 @@ class Codec(unittest.TestCase):
             self.reject(value[:size])
         self.reject(value + b"tail")
         self.reject(self.outer(heap_transform=lambda heap: b"x" * 20 + heap[20:]))
-        for tag in ("archived-checksum", "extracted-checksum"):
-            self.reject(self.outer(mutate=lambda toc: setattr(toc.find("file/data/" + tag), "text", "0" * 40)))
+        for index in range(8):  # Distribution and every one of the seven leaves.
+            for tag in ("archived-checksum", "extracted-checksum"):
+                def changed(toc):
+                    leaves = [node for node in toc.iter("file") if node.find("data") is not None]
+                    self.assertEqual(len(leaves), 8)
+                    leaves[index].find("data/" + tag).text = "0" * 40
+                with self.assertRaisesRegex(component.ComponentError, "member checksum or length differs"):
+                    self.inspect(self.outer(mutate=changed))
         for field, content in (("offset", "0"), ("length", "0"), ("length", "9999999999"),
                                ("size", "1"), ("size", "65537")):
             self.reject(self.outer(mutate=lambda toc: setattr(toc.find("file/data/" + field), "text", content)))
@@ -259,8 +264,28 @@ class Codec(unittest.TestCase):
                 codec._components(self.records, "0.1.0")
 
     def test_oversized_decoded_metadata_and_bom_reject_before_materializing(self):
-        self.reject(self.outer(changes={"Distribution": b"x" * 65537}))
-        self.reject(self.outer(changes={"app.pkg/Bom": b"x" * (codec.MAX_BOM + 1)}))
+        end = b"</installer-gui-script>"
+        exact = self.distribution.replace(end, b" " * (65536 - len(self.distribution)) + end)
+        self.assertEqual(len(exact), 65536)
+        ET.fromstring(exact)  # Valid semantics, not an invalid-XML negative.
+        self.inspect(self.outer(changes={"Distribution": exact}))
+        oversized = exact.replace(end, b" " + end)
+        self.assertEqual(len(oversized), 65537)
+        ET.fromstring(oversized)
+        with self.assertRaisesRegex(component.ComponentError, "decimal metadata exceeds bound"):
+            self.inspect(self.outer(changes={"Distribution": oversized}))
+        # Direct indexing avoids a small original Bom's final equality check
+        # masking the exact decoded-size boundary under test.
+        layout = {"Bom": ("application/x-gzip", codec.MAX_BOM)}
+        for size in (codec.MAX_BOM, codec.MAX_BOM + 1):
+            value = tree_xar({"Bom": b"x" * size})
+            self.product.write_bytes(value)
+            if size == codec.MAX_BOM:
+                identities, _metadata = codec._index(self.product, len(value), layout)
+                self.assertEqual(identities["Bom"], (digest(b"x" * size), size))
+            else:
+                with self.assertRaisesRegex(component.ComponentError, "decimal metadata exceeds bound"):
+                    codec._index(self.product, len(value), layout)
 
     def test_large_opaque_entry_streams_across_real_read_boundaries(self):
         body = b"".join(hashlib.sha256(index.to_bytes(4, "big")).digest() for index in range(65536))
