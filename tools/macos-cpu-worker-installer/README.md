@@ -958,6 +958,71 @@ rollback and production signing remain unqualified. Source success cannot
 establish them. Both existing unprivileged Mac CI lanes run this observation;
 no release route, key, production trust, installation or Auto gate is activated.
 
+### Inactive full-release application component owner
+
+`build_support/macos_app_pkg.py` owns one fresh unsigned `app.pkg`. It is an
+internal source-only function, not a CLI, release route or installer. The
+unchanged default-deny publisher policy rejects before caller inputs or tools.
+No caller-supplied package, admission result, policy or signing callback is
+accepted. This owner verifies the app publisher and invokes its own complete
+full-release admission, including a fresh native verifier for both production
+Metal packs. CPU-only admission is not substituted.
+
+It copies the admitted full release into new private staging, preserving bytes
+but canonicalizing directories and the four executables to `0755`, other files
+to `0644`. Exact directory inventories, regular single-link files, zero flags,
+no extended attributes and zero ACL entries are required; metadata is checked
+through retained descriptors. This is not a claim that every allocated empty
+ACL object lacks flags. The canonical app is independently publisher-verified;
+neither the original app nor its signatures are modified or re-signed.
+
+Fixed system `pkgbuild` uses the configured ownership/compression and bundle
+controls above. Native Intel/ARM observations established a dot-relative path
+for the inert `ScribeSourceFixture.app` bundle and an eight-child control shape.
+The fixed real-app expectation `./Scribe.app` still needs full-app native
+qualification. The codec neither normalizes alternative paths nor imports
+observation acceptance. It streams the complete owned XAR and gzip/ODC payload,
+checking all inventory, modes, numeric ownership, regular link counts, bounded
+positive directory link counts, zero `rdev`, sizes and SHA-256
+file content against retained staging. Bounds derive from that closed inventory,
+including long names and aggregate sizes over 4 GiB, without allocating a whole
+payload or trusting gzip's wrapping size footer. `installKBytes` is only a bounded
+positive producer hint, not an independently qualified disk-allocation formula.
+Inert source-device/inode fields are not payload authority and are not compared
+to staging; they are not claimed zero or qualified as Installer semantics.
+
+Only bounded own-output Bom metadata is materialized. Its write-descriptor
+identity and decoded SHA-256/size must match independent readback. The fixed
+system `lsbom -p fmugsc` projection must agree with every staged directory/file,
+mode, numeric owner, file size and independently obtained system `cksum` value.
+Package and Bom identities remain bound before/after that tool, before listing
+interpretation and before publication. This is coherence through trusted
+reviewed system tools, not a general hostile binary-BOM validator. Internal
+flags/link tables and actual Installer effects remain delegated and unqualified.
+
+Original app, full admitted copies, policy, staging and controls are rechecked.
+The admission scope's final recheck and cleanup must complete before exclusive
+publication. Confirmed pre-publication failures publish nothing; uncertain process
+cleanup keeps both private scopes. Collisions, uncertain publication or a cleanup
+failure after successful publication retain the existing final.
+Reviewed toolchain/system tools and non-hostile same-user/root writers remain
+assumptions; checks do not defeat hostile swap-and-restore writers.
+
+`python3 -B build_support/test_macos_app_pkg.py` discovers exactly 36 portable
+tests and two additional POSIX tests. Tools, pack authentication and publisher
+verification are mocked. Independent synthetic XAR/ODC fixtures cover streaming,
+truncation, checksums, heap coverage, controls, aliases, inventory, readback and
+same-byte replacements, admission exit, cleanup uncertainty and publication.
+This does not qualify a real full-app package or actual publisher/native-tool
+acceptance. CI runs only the source suite, never the inactive author or an
+installation. The next product owner still needs **one full same-app baseline**
+across fresh CPU, Metal and app construction, outer readback and publication;
+separate constructors or frozen document hashes do not provide that binding.
+Package authentication, signing/notarization, ordering, update/removal, rollback,
+clean-machine installation and GPU Auto remain separate gates. Reverting these
+source files, tests, CI coverage and guard disables this inactive unit without
+changing production runtime or trust policy.
+
 ## Not yet established
 
 The enclosing installer must authenticate this executable and its compiled

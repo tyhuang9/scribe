@@ -1811,6 +1811,95 @@ fn macos_app_payload_probe_is_configured_fixed_and_observation_only() {
 }
 
 #[test]
+fn macos_app_component_owns_full_admission_staging_and_streamed_package() {
+    let source = include_str!("../build_support/macos_app_pkg.py");
+    let codec = include_str!("../build_support/macos_app_pkg_codec.py");
+    let tests = include_str!("../build_support/test_macos_app_pkg.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let owner = &source[source.find("def build_component(").unwrap()..];
+    let stages = [
+        "signing._publisher()",
+        "app.is_absolute()",
+        "with full.owned_release(",
+        "staged = _stage(",
+        "operation=\"app-source-checksums\"",
+        "\"/usr/bin/pkgbuild\"",
+        "codec._inspect_fresh(",
+        "operation=\"app-bom-listing\"",
+        "codec._bom_listing(",
+        "component.publish_no_replace(",
+    ];
+    for pair in stages.windows(2) {
+        assert!(owner.find(pair[0]).unwrap() < owner.find(pair[1]).unwrap());
+    }
+    for required in [
+        "require(names == [APP_NAME]",
+        "_empty_acl(descriptor)",
+        "require(not os.listxattr(descriptor)",
+        "getattr(before, \"st_flags\", 0) == 0",
+        "owned.check_unchanged()",
+        "bom == private / \"inspected.bom\"",
+        "== bom_identity",
+        "signing._unchanged_policy(policy)",
+        "\"--ownership\", \"recommended\", \"--compression\", \"legacy\"",
+    ] {
+        assert!(source.contains(required), "app owner lost {required}");
+    }
+    assert_eq!(owner.matches("inspected_unchanged()").count(), 4); // definition + three phase checks
+    for required in [
+        "BUNDLE_PATH = \"./Scribe.app\"",
+        "streams._inflate(contents(), _payload_bound(expected), 31)",
+        "_odc(",
+        "measured.hexdigest() == digest",
+        "heap + cursor == before.st_size",
+        "component.fingerprint(os.fstat(output.fileno()))",
+        "owned Bom readback differs from decoded package bytes",
+        "return bom, bom_identity",
+        "fields[4] == str(size)",
+        "== checksums[name]",
+    ] {
+        assert!(codec.contains(required), "app codec lost {required}");
+    }
+    for forbidden in [
+        "argparse",
+        "__main__",
+        "subprocess.",
+        "signing_callback",
+        "productbuild",
+        "/usr/sbin/installer",
+        "macos_app_pkg_profile",
+        "macos_product_pkg_profile",
+    ] {
+        assert!(!source.contains(forbidden) && !codec.contains(forbidden));
+    }
+    assert!(tests.contains("expected = 36 + (2 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_bom_replaced_or_corrupted_before_first_readback_rejects",
+        "test_bom_change_during_package_hash_is_not_a_new_baseline",
+        "test_replaced_bom_and_package_block_listing_interpretation",
+        "test_candidate_change_after_codec_before_first_hash_blocks_listing",
+        "test_post_admission_exit_mutations_fail_final_binding_before_publication",
+        "test_admission_exit_precedes_publication_and_exit_failure_prevents_it",
+        "test_uncertain_construction_retains_both_private_scopes",
+        "test_collision_and_ambiguous_publication_retain_existing_final",
+    ] {
+        assert!(tests.contains(required));
+    }
+    assert_eq!(
+        workflow.matches("build_support/*macos_app_pkg.py").count(),
+        2
+    );
+    assert_eq!(
+        workflow
+            .matches("build_support/macos_app_pkg_codec.py")
+            .count(),
+        2
+    );
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_app_pkg.py"));
+    assert!(!workflow.contains("python3 -B build_support/macos_app_pkg.py"));
+}
+
+#[test]
 fn macos_author_cleanup_confirmation_requires_reap_and_absent_group() {
     let source = include_str!("../build_support/macos_cpu_component.py");
     let tests = include_str!("../build_support/test_macos_cpu_component.py");
