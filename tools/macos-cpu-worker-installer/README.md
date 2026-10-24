@@ -442,6 +442,50 @@ these source tests.
 
 ### Native package-format prerequisite
 
+#### Combined app/CPU/Metal product observation
+
+`python3 -B build_support/test_macos_product_pkg_profile.py` discovers 20 portable
+tests, one additional POSIX cleanup test, and one additional native test on each
+Mac lane. The source-only CLI `python3 -B build_support/macos_product_pkg_profile.py`
+accepts **no arguments**. It generates one tiny constant inert app payload and
+two distinct comment-only operation components, then an unsigned outer product
+using system `pkgbuild`/`productbuild`. The executable-mode text has no interpreter
+and is never run. No real app, worker, key, signing tool or Installer is involved.
+
+This is a format prerequisite, not a product author, acceptance codec or
+authentication decision. The existing scripts-only CPU codec cannot simply be
+reused for app `Payload`/`Bom` or an outer Distribution. Bounded in-memory
+observation records complete member-tree shapes, app PackageInfo controls,
+Distribution shapes, payload compression class and BOM presence/header class.
+Unsupported encodings remain opaque/unobserved; they do not trigger extraction
+or successful byte-comparison claims. A BOM header observation is not BOM
+validation, and decoded CPIO fixture equality is not installed-file qualification.
+
+Nested components may be raw XAR files or flattened member trees. The report
+distinguishes these forms instead of assuming raw inner package preservation.
+It compares fixed known decoded members to the original fresh component members;
+raw-archive equality is reported only when that archive is actually embedded.
+Transformations/mismatches remain explicit observations, not silently normalized
+or accepted. Input component files, fixture directories and source files retain
+their original content/node/inventory identities through assembly and reporting.
+
+No archives are extracted, published or uploaded. Reports contain only closed
+labels, flags, bounded counts/sizes and redacted XML shapes—not raw names, paths,
+identities, code, metadata values, digests or XML. Global archive/member/depth,
+decoded-byte and report bounds supplement the per-stream/XML limits. Ordinary
+success removes the owned temporary workspace; uncertain child cleanup preserves
+it and the original error. Both existing diagnostic lanes emit the report, and
+structural lanes run the exact-discovery suite before Rust setup/heavy builds.
+
+Native results are required before freezing app/product format acceptance. They
+do not prove signatures, fixed app destination/non-relocation, upgrades, Installer
+operation ordering, cross-component atomicity or rollback. Eventual composition
+still needs one complete release baseline across fresh app/CPU/Metal construction
+and the correct outer-product authentication. Existing publisher and Auto gates
+remain unchanged/default-deny.
+
+#### Scripts-only component observation
+
 Before implementing a real PKG author/validator, run the same source command as
 CI: `python3 -B build_support/test_macos_cpu_pkg_profile.py`. Exact discovery is
 57 portable tests, plus two native tests on each Mac lane. The native tests use

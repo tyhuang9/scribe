@@ -1,0 +1,354 @@
+"""Observe ONLY our fresh fixed unsigned three-component product fixture.
+
+No archive/path input, real app/worker, signing, extraction or installation.
+All parsing below is bounded observation, NEVER package acceptance or trust.
+Unknown formats remain unobserved; source/format checks do not authenticate.
+Reviewed system tools and non-hostile same-user/root writers are assumptions.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import sys
+import tempfile
+import zlib
+
+import macos_cpu_component as component
+import macos_cpu_pkg_profile as cpu_profile
+
+ROLES = ("cpu", "metal", "app")
+VERSION = "1.0.0"
+IDENTIFIERS = {role: "com.scribe.source-test.product-profile." + role for role in ROLES}
+OPERATIONS = {role: ("# Scribe " + role + " product fixture; no interpreter.\n").encode() for role in ROLES[:2]}
+APP_NAME = "ScribeSourceFixture.app"
+APP_FILES = {
+    APP_NAME + "/Contents/Info.plist": plistlib.dumps({
+        "CFBundleIdentifier": IDENTIFIERS["app"], "CFBundleName": "Scribe Source Fixture",
+        "CFBundlePackageType": "APPL", "CFBundleExecutable": "fixture",
+        "CFBundleVersion": VERSION, "CFBundleShortVersionString": VERSION}),
+    APP_NAME + "/Contents/MacOS/fixture": b"# Inert app payload fixture; no interpreter.\n",
+}
+MAX_PACKAGE = 2 * 1024 * 1024
+MAX_MEMBER = 512 * 1024
+MAX_MEMBERS = 32
+MAX_ARCHIVES = 7  # outer + three originals + at most three raw embedded archives
+MAX_ARCHIVE_BYTES = 4 * MAX_PACKAGE  # three originals and one outer input
+MAX_DECODED_BYTES = 4 * MAX_PACKAGE
+MAX_REPORT = 256 * 1024
+LEAVES = ("PackageInfo", "Scripts", "Payload", "Bom", "Distribution")
+XML_TAGS = frozenset(("pkg-info", "installer-gui-script", "options", "domains", "title", "choices-outline",
+    "line", "choice", "pkg-ref", "payload", "scripts", "postinstall", "preinstall", "bundle", "bundle-version",
+    "upgrade-bundle", "update-bundle", "atomic-update-bundle", "strict-identifier", "relocate",
+    "installation-check", "volume-check", "script", "allowed-os-versions", "os-version"))
+XML_ATTRIBUTES = frozenset(("identifier", "id", "version", "install-location", "auth", "format-version",
+    "generator-version", "relocatable", "overwrite-permissions", "postinstall-action", "file", "visible", "selected",
+    "enabled", "customize", "require-scripts", "allow-external-scripts", "hostArchitectures", "rootVolumeOnly",
+    "enable_localSystem", "enable_currentUserHome", "enable_anywhere", "installKBytes", "numberOfFiles",
+    "CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion", "path", "minSpecVersion", "start_enabled"))
+
+
+def require(condition: bool, message: str) -> None:
+    component.require(condition, "product profile: " + message)
+
+
+def _inflate(data: bytes, maximum: int) -> bytes:
+    require(type(data) is bytes and len(data) <= MAX_PACKAGE and type(maximum) is int
+            and 0 <= maximum <= MAX_MEMBER, "invalid compressed bounds")
+    decoder = zlib.decompressobj(47)
+    try:
+        decoded = decoder.decompress(data, maximum + 1)
+    except zlib.error:
+        raise component.ComponentError("product profile: malformed compression") from None
+    require(len(decoded) <= maximum and decoder.eof and not decoder.unused_data
+            and not decoder.unconsumed_tail, "incomplete, trailing or oversized compression")
+    return decoded
+
+
+def _xml(data: bytes):
+    try:
+        return cpu_profile.xml_tree(data)
+    except component.ComponentError:
+        raise component.ComponentError("product profile: invalid bounded XML") from None
+
+
+def _xml_shapes(data: bytes) -> list[dict]:
+    result, pending = [], [(_xml(data), 0)]
+    while pending:
+        node, depth = pending.pop()
+        fields = []
+        for name, value in sorted(node.attrib.items()):
+            if name in XML_ATTRIBUTES:
+                # Only fixed control literals are emitted; identities, paths,
+                # code, versions, names, references and arbitrary text are not.
+                literals = {"true", "false"} if name in {"visible", "selected", "enabled", "relocatable",
+                    "overwrite-permissions", "require-scripts", "allow-external-scripts", "rootVolumeOnly",
+                    "enable_localSystem", "enable_currentUserHome", "enable_anywhere", "start_enabled"} else set()
+                fields.append({"name": name, "value_class": "literal-" + value if value in literals else "redacted"})
+        result.append({"tag": node.tag if node.tag in XML_TAGS else "unrecognized", "depth": depth,
+                       "child_count": len(node), "attributes": fields,
+                       "unknown_attribute_count": sum(name not in XML_ATTRIBUTES for name in node.attrib),
+                       "has_text": bool((node.text or "").strip()), "has_tail": bool((node.tail or "").strip())})
+        pending.extend((child, depth + 1) for child in reversed(node))
+    return result
+
+
+def _xar(data: bytes) -> dict:
+    """Own generated bytes only. Does NOT validate XAR checksums/signatures."""
+    header = cpu_profile.HEADER
+    require(type(data) is bytes and header.size < len(data) <= MAX_PACKAGE, "archive size exceeds bound")
+    magic, size, version, compressed, expanded, _ = header.unpack(data[:header.size])
+    require(magic == b"xar!" and size == header.size and version == 1, "unsupported archive header")
+    require(0 < compressed <= cpu_profile.MAX_TOC and 0 < expanded <= cpu_profile.MAX_TOC
+            and size + compressed <= len(data), "invalid TOC bounds")
+    toc_data = _inflate(data[size:size + compressed], expanded)
+    require(len(toc_data) == expanded, "TOC length differs")
+    root = _xml(toc_data)
+    require(root.tag == "xar" and len(root) == 1 and root[0].tag == "toc", "unexpected archive root")
+    heap, ranges, members, declared_total = size + compressed, [], {}, 0
+    pending = [(node, "", 0) for node in reversed(root[0].findall("file"))]
+    while pending:
+        node, parent, depth = pending.pop()
+        require(len(members) < MAX_MEMBERS and depth <= 3, "member count or depth exceeds bound")
+        name, kind = cpu_profile.scalar(node, "name"), cpu_profile.scalar(node, "type")
+        require(re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,63}", name) is not None
+                and name not in (".", ".."), "unsafe member name")
+        path = parent + name
+        require(path.casefold() not in {key.casefold() for key in members}, "duplicate or aliased member")
+        require(kind in ("file", "directory"), "unsupported member type")
+        member = {"kind": kind, "encoding": "none", "stored": b"", "decoded": None}
+        members[path] = member
+        if kind == "directory":
+            require(not node.findall("data"), "directory has data")
+            pending.extend((child, path + "/", depth + 1) for child in reversed(node.findall("file")))
+            continue
+        require(not node.findall("file") and len(node.findall("data")) == 1, "ambiguous file structure")
+        record = node.find("data")
+        offset = cpu_profile.number(record, "offset", MAX_PACKAGE)
+        length = cpu_profile.number(record, "length", MAX_MEMBER)
+        declared = cpu_profile.number(record, "size", MAX_MEMBER)
+        declared_total += declared
+        require(declared_total <= MAX_PACKAGE, "decoded aggregate exceeds bound")
+        begin, end = heap + offset, heap + offset + length
+        require(heap <= begin <= end <= len(data) and all(end <= a or begin >= b for a, b in ranges),
+                "invalid member range")
+        ranges.append((begin, end))
+        encodings = record.findall("encoding")
+        require(len(encodings) == 1 and set(encodings[0].attrib) == {"style"}, "ambiguous member encoding")
+        style = encodings[0].get("style")
+        member["encoding"] = {"application/octet-stream": "raw", "application/x-gzip": "zlib-or-gzip"}.get(style, "unobserved")
+        member["stored"] = data[begin:end]
+        if member["encoding"] != "unobserved":
+            decoded = member["stored"] if member["encoding"] == "raw" else _inflate(member["stored"], declared)
+            require(len(decoded) == declared, "decoded member length differs")
+            member["decoded"] = decoded
+    return {"members": members, "signature_present": bool(root[0].findall("signature")),
+            "declared_bytes": declared_total,
+            "unknown_toc_child_count": sum(node.tag not in ("file", "creation-time", "checksum", "signature") for node in root[0])}
+
+
+def _label(path: str) -> str:
+    if path in LEAVES:
+        return path
+    for role in ROLES:
+        if path == role + ".pkg":
+            return role + "-component"
+        if path.startswith(role + ".pkg/") and path[len(role) + 5:] in LEAVES:
+            return role + "/" + path[len(role) + 5:]
+    return "unrecognized"
+
+
+def _tree_shapes(tree: dict) -> list[dict]:
+    return sorted(({"name_class": _label(name), "depth": name.count("/"), "kind": item["kind"],
+                    "encoding": item["encoding"], "stored_bytes": len(item["stored"]),
+                    "decoded_bytes": None if item["decoded"] is None else len(item["decoded"])}
+                   for name, item in tree["members"].items()), key=lambda item: (item["name_class"], item["depth"]))
+
+
+def _payload_report(members: dict) -> dict:
+    payload, bom = members.get("Payload"), members.get("Bom")
+    data = payload["decoded"] if payload else None
+    compression, body = "absent" if payload is None else "unobserved", None
+    if data is not None:
+        if data.startswith(b"\x1f\x8b"):
+            compression, body = "gzip", _inflate(data, cpu_profile.MAX_MEMBER)
+        elif len(data) >= 2 and data[0] & 15 == 8 and int.from_bytes(data[:2], "big") % 31 == 0:
+            compression, body = "zlib", _inflate(data, cpu_profile.MAX_MEMBER)
+        elif data.startswith(b"pbzx"):
+            compression = "pbzx-unobserved"
+        elif data.startswith(b"070707"):
+            compression, body = "none-odc", data
+    match, record_count = None, None
+    if body is not None and body.startswith(b"070707"):
+        records, _, _ = cpu_profile._decode_odc(body)
+        actual = {}
+        valid = True
+        for record in records:
+            if record["mode"] & 0o170000 == 0o100000:
+                name = record["name"].removeprefix(b"./")
+                valid = valid and name not in actual
+                actual[name] = record["data"]
+            else:
+                valid = valid and record["mode"] & 0o170000 == 0o040000 and not record["data"]
+        match = valid and actual == {name.encode(): value for name, value in APP_FILES.items()}
+        record_count = len(records)
+    bom_data = bom["decoded"] if bom else None
+    return {"compression_class": compression, "fixture_files_match": match, "odc_record_count": record_count,
+            "decoded_payload_bytes": len(body) if body is not None else 0,
+            "bom_present": bom is not None, "bom_format_class": "absent" if bom is None else
+                "bomstore" if bom_data is not None and bom_data.startswith(b"BOMStore") else "unobserved"}
+
+
+def _observe(archives: dict[str, bytes], product: bytes) -> dict:
+    require(set(archives) == set(ROLES), "fixed component set differs")
+    require(all(type(value) is bytes for value in (*archives.values(), product))
+            and sum(len(value) for value in (*archives.values(), product)) <= MAX_ARCHIVE_BYTES,
+            "aggregate archive input exceeds bound")
+    count, decoded_total = 0, 0
+    def read(data):
+        nonlocal count, decoded_total
+        count += 1
+        require(count <= MAX_ARCHIVES, "archive count exceeds bound")
+        tree = _xar(data)
+        decoded_total += tree["declared_bytes"]
+        require(decoded_total <= MAX_DECODED_BYTES, "aggregate decoded bytes exceed bound")
+        return tree
+    outer = read(product)
+    distribution = outer["members"].get("Distribution")
+    report = {"schema_version": 1, "observation_only": True, "checksum_or_signature_verification": False,
+              "owned_inputs_unchanged": False,
+              "outer_members": _tree_shapes(outer), "outer_signature_present": outer["signature_present"],
+              "unknown_outer_toc_children": outer["unknown_toc_child_count"], "components": [],
+              "distribution_shapes": _xml_shapes(distribution["decoded"]) if distribution and distribution["decoded"] is not None else None}
+    for role in ROLES:
+        original = read(archives[role])
+        nested = outer["members"].get(role + ".pkg")
+        form, raw_match, embedded, embedded_signature = "unobserved", None, {}, None
+        if nested and nested["kind"] == "directory":
+            form = "component-member-tree"
+            embedded = {key[len(role) + 5:]: value for key, value in outer["members"].items() if key.startswith(role + ".pkg/")}
+        elif nested and nested["kind"] == "file" and nested["decoded"] is not None and nested["decoded"].startswith(b"xar!"):
+            form, raw_match = "raw-xar-file", nested["decoded"] == archives[role]
+            tree = read(nested["decoded"])
+            embedded, embedded_signature = tree["members"], tree["signature_present"]
+        comparisons = []
+        for name in LEAVES[:-1]:
+            left, right = original["members"].get(name), embedded.get(name)
+            if left is not None or right is not None:
+                known = bool(left and right and left["decoded"] is not None and right["decoded"] is not None)
+                comparisons.append({"member": name, "both_present": bool(left and right),
+                                    "decoded_bytes_match": left["decoded"] == right["decoded"] if known else None})
+        info = original["members"].get("PackageInfo")
+        embedded_info = embedded.get("PackageInfo")
+        input_payload = _payload_report(original["members"]) if role == "app" else None
+        embedded_payload = _payload_report(embedded) if role == "app" else None
+        decoded_total += sum(item["decoded_payload_bytes"] for item in (input_payload, embedded_payload) if item is not None)
+        require(decoded_total <= MAX_DECODED_BYTES, "aggregate decoded bytes exceed bound")
+        report["components"].append({"role": role, "embedding_class": form, "raw_archive_bytes_match": raw_match,
+            "input_members": _tree_shapes(original), "input_signature_present": original["signature_present"],
+            "embedded_members": _tree_shapes({"members": embedded}), "embedded_signature_present": embedded_signature,
+            "member_comparisons": comparisons,
+            "input_package_info_shapes": _xml_shapes(info["decoded"]) if info and info["decoded"] is not None else None,
+            "embedded_package_info_shapes": _xml_shapes(embedded_info["decoded"]) if embedded_info and embedded_info["decoded"] is not None else None,
+            "input_payload": input_payload, "embedded_payload": embedded_payload})
+    require(len(json.dumps(report, sort_keys=True, separators=(",", ":")).encode()) <= MAX_REPORT,
+            "observation report exceeds bound")
+    return report
+
+
+def _write(path: Path, data: bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    path.chmod(mode)
+
+
+def _identity(path: Path) -> tuple:
+    return (*component.hash_file(path, MAX_PACKAGE), component.fingerprint(path.lstat()))
+
+
+def _directory_identity(path: Path) -> tuple:
+    component.check_node(path.lstat(), True)
+    names = []
+    with os.scandir(path) as entries:
+        for node in entries:
+            names.append(node.name)
+            require(len(names) <= 8, "fixture directory inventory exceeds bound")
+    return component.fingerprint(path.lstat()), tuple(sorted(names))
+
+
+def _owned_probe() -> dict:
+    with component.private_workspace(Path(tempfile.gettempdir()), "scribe-product-profile-") as workspace:
+        temporary = workspace / "tmp"
+        temporary.mkdir(mode=0o700)
+        environment = {**component.probe_environment(), "TMPDIR": str(temporary)}
+        inputs, retained = {}, {}
+        for name, data in APP_FILES.items():
+            path = workspace / "payload" / name
+            _write(path, data, 0o755 if name.endswith("/fixture") else 0o644)
+            inputs[path] = _identity(path)
+        for role in ROLES[:2]:
+            path = workspace / (role + "-scripts") / "postinstall"
+            _write(path, OPERATIONS[role], 0o755)
+            inputs[path] = _identity(path)
+        directories = {}
+        for path in inputs:
+            parent = path.parent
+            while parent != workspace:
+                directories[parent] = _directory_identity(parent)
+                parent = parent.parent
+        def unchanged():
+            require(all(_identity(path) == identity for path, identity in inputs.items())
+                    and all(_directory_identity(path) == identity for path, identity in directories.items()),
+                    "owned fixture input changed")
+        for role in ROLES:
+            target = workspace / (role + ".pkg")
+            args = ["/usr/bin/pkgbuild"] + (["--root", str(workspace / "payload")] if role == "app" else
+                    ["--nopayload", "--scripts", str(workspace / (role + "-scripts"))])
+            component.capture([*args, "--identifier", IDENTIFIERS[role], "--version", VERSION,
+                               "--install-location", "/Applications" if role == "app" else "/", str(target)],
+                              timeout=30, limit=8192, error_limit=8192, environment=environment, cwd=workspace)
+            unchanged()
+            inputs[target] = _identity(target)
+            retained[role] = component.read_bounded(target, MAX_PACKAGE)
+        distribution = workspace / "Distribution.xml"
+        component.capture(["/usr/bin/productbuild", "--synthesize", *[argument for role in ROLES
+            for argument in ("--package", str(workspace / (role + ".pkg")))], str(distribution)],
+            timeout=30, limit=8192, error_limit=8192, environment=environment, cwd=workspace)
+        unchanged()
+        inputs[distribution] = _identity(distribution)
+        output = workspace / "product.pkg"
+        component.capture(["/usr/bin/productbuild", "--distribution", str(distribution), "--package-path", str(workspace),
+                           str(output)], timeout=30, limit=8192, error_limit=8192, environment=environment, cwd=workspace)
+        unchanged()
+        output_identity = _identity(output)
+        report = _observe(retained, component.read_bounded(output, MAX_PACKAGE))
+        unchanged()
+        require(_identity(output) == output_identity, "owned product changed during observation")
+        report["owned_inputs_unchanged"] = True
+        return report
+
+
+def probe() -> dict:
+    require(sys.platform == "darwin" and os.geteuid() != 0, "requires an unprivileged Mac")
+    try:
+        return _owned_probe()
+    except component.CleanupUncertain as error:
+        # The owned scope has already retained its workspace. Preserve this
+        # exact error, but never render a TimeoutExpired's private command cause.
+        raise error from None
+    except OSError:
+        raise component.ComponentError("product profile: owned fixture filesystem operation failed") from None
+
+
+def main() -> None:
+    require(len(sys.argv) == 1, "fixed fixture accepts no arguments")
+    print(json.dumps(probe(), sort_keys=True, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

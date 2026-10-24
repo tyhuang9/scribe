@@ -1633,6 +1633,105 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
 }
 
 #[test]
+fn macos_product_format_probe_is_fixed_bounded_and_never_installation_authority() {
+    let source = include_str!("../build_support/macos_product_pkg_profile.py");
+    let tests = include_str!("../build_support/test_macos_product_pkg_profile.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml").replace("\r\n", "\n");
+    let codec = include_str!("../build_support/macos_cpu_pkg.py");
+    let probe = &source[source.find("def probe()").unwrap()..];
+    assert!(
+        probe.find("sys.platform == \"darwin\"").unwrap() < probe.find("_owned_probe()").unwrap()
+    );
+    for required in [
+        "com.scribe.source-test.product-profile.",
+        "MAX_ARCHIVES = 7",
+        "MAX_ARCHIVE_BYTES = 4 * MAX_PACKAGE",
+        "MAX_DECODED_BYTES = 4 * MAX_PACKAGE",
+        "MAX_REPORT = 256 * 1024",
+        "MAX_MEMBERS = 32",
+        "depth <= 3",
+        "\"checksum_or_signature_verification\": False",
+        "\"component-member-tree\"",
+        "\"raw-xar-file\"",
+        "\"unobserved\"",
+        "\"owned_inputs_unchanged\": False",
+        "inputs[target] = _identity(target)",
+        "_directory_identity(path) == identity",
+        "_identity(output) == output_identity",
+        "require(len(sys.argv) == 1",
+        "except OSError:",
+        "from None",
+    ] {
+        assert!(
+            source.contains(required),
+            "product format probe lost {required}"
+        );
+    }
+    for forbidden in [
+        "argparse",
+        "subprocess.",
+        "--sign",
+        "codesign",
+        "productsign",
+        "notarytool",
+        "pkgutil",
+        "--expand",
+        "/usr/sbin/installer",
+        "com.scribe.local-transcriber",
+        "scribe-inference-worker",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "format probe gained {forbidden}"
+        );
+    }
+    assert!(!codec.contains("macos_product_pkg_profile"));
+    for required in [
+        "expected = 20 + (1 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)",
+        "test_archive_decoded_and_report_aggregate_limits_are_executable",
+        "test_unknown_names_attributes_values_and_paths_never_enter_report",
+        "test_raw_archive_and_component_member_tree_are_distinct_observations",
+        "test_component_and_distribution_input_content_or_node_changes_reject",
+        "test_actual_fixed_unsigned_product_without_execution_or_installation",
+        "test_uncertain_product_child_retains_private_workspace",
+    ] {
+        assert!(
+            tests.contains(required),
+            "missing product probe regression {required}"
+        );
+    }
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_product_pkg_profile.py")
+            .count(),
+        2
+    );
+    let structural = workflow
+        .split_once("\n  structural:\n")
+        .unwrap()
+        .1
+        .split_once("\n  package-diagnostics:\n")
+        .unwrap()
+        .0;
+    assert!(
+        structural
+            .find("run: python3 -B build_support/test_macos_product_pkg_profile.py")
+            .unwrap()
+            < structural.find("uses: dtolnay/rust-toolchain@").unwrap()
+    );
+    let diagnostics = workflow
+        .split_once("\n  package-diagnostics:\n")
+        .unwrap()
+        .1
+        .split_once("\n  official-sign-notarize:\n")
+        .unwrap()
+        .0;
+    assert!(diagnostics.contains("run: python3 -B build_support/macos_product_pkg_profile.py"));
+    assert!(!diagnostics.contains("upload-artifact"));
+    assert!(!diagnostics.contains("secrets."));
+}
+
+#[test]
 fn macos_author_cleanup_confirmation_requires_reap_and_absent_group() {
     let source = include_str!("../build_support/macos_cpu_component.py");
     let tests = include_str!("../build_support/test_macos_cpu_component.py");
@@ -2277,7 +2376,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             .any(|forbidden| structural.contains(forbidden))
             && diagnostics.contains("timeout-minutes: 10")
             && diagnostics.contains("timeout-minutes: 4")
-            && diagnostics.matches("run:").count() == 1
+            && diagnostics.matches("run:").count() == 2
             && diagnostics.matches("- uses:").count() == 2
             && diagnostics.matches("- runner:").count() == 2
             && diagnostics.contains("runner: macos-15-intel\n            arch: x86_64")
@@ -2288,6 +2387,8 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             && diagnostics.contains("python-version: '3.13'")
             && diagnostics.contains("runs-on: ${{ matrix.runner }}")
             && diagnostics.matches("run: python3 -B build_support/macos_cpu_pkg_profile.py").count() == 1
+            && diagnostics.matches("run: python3 -B build_support/macos_product_pkg_profile.py").count() == 1
+            && diagnostics.contains("        timeout-minutes: 4\n        run: python3 -B build_support/macos_product_pkg_profile.py\n")
             && !["needs:", "secrets.", "continue-on-error:", "if:", "environment:", "permissions:",
                  "upload-artifact", "cargo ", "codesign", "notarytool", "sudo ", "env:"].iter()
                 .any(|forbidden| diagnostics.contains(forbidden))
@@ -2327,6 +2428,9 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         ("duplicate structural job", workflow.replacen("\n  structural:\n", "\n  structural:\n  structural:\n", 1)),
         ("duplicate official job", workflow.replacen("\n  official-sign-notarize:\n", "\n  official-sign-notarize:\n  official-sign-notarize:\n", 1)),
         ("unbounded diagnostic job", workflow.replacen("    timeout-minutes: 10", "    timeout-minutes: 20", 1)),
+        ("missing product diagnostic", workflow.replacen("        run: python3 -B build_support/macos_product_pkg_profile.py\n", "", 1)),
+        ("duplicate product diagnostic", workflow.replacen("        run: python3 -B build_support/macos_product_pkg_profile.py\n", "        run: python3 -B build_support/macos_product_pkg_profile.py\n        run: python3 -B build_support/macos_product_pkg_profile.py\n", 1)),
+        ("unbounded product diagnostic", workflow.replacen("        timeout-minutes: 4\n        run: python3 -B build_support/macos_product_pkg_profile.py\n", "        timeout-minutes: 5\n        run: python3 -B build_support/macos_product_pkg_profile.py\n", 1)),
         ("missing diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  unexpected-job:\n", 1)),
         ("cross-architecture barrier", workflow.replacen("\n  structural:\n", "\n  structural:\n    needs: package-profile\n", 1)),
         ("conditional structural job", workflow.replacen("\n  structural:\n", "\n  structural:\n    if: true\n", 1)),
