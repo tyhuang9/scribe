@@ -1978,7 +1978,7 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
     ] {
         assert!(!source.contains(forbidden) && !codec.contains(forbidden));
     }
-    assert!(tests.contains("expected = 30 + (2 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)"));
+    assert!(tests.contains("expected = 32 + (2 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_real_source_owners_share_one_retained_baseline_and_publish_unsigned_product",
         "test_mutation_between_each_real_child_owner_rejects_original_baseline",
@@ -1986,6 +1986,8 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
         "test_product_mutation_after_actual_readback_before_measurement_rejects",
         "test_oversized_decoded_metadata_and_bom_reject_before_materializing",
         "test_uncertain_outer_process_retains_full_admission_and_all_components",
+        "test_owned_native_observer_discloses_only_bounded_names_after_original_rejection",
+        "test_owned_native_observer_rejects_unsupported_names_and_nonexact_shapes",
     ] {
         assert!(tests.contains(required));
     }
