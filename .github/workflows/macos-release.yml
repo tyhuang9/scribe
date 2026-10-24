@@ -14,6 +14,7 @@ on:
       - 'build_support/*macos_cpu_pkg_final.py'
       - 'build_support/*macos_metal_pkg_entry.py'
       - 'build_support/*macos_metal_pkg_final.py'
+      - 'build_support/*macos_metal_pkg.py'
       - 'build_support/*macos_cpu_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
@@ -39,6 +40,7 @@ on:
       - 'build_support/*macos_cpu_pkg_final.py'
       - 'build_support/*macos_metal_pkg_entry.py'
       - 'build_support/*macos_metal_pkg_final.py'
+      - 'build_support/*macos_metal_pkg.py'
       - 'build_support/*macos_cpu_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
@@ -108,6 +110,8 @@ jobs:
         run: python3 -B build_support/test_macos_cpu_pkg_final.py
       - name: Verify inactive Metal entry finalization with mocked signing tools
         run: python3 -B build_support/test_macos_metal_pkg_final.py
+      - name: Verify inactive Metal component packaging with mocked native tools
+        run: python3 -B build_support/test_macos_metal_pkg.py
       - name: Verify Metal writer source in private unprivileged fixtures
         timeout-minutes: 15
         run: |

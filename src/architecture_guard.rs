@@ -1790,6 +1790,99 @@ fn macos_metal_finalization_is_default_denied_and_owns_only_fresh_metal_entries(
 }
 
 #[test]
+fn macos_metal_component_owns_finalized_entries_and_fixed_streaming_role() {
+    let source = include_str!("../build_support/macos_metal_pkg.py");
+    let codec = include_str!("../build_support/macos_cpu_pkg.py");
+    let tests = include_str!("../build_support/test_macos_metal_pkg.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let owner = &source[source.find("def build_component(").unwrap()..];
+    let stages = [
+        "signing._publisher()",
+        "app.is_absolute()",
+        "before = final._source_snapshot(",
+        "final.build_entry(",
+        "\"/usr/bin/pkgbuild\"",
+        "package._inspect_metal_fresh(",
+        "measured = component.hash_file(candidate,",
+        "component.publish_no_replace(",
+    ];
+    for pair in stages.windows(2) {
+        assert!(owner.find(pair[0]).unwrap() < owner.find(pair[1]).unwrap());
+    }
+    for required in [
+        "operation == scripts / \"postinstall\"",
+        "signing._only_entry(scripts)",
+        "component.hash_file(operation, entry.MAX_ENTRY) == (sha, size)",
+        "component.fingerprint(operation.lstat()) == identity",
+        "component.fingerprint(candidate.lstat()) == package_identity",
+        "signing._unchanged_policy(policy_before)",
+        "environment={**component.probe_environment(), \"TMPDIR\": str(temporary)}",
+        "operation=\"metal-component-pkg-build\"",
+        "package._metal_package_bound(size)",
+    ] {
+        assert!(source.contains(required), "Metal component lost {required}");
+    }
+    assert_eq!(
+        owner.matches("final._source_snapshot(app, frozen)").count(),
+        3
+    );
+    assert!(
+        owner.rfind("component.hash_file(candidate,").unwrap()
+            < owner.find("component.publish_no_replace(").unwrap()
+    );
+    for forbidden in [
+        "verify_cpu_app",
+        "_package_constructed_entry",
+        "argparse",
+        "__main__",
+        "os.environ",
+        "getenv(",
+        "signing_callback",
+        "subprocess.",
+        "productbuild",
+        "/usr/sbin/installer",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Metal component gained {forbidden}"
+        );
+    }
+    assert!(codec.contains("require(type(kind) is _Format,"));
+    assert!(codec.contains("return _bound_for(entry_size, _Format.CPU)"));
+    assert!(codec.contains("return _bound_for(entry_size, _Format.METAL)"));
+    assert!(
+        codec.contains("_inspect_format(package, entry_sha, entry_size, version, _Format.CPU)")
+    );
+    assert!(
+        codec.contains("_inspect_format(package, entry_sha, entry_size, version, _Format.METAL)")
+    );
+    let inspect = &codec[codec.find("def _inspect_format(").unwrap()..];
+    assert!(
+        inspect.find("_bound_for(entry_size, kind)").unwrap()
+            < inspect.find("component.open_regular(").unwrap()
+    );
+    assert!(tests.contains("expected = 18 + (1 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_source_fixed_profiles_reject_cross_role_identity",
+        "test_invalid_or_duck_typed_format_rejects_before_file_access",
+        "test_large_bound_arithmetic_preserves_cpu_limit_without_large_allocation",
+        "test_full_source_content_and_same_byte_replacement_during_packaging_reject",
+        "test_package_content_and_same_byte_replacement_after_inspection_reject",
+        "test_packaging_cleanup_uncertainty_retains_private_workspace",
+    ] {
+        assert!(tests.contains(required));
+    }
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_metal_pkg.py")
+            .count(),
+        2
+    );
+    assert!(workflow.contains("run: python3 -B build_support/test_macos_metal_pkg.py"));
+    assert!(!workflow.contains("python3 -B build_support/macos_metal_pkg.py"));
+}
+
+#[test]
 fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
     let source = include_str!("../build_support/macos_cpu_pkg_profile.py");
     let tests = include_str!("../build_support/test_macos_cpu_pkg_profile.py");
