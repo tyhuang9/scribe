@@ -1052,6 +1052,14 @@ post-sign entry bytes under the Metal size bound. It does not use CPU-only
 admission, construct a PKG, provision trust, invoke Installer or alter release
 selection. Its mocked tests are not native signature or installation evidence;
 see the Metal writer README for its remaining boundaries.
+A separate inactive Metal component owner now packages only its own freshly
+finalized entry. Its fixed Metal codec wrapper preserves the CPU format's
+streaming/inventory checks without borrowing CPU-only admission or CPU size and
+identity limits. Full app/pack inputs, policy and retained post-sign entry and
+package bytes/nodes remain bound through exclusive publication. The output is
+still an unsigned PKG; mocked source tests do not establish native Metal format
+acceptance, package authentication, product composition or installation. The
+publisher policy and release routes remain default-deny.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not

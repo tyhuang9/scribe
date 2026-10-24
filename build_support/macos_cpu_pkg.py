@@ -1,14 +1,16 @@
-"""Internal unsigned CPU component authoring, never installation or root trust.
+"""Internal unsigned CPU author and fixed CPU/Metal fresh-output codec.
 
 Inspect ONLY the fresh output of this invocation's trusted system pkgbuild.
-This is not an external archive/admission CLI. The finalized CPU-only app,
-reviewed source/toolchain and non-hostile same-user/root writers remain trusted.
+This is not an external archive/admission CLI. The CPU author admits only its
+CPU-only app; the separate Metal owner uses a fixed private format wrapper,
+never CPU app admission. Reviewed source/tools and non-hostile writers remain trusted.
 Production entry signing, final package authentication, notarization and product
 composition are separate work. No operation or worker executable is run here.
 """
 from __future__ import annotations
 
 import hashlib
+from enum import Enum
 import os
 from pathlib import Path
 import re
@@ -18,9 +20,11 @@ import zlib
 
 import macos_cpu_component as component
 import macos_cpu_pkg_entry as entry
+import macos_metal_pkg_entry as metal_entry
 from macos_cpu_pkg_profile import xml_tree
 
 IDENTIFIER = "com.scribe.local-transcriber.cpu-worker"
+_METAL_IDENTIFIER = "com.scribe.local-transcriber.metal-worker"
 CHUNK = 65536
 MAX_METADATA = 65536
 HEADER = struct.Struct(">4sHHQQI")
@@ -30,8 +34,28 @@ def require(condition: bool, message: str) -> None:
     component.require(condition, "CPU component package: " + message)
 
 
+class _Format(Enum):
+    CPU = "cpu"
+    METAL = "metal"
+
+
+def _format(kind: _Format) -> tuple[str, int]:
+    # Format selection is a fixed source choice, never archive/app admission.
+    require(type(kind) is _Format, "unsupported private component format")
+    return (IDENTIFIER, entry.MAX_ENTRY) if kind is _Format.CPU else (_METAL_IDENTIFIER, metal_entry.MAX_ENTRY)
+
+
 def _package_bound(entry_size: int) -> int:
-    require(type(entry_size) is int and 0 < entry_size <= entry.MAX_ENTRY, "invalid entry size")
+    return _bound_for(entry_size, _Format.CPU)
+
+
+def _metal_package_bound(entry_size: int) -> int:
+    return _bound_for(entry_size, _Format.METAL)
+
+
+def _bound_for(entry_size: int, kind: _Format) -> int:
+    _, maximum = _format(kind)
+    require(type(entry_size) is int and 0 < entry_size <= maximum, "invalid entry size")
     return entry_size + entry_size // 100 + 4 * 1024 * 1024
 
 
@@ -131,8 +155,13 @@ def _checksum(node, name: str) -> str:
 
 
 def _package_info(data: bytes, version: str) -> None:
+    _package_info_for(data, version, _Format.CPU)
+
+
+def _package_info_for(data: bytes, version: str, kind: _Format) -> None:
+    identifier, _ = _format(kind)
     root = xml_tree(data)
-    require(root.tag == "pkg-info" and root.get("identifier") == IDENTIFIER
+    require(root.tag == "pkg-info" and root.get("identifier") == identifier
             and root.get("version") == version and root.get("install-location") == "/", "package identity differs")
     # Exact native-observed controls for this private no-payload construction,
     # not Installer/root qualification or an observation-driven allowlist.
@@ -255,7 +284,16 @@ def _odc(chunks, entry_sha: str, entry_size: int) -> None:
 
 def _inspect_fresh(package: Path, entry_sha: str, entry_size: int, version: str) -> None:
     """Private fresh-output content binding, never signed-PKG/root admission."""
-    maximum = _package_bound(entry_size)
+    _inspect_format(package, entry_sha, entry_size, version, _Format.CPU)
+
+
+def _inspect_metal_fresh(package: Path, entry_sha: str, entry_size: int, version: str) -> None:
+    """Fixed Metal format only; caller must own this freshly constructed file."""
+    _inspect_format(package, entry_sha, entry_size, version, _Format.METAL)
+
+
+def _inspect_format(package: Path, entry_sha: str, entry_size: int, version: str, kind: _Format) -> None:
+    maximum = _bound_for(entry_size, kind)
     handle, before = component.open_regular(package, maximum)
     with handle:
         magic, size, version_id, compressed, expanded, algorithm = HEADER.unpack(_exact(handle, HEADER.size))
@@ -352,7 +390,10 @@ def _inspect_fresh(package: Path, entry_sha: str, entry_size: int, version: str)
                     yield block
 
             if name == "PackageInfo":
-                _package_info(b"".join(contents()), version)
+                if kind is _Format.CPU:
+                    _package_info(b"".join(contents()), version)
+                else:
+                    _package_info_for(b"".join(contents()), version, _Format.METAL)
             else:
                 # TOC's Scripts member is opaque gzip, followed by bounded ODC.
                 # Three fixed-name ODC headers/names need at most 255 bytes,

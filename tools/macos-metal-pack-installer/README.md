@@ -302,6 +302,39 @@ or installation. CI runs only this mocked source suite. Actual Metal
 construction/finalization, publisher provisioning, package authentication and
 hardware qualification remain separate gates.
 
+## Inactive unsigned component owner
+
+`build_support/macos_metal_pkg.py` extends the owned chain to an unsigned
+`metal-worker.pkg`. The internal function first applies the unchanged default-deny
+publisher policy. It accepts no prebuilt entry, CLI, caller-supplied trust result,
+signing callback or policy override. It calls its own fresh Metal finalization
+owner, preserving both production-pack verification paths and the full frozen
+app/pack inventory. CPU-only app admission is never used.
+
+Only that returned post-sign `postinstall` may enter the fixed system `pkgbuild`
+command, with a private scripts/TMPDIR workspace and sanitized environment.
+The existing streaming XAR/ODC codec now has two private source-fixed roles:
+unchanged CPU identity/bounds and distinct Metal identity/bounds. Invalid roles
+reject before file access; neither archive metadata nor caller-selected strings
+choose a role. Both wrappers retain the same bounded read/inflate, exact
+inventory/operation, no-payload, checksum and post-sign byte checks. The CPU
+author, admission, metadata predicate and existing tests remain unchanged.
+
+Full source and publisher policy, sole retained entry bytes/node, and inspected
+package bytes/node are rechecked before no-replace publication. Existing or
+ambiguously published outputs are not removed; uncertain process cleanup retains
+the private workspace. The result remains an **unsigned container**, not root
+authentication, Installer acceptance, product ordering or installation authority.
+No real publisher, key use, signing policy activation or production route is
+added. Native Metal construction and large-entry format acceptance remain
+unverified, independently of the existing CPU native fixture contract.
+
+`python3 -B build_support/test_macos_metal_pkg.py` discovers exactly 18 portable
+tests and one additional POSIX cleanup test. Synthetic tools/signatures exercise
+the owned chain and real streaming codec, including cross-role rejection,
+large-bound arithmetic without large allocations, mutation/replacement and
+publication failures. CI runs only this mocked suite, not the author itself.
+
 ## Remaining boundaries, not implemented here
 
 The writer is source-tested, not an installed or qualified release. Native Mac
