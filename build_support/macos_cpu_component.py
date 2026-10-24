@@ -483,7 +483,10 @@ def capture(arguments: list[str], *, timeout: float = 10, limit: int = 262144,
                 try:
                     os.killpg(process.pid, 0)
                 except ProcessLookupError:
-                    pass
+                    # A signal attempt may race natural exit. Only the owned
+                    # leader's reap AND confirmed group absence resolve it.
+                    # Preserve the original rejection, never return success.
+                    cleanup_error = None
                 except OSError as error:
                     cleanup_error = error
                 else:

@@ -10,6 +10,7 @@ import plistlib
 import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -483,6 +484,104 @@ class Portable(unittest.TestCase):
                     self.assertFalse(output.exists())
 
 
+    @contextmanager
+    def capture_cleanup_fixture(self, *, initial="ok", final="absent", wait_failure=False,
+                                ownership_lost=False, normal_exit=False, trigger="output"):
+        """All syscalls are mocked: never signal a real PID, including on Windows."""
+        events = []
+        process = Mock(pid=123456)
+        process.stdout.fileno.return_value = 101
+        process.stderr.fileno.return_value = 102
+        selector = Mock()
+        selector.get_map.return_value = {} if normal_exit else {101: object()}
+        selector.select.return_value = [(SimpleNamespace(data=0, fd=101, fileobj=process.stdout), 1)]
+
+        @contextmanager
+        def selection():
+            yield selector
+
+        def wait(*, timeout):
+            events.append(("wait", timeout))
+            if wait_failure == "timeout":
+                raise component.subprocess.TimeoutExpired("synthetic-child", timeout)
+            if wait_failure == "io":
+                raise OSError(errno.EIO, "synthetic wait failure")
+            return 0
+
+        def group(pid, number):
+            self.assertEqual(pid, process.pid)
+            events.append(("group", number))
+            outcome = initial if number == 9 else final
+            self.assertIn(number, (0, 9))
+            if outcome == "absent":
+                raise ProcessLookupError(errno.ESRCH, "synthetic absent group")
+            if outcome == "denied":
+                raise PermissionError(errno.EPERM, "synthetic denied group")
+            if outcome == "io":
+                raise OSError(errno.EIO, "synthetic group probe error")
+            self.assertIn(outcome, ("ok", "present"))
+
+        process.wait.side_effect = wait
+        with ExitStack() as stack:
+            spawn = stack.enter_context(patch.object(component.subprocess, "Popen", return_value=process))
+            stack.enter_context(patch.object(component.selectors, "DefaultSelector", side_effect=selection))
+            stack.enter_context(patch.object(component, "probe_environment", return_value={}))
+            stack.enter_context(patch.object(os, "set_blocking"))
+            stack.enter_context(patch.object(os, "read", return_value=b"12345"))
+            stack.enter_context(patch.object(os, "killpg", side_effect=group, create=True))
+            stack.enter_context(patch.object(os, "waitid", side_effect=ChildProcessError("synthetic ownership loss")
+                                             if ownership_lost else None,
+                                             return_value=object() if normal_exit else None, create=True))
+            for name, value in (("P_PID", 1), ("WEXITED", 2), ("WNOHANG", 4), ("WNOWAIT", 8)):
+                stack.enter_context(patch.object(os, name, value, create=True))
+            stack.enter_context(patch.object(component.signal, "SIGCHLD", 17, create=True))
+            stack.enter_context(patch.object(component.signal, "SIGKILL", 9, create=True))
+            stack.enter_context(patch.object(component.signal, "getsignal", return_value=component.signal.SIG_DFL))
+            stack.enter_context(patch.object(component.time, "monotonic", side_effect=[0, 2]
+                                             if trigger == "deadline" else None, return_value=0))
+            try:
+                yield events
+            finally:
+                process.stdout.close.assert_called_once()
+                process.stderr.close.assert_called_once()
+                self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+                self.assertTrue(spawn.call_args.kwargs["close_fds"])
+
+    def test_capture_cleanup_confirmed_absence_resolves_only_the_signal_error(self):
+        for initial in ("ok", "absent", "denied", "io"):
+            for trigger, message in (("output", "output bound"), ("deadline", "deadline")):
+                with self.subTest(initial=initial, trigger=trigger), \
+                     self.capture_cleanup_fixture(initial=initial, trigger=trigger) as events:
+                    with self.assertRaisesRegex(component.ComponentError, message) as caught:
+                        component.capture([sys.executable, "-V"], timeout=1, limit=4)
+                    self.assertNotIsInstance(caught.exception, component.CleanupUncertain)
+                    self.assertEqual(events, [("group", 9), ("wait", 2), ("group", 0)])
+
+    def test_capture_cleanup_uncertainty_still_overrides_original_rejection(self):
+        for final, wait_failure in (("denied", False), ("io", False), ("present", False),
+                                    ("absent", "timeout"), ("absent", "io")):
+            for trigger in ("output", "deadline"):
+                with self.subTest(final=final, wait_failure=wait_failure, trigger=trigger), \
+                     self.capture_cleanup_fixture(initial="denied", final=final, wait_failure=wait_failure,
+                                                  trigger=trigger) as events:
+                    with self.assertRaises(component.CleanupUncertain):
+                        component.capture([sys.executable, "-V"], timeout=1, limit=4)
+                    self.assertEqual(events, [("group", 9), ("wait", 2)] + ([] if wait_failure else [("group", 0)]))
+
+    def test_capture_lost_child_ownership_never_signals_or_waits(self):
+        with self.capture_cleanup_fixture(ownership_lost=True) as events:
+            with self.assertRaises(component.CleanupUncertain):
+                component.capture([sys.executable, "-V"], timeout=1, limit=4)
+            self.assertEqual(events, [])
+
+    def test_capture_normal_exit_probe_errors_remain_uncertain(self):
+        for final in ("denied", "io", "present"):
+            with self.subTest(final=final), self.capture_cleanup_fixture(normal_exit=True, final=final) as events:
+                with self.assertRaises(component.CleanupUncertain):
+                    component.capture([sys.executable, "-V"], timeout=1, limit=4)
+                self.assertEqual(events, [("wait", 1), ("group", 0)])
+
+
 class Posix(Portable):
     # Do not inherit/re-run Portable tests: runner loads only names defined here.
     def test_symlink_file(self):
@@ -888,7 +987,7 @@ def suite():
         classes.append(Posix)
     if sys.platform == "darwin":
         classes.append(NativeMac)
-    expected = 36 + (19 if os.name == "posix" else 0) + (6 if sys.platform == "darwin" else 0)
+    expected = 40 + (19 if os.name == "posix" else 0) + (6 if sys.platform == "darwin" else 0)
     for cls in classes:
         for name in sorted(cls.__dict__):
             if name.startswith("test_"):

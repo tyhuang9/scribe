@@ -170,7 +170,7 @@ does not contain the component. Structural CI assembles and inspects it, but
 does not upload it, install it, or invoke the production installer entry.
 
 Run `python3 -B build_support/test_macos_cpu_component.py` for exact-discovery
-source checks: 36 portable, 19 additional POSIX, and six additional Darwin tests.
+source checks: 40 portable, 19 additional POSIX, and six additional Darwin tests.
 The same command is used by CI. Fixtures are private and unprivileged. Windows
 and Linux checks do not establish native Mac acceptance.
 
@@ -214,6 +214,18 @@ child/group retirement, signature checks and failure policy are unchanged.
 Uncertain child cleanup takes precedence over an ordinary exit diagnostic and
 retains its workspace. POSIX tests exercise real failing children with sentinel
 arguments/environment/streams and check that none appears in the rendered error.
+
+Failure cleanup is confirmed only after reaping the owned leader and a final
+signal-zero probe reports the process group absent. At that point an earlier
+failed termination attempt is resolved; the original output-bound/deadline
+rejection still propagates, never success. Failed waits, denied/unknown probes,
+surviving groups and lost child ownership remain `CleanupUncertain` and retain
+the private workspace. No delivery signal is sent after reap or ownership loss;
+the two-second cleanup wait and normal-exit checks are unchanged. Portable
+mocked syscall-order tests cover this matrix without launching or signaling a
+real process, while the existing immediate-exit overflow tests remain intact.
+This rule does not infer why a particular OS denied a signal, or add containment
+for descendants that leave the process group.
 
 ## Dedicated native package-entry source
 
