@@ -1090,6 +1090,15 @@ component codecs continue to reject duplicate metadata.
 Native format observation is required before implementing app/outer-product
 acceptance and does not establish signatures, app replacement, operation order,
 cross-component rollback or installation. No source-test package is uploaded.
+A second fixed app fixture now requests explicit canonical payload modes,
+recommended archived ownership and bundle controls. It observes every ODC
+root/directory/file (including a resource path over 256 bytes), PackageInfo
+controls/counts and an unfiltered bounded system BOM listing. Only owned Bom
+metadata is materialized; payloads are never extracted or executed. CRC matches
+against system `cksum` are observations, not an assumed algorithm contract.
+Flags, ACLs/xattrs, hard-link tables, large files and Installer root/replacement
+effects remain unobserved. This source prerequisite does not add app-package
+admission, change protected CPU admission, activate publisher policy or install.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not

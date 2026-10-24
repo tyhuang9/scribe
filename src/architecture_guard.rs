@@ -1734,6 +1734,83 @@ fn macos_product_format_probe_is_fixed_bounded_and_never_installation_authority(
 }
 
 #[test]
+fn macos_app_payload_probe_is_configured_fixed_and_observation_only() {
+    let source = include_str!("../build_support/macos_app_pkg_profile.py");
+    let tests = include_str!("../build_support/test_macos_app_pkg_profile.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml").replace("\r\n", "\n");
+    for required in [
+        "sys.platform == \"darwin\" and os.geteuid() != 0",
+        "require(len(sys.argv) == 1",
+        "MAX_BYTES = 64 * 1024",
+        "MAX_RECORDS = 32",
+        "MAX_NAME = 1024",
+        "MAX_REPORT = 32 * 1024",
+        "\"BundleIsRelocatable\": False",
+        "\"BundleIsVersionChecked\": False",
+        "\"BundleHasStrictIdentifier\": True",
+        "\"BundleOverwriteAction\": \"upgrade\"",
+        "\"--ownership\", \"recommended\", \"--compression\", \"legacy\"",
+        "[\"/usr/bin/lsbom\", \"-p\", \"fmugsc\", str(bom)]",
+        "[\"/usr/bin/cksum\", str(path)]",
+        "\"package_admission\": False",
+        "\"flags_acl_xattrs_hardlink_tables\": \"unobserved\"",
+        "files[target] = _identity(target)",
+        "files[bom] = _identity(bom)",
+        "product._directory_identity(path) == value",
+    ] {
+        assert!(source.contains(required), "app observation lost {required}");
+    }
+    for forbidden in [
+        "argparse",
+        "subprocess.",
+        "--sign",
+        "codesign",
+        "notarytool",
+        "--expand",
+        "/usr/sbin/installer",
+        "scribe-inference-worker",
+        "com.scribe.local-transcriber",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "app observation gained {forbidden}"
+        );
+    }
+    for required in [
+        "expected = 14 + (1 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)",
+        "test_closed_probe_commands_controls_and_cleanup",
+        "test_source_inventory_package_and_bom_replacement_reject",
+        "test_bom_missing_extra_duplicates_and_case_alias_do_not_match",
+        "test_uncertain_child_preserves_workspace_without_private_cause",
+    ] {
+        assert!(
+            tests.contains(required),
+            "app observation lost test {required}"
+        );
+    }
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_app_pkg_profile.py")
+            .count(),
+        2
+    );
+    let structural = workflow
+        .split_once("\n  structural:\n")
+        .unwrap()
+        .1
+        .split_once("\n  package-diagnostics:\n")
+        .unwrap()
+        .0;
+    assert!(
+        structural
+            .find("run: python3 -B build_support/test_macos_app_pkg_profile.py")
+            .unwrap()
+            < structural.find("uses: dtolnay/rust-toolchain@").unwrap()
+    );
+    assert!(!include_str!("../build_support/macos_cpu_pkg.py").contains("macos_app_pkg_profile"));
+}
+
+#[test]
 fn macos_author_cleanup_confirmation_requires_reap_and_absent_group() {
     let source = include_str!("../build_support/macos_cpu_component.py");
     let tests = include_str!("../build_support/test_macos_cpu_component.py");
@@ -2378,7 +2455,7 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             .any(|forbidden| structural.contains(forbidden))
             && diagnostics.contains("timeout-minutes: 10")
             && diagnostics.contains("timeout-minutes: 4")
-            && diagnostics.matches("run:").count() == 2
+            && diagnostics.matches("run:").count() == 3
             && diagnostics.matches("- uses:").count() == 2
             && diagnostics.matches("- runner:").count() == 2
             && diagnostics.contains("runner: macos-15-intel\n            arch: x86_64")
@@ -2391,6 +2468,8 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
             && diagnostics.matches("run: python3 -B build_support/macos_cpu_pkg_profile.py").count() == 1
             && diagnostics.matches("run: python3 -B build_support/macos_product_pkg_profile.py").count() == 1
             && diagnostics.contains("        timeout-minutes: 4\n        run: python3 -B build_support/macos_product_pkg_profile.py\n")
+            && diagnostics.matches("run: python3 -B build_support/macos_app_pkg_profile.py").count() == 1
+            && diagnostics.contains("        timeout-minutes: 4\n        run: python3 -B build_support/macos_app_pkg_profile.py\n")
             && !["needs:", "secrets.", "continue-on-error:", "if:", "environment:", "permissions:",
                  "upload-artifact", "cargo ", "codesign", "notarytool", "sudo ", "env:"].iter()
                 .any(|forbidden| diagnostics.contains(forbidden))
@@ -2433,6 +2512,9 @@ fn macos_package_profile_only_observes_a_fixed_unprivileged_fixture() {
         ("missing product diagnostic", workflow.replacen("        run: python3 -B build_support/macos_product_pkg_profile.py\n", "", 1)),
         ("duplicate product diagnostic", workflow.replacen("        run: python3 -B build_support/macos_product_pkg_profile.py\n", "        run: python3 -B build_support/macos_product_pkg_profile.py\n        run: python3 -B build_support/macos_product_pkg_profile.py\n", 1)),
         ("unbounded product diagnostic", workflow.replacen("        timeout-minutes: 4\n        run: python3 -B build_support/macos_product_pkg_profile.py\n", "        timeout-minutes: 5\n        run: python3 -B build_support/macos_product_pkg_profile.py\n", 1)),
+        ("missing app diagnostic", workflow.replacen("        run: python3 -B build_support/macos_app_pkg_profile.py\n", "", 1)),
+        ("duplicate app diagnostic", workflow.replacen("        run: python3 -B build_support/macos_app_pkg_profile.py\n", "        run: python3 -B build_support/macos_app_pkg_profile.py\n        run: python3 -B build_support/macos_app_pkg_profile.py\n", 1)),
+        ("unbounded app diagnostic", workflow.replacen("        timeout-minutes: 4\n        run: python3 -B build_support/macos_app_pkg_profile.py\n", "        timeout-minutes: 5\n        run: python3 -B build_support/macos_app_pkg_profile.py\n", 1)),
         ("missing diagnostics", workflow.replacen("\n  package-diagnostics:\n", "\n  unexpected-job:\n", 1)),
         ("cross-architecture barrier", workflow.replacen("\n  structural:\n", "\n  structural:\n    needs: package-profile\n", 1)),
         ("conditional structural job", workflow.replacen("\n  structural:\n", "\n  structural:\n    if: true\n", 1)),
