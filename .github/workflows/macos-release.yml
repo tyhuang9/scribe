@@ -17,6 +17,7 @@ on:
       - 'build_support/*macos_metal_pkg.py'
       - 'build_support/*macos_full_release*.py'
       - 'build_support/*macos_cpu_pkg_profile.py'
+      - 'build_support/*macos_product_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
       - 'native/**'
@@ -44,6 +45,7 @@ on:
       - 'build_support/*macos_metal_pkg.py'
       - 'build_support/*macos_full_release*.py'
       - 'build_support/*macos_cpu_pkg_profile.py'
+      - 'build_support/*macos_product_pkg_profile.py'
       - 'tests/build_revision_invalidation.rs'
       - 'installer/macos/**'
       - 'native/**'
@@ -85,6 +87,9 @@ jobs:
       - name: Observe fixed unsigned PKG fixture format without installation
         timeout-minutes: 4
         run: python3 -B build_support/test_macos_cpu_pkg_profile.py
+      - name: Observe fixed unsigned three-component product without installation
+        timeout-minutes: 4
+        run: python3 -B build_support/test_macos_product_pkg_profile.py
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -214,6 +219,9 @@ jobs:
       - name: Observe paired inert text and universal Mach-O package metadata
         timeout-minutes: 4
         run: python3 -B build_support/macos_cpu_pkg_profile.py
+      - name: Observe fixed unsigned app and worker-component product format
+        timeout-minutes: 4
+        run: python3 -B build_support/macos_product_pkg_profile.py
 
   official-sign-notarize:
     name: Protected official macOS signing and notarization

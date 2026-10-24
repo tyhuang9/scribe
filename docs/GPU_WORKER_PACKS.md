@@ -1076,6 +1076,20 @@ Mocked source tests do not establish native full-release construction, package
 authentication, real signing or installation; eventual product composition still
 needs one complete app baseline across both component builds, not only the
 frozen document/worker hashes. Publisher policy and release routes remain denied.
+A separate input-free three-component native-format fixture now prepares the
+missing app/product codec work. It creates only a tiny inert app payload and two
+distinct comment-only operation components, then an unsigned product, without
+execution or installation. Bounded path/value-free observations distinguish raw
+nested XAR files from member trees, compare available decoded component members,
+and record Distribution/PackageInfo shapes, Payload compression and BOM presence.
+Unknown encodings remain unobserved; no package acceptance predicate changes.
+An embedded-file observation may retain two exactly agreeing fixed name
+properties in its reported field count, under a narrowly scoped native-format
+hypothesis. Conflicts and other ambiguous shapes still reject; production
+component codecs continue to reject duplicate metadata.
+Native format observation is required before implementing app/outer-product
+acceptance and does not establish signatures, app replacement, operation order,
+cross-component rollback or installation. No source-test package is uploaded.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not
