@@ -1835,6 +1835,9 @@ fn macos_app_component_owns_full_admission_staging_and_streamed_package() {
     for required in [
         "require(names == [APP_NAME]",
         "_empty_acl(descriptor)",
+        "_empty_xattrs(descriptor)",
+        "query.restype = ctypes.c_ssize_t",
+        "query(descriptor, None, 0, 0x20) == 0",
         "require(not os.listxattr(descriptor)",
         "getattr(before, \"st_flags\", 0) == 0",
         "owned.check_unchanged()",
@@ -1872,7 +1875,7 @@ fn macos_app_component_owns_full_admission_staging_and_streamed_package() {
     ] {
         assert!(!source.contains(forbidden) && !codec.contains(forbidden));
     }
-    assert!(tests.contains("expected = 36 + (2 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 37 + (2 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_bom_replaced_or_corrupted_before_first_readback_rejects",
         "test_bom_change_during_package_hash_is_not_a_new_baseline",
@@ -1882,6 +1885,8 @@ fn macos_app_component_owns_full_admission_staging_and_streamed_package() {
         "test_admission_exit_precedes_publication_and_exit_failure_prevents_it",
         "test_uncertain_construction_retains_both_private_scopes",
         "test_collision_and_ambiguous_publication_retain_existing_final",
+        "test_darwin_xattr_abi_requires_zero_and_never_allocates_or_ignores_errors",
+        "test_native_descriptor_gate_rejects_file_and_directory_xattrs_without_python_api",
     ] {
         assert!(tests.contains(required));
     }

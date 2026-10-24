@@ -383,6 +383,35 @@ class Function:
 
 
 class OwnerPortable(unittest.TestCase):
+    def test_darwin_xattr_abi_requires_zero_and_never_allocates_or_ignores_errors(self):
+        for count in (0, 1, 4096, 2**40, -1):
+            calls = []
+            class Library:
+                pass
+            library = Library()
+            def queried(*args):
+                calls.append(args)
+                ctypes.set_errno(errno.ENOTSUP)
+                return count
+            library.flistxattr = Function(queried)
+            with patch.object(author.ctypes, "CDLL", return_value=library):
+                if count == 0:
+                    author._empty_xattrs(7)
+                else:
+                    with self.assertRaisesRegex(component.ComponentError, "extended attributes present or unreadable"):
+                        author._empty_xattrs(7)
+            self.assertEqual(calls, [(7, None, 0, 0x20)])
+            self.assertEqual(library.flistxattr.argtypes, [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int])
+            self.assertIs(library.flistxattr.restype, ctypes.c_ssize_t)
+        with patch.object(author.ctypes, "CDLL", return_value=object()), self.assertRaisesRegex(
+                component.ComponentError, "descriptor xattr API unavailable"):
+            author._empty_xattrs(7)
+        with patch.object(author.ctypes, "CDLL", side_effect=OSError("PrivateSentinel")), self.assertRaisesRegex(
+                component.ComponentError, "descriptor xattr API unavailable") as caught:
+            author._empty_xattrs(7)
+        self.assertNotIn("PrivateSentinel", str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+
     def test_default_publisher_denies_before_inputs_or_tools(self):
         with patch.object(component, "capture") as tool, patch.object(component, "private_workspace") as workspace, \
              patch.object(author.full, "release_inputs") as inputs, self.assertRaisesRegex(
@@ -730,7 +759,9 @@ class PosixOwner(FullOwner):
         alias.symlink_to(path)
         with self.assertRaises(component.ComponentError):
             author._metadata(alias, 0o100644, 7)
-        with patch.object(os, "listxattr", return_value=["PrivateSentinel"]), self.assertRaises(component.ComponentError):
+        attribute_gate = (patch.object(author, "_empty_xattrs", side_effect=component.ComponentError("synthetic attribute"))
+                          if component.NATIVE_DARWIN else patch.object(os, "listxattr", return_value=["PrivateSentinel"]))
+        with attribute_gate, self.assertRaises(component.ComponentError):
             author._metadata(path, 0o100644, 7)
         original = os.fstat
         def replaced(descriptor):
@@ -743,14 +774,55 @@ class PosixOwner(FullOwner):
             author._metadata(path, 0o100644, 7)
 
 
+class NativeMetadata(unittest.TestCase):
+    def test_native_descriptor_gate_rejects_file_and_directory_xattrs_without_python_api(self):
+        # Only our own unprivileged temporary nodes; never a signed app, a
+        # protected path or attribute removal. The whole fixture self-cleans.
+        library = ctypes.CDLL(None, use_errno=True)
+        library.fsetxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
+                                     ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+        library.fsetxattr.restype = ctypes.c_int
+        with tempfile.TemporaryDirectory(prefix="scribe-native-xattr-source-") as temporary:
+            root = Path(temporary)
+            for directory in (False, True):
+                path = root / ("directory" if directory else "file")
+                if directory:
+                    path.mkdir(mode=0o755)
+                    path.chmod(0o755)
+                else:
+                    path.write_bytes(b"fixture")
+                    path.chmod(0o644)
+                mode = 0o40755 if directory else 0o100644
+                with patch.object(os, "listxattr", create=True) as python_api:
+                    author._metadata(path, mode, 7)
+                    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if directory else 0))
+                    try:
+                        value = ctypes.create_string_buffer(b"fixture")
+                        self.assertEqual(library.fsetxattr(descriptor, b"com.scribe.source-test.xattr", value, 7, 0, 0x2), 0)
+                        with self.assertRaisesRegex(component.ComponentError, "extended attributes present or unreadable"):
+                            author._empty_xattrs(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    with self.assertRaisesRegex(component.ComponentError, "extended attributes present or unreadable"):
+                        author._metadata(path, mode, 7)
+                    python_api.assert_not_called()
+                # Also exercise the real Python surface after restoring it:
+                # official Mac Python currently has no os.listxattr attribute.
+                # A has-API guard must not skip the populated-node rejection.
+                with self.assertRaisesRegex(component.ComponentError, "extended attributes present or unreadable"):
+                    author._metadata(path, mode, 7)
+
+
 def suite():
     result = unittest.TestSuite()
     classes = (CodecPortable, PackageInspection, OwnerPortable, FullOwner)
     if os.name == "posix":
         classes += (PosixOwner,)
+    if sys.platform == "darwin":
+        classes += (NativeMetadata,)
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 36 + (2 if os.name == "posix" else 0)
+    expected = 37 + (2 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"App package source discovery mismatch: expected {expected}")
     return result

@@ -976,6 +976,13 @@ through retained descriptors. This is not a claim that every allocated empty
 ACL object lacks flags. The canonical app is independently publisher-verified;
 neither the original app nor its signatures are modified or re-signed.
 
+On Darwin, extended attributes are inspected unconditionally with descriptor
+`flistxattr`, independently of Python's Linux-only `os.listxattr` API. The
+zero-buffer size query must return exactly zero; all positive sizes and API
+errors reject. `XATTR_SHOWCOMPRESSION` includes normally hidden compression
+metadata. No names/values are allocated, reported or removed. ABI and options
+follow [Apple's sys/xattr.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/xattr.h).
+
 Fixed system `pkgbuild` uses the configured ownership/compression and bundle
 controls above. Native Intel/ARM observations established a dot-relative path
 for the inert `ScribeSourceFixture.app` bundle and an eight-child control shape.
@@ -1008,9 +1015,13 @@ failure after successful publication retain the existing final.
 Reviewed toolchain/system tools and non-hostile same-user/root writers remain
 assumptions; checks do not defeat hostile swap-and-restore writers.
 
-`python3 -B build_support/test_macos_app_pkg.py` discovers exactly 36 portable
-tests and two additional POSIX tests. Tools, pack authentication and publisher
-verification are mocked. Independent synthetic XAR/ODC fixtures cover streaming,
+`python3 -B build_support/test_macos_app_pkg.py` discovers exactly 37 portable
+tests, two additional POSIX tests and one additional native Mac test. Tools,
+pack authentication and publisher verification are mocked. The native metadata
+test uses only its own temporary file/directory: empty metadata passes, then a
+fixture attribute must reject through the descriptor gate without Python's
+xattr API. This is a limited native fixture, not full-app metadata qualification.
+Independent synthetic XAR/ODC fixtures cover streaming,
 truncation, checksums, heap coverage, controls, aliases, inventory, readback and
 same-byte replacements, admission exit, cleanup uncertainty and publication.
 This does not qualify a real full-app package or actual publisher/native-tool

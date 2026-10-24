@@ -60,6 +60,23 @@ def _empty_acl(descriptor: int) -> None:
         require(library.acl_free(acl) == 0, "cannot release staged ACL")
 
 
+def _empty_xattrs(descriptor: int) -> None:
+    """Darwin descriptor query, independent of Linux-only Python xattr APIs.
+
+    Require exact zero, including normally hidden compression metadata. Never
+    allocate a name/value buffer, remove attributes or treat API errors as empty.
+    Signatures/options follow Apple's sys/xattr.h, not a pathname shell probe.
+    """
+    try:
+        query = ctypes.CDLL(None, use_errno=True).flistxattr
+    except (AttributeError, OSError):
+        raise component.ComponentError("app component: descriptor xattr API unavailable") from None
+    query.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    query.restype = ctypes.c_ssize_t
+    require(query(descriptor, None, 0, 0x20) == 0,
+            "staged extended attributes present or unreadable")
+
+
 def _metadata(path: Path, expected_mode: int, maximum: int) -> tuple:
     before = path.lstat()
     directory = stat.S_ISDIR(expected_mode)
@@ -75,7 +92,9 @@ def _metadata(path: Path, expected_mode: int, maximum: int) -> tuple:
                     "staged node changed during metadata open")
             if component.NATIVE_DARWIN:
                 _empty_acl(descriptor)
-            if hasattr(os, "listxattr"):
+                _empty_xattrs(descriptor)
+            else:
+                require(hasattr(os, "listxattr"), "descriptor xattr inspection unavailable")
                 require(not os.listxattr(descriptor), "staged node contains extended attributes")
             require(component.fingerprint(os.fstat(descriptor)) == component.fingerprint(before),
                     "staged node changed during metadata inspection")
