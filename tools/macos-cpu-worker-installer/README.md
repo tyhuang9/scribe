@@ -1079,14 +1079,37 @@ attributes or opaque subtrees reject. Two unidentified attributes seen only as
 redacted counts in the earlier inert observation are **not** accepted here.
 Native compatibility therefore remains unqualified, not inferred from mocks.
 
-`python3 -B build_support/test_macos_product_pkg.py` discovers 23 portable tests
-and one additional POSIX cleanup test. All three real source owners run with
-mocked tool/signature/pack verification; no production entry is executed. Tests
+`python3 -B build_support/test_macos_product_pkg.py` discovers 28 portable tests,
+two additional POSIX cleanup tests and one additional native Mac test (31 on
+Mac). The owner tests run all three real source owners with mocked
+tool/signature/pack verification; no production entry is executed. Tests
 cover every embedded member/checksum, semantically valid exact/+1 metadata and
 direct Bom bounds, real chunk crossings, role/controls/reference deviations,
 original and retained-component mutations between phases, inspection/admission
 exit boundaries, cleanup uncertainty and retained finals after ambiguous or
-completed publication. CI runs only this mocked suite, not the inactive author.
+completed publication.
+
+The native test constructs only one fresh fixed inert fixture in its own private
+workspace. It uses fixture identities, production component filenames and the
+configured app controls with only the fixture bundle path substituted. Three
+absolute system `pkgbuild` calls produce comment-only scripts/app text; one
+`productbuild` uses the production source-generated Distribution. The private
+production codec indexes the retained native originals, derives member/metadata
+expectations and checks the actual product readback. Production `_components`
+identity checks are never patched or bypassed for real inputs, and no full-app
+admission, publisher/signing call, payload execution, extraction or installation
+occurs. Inputs, inventories, components, controls and output identities are
+rechecked across tools and readback. The fixed success marker appears only after
+successful scope cleanup; uncertainty retains the owned scope. Portable tests
+mock these four native calls and cover their exact recipe and failure seams.
+
+The earlier observation uses `productbuild --synthesize`; its two unidentified
+reference attributes do not prove they are introduced into this owner's fixed
+Distribution. The new test does not synthesize, strip unknown attributes or
+relax production acceptance. Its first native result remains pending. Any pass
+establishes only **fixed inert native codec compatibility**, not full-app or
+publisher authentication, real installer operation or execution order. CI bounds
+this source/native suite to four minutes and never runs the inactive author.
 
 Trusted reviewed toolchain/system tools and non-hostile same-user/root writers
 remain assumptions. Real signed full-app/component/product compatibility,

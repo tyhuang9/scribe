@@ -1909,7 +1909,7 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
     let source = include_str!("../build_support/macos_product_pkg.py");
     let codec = include_str!("../build_support/macos_product_pkg_codec.py");
     let tests = include_str!("../build_support/test_macos_product_pkg.py");
-    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let workflow = include_str!("../.github/workflows/macos-release.yml").replace("\r\n", "\n");
     let owner = &source[source.find("def build_product(").unwrap()..];
     let stages = [
         "signing._publisher()",
@@ -1978,7 +1978,7 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
     ] {
         assert!(!source.contains(forbidden) && !codec.contains(forbidden));
     }
-    assert!(tests.contains("expected = 23 + (1 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 28 + (2 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_real_source_owners_share_one_retained_baseline_and_publish_unsigned_product",
         "test_mutation_between_each_real_child_owner_rejects_original_baseline",
@@ -2002,7 +2002,60 @@ fn macos_product_owner_keeps_one_full_baseline_through_all_components_and_readba
         2
     );
     assert!(workflow.contains("run: python3 -B build_support/test_macos_product_pkg.py"));
+    assert!(workflow.contains("        timeout-minutes: 4\n        run: python3 -B build_support/test_macos_product_pkg.py\n"));
+    assert!(
+        workflow
+            .find("run: python3 -B build_support/test_macos_product_pkg.py")
+            .unwrap()
+            < workflow.find("uses: dtolnay/rust-toolchain@").unwrap()
+    );
     assert!(!workflow.contains("python3 -B build_support/macos_product_pkg.py"));
+    let native = &tests[tests.find("def native_product_fixture():").unwrap()
+        ..tests.find("def tree_xar(").unwrap()];
+    for required in [
+        "sys.platform == \"darwin\" and os.geteuid() != 0",
+        "component.private_workspace(",
+        "codec._index(",
+        "codec._distribution_source(NATIVE_VERSION, infos)",
+        "codec._inspect_product(output, records, members, infos, distribution)",
+        "identity(output) == original",
+        "component inventory changed",
+        "raise error from None",
+    ] {
+        assert!(
+            native.contains(required),
+            "native product fixture lost {required}"
+        );
+    }
+    assert!(
+        native.find("os.geteuid() != 0").unwrap()
+            < native.find("component.private_workspace(").unwrap()
+    );
+    for forbidden in [
+        "--synthesize",
+        "--sign",
+        "codec._components(",
+        "signing._publisher(",
+        "full.owned_release(",
+        "publish_no_replace(",
+        "/usr/sbin/installer",
+        "sys.argv",
+    ] {
+        assert!(
+            !native.contains(forbidden),
+            "native product fixture gained {forbidden}"
+        );
+    }
+    assert!(
+        !native
+            .lines()
+            .any(|line| line.trim_start().starts_with("print("))
+    );
+    assert!(tests.contains(
+        "test_fixed_inert_native_product_matches_exact_source_distribution_and_readback"
+    ));
+    assert!(tests.contains("test_native_recipe_uncertain_process_retains_its_owned_private_scope"));
+    assert!(tests.contains("SCRIBE_NATIVE_SOURCE_PRODUCT_READBACK_PASS"));
 }
 
 #[test]
