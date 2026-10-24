@@ -1026,13 +1026,76 @@ truncation, checksums, heap coverage, controls, aliases, inventory, readback and
 same-byte replacements, admission exit, cleanup uncertainty and publication.
 This does not qualify a real full-app package or actual publisher/native-tool
 acceptance. CI runs only the source suite, never the inactive author or an
-installation. The next product owner still needs **one full same-app baseline**
-across fresh CPU, Metal and app construction, outer readback and publication;
-separate constructors or frozen document hashes do not provide that binding.
+installation. The separate inactive product owner below retains **one full
+same-app baseline** across fresh CPU, Metal and app construction, outer readback
+and publication; component constructors or frozen document hashes alone do not
+provide that binding.
 Package authentication, signing/notarization, ordering, update/removal, rollback,
 clean-machine installation and GPU Auto remain separate gates. Reverting these
 source files, tests, CI coverage and guard disables this inactive unit without
 changing production runtime or trust policy.
+
+### Inactive same-release product owner
+
+`build_support/macos_product_pkg.py` exposes only the internal source function
+`build_product(app, workspace, frozen, signing_identity_sha1)`. It accepts no
+prebuilt packages, receipts, callbacks, policy overrides or CLI options. The
+unchanged publisher policy denies before input access. Its result is one
+**unsigned** `Scribe.pkg`, not authenticated root input or an installation route.
+
+One original complete app content/node snapshot and publisher-policy identity
+are retained before the first component build and never refreshed. An outer
+`full.owned_release` scope independently admits both packs and retains actual
+app copies and its fresh native verifier across all three real component
+constructors, product construction and outer readback. Each child keeps its own
+admission. Exact `cpu-worker.pkg`, `metal-worker.pkg` and `app.pkg` paths,
+hashes/sizes/nodes and the final three-file inventory remain bound throughout.
+The outer admission's final recheck and cleanup must succeed before final
+source/policy/component/controls/product checks and no-replace publication.
+
+The fixed absolute system `productbuild` receives only a source-generated
+Distribution and this private package directory. All components are mandatory,
+customization is disabled, only the local-system domain is enabled, and no
+JavaScript, external scripts, resources or download URLs are admitted. Choice
+outline order is app/CPU/Metal; construction order is CPU/Metal/app. Neither is
+proof of actual Installer execution order or transactionality.
+
+The private codec streams the three own originals and exactly eleven outer XAR
+nodes: Distribution, three component directories and seven embedded leaves.
+Originals require one name property. Each embedded leaf requires exactly two
+identical attribute-free names under its fixed real component parent; there is
+no raw-inner-XAR fallback or arbitrary duplicate-name normalization. Complete
+checksums and heap coverage are verified, then all seven decoded SHA-256/length
+identities must match the retained originals. Scripts/Payload member bytes stay
+opaque here: equality preserves the content already inspected by their owners.
+No second payload extraction or BOM interpretation is introduced.
+
+[Apple's Distribution XML reference](https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html)
+documents producer-generated bundle/version/size metadata. Readback compares
+the fixed source semantic tree, permitting only exact local `#filename` URL
+rewrites and independently checked bundle-version additions derived from each
+own PackageInfo. Versions and space hints remain role-specific; unknown
+attributes or opaque subtrees reject. Two unidentified attributes seen only as
+redacted counts in the earlier inert observation are **not** accepted here.
+Native compatibility therefore remains unqualified, not inferred from mocks.
+
+`python3 -B build_support/test_macos_product_pkg.py` discovers 23 portable tests
+and one additional POSIX cleanup test. All three real source owners run with
+mocked tool/signature/pack verification; no production entry is executed. Tests
+cover every embedded member/checksum, semantically valid exact/+1 metadata and
+direct Bom bounds, real chunk crossings, role/controls/reference deviations,
+original and retained-component mutations between phases, inspection/admission
+exit boundaries, cleanup uncertainty and retained finals after ambiguous or
+completed publication. CI runs only this mocked suite, not the inactive author.
+
+Trusted reviewed toolchain/system tools and non-hostile same-user/root writers
+remain assumptions. Real signed full-app/component/product compatibility,
+installer authentication, ordering, rollback, power-loss durability, update and
+removal, actual installation and GPU Auto qualification remain separate gates.
+Confirmed pre-publication failures publish nothing; uncertain process cleanup
+retains owned scopes, and collision/publication/post-publication cleanup errors
+retain any existing final. Revert this inactive owner/codec, tests, guard, CI and
+docs to disable it without changing production runtime or trust policy.
 
 ## Not yet established
 

@@ -53,6 +53,7 @@ TOOL_OPERATIONS = frozenset({
     "metal-entry-build-arm64", "metal-entry-build-x86_64", "metal-entry-combine",
     "cpu-component-pkg-build", "metal-component-pkg-build",
     "app-component-pkg-build", "app-source-checksums", "app-bom-listing",
+    "product-component-pkg-build",
     "final-entry-signing", "final-entry-signature", "final-entry-properties", "final-entry-entitlements",
 })
 
