@@ -166,8 +166,15 @@ def _components(records: dict, version: str) -> tuple[dict, dict]:
             require(not payload or len(payload) == 1 and payload[0].attrib == {"installKBytes": "0", "numberOfFiles": "0"},
                     "worker component unexpectedly has payload")
             space = 0
+        bundles = []
+        for bundle in info.findall("bundle"):
+            require(name == "app.pkg" and info.get("install-location") == "/Applications"
+                    and bundle.get("path") == app.BUNDLE_PATH, "app bundle installation path differs")
+            installed = app.xml_tree(ET.tostring(bundle))
+            installed.set("path", "Applications/Scribe.app")
+            bundles.append(ET.tostring(installed))
         members.update({name + "/" + leaf: identity for leaf, identity in identities.items()})
-        infos[name] = (identifier, space, tuple(ET.tostring(bundle) for bundle in info.findall("bundle")))
+        infos[name] = (identifier, space, tuple(bundles))
     return members, infos
 
 
