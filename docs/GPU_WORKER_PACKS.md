@@ -1083,6 +1083,10 @@ execution or installation. Bounded path/value-free observations distinguish raw
 nested XAR files from member trees, compare available decoded component members,
 and record Distribution/PackageInfo shapes, Payload compression and BOM presence.
 Unknown encodings remain unobserved; no package acceptance predicate changes.
+An embedded-file observation may retain two exactly agreeing fixed name
+properties in its reported field count, under a narrowly scoped native-format
+hypothesis. Conflicts and other ambiguous shapes still reject; production
+component codecs continue to reject duplicate metadata.
 Native format observation is required before implementing app/outer-product
 acceptance and does not establish signatures, app replacement, operation order,
 cross-component rollback or installation. No source-test package is uploaded.

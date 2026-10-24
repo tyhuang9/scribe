@@ -444,7 +444,7 @@ these source tests.
 
 #### Combined app/CPU/Metal product observation
 
-`python3 -B build_support/test_macos_product_pkg_profile.py` discovers 20 portable
+`python3 -B build_support/test_macos_product_pkg_profile.py` discovers 21 portable
 tests, one additional POSIX cleanup test, and one additional native test on each
 Mac lane. The source-only CLI `python3 -B build_support/macos_product_pkg_profile.py`
 accepts **no arguments**. It generates one tiny constant inert app payload and
@@ -468,6 +468,19 @@ raw-archive equality is reported only when that archive is actually embedded.
 Transformations/mismatches remain explicit observations, not silently normalized
 or accepted. Input component files, fixture directories and source files retain
 their original content/node/inventory identities through assembly and reporting.
+
+Native Intel and ARM diagnostics found two leaf `name` properties in an embedded
+file. The observer tests one narrow hypothesis: exactly two attribute-free,
+identical fixed leaf names at depth one under the three fixed component roots,
+with exactly one attribute-free leaf `type=file`. It retains `name_field_count`
+in both original and embedded reports; conflicting names, other counts/scopes or
+ambiguous types still reject. Failure summaries also expose only equality and
+closed name classes, never values. Apple's
+[XAR replication source](https://github.com/apple-oss-distributions/xar/blob/3efbc308e3699a4ab8258fd769f5853bae91a2dc/xar/lib/filetree.c)
+provides a plausible duplicate-property mechanism, not proof of productbuild's
+call path. Native confirmation of this exact hypothesis is still required.
+Neither the shared scalar reader nor the production CPU/Metal package codec is
+relaxed; duplicate metadata remains rejected there.
 
 No archives are extracted, published or uploaded. Reports contain only closed
 labels, flags, bounded counts/sizes and redacted XML shapes—not raw names, paths,

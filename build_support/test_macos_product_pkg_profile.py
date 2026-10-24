@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 import zlib
 
 import macos_cpu_component as component
+import macos_cpu_pkg as package
 import macos_product_pkg_profile as profile
 from test_macos_cpu_pkg_profile import odc_archive, odc_record
 
@@ -67,7 +68,13 @@ def component_members(role):
             "Scripts": gzip.compress(odc_archive(odc_record(body=profile.OPERATIONS[role])), mtime=0)}
 
 
-def fixture(*, raw=False, changes=None, encoding=None, unknown=False):
+def repeat_member_names(toc):
+    for directory in toc.findall("file"):
+        for member in directory.findall("file"):
+            ET.SubElement(member, "name").text = member.find("name").text
+
+
+def fixture(*, raw=False, changes=None, encoding=None, unknown=False, mutate=None):
     originals = {role: xar(component_members(role)) for role in profile.ROLES}
     members = {"Distribution": DISTRIBUTION}
     for role in profile.ROLES:
@@ -79,7 +86,7 @@ def fixture(*, raw=False, changes=None, encoding=None, unknown=False):
     members.update(changes or {})
     if unknown:
         members["PrivateSentinel/member"] = b"private content"
-    return originals, xar(members, encoding=encoding)
+    return originals, xar(members, encoding=encoding, mutate=mutate)
 
 
 class Portable(unittest.TestCase):
@@ -184,6 +191,65 @@ class Portable(unittest.TestCase):
         comparison = next(item for item in report["components"][0]["member_comparisons"] if item["member"] == "Scripts")
         self.assertFalse(comparison["decoded_bytes_match"])
 
+    def test_identical_embedded_name_properties_are_observed_without_admission(self):
+        files = {role + ".pkg/" + name: b"x" for role in profile.ROLES for name in profile.LEAVES[:-1]}
+        tree = profile._xar(xar(files, mutate=repeat_member_names))
+        for item in profile._tree_shapes(tree):
+            self.assertEqual(item["name_field_count"], 2 if item["kind"] == "file" else 1)
+        report = profile._observe(*fixture(mutate=repeat_member_names))
+        for item in report["components"]:
+            self.assertTrue(all(value["name_field_count"] == 1 for value in item["input_members"]))
+            self.assertTrue(all(value["name_field_count"] == 2 for value in item["embedded_members"]))
+            self.assertTrue(all(value["decoded_bytes_match"] for value in item["member_comparisons"]))
+        self.assertTrue(report["observation_only"])
+        self.assertFalse(report["checksum_or_signature_verification"])
+        duplicate = ET.fromstring(b'<file><name>Scripts</name><name>Scripts</name></file>')
+        with self.assertRaises(component.ComponentError):
+            profile.cpu_profile.scalar(duplicate, "name")
+        with self.assertRaises(component.ComponentError):
+            package._leaf(duplicate, "name")
+        for path, selector in (("Scripts", "file"), ("cpu.pkg/Scripts", "file"),
+                               ("other.pkg/Scripts", "file/file"), ("CPU.pkg/Scripts", "file/file"),
+                               ("cpu.pkg/other/Scripts", "file/file/file"),
+                               ("cpu.pkg/PrivateSentinel", "file/file")):
+            def repeat(toc):
+                node = toc.find(selector)
+                ET.SubElement(node, "name").text = node.find("name").text
+            with self.assertRaisesRegex(component.ComponentError, "product profile: ambiguous member scalar"):
+                profile._xar(xar({path: b"x"}, mutate=repeat))
+        # No data-bearing-file check may mask the promised file-only scope.
+        with self.assertRaisesRegex(component.ComponentError, "product profile: ambiguous member scalar"):
+            profile._xar(xar({"cpu.pkg/Scripts": None}, mutate=repeat_member_names))
+        for mutation in ("unequal", "case", "traversal", "three", "name-attribute-first", "name-attribute-second",
+                         "name-child-first", "name-child-second", "missing-type", "duplicate-type", "type-child",
+                         "type-attribute", "non-file-type", "directory"):
+            def change(toc):
+                repeat_member_names(toc)
+                node = toc.find("file/file")
+                first, second = node.findall("name")
+                if mutation in ("unequal", "case", "traversal"):
+                    second.text = {"unequal": "PackageInfo", "case": "scripts", "traversal": "../PrivateSentinel"}[mutation]
+                elif mutation == "three":
+                    ET.SubElement(node, "name").text = "Scripts"
+                elif mutation.startswith("name-attribute"):
+                    (first if mutation.endswith("first") else second).set("PrivateSentinel", "private")
+                elif mutation.startswith("name-child"):
+                    ET.SubElement(first if mutation.endswith("first") else second, "PrivateSentinel")
+                elif mutation == "missing-type":
+                    node.remove(node.find("type"))
+                elif mutation == "duplicate-type":
+                    ET.SubElement(node, "type").text = "file"
+                elif mutation == "type-child":
+                    ET.SubElement(node.find("type"), "PrivateSentinel")
+                elif mutation == "type-attribute":
+                    node.find("type").set("PrivateSentinel", "private")
+                else:
+                    node.find("type").text = "directory" if mutation == "directory" else "symlink"
+            with self.subTest(mutation=mutation), \
+                 self.assertRaisesRegex(component.ComponentError, "product profile: ambiguous member scalar") as caught:
+                profile._xar(xar({"cpu.pkg/Scripts": b"x"}, mutate=change))
+            self.assertNotIn("PrivateSentinel", str(caught.exception))
+
     def test_swapped_component_contents_are_not_matched_by_basename(self):
         report = profile._observe(*fixture(changes={"cpu.pkg/Scripts": component_members("metal")["Scripts"]}))
         self.assertFalse(report["components"][0]["member_comparisons"][1]["decoded_bytes_match"])
@@ -248,7 +314,11 @@ class Portable(unittest.TestCase):
                         self.assertLess(len(message), 1024)
                         shape = json.loads(message.removeprefix(prefix))
                         self.assertEqual(set(shape), {"field", "depth", "member_ordinal", "direct_data_count",
-                                                     "direct_file_count", "type_class", "scalars"})
+                                                     "direct_file_count", "type_class", "scalars",
+                                                     "name_texts_equal", "name_classes"})
+                        self.assertEqual(shape["name_classes"], [] if field == "name" and mutation == "missing" else
+                                         ["unrecognized"] if field == "name" else ["Scripts"])
+                        self.assertEqual(shape["name_texts_equal"], field != "name" or mutation == "nested")
                         self.assertEqual((shape["field"], shape["depth"], shape["member_ordinal"]),
                                          (field, depth, ordinal))
                         self.assertEqual((shape["direct_data_count"], shape["direct_file_count"]), (1, 0))
@@ -430,7 +500,7 @@ def suite():
     classes = [Portable] + ([Posix] if os.name == "posix" else []) + ([NativeMac] if sys.platform == "darwin" else [])
     for cls in classes:
         result.addTests(cls(name) for name in sorted(cls.__dict__) if name.startswith("test_"))
-    expected = 20 + (1 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
+    expected = 21 + (1 if os.name == "posix" else 0) + (1 if sys.platform == "darwin" else 0)
     if result.countTestCases() != expected:
         raise RuntimeError(f"Product profile discovery mismatch: expected {expected}, got {result.countTestCases()}")
     return result

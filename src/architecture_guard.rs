@@ -1655,6 +1655,7 @@ fn macos_product_format_probe_is_fixed_bounded_and_never_installation_authority(
         "\"raw-xar-file\"",
         "\"unobserved\"",
         "\"owned_inputs_unchanged\": False",
+        "\"name_field_count\": len(names)",
         "inputs[target] = _identity(target)",
         "_directory_identity(path) == identity",
         "_identity(output) == output_identity",
@@ -1687,7 +1688,8 @@ fn macos_product_format_probe_is_fixed_bounded_and_never_installation_authority(
     }
     assert!(!codec.contains("macos_product_pkg_profile"));
     for required in [
-        "expected = 20 + (1 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)",
+        "expected = 21 + (1 if os.name == \"posix\" else 0) + (1 if sys.platform == \"darwin\" else 0)",
+        "test_identical_embedded_name_properties_are_observed_without_admission",
         "test_archive_decoded_and_report_aggregate_limits_are_executable",
         "test_unknown_names_attributes_values_and_paths_never_enter_report",
         "test_raw_archive_and_component_member_tree_are_distinct_observations",

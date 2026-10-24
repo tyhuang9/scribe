@@ -112,17 +112,26 @@ def _xar(data: bytes) -> dict:
     while pending:
         node, parent, depth = pending.pop()
         require(len(members) < MAX_MEMBERS and depth <= 3, "member count or depth exceeds bound")
+        names, types = node.findall("name"), node.findall("type")
+        # Own-fixture observation only. Native evidence shows two leaf names;
+        # Apple's replication code supplies a hypothesis, not productbuild proof.
+        # Require exact agreement and retain multiplicity instead of hiding it.
+        repeated_name = (depth == 1 and parent in {role + ".pkg/" for role in ROLES}
+                         and len(names) == 2 and all(not len(value) and not value.attrib for value in names)
+                         and names[0].text == names[1].text and names[0].text in LEAVES[:-1]
+                         and len(types) == 1 and not len(types[0]) and not types[0].attrib
+                         and types[0].text == "file")
         for field in ("name", "type"):
             matches = node.findall(field)
-            if len(matches) != 1 or len(matches[0]) != 0:
-                # Failure-only shape evidence. Do not select, synthesize or
-                # normalize a scalar; the shared strict predicate is unchanged.
-                types = node.findall("type")
+            if (len(matches) != 1 or len(matches[0]) != 0) and not (field == "name" and repeated_name):
+                # Closed failure evidence never chooses a conflicting value.
                 kind = "missing" if not types else "ambiguous" if len(types) != 1 or len(types[0]) else (
                     types[0].text if types[0].text in ("file", "directory") else "other")
                 shape = {"field": field, "depth": depth, "member_ordinal": len(members) + 1,
                          "direct_data_count": len(node.findall("data")),
                          "direct_file_count": len(node.findall("file")), "type_class": kind,
+                         "name_texts_equal": bool(names) and len({value.text for value in names}) == 1,
+                         "name_classes": sorted({_label(value.text or "") for value in names}),
                          "scalars": [{"field": key, "match_count": len(values),
                                       "nonleaf_count": sum(bool(len(value)) for value in values),
                                       "child_count": sum(len(value) for value in values),
@@ -131,13 +140,14 @@ def _xar(data: bytes) -> dict:
                                      for key in ("name", "type") for values in (node.findall(key),)]}
                 raise component.ComponentError("product profile: ambiguous member scalar " +
                     json.dumps(shape, sort_keys=True, separators=(",", ":"))) from None
-        name, kind = cpu_profile.scalar(node, "name"), cpu_profile.scalar(node, "type")
+        name = names[0].text if repeated_name else cpu_profile.scalar(node, "name")
+        kind = cpu_profile.scalar(node, "type")
         require(re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,63}", name) is not None
                 and name not in (".", ".."), "unsafe member name")
         path = parent + name
         require(path.casefold() not in {key.casefold() for key in members}, "duplicate or aliased member")
         require(kind in ("file", "directory"), "unsupported member type")
-        member = {"kind": kind, "encoding": "none", "stored": b"", "decoded": None}
+        member = {"kind": kind, "name_field_count": len(names), "encoding": "none", "stored": b"", "decoded": None}
         members[path] = member
         if kind == "directory":
             require(not node.findall("data"), "directory has data")
@@ -181,6 +191,7 @@ def _label(path: str) -> str:
 
 def _tree_shapes(tree: dict) -> list[dict]:
     return sorted(({"name_class": _label(name), "depth": name.count("/"), "kind": item["kind"],
+                    "name_field_count": item["name_field_count"],
                     "encoding": item["encoding"], "stored_bytes": len(item["stored"]),
                     "decoded_bytes": None if item["decoded"] is None else len(item["decoded"])}
                    for name, item in tree["members"].items()), key=lambda item: (item["name_class"], item["depth"]))
