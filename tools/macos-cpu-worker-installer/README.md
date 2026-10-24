@@ -393,12 +393,52 @@ These are source orchestration tests, not authentic pack/signature admission or
 native CPU-from-full-release construction evidence.
 
 This result is PRE-SIGN path/hash/size only. The existing CPU finalizer/package
-owner is still CPU-only and does not consume this new output. A later full-release
-CPU component owner must construct/finalize it itself. Eventual product
+owner remains CPU-only and does not consume this new output. The separate
+full-release owner below constructs/finalizes it itself. Eventual product
 composition must retain one complete app baseline across both component builds:
 `FrozenInputs` alone does not pin every desktop/Info/profile byte across separate
 calls. No publisher activation, package signing/authentication, product assembly,
 Installer invocation, installation or Auto enablement is added here.
+
+### Inactive full-release CPU finalization and component owner
+
+`build_support/macos_full_release_cpu_pkg_final.py` constructs an unsigned CPU
+component from its **own freshly built** full-release CPU entry. The source-fixed
+publisher policy denies before caller input access or native tools. No CLI,
+prebuilt-entry input, signing callback, publisher override or key discovery exists.
+The legacy CPU-only owner and its empty-catalog/default-deny admission are unchanged.
+
+The new owner retains one complete inventory and immutable content/node snapshot
+before application-publisher verification. It calls the full-release constructor,
+which independently admits the app and both production packs. That same baseline
+remains bound across construction, entry signing and packaging; it is never
+refreshed. The six-file CPU-only packaging tail is deliberately not used.
+
+Only the sole expected private `postinstall` can be finalized with the fixed CPU
+identifier, hardened runtime and timestamp request. Existing independent Apple
+Developer ID publisher/role checks, both-slice properties, no-entitlement grammar,
+CPU markers/dependencies/deployment target and CPU size limits remain required.
+The owner measures **post-sign** bytes and pins their node before building the
+fixed CPU `--nopayload` package. The bounded streaming CPU inspector must find
+exactly those bytes. Package identity is captured before inspection, rechecked
+after measurement, and rechecked with full source, policy and retained-entry
+identity immediately before exclusive publication. Neither an archive checksum
+nor the public signing-key selector grants publisher or installation authority.
+
+`python3 -B build_support/test_macos_full_release_cpu_pkg_final.py` discovers
+exactly 17 portable tests plus one POSIX cleanup test. All native children,
+including signing, remain mocked. Tests cover full-source changes and same-byte
+replacement, pre/post-sign and packaged-byte binding, cross-role/version rejection,
+policy changes, malformed or missing packages, collisions and uncertain cleanup.
+Publication ambiguity retains the final; cleanup uncertainty retains the owned
+workspace and error. This is not transactional source/package rollback.
+
+The result is still an **unsigned component package**, not authenticated installer
+input. Real full-release construction/signature qualification, component and
+outer-product authentication, app placement/replacement and Installer behavior
+remain separate work. Publisher policy, release routes and Auto stay default-deny.
+No actual signing, installation or protected-directory writes are needed to run
+these source tests.
 
 ### Native package-format prerequisite
 

@@ -1065,11 +1065,17 @@ owned full-release admission as Metal construction, including fresh Rust
 verification of both packs before CPU entry compilation. It embeds only the
 exact universal CPU worker under CPU bounds; the old CPU-only APIs still reject
 positive catalogs. Full original/private input bytes and node identities remain
-bound, without a public verified-receipt interface. This prerequisite does not
-integrate the CPU finalizer/component owner or product installer. Mocked source
-tests do not establish native full-release construction, package authentication,
-signing or installation; eventual composition still needs one complete app
-baseline across component builds, not only the frozen document/worker hashes.
+bound, without a public verified-receipt interface. A separate inactive CPU
+finalizer/component owner now constructs its own full-release entry, preserving
+one complete immutable input baseline across entry signing and fixed CPU
+packaging. It reuses independent CPU publisher/role checks and the bounded CPU
+package inspector, and binds inspected package bytes/nodes and the post-sign
+entry through exclusive publication. Legacy CPU-only admission is unchanged.
+Its output is an unsigned component, not authenticated installation input.
+Mocked source tests do not establish native full-release construction, package
+authentication, real signing or installation; eventual product composition still
+needs one complete app baseline across both component builds, not only the
+frozen document/worker hashes. Publisher policy and release routes remain denied.
 Before freezing the real PKG format, both Mac CI lanes also observe a tiny fixed
 unsigned scripts-only fixture using system tools without installing or executing
 it. The path-free profile is a prerequisite for author/validator source, not
