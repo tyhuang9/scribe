@@ -1820,6 +1820,92 @@ fn macos_cpu_finalization_is_default_denied_and_binds_only_own_postsign_bytes() 
 }
 
 #[test]
+fn macos_full_release_cpu_finalization_owns_construction_and_complete_binding() {
+    let source = include_str!("../build_support/macos_full_release_cpu_pkg_final.py");
+    let tests = include_str!("../build_support/test_macos_full_release_cpu_pkg_final.py");
+    let legacy = include_str!("../build_support/macos_cpu_pkg_final.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let owner = &source[source.find("def build_component(").unwrap()..];
+    let stages = [
+        "signing._publisher()",
+        "app.is_absolute()",
+        "files = tuple(sorted(full.input_files(packs).items()))",
+        "before = tuple(sorted(full.snapshot(app, dict(files)).items()))",
+        "signing._signature(app, publisher, \"application\")",
+        "entry.build_entry(app, scripts, frozen)",
+        "\"final-entry-signing\"",
+        "finalized = component.hash_file(operation, cpu.MAX_ENTRY)",
+        "signing._signature(operation, publisher, \"cpu\")",
+        "\"/usr/bin/pkgbuild\"",
+        "package_identity = component.fingerprint(candidate.lstat())",
+        "package._inspect_fresh(candidate, *finalized, version)",
+        "measured = component.hash_file(candidate,",
+        "component.publish_no_replace(candidate, output)",
+    ];
+    for pair in stages.windows(2) {
+        assert!(owner.find(pair[0]).unwrap() < owner.find(pair[1]).unwrap());
+    }
+    assert_eq!(owner.matches("\n    before =").count(), 1);
+    assert_eq!(owner.matches("_unchanged(app, files, before)").count(), 4);
+    for required in [
+        "import macos_full_release_cpu_entry as entry",
+        "type(frozen) is full.FrozenInputs",
+        "signing.CODE_IDENTIFIERS[\"cpu\"]",
+        "signing._entitlements(",
+        "component.CPU_ROOT.encode()",
+        "signing._only_entry(scripts)",
+        "signing._unchanged_policy(policy_before)",
+        "component.fingerprint(operation.lstat()) == identity",
+        "component.fingerprint(candidate.lstat()) == package_identity",
+        "package._package_bound(finalized[1])",
+        "operation=\"cpu-component-pkg-build\"",
+    ] {
+        assert!(
+            source.contains(required),
+            "full-release CPU owner lost {required}"
+        );
+    }
+    for forbidden in [
+        "verify_cpu_app",
+        "cpu_app_input_snapshot",
+        "_package_constructed_entry",
+        "argparse",
+        "__main__",
+        "os.environ",
+        "getenv(",
+        "signing_callback",
+        "subprocess.",
+        "productbuild",
+        "/usr/sbin/installer",
+        "--deep",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "full-release CPU owner gained {forbidden}"
+        );
+    }
+    assert!(legacy.contains("version = component.verify_cpu_app(app)"));
+    assert!(legacy.contains("entry.build_entry(app, scripts, digest, revision)"));
+    for required in [
+        "expected = 17 + (1 if os.name == \"posix\" else 0)",
+        "test_default_policy_denies_before_inputs_tools_or_workspace",
+        "test_every_full_source_file_content_and_same_byte_replacement_remain_bound",
+        "test_inspected_package_bytes_and_node_identity_remain_bound_until_publication",
+        "test_legacy_cpu_only_finalizer_still_rejects_full_release",
+        "test_uncertain_signer_and_packager_retain_owned_workspace_and_original_error",
+    ] {
+        assert!(
+            tests.contains(required),
+            "missing CPU finalization regression {required}"
+        );
+    }
+    assert!(
+        workflow.contains("run: python3 -B build_support/test_macos_full_release_cpu_pkg_final.py")
+    );
+    assert!(!workflow.contains("python3 -B build_support/macos_full_release_cpu_pkg_final.py"));
+}
+
+#[test]
 fn macos_metal_finalization_is_default_denied_and_owns_only_fresh_metal_entries() {
     let source = include_str!("../build_support/macos_metal_pkg_final.py");
     let tests = include_str!("../build_support/test_macos_metal_pkg_final.py");

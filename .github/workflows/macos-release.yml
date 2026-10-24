@@ -108,6 +108,8 @@ jobs:
         run: python3 -B build_support/test_macos_metal_pkg_entry.py
       - name: Verify same-release CPU entry construction with mocked native tools
         run: python3 -B build_support/test_macos_full_release_cpu_entry.py
+      - name: Verify inactive same-release CPU finalization and packaging with mocked tools
+        run: python3 -B build_support/test_macos_full_release_cpu_pkg_final.py
       - name: Verify CPU component PKG construction with mocked native tools
         run: python3 -B build_support/test_macos_cpu_pkg.py
       - name: Verify inactive CPU entry finalization with mocked signing tools
