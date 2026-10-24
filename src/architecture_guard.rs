@@ -1538,6 +1538,45 @@ fn macos_native_cpu_entry_contract_constructs_without_executing_or_uploading() {
 }
 
 #[test]
+fn macos_author_cleanup_confirmation_requires_reap_and_absent_group() {
+    let source = include_str!("../build_support/macos_cpu_component.py");
+    let tests = include_str!("../build_support/test_macos_cpu_component.py");
+    let capture = &source
+        [source.find("def capture(").unwrap()..source.find("def expected_description(").unwrap()];
+    let cleanup = &capture[capture.find("    finally:").unwrap()..];
+    let proof = &cleanup[cleanup.find("            if reaped:").unwrap()..];
+    assert!(
+        proof.find("os.killpg(process.pid, 0)").unwrap()
+            < proof.find("cleanup_error = None").unwrap()
+    );
+    assert!(
+        proof.find("except ProcessLookupError:").unwrap()
+            < proof.find("cleanup_error = None").unwrap()
+    );
+    assert!(
+        cleanup.find("process.wait(timeout=2)").unwrap()
+            < cleanup.find("            if reaped:").unwrap()
+    );
+    assert!(cleanup.contains("if not reaped and reserved:"));
+    assert!(cleanup.contains("if cleanup_error is not None or not reaped:"));
+    assert!(!proof.contains("signal.SIGKILL"));
+    for required in [
+        "test_capture_cleanup_confirmed_absence_resolves_only_the_signal_error",
+        "test_capture_cleanup_uncertainty_still_overrides_original_rejection",
+        "test_capture_lost_child_ownership_never_signals_or_waits",
+        "test_capture_normal_exit_probe_errors_remain_uncertain",
+        "test_capture_flood_bounds",
+        "test_signature_property_stream_keeps_both_bounds_and_returns_only_stderr",
+        "expected = 40",
+    ] {
+        assert!(
+            tests.contains(required),
+            "missing cleanup contract {required}"
+        );
+    }
+}
+
+#[test]
 fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
     let source = include_str!("../build_support/macos_cpu_component.py");
     let entry = include_str!("../build_support/macos_cpu_pkg_entry.py");
@@ -1596,7 +1635,7 @@ fn macos_authoring_tool_failures_report_closed_phase_without_raw_diagnostics() {
     for phase in ["entry-build-arm64", "entry-build-x86_64", "entry-combine"] {
         assert!(entry.contains(phase));
     }
-    assert!(tests.contains("expected = 36 + (19 if os.name == \"posix\" else 0)"));
+    assert!(tests.contains("expected = 40 + (19 if os.name == \"posix\" else 0)"));
     assert!(tests.contains("(6 if sys.platform == \"darwin\" else 0)"));
     for required in [
         "test_actual_bundle_context_preserves_signed_input_binding_without_execution",
