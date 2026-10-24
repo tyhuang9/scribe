@@ -1186,10 +1186,12 @@ fn macos_cpu_entry_construction_is_frozen_source_only_and_not_installation_autho
 #[test]
 fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
     let source = include_str!("../build_support/macos_metal_pkg_entry.py");
+    let admission = include_str!("../build_support/macos_full_release.py");
     let tests = include_str!("../build_support/test_macos_metal_pkg_entry.py");
     let workflow = include_str!("../.github/workflows/macos-release.yml");
     let build = &source[source.find("def build_entry(").unwrap()..];
-    assert!(build.find("os.geteuid() != 0").unwrap() < build.find("app.is_dir()").unwrap());
+    assert!(admission.find("os.geteuid() != 0").unwrap() < admission.find("app.is_dir()").unwrap());
+    assert!(build.contains("with full.owned_release(app, workspace, frozen) as owned:"));
     for required in [
         "snapshot(app, files)",
         "snapshot(copied, files)",
@@ -1197,6 +1199,13 @@ fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
         "desktop-bundle-signature-verification",
         "component.copy_new(app / name, destination, maximum) == before[name][:2]",
         "verify_pack(tool, root, arch, pack, release, version, frozen)",
+    ] {
+        assert!(
+            admission.contains(required),
+            "full-release admission lost {required}"
+        );
+    }
+    for required in [
         "\"--locked\", \"--offline\", \"--release\"",
         "\"--no-default-features\", \"--features\", \"installer-package-entry\"",
         "component.hash_file(binary, MAX_SLICE)",
@@ -1208,8 +1217,8 @@ fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
             "Metal entry constructor lost {required}"
         );
     }
-    assert!(source.contains("verify-production-macos-metal"));
-    assert!(source.contains("@dataclass(frozen=True)"));
+    assert!(admission.contains("verify-production-macos-metal"));
+    assert!(admission.contains("@dataclass(frozen=True)"));
     assert!(source.contains("MAX_ENTRY = 2 * MAX_SLICE"));
     for forbidden in [
         "__main__",
@@ -1226,6 +1235,10 @@ fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
             !source.contains(forbidden),
             "Metal construction gained {forbidden}"
         );
+        assert!(
+            !admission.contains(forbidden),
+            "full-release admission gained {forbidden}"
+        );
     }
     assert!(tests.contains("expected = 21 + (2 if os.name == \"posix\" else 0)"));
     assert!(workflow.contains("run: python3 -B build_support/test_macos_metal_pkg_entry.py"));
@@ -1235,6 +1248,88 @@ fn macos_metal_entry_constructor_preserves_source_only_frozen_boundaries() {
             .count(),
         2
     );
+}
+
+#[test]
+fn macos_full_release_cpu_entry_owns_admission_and_preserves_cpu_only_route() {
+    let source = include_str!("../build_support/macos_full_release_cpu_entry.py");
+    let admission = include_str!("../build_support/macos_full_release.py");
+    let cpu = include_str!("../build_support/macos_cpu_pkg_entry.py");
+    let tests = include_str!("../build_support/test_macos_full_release_cpu_entry.py");
+    let workflow = include_str!("../.github/workflows/macos-release.yml");
+    let stages = [
+        "with full.owned_release(app, workspace, frozen) as owned:",
+        "cpu._compile_owned_worker(",
+        "owned.check_unchanged()",
+        "component.hash_file(candidate, cpu.MAX_ENTRY)",
+        "component.publish_no_replace(candidate, owned.output)",
+    ];
+    for pair in stages.windows(2) {
+        assert!(source.find(pair[0]).unwrap() < source.find(pair[1]).unwrap());
+    }
+    assert!(source.contains("component.fingerprint(candidate.lstat()) == identity"));
+    let cpu_only = &cpu
+        [cpu.find("def build_entry(").unwrap()..cpu.find("def _compile_owned_worker(").unwrap()];
+    assert!(
+        cpu_only.find("component.snapshot_cpu_app_inputs(").unwrap()
+            < cpu_only.find("_compile_owned_worker(").unwrap()
+    );
+    assert!(!cpu_only.contains("owned_release"));
+    for required in [
+        "type(frozen) is FrozenInputs",
+        "tuple(sorted(files.items()))",
+        "tuple(sorted(before.items()))",
+        "tuple(sorted(copies.items()))",
+        "snapshot(self._app, dict(self._files))",
+        "snapshot(self.copied, dict(self._files))",
+        "component.hash_file(self._tool, component.MAX_WRITER) == self._tool_identity",
+        "verify_pack(tool, root, arch, pack, release, version, frozen)",
+    ] {
+        assert!(
+            admission.contains(required),
+            "full-release binding lost {required}"
+        );
+    }
+    assert!(
+        admission
+            .find("verify_pack(tool, root, arch, pack, release, version, frozen)")
+            .unwrap()
+            < admission.find("yield owned").unwrap()
+    );
+    assert!(!admission[admission.find("yield owned").unwrap()..].contains("finally:"));
+    for forbidden in [
+        "argparse",
+        "__main__",
+        "--sign",
+        "pkgbuild",
+        "productbuild",
+        "/usr/sbin/installer",
+    ] {
+        assert!(!source.contains(forbidden));
+        assert!(!admission.contains(forbidden));
+    }
+    assert!(!source.contains("SCRIBE_MACOS_METAL_PACKAGE_PACK"));
+    assert!(tests.contains("expected = 11 + (1 if os.name == \"posix\" else 0)"));
+    for required in [
+        "test_existing_cpu_only_constructor_still_rejects_the_full_app",
+        "test_either_pack_failure_prevents_all_cpu_compilation",
+        "test_every_source_and_private_file_change_or_replacement_rejects",
+        "test_candidate_change_and_same_byte_replacement_at_final_scope_check_reject",
+        "test_normal_postpublication_recheck_failure_reports_error_and_retains_final",
+        "test_uncertain_cpu_child_preserves_original_error_and_owned_workspace",
+    ] {
+        assert!(tests.contains(required));
+    }
+    assert_eq!(
+        workflow
+            .matches("build_support/*macos_full_release*.py")
+            .count(),
+        2
+    );
+    assert!(
+        workflow.contains("run: python3 -B build_support/test_macos_full_release_cpu_entry.py")
+    );
+    assert!(!workflow.contains("python3 -B build_support/macos_full_release_cpu_entry.py"));
 }
 
 #[test]
