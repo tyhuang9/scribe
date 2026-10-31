@@ -996,10 +996,7 @@ pub(super) fn run(
         .ok_or_else(|| anyhow!("campaign mode requires an expected power source"))?;
     // Establish the immutable baseline before opening inputs or constructing
     // either worker factory. This opt-in observation has no qualification authority.
-    let base_power_scheme = options
-        .guard_power_plan
-        .then(PowerPlanGuard::capture)
-        .transpose()
+    let base_power_scheme = PowerPlanGuard::optional(options.guard_power_plan)
         .map_err(|_| anyhow!("base power-scheme guard baseline unavailable; no worker started"))?;
     let guards = CaptureGuards {
         collector_affinity: collector_affinity.as_ref(),

@@ -7,11 +7,16 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, LocalFree};
-use windows_sys::Win32::System::Power::{
-    ACCESS_INDIVIDUAL_SETTING, ACCESS_SUBGROUP, PowerEnumerate, PowerGetActiveScheme,
-    PowerReadACValueIndex, PowerReadDCValueIndex,
+use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FreeLibrary, HMODULE, LocalFree,
 };
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
+use windows_sys::Win32::System::Power::{
+    ACCESS_INDIVIDUAL_SETTING, ACCESS_SUBGROUP, POWER_DATA_ACCESSOR,
+};
+use windows_sys::Win32::System::Registry::HKEY;
 use windows_sys::core::GUID;
 
 const METHOD: &str = "powrprof_active_base_scheme_ac_dc_indexes_v1";
@@ -226,9 +231,13 @@ pub(super) struct PowerPlanGuard {
 }
 
 impl PowerPlanGuard {
+    pub(super) fn optional(enabled: bool) -> ReadResult<Option<Self>> {
+        capture_when(enabled, Self::capture)
+    }
+
     pub(super) fn capture() -> ReadResult<Self> {
         let started = Instant::now();
-        let baseline = stable_snapshot(&mut NativeReader::new())?;
+        let baseline = native_snapshot()?;
         Ok(Self {
             baseline,
             attempts: Cell::new(1),
@@ -274,16 +283,19 @@ impl PowerPlanGuard {
     }
 }
 
+fn capture_when<T>(
+    enabled: bool,
+    capture: impl FnOnce() -> ReadResult<T>,
+) -> ReadResult<Option<T>> {
+    enabled.then(capture).transpose()
+}
+
 impl SchemeGuard for PowerPlanGuard {
     fn verify_unchanged(&self) -> ReadResult<()> {
         let started = Instant::now();
-        self.verify_with(
-            || stable_snapshot(&mut NativeReader::new()),
-            || {
-                u64::try_from(started.elapsed().as_micros())
-                    .map_err(|_| GuardFailure::EvidenceBound)
-            },
-        )
+        self.verify_with(native_snapshot, || {
+            u64::try_from(started.elapsed().as_micros()).map_err(|_| GuardFailure::EvidenceBound)
+        })
     }
 
     fn report(&self) -> GuardReport {
@@ -309,21 +321,164 @@ impl SchemeGuard for PowerPlanGuard {
 
 struct NativeReader {
     deadline: Instant,
+    api: PowerApi<SystemLibrary>,
+}
+
+fn native_snapshot() -> ReadResult<Snapshot> {
+    let mut reader = NativeReader::new()?;
+    let deadline = reader.deadline;
+    let observed = stable_snapshot(&mut reader);
+    drop(reader);
+    // Include releasing the owned module reference in the sampled budget.
+    check_deadline(deadline)?;
+    observed
 }
 
 impl NativeReader {
-    fn new() -> Self {
-        Self {
-            deadline: Instant::now() + READ_BUDGET,
-        }
+    fn new() -> ReadResult<Self> {
+        let deadline = Instant::now() + READ_BUDGET;
+        // SAFETY: the Windows loader returns the four documented PowrProf
+        // exports with the exact system ABI signatures declared below.
+        let api = unsafe { PowerApi::load_with(SystemLibrary, || check_deadline(deadline)) }?;
+        Ok(Self { deadline, api })
     }
 
     fn budget(&self) -> ReadResult<()> {
-        if Instant::now() >= self.deadline {
-            Err(GuardFailure::ReadBudgetExceeded)
-        } else {
-            Ok(())
+        check_deadline(self.deadline)
+    }
+}
+
+fn check_deadline(deadline: Instant) -> ReadResult<()> {
+    if Instant::now() >= deadline {
+        Err(GuardFailure::ReadBudgetExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+type Procedure = unsafe extern "system" fn() -> isize;
+type GetActive = unsafe extern "system" fn(HKEY, *mut *mut GUID) -> u32;
+type Enumerate = unsafe extern "system" fn(
+    HKEY,
+    *const GUID,
+    *const GUID,
+    POWER_DATA_ACCESSOR,
+    u32,
+    *mut u8,
+    *mut u32,
+) -> u32;
+type ReadIndex =
+    unsafe extern "system" fn(HKEY, *const GUID, *const GUID, *const GUID, *mut u32) -> u32;
+
+trait LibraryAccess {
+    fn directory(&self, buffer: &mut [u16]) -> u32;
+    fn load(&self, path: &[u16], flags: u32) -> HMODULE;
+    fn resolve(&self, module: HMODULE, name: &'static [u8]) -> Option<Procedure>;
+    fn release(&self, module: HMODULE);
+}
+
+struct SystemLibrary;
+
+impl LibraryAccess for SystemLibrary {
+    fn directory(&self, buffer: &mut [u16]) -> u32 {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
         }
+        // SAFETY: the bounded output buffer is valid for the synchronous call.
+        unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) }
+    }
+    fn load(&self, path: &[u16], flags: u32) -> HMODULE {
+        // SAFETY: the caller supplies a terminated, OS-derived absolute path.
+        unsafe { LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), flags) }
+    }
+    fn resolve(&self, module: HMODULE, name: &'static [u8]) -> Option<Procedure> {
+        // SAFETY: owner retains the acquired module; each fixed name is terminated.
+        unsafe { GetProcAddress(module, name.as_ptr()) }
+    }
+    fn release(&self, module: HMODULE) {
+        // SAFETY: release exactly this owner's acquired reference, not all mappings.
+        unsafe {
+            FreeLibrary(module);
+        }
+    }
+}
+
+struct LibraryOwner<L: LibraryAccess> {
+    access: L,
+    module: HMODULE,
+}
+
+impl<L: LibraryAccess> Drop for LibraryOwner<L> {
+    fn drop(&mut self) {
+        self.access.release(self.module);
+    }
+}
+
+struct PowerApi<L: LibraryAccess> {
+    active: GetActive,
+    enumerate: Enumerate,
+    ac: ReadIndex,
+    dc: ReadIndex,
+    _owner: LibraryOwner<L>,
+}
+
+fn system_library_path(query: impl FnOnce(&mut [u16]) -> u32) -> ReadResult<Vec<u16>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let mut buffer = [0_u16; 260];
+    let length = query(&mut buffer) as usize;
+    if length == 0 {
+        return Err(GuardFailure::QueryFailed);
+    }
+    if length >= buffer.len() || buffer[length] != 0 || buffer[..length].contains(&0) {
+        return Err(GuardFailure::MalformedResult);
+    }
+    let directory = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+    if !directory.is_absolute() {
+        return Err(GuardFailure::MalformedResult);
+    }
+    let mut path = directory
+        .join("powrprof.dll")
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
+    path.push(0);
+    Ok(path)
+}
+
+impl<L: LibraryAccess> PowerApi<L> {
+    // SAFETY: access must supply valid functions with the exact documented
+    // signatures for these fixed export names, valid through its module lifetime.
+    unsafe fn load_with(access: L, budget: impl Fn() -> ReadResult<()>) -> ReadResult<Self> {
+        budget()?;
+        let path = system_library_path(|buffer| access.directory(buffer));
+        budget()?;
+        let path = path?;
+        let module = access.load(&path, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if module.is_null() {
+            budget()?;
+            return Err(GuardFailure::QueryFailed);
+        }
+        let owner = LibraryOwner { access, module };
+        budget()?;
+        macro_rules! export {
+            ($name:literal, $signature:ty) => {{
+                let address = owner
+                    .access
+                    .resolve(owner.module, concat!($name, "\0").as_bytes());
+                budget()?;
+                let address = address.ok_or(GuardFailure::QueryFailed)?;
+                // SAFETY: the caller guarantees the fixed export's exact ABI.
+                unsafe { std::mem::transmute::<Procedure, $signature>(address) }
+            }};
+        }
+        Ok(Self {
+            active: export!("PowerGetActiveScheme", GetActive),
+            enumerate: export!("PowerEnumerate", Enumerate),
+            ac: export!("PowerReadACValueIndex", ReadIndex),
+            dc: export!("PowerReadDCValueIndex", ReadIndex),
+            _owner: owner,
+        })
     }
 }
 
@@ -411,7 +566,7 @@ impl Reader for NativeReader {
         // only that allocation is passed exactly once to its documented releaser.
         unsafe {
             active_query(
-                |pointer| PowerGetActiveScheme(std::ptr::null_mut(), pointer),
+                |pointer| (self.api.active)(std::ptr::null_mut(), pointer),
                 |pointer| LocalFree(pointer.cast()).is_null(),
                 || self.budget(),
             )
@@ -424,7 +579,7 @@ impl Reader for NativeReader {
         // SAFETY: all inputs live for the synchronous call; buffer is exactly one GUID.
         entry_query(
             |output, size| unsafe {
-                PowerEnumerate(
+                (self.api.enumerate)(
                     std::ptr::null_mut(),
                     &scheme,
                     group
@@ -452,12 +607,8 @@ impl Reader for NativeReader {
         );
         // SAFETY: reserved key is null; GUIDs and DWORD outputs live for each call.
         index_queries(
-            |ac| unsafe {
-                PowerReadACValueIndex(std::ptr::null_mut(), &scheme, &group, &setting, ac)
-            },
-            |dc| unsafe {
-                PowerReadDCValueIndex(std::ptr::null_mut(), &scheme, &group, &setting, dc)
-            },
+            |ac| unsafe { (self.api.ac)(std::ptr::null_mut(), &scheme, &group, &setting, ac) },
+            |dc| unsafe { (self.api.dc)(std::ptr::null_mut(), &scheme, &group, &setting, dc) },
             || self.budget(),
         )
     }
@@ -802,10 +953,271 @@ mod tests {
 
     #[test]
     fn expired_native_budget_rejects_before_any_query() {
-        let reader = NativeReader {
-            deadline: Instant::now() - Duration::from_secs(1),
-        };
-        assert_eq!(reader.budget(), Err(GuardFailure::ReadBudgetExceeded));
+        assert_eq!(
+            check_deadline(Instant::now() - Duration::from_secs(1)),
+            Err(GuardFailure::ReadBudgetExceeded)
+        );
+    }
+
+    #[derive(Default)]
+    struct LibraryState {
+        loads: Cell<usize>,
+        frees: Cell<usize>,
+        names: std::cell::RefCell<Vec<&'static [u8]>>,
+    }
+    struct TestLibrary {
+        state: std::rc::Rc<LibraryState>,
+        load_fails: bool,
+        missing: Option<usize>,
+    }
+    impl TestLibrary {
+        fn new(
+            state: &std::rc::Rc<LibraryState>,
+            load_fails: bool,
+            missing: Option<usize>,
+        ) -> Self {
+            Self {
+                state: state.clone(),
+                load_fails,
+                missing,
+            }
+        }
+    }
+    unsafe extern "system" fn stub_active(_: HKEY, _: *mut *mut GUID) -> u32 {
+        5
+    }
+    unsafe extern "system" fn stub_enumerate(
+        _: HKEY,
+        _: *const GUID,
+        _: *const GUID,
+        _: POWER_DATA_ACCESSOR,
+        _: u32,
+        _: *mut u8,
+        _: *mut u32,
+    ) -> u32 {
+        ERROR_NO_MORE_ITEMS
+    }
+    unsafe extern "system" fn stub_ac(
+        _: HKEY,
+        _: *const GUID,
+        _: *const GUID,
+        _: *const GUID,
+        output: *mut u32,
+    ) -> u32 {
+        // SAFETY: the caller supplies a live DWORD output, matching the OS API.
+        unsafe {
+            *output = 11;
+        }
+        ERROR_SUCCESS
+    }
+    unsafe extern "system" fn stub_dc(
+        _: HKEY,
+        _: *const GUID,
+        _: *const GUID,
+        _: *const GUID,
+        output: *mut u32,
+    ) -> u32 {
+        // SAFETY: the caller supplies a live DWORD output, matching the OS API.
+        unsafe {
+            *output = 13;
+        }
+        ERROR_SUCCESS
+    }
+    impl LibraryAccess for TestLibrary {
+        fn directory(&self, buffer: &mut [u16]) -> u32 {
+            let directory = "C:\\Windows\\System32\0".encode_utf16().collect::<Vec<_>>();
+            buffer[..directory.len()].copy_from_slice(&directory);
+            directory.len() as u32 - 1
+        }
+        fn load(&self, path: &[u16], flags: u32) -> HMODULE {
+            assert_eq!(
+                path,
+                "C:\\Windows\\System32\\powrprof.dll\0"
+                    .encode_utf16()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(flags, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            self.state.loads.set(self.state.loads.get() + 1);
+            if self.load_fails {
+                std::ptr::null_mut()
+            } else {
+                1_usize as HMODULE
+            }
+        }
+        fn resolve(&self, module: HMODULE, name: &'static [u8]) -> Option<Procedure> {
+            assert_eq!(module, 1_usize as HMODULE);
+            assert_eq!(self.state.frees.get(), 0, "resolved after module release");
+            let index = self.state.names.borrow().len();
+            self.state.names.borrow_mut().push(name);
+            if self.missing == Some(index) {
+                return None;
+            }
+            // SAFETY: each fixture address has exactly the corresponding
+            // documented signature; the loader restores that signature.
+            Some(unsafe {
+                match name {
+                    b"PowerGetActiveScheme\0" => {
+                        std::mem::transmute::<GetActive, Procedure>(stub_active)
+                    }
+                    b"PowerEnumerate\0" => {
+                        std::mem::transmute::<Enumerate, Procedure>(stub_enumerate)
+                    }
+                    b"PowerReadACValueIndex\0" => {
+                        std::mem::transmute::<ReadIndex, Procedure>(stub_ac)
+                    }
+                    b"PowerReadDCValueIndex\0" => {
+                        std::mem::transmute::<ReadIndex, Procedure>(stub_dc)
+                    }
+                    _ => panic!("unexpected export"),
+                }
+            })
+        }
+        fn release(&self, module: HMODULE) {
+            assert_eq!(module, 1_usize as HMODULE);
+            self.state.frees.set(self.state.frees.get() + 1);
+            assert_eq!(self.state.frees.get(), 1, "module reference released twice");
+        }
+    }
+
+    #[test]
+    fn system_library_path_is_os_derived_absolute_and_bounded() {
+        for directory in [
+            "",
+            "System32",
+            "\\Windows\\System32",
+            "C:System32",
+            "C:\\Windows\0\\System32",
+        ] {
+            let observed = system_library_path(|buffer| {
+                let value = directory.encode_utf16().collect::<Vec<_>>();
+                buffer[..value.len()].copy_from_slice(&value);
+                value.len() as u32
+            });
+            assert!(observed.is_err(), "accepted malformed system directory");
+        }
+        for size in [260, 261, u32::MAX] {
+            assert_eq!(
+                system_library_path(|_| size),
+                Err(GuardFailure::MalformedResult)
+            );
+        }
+        assert_eq!(
+            system_library_path(|buffer| {
+                buffer.fill(1);
+                20
+            }),
+            Err(GuardFailure::MalformedResult)
+        );
+    }
+
+    #[test]
+    fn library_load_and_every_missing_export_fail_closed_and_release_once() {
+        let expected: [&[u8]; 4] = [
+            b"PowerGetActiveScheme\0",
+            b"PowerEnumerate\0",
+            b"PowerReadACValueIndex\0",
+            b"PowerReadDCValueIndex\0",
+        ];
+        for missing in 0..4 {
+            let state = std::rc::Rc::new(LibraryState::default());
+            // SAFETY: TestLibrary supplies only fixed, exact-signature stubs.
+            let result = unsafe {
+                PowerApi::load_with(TestLibrary::new(&state, false, Some(missing)), || Ok(()))
+            };
+            assert_eq!(result.err(), Some(GuardFailure::QueryFailed));
+            assert_eq!(state.loads.get(), 1);
+            assert_eq!(state.frees.get(), 1);
+            assert_eq!(*state.names.borrow(), expected[..=missing]);
+        }
+        let state = std::rc::Rc::new(LibraryState::default());
+        // SAFETY: this fixture returns no module and cannot resolve any address.
+        let result =
+            unsafe { PowerApi::load_with(TestLibrary::new(&state, true, None), || Ok(())) };
+        assert_eq!(result.err(), Some(GuardFailure::QueryFailed));
+        assert_eq!(state.loads.get(), 1);
+        assert_eq!(state.frees.get(), 0);
+        assert!(state.names.borrow().is_empty());
+    }
+
+    #[test]
+    fn owned_library_survives_calls_and_disabled_guard_initiates_no_load() {
+        for enabled in [false, true] {
+            let state = std::rc::Rc::new(LibraryState::default());
+            let api = capture_when(enabled, || {
+                // SAFETY: exact-signature stubs live throughout the fixture.
+                unsafe { PowerApi::load_with(TestLibrary::new(&state, false, None), || Ok(())) }
+            })
+            .unwrap();
+            assert_eq!(state.loads.get(), usize::from(enabled));
+            assert_eq!(state.frees.get(), 0);
+            if let Some(api) = api.as_ref() {
+                let mut output = 0;
+                // SAFETY: reserved keys/pointers are unused by these stubs;
+                // DWORD output is live, and the module owner is still alive.
+                unsafe {
+                    assert_eq!((api.active)(std::ptr::null_mut(), std::ptr::null_mut()), 5);
+                    assert_eq!(
+                        (api.enumerate)(
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            ACCESS_SUBGROUP,
+                            0,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut()
+                        ),
+                        ERROR_NO_MORE_ITEMS
+                    );
+                    assert_eq!(
+                        (api.ac)(
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            &mut output
+                        ),
+                        ERROR_SUCCESS
+                    );
+                    assert_eq!(output, 11);
+                    assert_eq!(
+                        (api.dc)(
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            &mut output
+                        ),
+                        ERROR_SUCCESS
+                    );
+                    assert_eq!(output, 13);
+                }
+                assert_eq!(state.frees.get(), 0);
+            }
+            drop(api);
+            assert_eq!(state.frees.get(), usize::from(enabled));
+        }
+    }
+
+    #[test]
+    fn loader_budget_failure_releases_any_acquired_reference() {
+        for expired_at in 1..=7 {
+            let state = std::rc::Rc::new(LibraryState::default());
+            let checks = Cell::new(0);
+            // SAFETY: fixture exports have the exact ABI if resolution is reached.
+            let result = unsafe {
+                PowerApi::load_with(TestLibrary::new(&state, false, None), || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == expired_at {
+                        Err(GuardFailure::ReadBudgetExceeded)
+                    } else {
+                        Ok(())
+                    }
+                })
+            };
+            assert_eq!(result.err(), Some(GuardFailure::ReadBudgetExceeded));
+            assert_eq!(state.loads.get(), usize::from(expired_at >= 3));
+            assert_eq!(state.frees.get(), usize::from(expired_at >= 3));
+        }
     }
 
     #[test]

@@ -638,7 +638,18 @@ continue rejecting the distinct guarded schema 4; this change does not adapt
 diagnostics into qualification evidence.
 
 Before opening model/audio inputs or constructing worker factories, the guard
-captures the active **base** scheme using read-only PowrProf APIs. It enumerates
+captures the active **base** scheme using read-only PowrProf APIs. It obtains
+the OS system directory through `GetSystemDirectoryW` and loads the fixed
+`powrprof.dll` absolute path with `LOAD_LIBRARY_SEARCH_SYSTEM32`, only when the
+guard is requested. Four fixed, exact-signature exports share an owned module
+reference; setup failure and reader destruction release that reference. This
+does not guarantee the module is unmapped if other owners retain it. Missing
+DLLs/exports fail closed without an alternative search path. PowrProf remains
+forbidden as a normal/delay PE import or bundled payload; existing desktop and
+worker import policies stay unchanged. Module setup/release cost is included in
+the observed query overhead and the cooperative read budget.
+
+The guard enumerates
 subgroups and their stored AC/DC DWORD indices, explicitly including root
 settings through `NO_SUBGROUP_GUID`. A complete sample brackets enumeration with
 active-scheme queries and requires two equal traversals. It rejects query errors,
