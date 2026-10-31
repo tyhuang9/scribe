@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::power_plan::{GuardFailure, GuardReport, PowerPlanGuard, SchemeGuard};
 use super::telemetry::{ProcessAffinityObservation, SamplingSession, observe_process_affinity};
 use super::{
     CampaignPower, CommandOptions, InputReport, MemoryAvailabilityReport, ProviderMemoryReport,
@@ -35,6 +36,7 @@ use crate::transcription::{AccelerationPreference, ModelId};
 
 const KIND: &str = "windows_gpu_capture_campaign";
 const SCHEMA_VERSION: u8 = 3;
+const GUARDED_SCHEMA_VERSION: u8 = 4;
 const COLD_PAIRS: u8 = 5;
 const WARM_PAIRS: u8 = 20;
 const MAX_CAPTURES: usize = 14;
@@ -92,6 +94,7 @@ enum RecordStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FailureStage {
+    BasePowerScheme,
     PowerPreflight,
     WorkerPreflight,
     AudioPreparation,
@@ -109,6 +112,8 @@ enum FailureStage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FailureCategory {
+    BasePowerSchemeUnavailable,
+    BasePowerSchemeChanged,
     PowerUnknown,
     PowerMismatch,
     PowerChanged,
@@ -192,6 +197,30 @@ struct CampaignReport {
     failure: Option<FailureDescriptor>,
     unavailable: UnavailableReport,
     environmental_controls: EnvironmentalControls,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_power_scheme_guard: Option<GuardReport>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CaptureGuards<'a> {
+    collector_affinity: Option<&'a super::affinity::CollectorAffinityGuard>,
+    base_power_scheme: Option<&'a dyn SchemeGuard>,
+}
+
+impl CaptureGuards<'_> {
+    fn verify_base_scheme(self) -> std::result::Result<(), (FailureStage, FailureCategory)> {
+        self.base_power_scheme
+            .map_or(Ok(()), SchemeGuard::verify_unchanged)
+            .map_err(|failure| {
+                (
+                    FailureStage::BasePowerScheme,
+                    match failure {
+                        GuardFailure::StateChanged => FailureCategory::BasePowerSchemeChanged,
+                        _ => FailureCategory::BasePowerSchemeUnavailable,
+                    },
+                )
+            })
+    }
 }
 
 #[derive(Serialize)]
@@ -480,6 +509,7 @@ impl ReportBuilder {
                     affinity_control: unavailable,
                     power_plan: unavailable,
                 },
+                base_power_scheme_guard: None,
             },
             next_sequence: 0,
         }
@@ -801,6 +831,41 @@ impl WarmPool {
         Ok(())
     }
 
+    fn begin_guarded(
+        &self,
+        spec: RunSpec,
+        guards: CaptureGuards<'_>,
+    ) -> std::result::Result<
+        (
+            Arc<CaptureObservationWorker>,
+            WorkerObservationLease,
+            String,
+        ),
+        FailureDescriptor,
+    > {
+        // A potentially blocked native query must never clear the idle deadline
+        // or hold the lifecycle lock. Read the clock only after it returns.
+        guards
+            .verify_base_scheme()
+            .map_err(|(stage, category)| FailureDescriptor::for_spec(spec, stage, category))?;
+        self.begin(spec.target, Instant::now()).map_err(|_| {
+            let expired = self.failure().ok().flatten().is_some();
+            FailureDescriptor::for_spec(
+                spec,
+                if expired {
+                    FailureStage::WarmModelTtl
+                } else {
+                    FailureStage::ObservationValidation
+                },
+                if expired {
+                    FailureCategory::TtlExpired
+                } else {
+                    FailureCategory::IdentityMismatch
+                },
+            )
+        })
+    }
+
     fn failure(&self) -> Result<Option<Target>> {
         let state = self
             .shared
@@ -929,6 +994,16 @@ pub(super) fn run(
     let expected_power = options
         .campaign_power
         .ok_or_else(|| anyhow!("campaign mode requires an expected power source"))?;
+    // Establish the immutable baseline before opening inputs or constructing
+    // either worker factory. This opt-in observation has no qualification authority.
+    let base_power_scheme = PowerPlanGuard::optional(options.guard_power_plan)
+        .map_err(|_| anyhow!("base power-scheme guard baseline unavailable; no worker started"))?;
+    let guards = CaptureGuards {
+        collector_affinity: collector_affinity.as_ref(),
+        base_power_scheme: base_power_scheme
+            .as_ref()
+            .map(|guard| guard as &dyn SchemeGuard),
+    };
     let mut model = verify_input(
         &options.model,
         &options.model_sha256,
@@ -972,7 +1047,7 @@ pub(super) fn run(
                 FailureStage::WorkerPreflight,
                 FailureCategory::WorkerUnavailable,
             ));
-            return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
+            return publish_campaign(builder.report, &options.output, guards);
         }
     };
     let mut builder =
@@ -983,14 +1058,18 @@ pub(super) fn run(
             FailureStage::PowerPreflight,
             category,
         ));
-        return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
+        return publish_campaign(builder.report, &options.output, guards);
     }
 
-    if let Err(failure) =
-        preflight_workers(&cpu_factory, &gpu_factory, expected_power, &mut builder)
-    {
+    if let Err(failure) = preflight_workers(
+        &cpu_factory,
+        &gpu_factory,
+        expected_power,
+        &mut builder,
+        guards,
+    ) {
         builder.fail(failure);
-        return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
+        return publish_campaign(builder.report, &options.output, guards);
     }
 
     // Preflight support has succeeded for both exact workers before the WAV is
@@ -1007,7 +1086,7 @@ pub(super) fn run(
                 FailureStage::AudioPreparation,
                 FailureCategory::InvariantViolation,
             ));
-            return publish_campaign(builder.report, &options.output, collector_affinity.as_ref());
+            return publish_campaign(builder.report, &options.output, guards);
         }
     };
 
@@ -1026,7 +1105,7 @@ pub(super) fn run(
             &audio,
             expected_power,
             &mut builder,
-            collector_affinity.as_ref(),
+            guards,
         );
         let failed = record.failure;
         builder.report.runs.push(record);
@@ -1048,7 +1127,7 @@ pub(super) fn run(
                 &audio,
                 expected_power,
                 &mut builder,
-                collector_affinity.as_ref(),
+                guards,
             ),
             Err(_) => builder.fail(FailureDescriptor::global(
                 FailureStage::WarmModelTtl,
@@ -1057,7 +1136,7 @@ pub(super) fn run(
         }
     }
 
-    publish_campaign(builder.report, &options.output, collector_affinity.as_ref())
+    publish_campaign(builder.report, &options.output, guards)
 }
 
 fn preflight_workers(
@@ -1065,7 +1144,11 @@ fn preflight_workers(
     gpu_factory: &CaptureObservationWorkerFactory,
     expected_power: CampaignPower,
     builder: &mut ReportBuilder,
+    guards: CaptureGuards<'_>,
 ) -> std::result::Result<(), FailureDescriptor> {
+    guards
+        .verify_base_scheme()
+        .map_err(|(stage, category)| FailureDescriptor::global(stage, category))?;
     let cpu = Arc::new(cpu_factory.spawn());
     let gpu = Arc::new(gpu_factory.spawn());
     let mut cpu_lease = None;
@@ -1156,6 +1239,13 @@ fn preflight_workers(
     if !cpu_clean {
         builder.cleanup_failed(Some(Target::Cpu), None);
     }
+    // Cleanup must precede another potentially blocked native query. A known
+    // preflight/cleanup failure goes straight to the final post-cleanup check.
+    if !builder.report.incomplete
+        && let Err((stage, category)) = guards.verify_base_scheme()
+    {
+        builder.fail(FailureDescriptor::global(stage, category));
+    }
     if builder.report.incomplete {
         return Err(builder.report.failure.unwrap_or(FailureDescriptor::global(
             FailureStage::Cleanup,
@@ -1172,9 +1262,9 @@ fn run_cold(
     audio: &PreparedAudio,
     expected_power: CampaignPower,
     builder: &mut ReportBuilder,
-    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
+    guards: CaptureGuards<'_>,
 ) -> (CampaignRunRecord, bool) {
-    if super::require_collector_affinity(collector_affinity).is_err() {
+    if super::require_collector_affinity(guards.collector_affinity).is_err() {
         let failure = FailureDescriptor::for_spec(
             spec,
             FailureStage::ObservationValidation,
@@ -1268,9 +1358,10 @@ fn run_cold(
         expected_power,
         started,
         Some(power_before),
-        collector_affinity,
+        guards,
         |_, _| Ok(()),
     );
+    let record = postcheck_successful_attempt(spec, record, guards);
     let clean = cleanup_worker(&worker, Some(&lease));
     (record, clean)
 }
@@ -1287,7 +1378,7 @@ fn run_retained_campaign(
     audio: &PreparedAudio,
     expected_power: CampaignPower,
     builder: &mut ReportBuilder,
-    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
+    guards: CaptureGuards<'_>,
 ) {
     for (order, target) in [Target::Cpu, Target::Gpu].into_iter().enumerate() {
         check_pool(&pool, builder, Phase::Prime);
@@ -1301,7 +1392,7 @@ fn run_retained_campaign(
             order_in_pair: u8::try_from(order + 1).expect("prime order is bounded"),
             target,
         };
-        if super::require_collector_affinity(collector_affinity).is_err() {
+        if super::require_collector_affinity(guards.collector_affinity).is_err() {
             let failure = FailureDescriptor::for_spec(
                 spec,
                 FailureStage::ObservationValidation,
@@ -1440,7 +1531,7 @@ fn run_retained_campaign(
             expected_power,
             started,
             Some(power_before),
-            collector_affinity,
+            guards,
             |result_at, succeeded| {
                 if succeeded {
                     pool.install(
@@ -1455,6 +1546,7 @@ fn run_retained_campaign(
                 }
             },
         );
+        let record = postcheck_successful_attempt(spec, record, guards);
         let failure = record.failure;
         builder.report.runs.push(record);
         if let Some(failure) = failure {
@@ -1472,7 +1564,7 @@ fn run_retained_campaign(
             if builder.report.incomplete {
                 break;
             }
-            if super::require_collector_affinity(collector_affinity).is_err() {
+            if super::require_collector_affinity(guards.collector_affinity).is_err() {
                 let failure = FailureDescriptor::for_spec(
                     spec,
                     FailureStage::ObservationValidation,
@@ -1490,23 +1582,9 @@ fn run_retained_campaign(
                 break;
             }
             let started = Instant::now();
-            let (worker, lease, generation_ref) = match pool.begin(spec.target, started) {
+            let (worker, lease, generation_ref) = match pool.begin_guarded(spec, guards) {
                 Ok(retained) => retained,
-                Err(_) => {
-                    let expired = pool.failure().ok().flatten().is_some();
-                    let failure = FailureDescriptor::for_spec(
-                        spec,
-                        if expired {
-                            FailureStage::WarmModelTtl
-                        } else {
-                            FailureStage::ObservationValidation
-                        },
-                        if expired {
-                            FailureCategory::TtlExpired
-                        } else {
-                            FailureCategory::IdentityMismatch
-                        },
-                    );
+                Err(failure) => {
                     builder.report.runs.push(CampaignRunRecord::failed(
                         spec,
                         None,
@@ -1529,9 +1607,10 @@ fn run_retained_campaign(
                 expected_power,
                 started,
                 None,
-                collector_affinity,
+                guards,
                 |result_at, succeeded| pool.finish(spec.target, result_at, succeeded),
             );
+            let record = postcheck_successful_attempt(spec, record, guards);
             let failure = record.failure;
             builder.report.runs.push(record);
             if let Some(failure) = failure {
@@ -1614,6 +1693,44 @@ fn terminal_attempt_failure(
         })
 }
 
+fn dispatch_guarded_request<T>(
+    spec: RunSpec,
+    guards: CaptureGuards<'_>,
+    send: impl FnOnce() -> std::result::Result<T, (FailureStage, FailureCategory)>,
+) -> std::result::Result<T, (FailureStage, FailureCategory)> {
+    // Warm requests were checked before begin_guarded claimed the active slot;
+    // another potentially blocking read there would disable the idle watchdog.
+    if spec.phase != Phase::Warm {
+        guards.verify_base_scheme()?;
+    }
+    send()
+}
+
+fn postcheck_successful_attempt(
+    spec: RunSpec,
+    record: CampaignRunRecord,
+    guards: CaptureGuards<'_>,
+) -> CampaignRunRecord {
+    // Known failures must return to their owner's terminal cleanup immediately.
+    // The final post-cleanup guard still records any independently observed drift.
+    if record.status == RecordStatus::Failed {
+        return record;
+    }
+    if let Err((stage, category)) = guards.verify_base_scheme() {
+        let mut failed = CampaignRunRecord::failed(
+            spec,
+            record.generation_ref,
+            Duration::from_millis(record.end_to_end_ms),
+            record.power_source_before,
+            record.power_source_after,
+            FailureDescriptor::for_spec(spec, stage, category),
+        );
+        failed.worker_process_affinity = record.worker_process_affinity;
+        return failed;
+    }
+    record
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one attempt carries its exact frozen worker lease, prepared inputs, timing boundary and result-time lifecycle callback"
@@ -1628,7 +1745,7 @@ fn observe_attempt(
     expected_power: CampaignPower,
     started: Instant,
     initial_power: Option<PowerSource>,
-    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
+    guards: CaptureGuards<'_>,
     settled: impl FnOnce(Instant, bool) -> Result<()>,
 ) -> CampaignRunRecord {
     let mut power_before = initial_power;
@@ -1669,9 +1786,17 @@ fn observe_attempt(
                 )
             })?,
         );
-        worker
-            .transcribe_observed_retained(lease, artifact, spec.target.preference(), audio)
-            .map_err(|_| (FailureStage::Inference, FailureCategory::ObservationFailed))
+        dispatch_guarded_request(spec, guards, || {
+            lease.require_current().map_err(|_| {
+                (
+                    FailureStage::ObservationValidation,
+                    FailureCategory::IdentityMismatch,
+                )
+            })?;
+            worker
+                .transcribe_observed_retained(lease, artifact, spec.target.preference(), audio)
+                .map_err(|_| (FailureStage::Inference, FailureCategory::ObservationFailed))
+        })
     })();
     // The correlated response timestamp precedes sampler joining, endpoint
     // checks, validation, transcript hashing and report work. Notify the TTL
@@ -1704,7 +1829,8 @@ fn observe_attempt(
         record
     };
     let request_failure = execution.as_ref().err().copied();
-    let collector_constraint_stale = super::require_collector_affinity(collector_affinity).is_err();
+    let collector_constraint_stale =
+        super::require_collector_affinity(guards.collector_affinity).is_err();
     if let Some((stage, category)) = terminal_attempt_failure(
         request_failure,
         affinity_after
@@ -1865,6 +1991,19 @@ fn campaign_specs() -> Vec<RunSpec> {
 }
 
 fn validate_report(report: &CampaignReport) -> Result<()> {
+    match (
+        report.schema_version,
+        report.base_power_scheme_guard.as_ref(),
+    ) {
+        (SCHEMA_VERSION, None) => {}
+        (GUARDED_SCHEMA_VERSION, Some(guard)) if guard.validate(report.incomplete) => {
+            if !report.incomplete && guard.completed_checks() != 1 + 2 + 2 * MAX_RECORDS as u32 + 1
+            {
+                bail!("guarded campaign omitted required endpoint checks")
+            }
+        }
+        _ => bail!("campaign power-scheme guard and schema are inconsistent"),
+    }
     if report.captures.len() > MAX_CAPTURES || report.runs.len() > MAX_RECORDS {
         bail!("campaign report exceeds its record bounds")
     }
@@ -2059,21 +2198,37 @@ fn serialize_report(report: &CampaignReport) -> Result<Vec<u8>> {
 fn publish_campaign(
     mut report: CampaignReport,
     output: &Path,
-    collector_affinity: Option<&super::affinity::CollectorAffinityGuard>,
+    guards: CaptureGuards<'_>,
 ) -> Result<()> {
     // The final collector check precedes serialization and the no-replace
     // publication. A failure converts a would-be success into the existing
     // categorized incomplete shape; there is no fallible post-publication
     // collector check that could contradict the immutable artifact.
-    if super::require_collector_affinity(collector_affinity).is_err() {
+    if super::require_collector_affinity(guards.collector_affinity).is_err() {
         mark_collector_constraint_failure(&mut report);
     }
+    finalize_base_scheme_guard(&mut report, guards);
     let bytes = serialize_report(&report)?;
     publish_atomic_new(output, &bytes)?;
     if report.incomplete {
         bail!("campaign incomplete; categorized diagnostic report published after cleanup")
     }
     Ok(())
+}
+
+fn finalize_base_scheme_guard(report: &mut CampaignReport, guards: CaptureGuards<'_>) {
+    if let Some(guard) = guards.base_power_scheme {
+        // All workers have been retired before the final observation. Nothing
+        // fallible is checked after immutable no-replace publication.
+        if let Err((stage, category)) = guards.verify_base_scheme() {
+            report.incomplete = true;
+            report
+                .failure
+                .get_or_insert(FailureDescriptor::global(stage, category));
+        }
+        report.schema_version = GUARDED_SCHEMA_VERSION;
+        report.base_power_scheme_guard = Some(guard.report());
+    }
 }
 
 fn mark_collector_constraint_failure(report: &mut CampaignReport) {
@@ -2832,6 +2987,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["kind"], KIND);
         assert_eq!(value["schema_version"], 3);
+        assert!(value.get("base_power_scheme_guard").is_none());
         assert_eq!(value["unsigned"], true);
         assert_eq!(value["unqualified"], true);
         assert_eq!(value["auto_eligible"], false);
@@ -3191,9 +3347,9 @@ mod tests {
             FailureStage::WorkerPreflight,
             FailureCategory::WorkerUnavailable,
         ));
-        assert!(publish_campaign(builder.report, &output, None).is_err());
+        assert!(publish_campaign(builder.report, &output, CaptureGuards::default()).is_err());
         let original = std::fs::read(&output).unwrap();
-        assert!(publish_campaign(complete_report(), &output, None).is_err());
+        assert!(publish_campaign(complete_report(), &output, CaptureGuards::default()).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), original);
         let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
         assert_eq!(value["incomplete"], true);
@@ -3201,5 +3357,261 @@ mod tests {
         assert!(value["runs"].as_array().unwrap().is_empty());
         std::fs::remove_file(&output).unwrap();
         std::fs::remove_dir(&directory).unwrap();
+    }
+
+    struct TestSchemeGuard {
+        checks: std::cell::Cell<u32>,
+        fail_at: Option<u32>,
+        failure: std::cell::Cell<Option<GuardFailure>>,
+    }
+
+    impl TestSchemeGuard {
+        fn new(checks: u32, fail_at: Option<u32>) -> Self {
+            Self {
+                checks: std::cell::Cell::new(checks),
+                fail_at,
+                failure: std::cell::Cell::new(None),
+            }
+        }
+        fn guards(&self) -> CaptureGuards<'_> {
+            CaptureGuards {
+                base_power_scheme: Some(self),
+                ..CaptureGuards::default()
+            }
+        }
+    }
+
+    impl SchemeGuard for TestSchemeGuard {
+        fn verify_unchanged(&self) -> std::result::Result<(), GuardFailure> {
+            if let Some(failure) = self.failure.get() {
+                return Err(failure);
+            }
+            self.checks.set(self.checks.get() + 1);
+            if self.fail_at == Some(self.checks.get()) {
+                self.failure.set(Some(GuardFailure::StateChanged));
+                Err(GuardFailure::StateChanged)
+            } else {
+                Ok(())
+            }
+        }
+        fn report(&self) -> GuardReport {
+            GuardReport::fixture(
+                self.checks.get() - u32::from(self.failure.get().is_some()),
+                self.failure.get(),
+            )
+        }
+    }
+
+    #[test]
+    fn guarded_schema_requires_all_endpoints_and_retains_unqualified_scope() {
+        let guard = TestSchemeGuard::new(107, None);
+        let mut report = complete_report();
+        finalize_base_scheme_guard(&mut report, guard.guards());
+        let value: serde_json::Value =
+            serde_json::from_slice(&serialize_report(&report).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["base_power_scheme_guard"]["checks_completed"], 108);
+        assert_eq!(
+            value["base_power_scheme_guard"]["effective_policy_observed"],
+            false
+        );
+        assert_eq!(
+            value["base_power_scheme_guard"]["continuous_stability_established"],
+            false
+        );
+        assert_eq!(
+            value["environmental_controls"]["power_plan"]["status"],
+            "unavailable"
+        );
+        assert_eq!(value["unsigned"], true);
+        assert_eq!(value["unqualified"], true);
+        assert_eq!(value["auto_eligible"], false);
+        assert_eq!(value["release_approved"], false);
+        for checks in [1, 107, 109] {
+            report.base_power_scheme_guard = Some(GuardReport::fixture(checks, None));
+            assert!(serialize_report(&report).is_err());
+        }
+        report.base_power_scheme_guard = None;
+        assert!(serialize_report(&report).is_err());
+        report.schema_version = 3;
+        report.base_power_scheme_guard = Some(guard.report());
+        assert!(serialize_report(&report).is_err());
+    }
+
+    #[test]
+    fn final_guard_failure_preserves_primary_error_and_cannot_overwrite_publication() {
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let directory = std::env::temp_dir().join(format!("scribe-guarded-report-{}", hex(&nonce)));
+        std::fs::create_dir(&directory).unwrap();
+        let output = directory.join("guarded.json");
+        let guard = TestSchemeGuard::new(107, Some(108));
+        assert!(publish_campaign(complete_report(), &output, guard.guards()).is_err());
+        let original = std::fs::read(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(value["incomplete"], true);
+        assert_eq!(value["cleanup_complete"], true);
+        assert_eq!(value["failure"]["stage"], "base_power_scheme");
+        assert_eq!(value["base_power_scheme_guard"]["failure"], "state_changed");
+        assert!(
+            publish_campaign(
+                complete_report(),
+                &output,
+                TestSchemeGuard::new(107, None).guards()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), original);
+
+        let primary =
+            FailureDescriptor::global(FailureStage::Inference, FailureCategory::ObservationFailed);
+        let mut failed = builder();
+        failed.fail(primary);
+        failed.cleanup_failed(Some(Target::Gpu), Some(Phase::Warm));
+        finalize_base_scheme_guard(&mut failed.report, guard.guards());
+        assert_eq!(failed.report.failure, Some(primary));
+        assert!(!failed.report.cleanup_complete);
+        assert!(serialize_report(&failed.report).is_ok());
+        assert_eq!(
+            guard.checks.get(),
+            108,
+            "latched failure must not read again"
+        );
+        let value = serde_json::to_value(failed.report).unwrap();
+        assert_eq!(value["base_power_scheme_guard"]["failure"], "state_changed");
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn warm_precheck_leaves_idle_deadline_armed_and_revalidates_expiry_before_dispatch() {
+        struct ExpireDuringQuery<'a>(&'a WarmPool);
+        impl SchemeGuard for ExpireDuringQuery<'_> {
+            fn verify_unchanged(&self) -> std::result::Result<(), GuardFailure> {
+                let mut state = self
+                    .0
+                    .shared
+                    .0
+                    .try_lock()
+                    .expect("guard must hold no pool lock");
+                assert_eq!(state.lifecycle.active, None);
+                assert!(
+                    state.lifecycle.slots[Target::Cpu.index()]
+                        .deadline_ns
+                        .is_some()
+                );
+                // Deterministic simulated delay: the idle deadline passes while
+                // the native query is in progress. No worker/model is installed.
+                state.lifecycle.slots[Target::Cpu.index()].deadline_ns = Some(0);
+                Ok(())
+            }
+            fn report(&self) -> GuardReport {
+                GuardReport::fixture(1, None)
+            }
+        }
+        let pool = WarmPool::start().unwrap();
+        pool.shared
+            .0
+            .lock()
+            .unwrap()
+            .lifecycle
+            .install(Target::Cpu, pool.tick(Instant::now()), pool.ttl_ns)
+            .unwrap();
+        let spec = measured_specs(Phase::Warm, 1)[0];
+        assert_eq!(spec.target, Target::Cpu);
+        let guard = ExpireDuringQuery(&pool);
+        let result = pool.begin_guarded(
+            spec,
+            CaptureGuards {
+                base_power_scheme: Some(&guard),
+                ..CaptureGuards::default()
+            },
+        );
+        assert_eq!(result.err().unwrap().category, FailureCategory::TtlExpired);
+        assert_eq!(pool.shared.0.lock().unwrap().lifecycle.active, None);
+        assert!(pool.stop_and_cleanup().iter().all(|(_, clean)| *clean));
+    }
+
+    #[test]
+    fn failed_warm_guard_never_begins_a_request_and_retains_terminal_cleanup() {
+        let pool = WarmPool::start().unwrap();
+        let guard = TestSchemeGuard::new(1, Some(2));
+        let spec = measured_specs(Phase::Warm, 1)[0];
+        let failure = pool.begin_guarded(spec, guard.guards()).err().unwrap();
+        assert_eq!(failure.stage, FailureStage::BasePowerScheme);
+        assert_eq!(pool.shared.0.lock().unwrap().lifecycle.active, None);
+        assert!(pool.stop_and_cleanup().iter().all(|(_, clean)| *clean));
+    }
+
+    #[test]
+    fn cold_and_prime_guard_failure_prevents_model_audio_dispatch() {
+        for phase in [Phase::Cold, Phase::Prime] {
+            let mut spec = measured_specs(Phase::Cold, 1)[0];
+            spec.phase = phase;
+            let guard = TestSchemeGuard::new(1, Some(2));
+            let result: std::result::Result<(), _> =
+                dispatch_guarded_request(spec, guard.guards(), || {
+                    panic!("model/audio request dispatched after failed guard")
+                });
+            assert_eq!(
+                result,
+                Err((
+                    FailureStage::BasePowerScheme,
+                    FailureCategory::BasePowerSchemeChanged
+                ))
+            );
+        }
+        let spec = measured_specs(Phase::Warm, 1)[0];
+        let guard = TestSchemeGuard::new(1, Some(2));
+        assert_eq!(
+            dispatch_guarded_request(spec, guard.guards(), || Ok(7)),
+            Ok(7)
+        );
+        assert_eq!(
+            guard.checks.get(),
+            1,
+            "warm dispatch cannot add a blocking check after begin"
+        );
+    }
+
+    #[test]
+    fn known_attempt_failures_skip_postquery_and_success_postfailure_preserves_timing() {
+        for (index, spec) in campaign_specs().into_iter().enumerate() {
+            let guard = TestSchemeGuard::new(1, Some(2));
+            let primary = FailureDescriptor::for_spec(
+                spec,
+                FailureStage::Inference,
+                FailureCategory::ObservationFailed,
+            );
+            let failed = CampaignRunRecord::failed(
+                spec,
+                None,
+                Duration::from_millis(17),
+                None,
+                None,
+                primary,
+            );
+            let result = postcheck_successful_attempt(spec, failed, guard.guards());
+            assert_eq!(result.failure, Some(primary));
+            assert_eq!(
+                guard.checks.get(),
+                1,
+                "known failure blocked cleanup on a new query"
+            );
+
+            let mut complete = complete_report();
+            let record = complete.runs.swap_remove(index);
+            let elapsed = record.end_to_end_ms;
+            let affinity = record.worker_process_affinity.clone();
+            let result = postcheck_successful_attempt(spec, record, guard.guards());
+            assert_eq!(result.status, RecordStatus::Failed);
+            assert_eq!(result.failure.unwrap().stage, FailureStage::BasePowerScheme);
+            assert_eq!(result.end_to_end_ms, elapsed);
+            assert_eq!(result.worker_process_affinity, affinity);
+            assert!(result.backend_ms.is_none());
+            assert!(result.available_device_memory_bytes_before.is_none());
+            assert!(result.available_device_memory_bytes_after.is_none());
+            assert_eq!(guard.checks.get(), 2);
+        }
     }
 }

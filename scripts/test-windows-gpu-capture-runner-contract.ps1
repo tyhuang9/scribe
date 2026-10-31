@@ -30,6 +30,7 @@ function Get-LoopFilterLiterals([Management.Automation.Language.ForEachStatement
 $expectedCaptureFilters = @(
     'windows_gpu_capture::tests',
     'windows_gpu_capture::affinity::tests',
+    'windows_gpu_capture::power_plan::tests',
     'onnx_worker::windows_capture_launch::tests',
     'windows_gpu_capture::telemetry::tests',
     'windows_gpu_capture::campaign::tests',
@@ -180,7 +181,8 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
             [string]$GpuPackSha256,
             [string]$GpuPackSecurityEpoch,
             [string]$WorkerAllowedProcessorMask,
-            [switch]$ConstrainCollector
+            [switch]$ConstrainCollector,
+            [switch]$GuardPowerPlan
         )
         # Production passes this dictionary, not a Hashtable. In particular,
         # Hashtable.Contains must not appear to work only in these fixtures.
@@ -255,21 +257,29 @@ if ($argumentBuilder.Count -ne 1) { throw 'Expected exactly one capture wrapper 
                     } elseif ($affinityCase -eq 'disabled') {
                         $caseOptions.ConstrainCollector = $false
                     }
-                    $actual = @(Invoke-CaptureBoundArgumentFixture @caseOptions)
-                    if ($actual.Count -ne $caseExpected.Count) { throw 'Capture wrapper changed its argument count.' }
-                    for ($index = 0; $index -lt $caseExpected.Count; $index++) {
-                        if ($actual[$index] -cne $caseExpected[$index]) {
-                            throw 'Capture wrapper changed an input, campaign power or affinity constraint.'
+                    $guardCases = @('omitted', 'disabled')
+                    if ($includeFrozenIdentity -and $null -ne $power) { $guardCases += 'enabled' }
+                    foreach ($guardCase in $guardCases) {
+                        $guardOptions = $caseOptions.Clone()
+                        $guardExpected = @($caseExpected)
+                        if ($guardCase -ne 'omitted') { $guardOptions.GuardPowerPlan = ($guardCase -eq 'enabled') }
+                        if ($guardCase -eq 'enabled') { $guardExpected += '--guard-power-plan' }
+                        $actual = @(Invoke-CaptureBoundArgumentFixture @guardOptions)
+                        if ($actual.Count -ne $guardExpected.Count) { throw 'Capture wrapper changed its argument count.' }
+                        for ($index = 0; $index -lt $guardExpected.Count; $index++) {
+                            if ($actual[$index] -cne $guardExpected[$index]) {
+                                throw 'Capture wrapper changed an input, campaign power or guard constraint.'
+                            }
                         }
+                        $forwardingCount++
                     }
-                    $forwardingCount++
                 }
             }
         }
     }
-    if ($forwardingCount -ne 36) { throw 'Capture wrapper forwarding cases were not all discovered.' }
+    if ($forwardingCount -ne 88) { throw 'Capture wrapper forwarding cases were not all discovered.' }
 } -Definition $argumentBuilder[0].Extent.Text
-Write-Output 'Capture wrapper forwarding contracts passed (36 cases, including worker-only, collector and explicitly disabled constraints); no collector was launched.'
+Write-Output 'Capture wrapper forwarding contracts passed (88 cases, including omitted, disabled and enabled power-plan guard); no collector was launched.'
 
 # Exercise the full wrapper with a GUI executable, not a console mock. Named
 # events control completion, so no sleep or GPU/app/profile access is needed.

@@ -301,12 +301,52 @@ try {
         $prelaunchAssertionCount++
     }
 
+    foreach ($includePins in @($false, $true)) {
+        foreach ($includeCampaign in @($false, $true)) {
+            if ($includePins -and $includeCampaign) { continue }
+            $arguments = $wrapperArguments.Clone()
+            if (-not $includePins) { foreach ($field in $frozenIdentityFields) { $arguments.Remove($field) } }
+            if ($includeCampaign) { $arguments.CampaignPower = 'ac' }
+            $arguments.GuardPowerPlan = $true
+            $rejected = $false
+            try { & $wrapper @arguments }
+            catch {
+                if ($_.Exception.Message -cne 'Power-plan guard requires campaign mode and the complete frozen worker and pack identity set.') { throw 'Power-plan guard rejected at the wrong boundary.' }
+                $rejected = $true
+            }
+            if (-not $rejected) { throw 'Power-plan guard accepted incomplete constraints.' }
+            $prelaunchAssertionCount++
+        }
+    }
+    foreach ($field in $frozenIdentityFields) {
+        $arguments = $wrapperArguments.Clone()
+        $arguments.Remove($field)
+        $arguments.CampaignPower = 'ac'
+        $arguments.GuardPowerPlan = $true
+        $rejected = $false
+        try { & $wrapper @arguments }
+        catch {
+            if ($_.Exception.Message -cne 'Frozen worker and pack identity pins must be supplied as one complete set.') { throw 'Guarded partial pins rejected at the wrong boundary.' }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Power-plan guard accepted partial pins.' }
+        $prelaunchAssertionCount++
+    }
+    $duplicateRejected = $false
+    try { & $wrapper @wrapperArguments -GuardPowerPlan -GuardPowerPlan }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike 'ParameterAlreadyBound,*') { throw 'Duplicate power-plan guard rejected at the wrong boundary.' }
+        $duplicateRejected = $true
+    }
+    if (-not $duplicateRejected) { throw 'Capture wrapper accepted a duplicate power-plan guard.' }
+    $prelaunchAssertionCount++
+
     $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('scribe-capture-wrapper-' + [Guid]::NewGuid().ToString('N'))
-    $null = New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop
     $emptyExe = Join-Path $fixtureRoot 'empty.exe'
     $notExe = Join-Path $fixtureRoot 'not-executable.bin'
     $wrongDigestExe = Join-Path $fixtureRoot 'wrong-digest.exe'
     $ownedFiles = @($emptyExe, $notExe, $wrongDigestExe)
+    $null = New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop
     try {
         foreach ($path in $ownedFiles) {
             $fixture = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -365,6 +405,37 @@ try {
             if (-not $rejected) { throw 'Capture wrapper bypassed the digest check with a disabled constraint.' }
             $prelaunchAssertionCount++
         }
+        foreach ($power in @('ac', 'battery')) {
+            $arguments = $wrapperArguments.Clone()
+            $arguments.CollectorPath = $wrongDigestExe
+            $arguments.CampaignPower = $power
+            $arguments.GuardPowerPlan = $true
+            $rejected = $false
+            try { & $wrapper @arguments }
+            catch {
+                if ($_.Exception.Message -cne 'Collector digest does not match the expected build.') { throw 'Valid guarded campaign rejected before the digest boundary.' }
+                $rejected = $true
+            }
+            if (-not $rejected) { throw 'Guarded campaign bypassed digest verification.' }
+            $prelaunchAssertionCount++
+        }
+        foreach ($includePins in @($false, $true)) {
+            foreach ($power in @($null, 'ac', 'battery')) {
+                $arguments = $wrapperArguments.Clone()
+                if (-not $includePins) { foreach ($field in $frozenIdentityFields) { $arguments.Remove($field) } }
+                if ($null -ne $power) { $arguments.CampaignPower = $power }
+                $arguments.CollectorPath = $wrongDigestExe
+                $arguments.GuardPowerPlan = $false
+                $rejected = $false
+                try { & $wrapper @arguments }
+                catch {
+                    if ($_.Exception.Message -cne 'Collector digest does not match the expected build.') { throw 'Disabled guard changed the existing digest boundary.' }
+                    $rejected = $true
+                }
+                if (-not $rejected) { throw 'Disabled guard bypassed digest verification.' }
+                $prelaunchAssertionCount++
+            }
+        }
         # A rejected digest must release the read lock; none of these fixtures
         # is runnable, and no test is allowed to reach executable launch.
         $exclusive = [IO.File]::Open($wrongDigestExe, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -378,11 +449,11 @@ try {
         }
         Remove-Item -LiteralPath $fixtureRoot -ErrorAction Stop
     }
-    if ($prelaunchAssertionCount -ne 87) {
-        throw "Capture wrapper prelaunch assertion count changed: expected 87, observed $prelaunchAssertionCount."
+    if ($prelaunchAssertionCount -ne 110) {
+        throw "Capture wrapper prelaunch assertion count changed: expected 110, observed $prelaunchAssertionCount."
     }
     if ($ScriptOnly) {
-        Write-Output 'Windows GPU capture observation script contracts passed (87 prelaunch assertions plus 9 GUI process fixtures); GPU/Cargo checks not run.'
+        Write-Output 'Windows GPU capture observation script contracts passed (110 prelaunch assertions plus 9 GUI process fixtures); GPU/Cargo checks not run.'
         return
     }
 
@@ -399,6 +470,7 @@ try {
     Invoke-CaptureCargo @('clippy', '--locked', '--offline', '--all-targets', '--features', "ui-harness,$feature", '--', '-D', 'warnings')
 
     foreach ($filter in @('windows_gpu_capture::tests', 'windows_gpu_capture::affinity::tests',
+            'windows_gpu_capture::power_plan::tests',
             'onnx_worker::windows_capture_launch::tests',
             'windows_gpu_capture::telemetry::tests',
             'windows_gpu_capture::campaign::tests',

@@ -687,6 +687,17 @@ try {
     $unreviewedCollectorDelay = Join-Path $testRoot 'unreviewed-collector-delay.exe'
     Write-TestPe $unreviewedCollectorDelay 0x8664 'kernel32.dll' 'psapi-helper.dll'
     Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $unreviewedCollectorDelay } 'unreviewed delay import DLL: psapi-helper.dll'
+    # The optional base-scheme guard must load its system DLL explicitly from
+    # the OS system directory. Never turn it into a loader-time dependency.
+    $powerNormal = Join-Path $testRoot 'power-normal.exe'
+    Write-TestPe $powerNormal 0x8664 'PowrProf.DLL' 'user32.dll'
+    Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $powerNormal } 'unreviewed normal import DLL: powrprof.dll'
+    $powerDelay = Join-Path $testRoot 'power-delay.exe'
+    Write-TestPe $powerDelay 0x8664 'kernel32.dll' 'PowrProf.DLL'
+    Invoke-ExpectedFailure { Assert-ReviewedWindowsPe $powerDelay } 'unreviewed delay import DLL: powrprof.dll'
+    foreach ($relativeDll in @('powrprof.dll', 'PowrProf.DLL', 'nested/powrprof.dll')) {
+        Invoke-ExpectedFailure { Assert-AllowedPayloadFile $relativeDll } 'unallowlisted executable or DLL'
+    }
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
     Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3
