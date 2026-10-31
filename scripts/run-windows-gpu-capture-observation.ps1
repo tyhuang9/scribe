@@ -23,7 +23,8 @@ param(
     [string]$GpuPackSha256,
     [string]$GpuPackSecurityEpoch,
     [string]$WorkerAllowedProcessorMask,
-    [switch]$ConstrainCollector
+    [switch]$ConstrainCollector,
+    [switch]$GuardPowerPlan
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +54,10 @@ if ($PSBoundParameters.ContainsKey('WorkerAllowedProcessorMask')) {
 }
 if ($ConstrainCollector -and -not $PSBoundParameters.ContainsKey('WorkerAllowedProcessorMask')) {
     throw 'Collector constraint requires a worker allowed processor mask and complete frozen identity set.'
+}
+if ($GuardPowerPlan -and (-not $PSBoundParameters.ContainsKey('CampaignPower') -or
+        $frozenIdentityCount -ne $frozenIdentityFields.Count)) {
+    throw 'Power-plan guard requires campaign mode and the complete frozen worker and pack identity set.'
 }
 
 function Test-CaptureReservedWindowsName([string]$Value) {
@@ -141,6 +146,9 @@ function Get-CaptureObservationArguments([Collections.IDictionary]$Options) {
     }
     if ($Options.Keys -contains 'ConstrainCollector' -and [bool]$Options['ConstrainCollector']) {
         $arguments += '--constrain-collector'
+    }
+    if ($Options.Keys -contains 'GuardPowerPlan' -and [bool]$Options['GuardPowerPlan']) {
+        $arguments += '--guard-power-plan'
     }
     return $arguments
 }

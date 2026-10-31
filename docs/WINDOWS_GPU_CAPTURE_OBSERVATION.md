@@ -627,6 +627,72 @@ and
 APIs. Their endpoint results do not establish a resolved native inference-thread
 count, which remains unavailable.
 
+## Optional sampled base power-scheme guard
+
+Frozen campaigns may add `--guard-power-plan` (PowerShell `-GuardPowerPlan`).
+It requires campaign mode and all eleven existing CPU/GPU worker and pack pins,
+validated before input or executable access. Omitting it, or explicitly passing
+`-GuardPowerPlan:$false`, preserves schema 3 and performs no power-scheme query.
+Single-pair observation is unchanged. Existing installed schema-3 validators
+continue rejecting the distinct guarded schema 4; this change does not adapt
+diagnostics into qualification evidence.
+
+Before opening model/audio inputs or constructing worker factories, the guard
+captures the active **base** scheme using read-only PowrProf APIs. It enumerates
+subgroups and their stored AC/DC DWORD indices, explicitly including root
+settings through `NO_SUBGROUP_GUID`. A complete sample brackets enumeration with
+active-scheme queries and requires two equal traversals. It rejects query errors,
+zero or duplicate identifiers, malformed results, empty setting inventories,
+more than 64 total subgroup namespaces or 1,024 total settings, and truncated
+enumeration. Ordering is canonical before comparing and hashing snapshots.
+
+Guarded acquisition rechecks against the original immutable baseline around
+preflight and every request, then after all worker cleanup and before immutable
+publication. Cold/prime prechecks precede model/audio dispatch. Warm prechecks
+run outside lifecycle locks while the idle watchdog remains armed; beginning the
+request then revalidates expiry and worker identity. The correlated response
+timestamp still starts the five-minute idle lifetime before sampler completion
+or the postcheck. A guard error latches, stops later requests, and preserves
+existing retirement paths. An earlier request/cleanup failure remains visible
+beside the independent guard failure; a final-check error publishes only an
+incomplete diagnostic report.
+Known failed requests return directly to terminal cleanup without another native
+postcheck. Preflight workers are retired before their postcheck; failed preflight
+skips it. The final post-cleanup check still observes independent scheme failure.
+
+The new `base_power_scheme_guard` contains a fixed method
+`powrprof_active_base_scheme_ac_dc_indexes_v1`, baseline `snapshot_sha256`,
+subgroup/setting counts, attempted/completed checks, aggregate
+`query_elapsed_micros`, and an optional categorical failure. A successful full
+campaign requires exactly 108 checks: baseline, two preflight endpoints, two
+endpoints for each of 52 requests, and final publication. Each sample's finite
+queries share a cooperative three-second budget checked before/after native
+calls; this cannot interrupt an OS call that blocks. Evidence counts are bounded
+at 256. No GUIDs, setting values, friendly names or user labels are serialized.
+
+The SHA-256 input is the domain bytes
+`SCRIBE-WINDOWS-BASE-POWER-SCHEME-SNAPSHOT-V1` followed by a NUL, the scheme's
+16 RFC-order GUID bytes, then a little-endian u32 subgroup count. Each sorted
+subgroup contributes its GUID and little-endian u32 setting count; each sorted
+setting contributes its GUID and little-endian u32 AC and DC indices. It is
+distinct from the qualification contract's `power_plan_sha256`.
+
+Prechecks add cost inside the cold, prime and warm end-to-end timing windows;
+postchecks occur after the recorded response timestamp and sampler completion.
+Aggregate query cost includes baseline, preflight and final checks as well.
+These timings require separate instrumentation qualification. Endpoint equality
+cannot establish continuous stability. Effective power-mode overlays, PPM/vendor
+policies, thermal state and background isolation are not observed. Therefore
+`effective_policy_observed` and `continuous_stability_established` remain false,
+and `environmental_controls.power_plan` remains unavailable. All reports remain
+unsigned, unqualified, not Auto-eligible and not release-approved.
+
+The native contract is documented by Microsoft for
+[`PowerGetActiveScheme`](https://learn.microsoft.com/en-us/windows/win32/api/powersetting/nf-powersetting-powergetactivescheme),
+[`PowerEnumerate`](https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerenumerate),
+[`PowerReadACValueIndex`](https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerreadacvalueindex)
+and [`PowerReadDCValueIndex`](https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerreaddcvalueindex).
+
 ## Verification
 
 The canonical offline verification entry point is:
@@ -637,7 +703,8 @@ pwsh -NoProfile -File .\scripts\test-windows-gpu-capture-observation.ps1
 
 It uses locked, offline Cargo commands: formatting, ordinary desktop, collector
 and independent CPU-worker production checks, strict lint, positive test
-discovery and fourteen test groups: collector, capture-owned job affinity,
+discovery and fifteen test groups: collector, capture-owned job affinity,
+sampled base power-scheme guard,
 native capture launch,
 native telemetry, paired campaigns,
 strict probe CLI, authenticated probe stages/privacy/cleanup, supervisor
@@ -651,7 +718,7 @@ child helper, with event/pipe gates and bounded exit/cleanup checks; the test ho
 never assigns itself. No-policy and post-assignment-failure child cases cover
 unchanged scheduling and exit-only failure behavior. These are synthetic native
 process tests, not GPU/model or protected-host qualification.
-`-ScriptOnly` provides the fast inner-loop check: script parsing, eighty-seven
+`-ScriptOnly` provides the fast inner-loop check: script parsing, 110
 counted prelaunch argument/file-rejection assertions (including frozen identity
 forwarding, partial, duplicate and malformed values), and nine local GUI-process
 cases covering omitted identities, worker-only and collector constraints.
@@ -666,10 +733,11 @@ Both modes also run fifteen in-memory runner contracts covering exact feature
 arguments, locked/offline execution, list-before-run discovery, empty or wrong
 test groups and nonzero discovery/execution exits. These use a fake Cargo
 command and cannot substitute for native verification.
-Thirty-six in-memory forwarding cases additionally cover both GPU backends with the
+Eighty-eight in-memory forwarding cases additionally cover both GPU backends with the
 campaign option omitted, on AC, or on battery, with and without the complete
 frozen identity set, optional worker-only or collector constraints with the
-complete set, and an explicitly disabled collector switch.
+complete set, an explicitly disabled collector switch, and omitted, disabled or
+enabled power-scheme guards.
 They preserve individual argument values containing spaces
 and shell metacharacters. They exercise the actual PowerShell bound-parameter
 dictionary, not just a Hashtable substitute, and launch no collector.

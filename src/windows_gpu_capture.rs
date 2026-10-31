@@ -6,6 +6,7 @@
 
 pub(crate) mod affinity;
 mod campaign;
+mod power_plan;
 mod telemetry;
 
 use std::ffi::{OsStr, OsString};
@@ -58,6 +59,7 @@ struct CommandOptions {
     frozen_inputs: Option<Arc<CaptureFrozenInputs>>,
     worker_allowed_processor_mask: Option<RequestedWorkerAffinity>,
     constrain_collector: bool,
+    guard_power_plan: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -646,6 +648,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     let mut campaign_power = None;
     let mut worker_allowed_processor_mask = None;
     let mut constrain_collector = false;
+    let mut guard_power_plan = false;
     let pin_flags = [
         "--cpu-worker-build-id",
         "--cpu-worker-sha256",
@@ -680,6 +683,14 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
                 "battery" => CampaignPower::Battery,
                 _ => bail!("--campaign-power must be ac or battery"),
             });
+            index += 1;
+            continue;
+        }
+        if name == "--guard-power-plan" {
+            if guard_power_plan {
+                bail!("--guard-power-plan may be specified only once")
+            }
+            guard_power_plan = true;
             index += 1;
             continue;
         }
@@ -808,6 +819,9 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
     if worker_allowed_processor_mask.is_some() && frozen_inputs.is_none() {
         bail!("worker allowed processor mask requires the complete frozen worker constraints");
     }
+    if guard_power_plan && (campaign_power.is_none() || frozen_inputs.is_none()) {
+        bail!("power-plan guard requires campaign mode and complete frozen worker constraints");
+    }
     Ok(CommandOptions {
         model: PathBuf::from(required(model, "--model")?),
         model_sha256,
@@ -821,6 +835,7 @@ fn parse_command(args: &[OsString]) -> Result<CommandOptions> {
         frozen_inputs,
         worker_allowed_processor_mask,
         constrain_collector,
+        guard_power_plan,
     })
 }
 
@@ -1097,6 +1112,53 @@ mod tests {
             args.extend([flag.into(), value.into()]);
         }
         args
+    }
+
+    #[test]
+    fn power_plan_guard_cli_is_opt_in_unique_and_requires_campaign_with_all_pins_before_io() {
+        assert!(!parse_command(&command_args()).unwrap().guard_power_plan);
+        for power in ["ac", "battery"] {
+            let mut valid = frozen_command_args();
+            valid.extend([
+                "--campaign-power".into(),
+                power.into(),
+                "--guard-power-plan".into(),
+            ]);
+            assert!(parse_command(&valid).unwrap().guard_power_plan);
+            for index in (command_args().len()..frozen_command_args().len()).step_by(2) {
+                let mut partial = valid.clone();
+                partial.drain(index..index + 2);
+                assert!(run_local_command(&partial).is_err());
+            }
+            valid.push("--guard-power-plan".into());
+            assert!(
+                run_local_command(&valid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("only once")
+            );
+        }
+        for mut args in [command_args(), frozen_command_args()] {
+            args.push("--guard-power-plan".into());
+            assert!(
+                run_local_command(&args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires campaign")
+            );
+        }
+        let mut no_pins = command_args();
+        no_pins.extend([
+            "--campaign-power".into(),
+            "ac".into(),
+            "--guard-power-plan".into(),
+        ]);
+        assert!(
+            run_local_command(&no_pins)
+                .unwrap_err()
+                .to_string()
+                .contains("complete frozen")
+        );
     }
 
     #[test]
