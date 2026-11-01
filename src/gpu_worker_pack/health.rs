@@ -79,6 +79,12 @@ pub(crate) enum FailureObservation {
     PartialOutput,
 }
 
+impl FailureObservation {
+    pub(crate) fn is_quarantine_eligible(self) -> bool {
+        quarantine_eligible_code(self).is_some()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthRecord {
@@ -486,6 +492,15 @@ impl<'a> HealthCache<'a> {
             .and_then(|name| name.to_str())
             .unwrap_or("gpu-health");
         self.path.with_file_name(format!(".{name}.lock"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_exclusive_lock_for_test<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> Result<R, HealthCacheError> {
+        let _lock = exclusive_file_lock(&self.lock_path())?;
+        Ok(operation())
     }
 }
 
