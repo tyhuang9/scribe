@@ -9731,30 +9731,148 @@ struct ActiveInferenceRoute {
 struct GpuRouteHealth {
     path: Arc<PathBuf>,
     witnesses: HealthWitnesses,
+    pending_failures: Arc<Mutex<PendingGpuHealthFailures>>,
 }
 
 static GPU_HEALTH_CLOCK: SystemClock = SystemClock;
+const MAX_PENDING_GPU_HEALTH_FAILURES: usize = 128;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingGpuHealthFailure {
+    witnesses: HealthWitnesses,
+    key: HealthKey,
+    observation: FailureObservation,
+    needs_persist: bool,
+}
+
+#[derive(Default)]
+struct PendingGpuHealthFailures {
+    entries: Vec<PendingGpuHealthFailure>,
+    deny_all_gpu: bool,
+}
+
+impl PendingGpuHealthFailures {
+    fn retain_failed_write(
+        &mut self,
+        witnesses: &HealthWitnesses,
+        key: &HealthKey,
+        observation: FailureObservation,
+    ) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.witnesses == *witnesses && entry.key == *key)
+        {
+            existing.observation = observation;
+            existing.needs_persist = true;
+            return;
+        }
+        if self.entries.len() == MAX_PENDING_GPU_HEALTH_FAILURES {
+            self.deny_all_gpu = true;
+            return;
+        }
+        self.entries.push(PendingGpuHealthFailure {
+            witnesses: witnesses.clone(),
+            key: key.clone(),
+            observation,
+            needs_persist: true,
+        });
+    }
+
+    fn matching(
+        &self,
+        witnesses: &HealthWitnesses,
+        key: &HealthKey,
+    ) -> Option<&PendingGpuHealthFailure> {
+        self.entries
+            .iter()
+            .find(|entry| entry.witnesses == *witnesses && entry.key == *key)
+    }
+
+    fn matching_mut(
+        &mut self,
+        witnesses: &HealthWitnesses,
+        key: &HealthKey,
+    ) -> Option<&mut PendingGpuHealthFailure> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.witnesses == *witnesses && entry.key == *key)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectiveGpuHealthDecision {
+    Disk(HealthDecision),
+    PendingFailure,
+    SessionDenied,
+}
 
 impl GpuRouteHealth {
     fn cache(&self) -> HealthCache<'static> {
         HealthCache::open(&*self.path, self.witnesses.clone(), &GPU_HEALTH_CLOCK)
     }
 
-    fn consume_retry(&self, route: &InferenceWorkerRoute) -> bool {
-        if !route.consume_retry_bypass {
+    fn consume_retry(&self, route: &InferenceWorkerRoute, allow_pending_recovery: bool) -> bool {
+        if !route.provider.is_gpu() {
             return true;
         }
         let Some(key) = route.health_key.as_ref() else {
             return false;
         };
-        self.cache().consume_explicit_retry(key).unwrap_or(false)
+        match self.decision(key) {
+            EffectiveGpuHealthDecision::Disk(HealthDecision::Available) => {
+                !route.consume_retry_bypass
+            }
+            EffectiveGpuHealthDecision::Disk(HealthDecision::RetryBypass) => {
+                route.consume_retry_bypass
+                    && self.cache().consume_explicit_retry(key).unwrap_or(false)
+            }
+            EffectiveGpuHealthDecision::Disk(HealthDecision::InvalidOrUnprobed)
+            | EffectiveGpuHealthDecision::PendingFailure => allow_pending_recovery,
+            EffectiveGpuHealthDecision::Disk(HealthDecision::Quarantined { .. })
+            | EffectiveGpuHealthDecision::SessionDenied => false,
+        }
+    }
+
+    fn decision(&self, key: &HealthKey) -> EffectiveGpuHealthDecision {
+        let pending = match self.pending_failures.lock() {
+            Ok(pending) => pending,
+            Err(_) => return EffectiveGpuHealthDecision::SessionDenied,
+        };
+        if pending.deny_all_gpu {
+            return EffectiveGpuHealthDecision::SessionDenied;
+        }
+        if pending.matching(&self.witnesses, key).is_some() {
+            return EffectiveGpuHealthDecision::PendingFailure;
+        }
+        drop(pending);
+        EffectiveGpuHealthDecision::Disk(self.cache().decision(key))
     }
 
     fn record_failure(&self, route: &InferenceWorkerRoute, observation: FailureObservation) {
         let Some(key) = route.health_key.clone() else {
             return;
         };
-        let _ = self.cache().record_observed_failure(key, observation);
+        match self
+            .cache()
+            .record_observed_failure(key.clone(), observation)
+        {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                if let Ok(mut pending) = self.pending_failures.lock()
+                    && let Some(entry) = pending.matching_mut(&self.witnesses, &key)
+                {
+                    entry.observation = observation;
+                    entry.needs_persist = false;
+                }
+            }
+            Err(_) if observation.is_quarantine_eligible() => {
+                if let Ok(mut pending) = self.pending_failures.lock() {
+                    pending.retain_failed_write(&self.witnesses, &key, observation);
+                }
+            }
+            Err(_) => {}
+        }
     }
 
     fn record_idle_probe_success(&self, route: &InferenceWorkerRoute) {
@@ -9769,7 +9887,86 @@ impl GpuRouteHealth {
         reason = "Stage 5 exposes the existing internal explicit-retry action in the UI"
     )]
     fn grant_explicit_retry(&self, key: &HealthKey) -> bool {
+        if !matches!(self.decision(key), EffectiveGpuHealthDecision::Disk(_)) {
+            return false;
+        }
         self.cache().grant_explicit_retry(key).unwrap_or(false)
+    }
+
+    fn persist_pending_failure_for_recovery(&self, key: &HealthKey) -> Result<(), RuntimeError> {
+        let pending = self.pending_failures.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable(
+                "retained GPU health failure state is unavailable".to_owned(),
+            )
+        })?;
+        if pending.deny_all_gpu {
+            return Err(RuntimeError::WorkerUnavailable(
+                "retained GPU health failures deny GPU recovery for this app session".to_owned(),
+            ));
+        }
+        let entry = pending
+            .matching(&self.witnesses, key)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::WorkerUnavailable(
+                    "retained GPU health failure is unavailable for recovery".to_owned(),
+                )
+            })?;
+        drop(pending);
+
+        if !entry.needs_persist
+            && matches!(
+                self.cache().decision(key),
+                HealthDecision::Quarantined { .. } | HealthDecision::RetryBypass
+            )
+        {
+            return Ok(());
+        }
+        match self
+            .cache()
+            .record_observed_failure(key.clone(), entry.observation)
+        {
+            Ok(Some(_)) => {
+                let mut pending = self.pending_failures.lock().map_err(|_| {
+                    RuntimeError::WorkerUnavailable(
+                        "retained GPU health failure state is unavailable".to_owned(),
+                    )
+                })?;
+                let retained = pending.matching_mut(&self.witnesses, key).ok_or_else(|| {
+                    RuntimeError::WorkerUnavailable(
+                        "retained GPU health failure changed during recovery".to_owned(),
+                    )
+                })?;
+                retained.needs_persist = false;
+                Ok(())
+            }
+            Ok(None) | Err(_) => Err(RuntimeError::WorkerUnavailable(
+                "GPU retry could not persist the retained health failure".to_owned(),
+            )),
+        }
+    }
+
+    fn clear_pending_failure(&self, key: &HealthKey) -> Result<(), RuntimeError> {
+        let mut pending = self.pending_failures.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable(
+                "retained GPU health failure state is unavailable".to_owned(),
+            )
+        })?;
+        pending
+            .entries
+            .retain(|entry| entry.witnesses != self.witnesses || entry.key != *key);
+        Ok(())
+    }
+
+    fn retain_pending_after_interrupted_recovery(&self, key: &HealthKey) {
+        if self.cache().decision(key) != HealthDecision::Available {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_failures.lock()
+            && let Some(entry) = pending.matching_mut(&self.witnesses, key)
+        {
+            entry.needs_persist = true;
+        }
     }
 }
 
@@ -9787,6 +9984,7 @@ pub(crate) struct InferenceWorkerRegistry {
     /// widen its pre-probe qualification allowlist.
     auto_gpu_routes: Arc<Mutex<GpuRouteCatalogCache>>,
     gpu_health_path: Option<Arc<PathBuf>>,
+    pending_gpu_health: Arc<Mutex<PendingGpuHealthFailures>>,
     active_route: Arc<Mutex<Option<ActiveInferenceRoute>>>,
     route_execution: Arc<Mutex<()>>,
     #[cfg(test)]
@@ -10745,35 +10943,6 @@ fn auto_qualified_gpu_route_catalog(
         .catalog
 }
 
-fn auto_gpu_route_plan(
-    cpu_routes: Arc<Vec<InferenceWorkerRoute>>,
-    catalog: VerifiedGpuRouteCatalog,
-    policy: &AutoQualificationPolicy,
-    model_digest: &str,
-    health_path: Option<&Arc<PathBuf>>,
-    allow_unprobed_idle_health: bool,
-    selection_power_source: PowerSource,
-) -> (InferenceWorkerRoutePlan, Option<AutoAdmissionWitness>) {
-    let qualified = auto_qualified_gpu_route_catalog_with_admission(
-        catalog,
-        policy,
-        model_digest,
-        selection_power_source,
-    );
-    let catalog = qualified.catalog;
-    let auto_live_admission = (!catalog.routes.is_empty()).then(|| catalog.clone());
-    let mut plan = health_filtered_gpu_route_plan(
-        catalog,
-        model_digest,
-        health_path,
-        allow_unprobed_idle_health,
-    );
-    plan.selection_power_source = Some(selection_power_source);
-    plan.auto_live_admission = auto_live_admission;
-    reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
-    (plan, qualified.volatile_admission_witness)
-}
-
 fn auto_route_is_power_eligible(route: &InferenceWorkerRoute, power_source: PowerSource) -> bool {
     power_source == PowerSource::Ac
         || !route.provider.is_gpu()
@@ -10843,10 +11012,27 @@ fn reserve_auto_cpu_fallback(
     plan.routes = Arc::new(routes);
 }
 
+#[cfg(test)]
 fn health_filtered_gpu_route_plan(
     catalog: VerifiedGpuRouteCatalog,
     model_digest: &str,
     health_path: Option<&Arc<PathBuf>>,
+    allow_unprobed_idle_health: bool,
+) -> InferenceWorkerRoutePlan {
+    health_filtered_gpu_route_plan_with_pending(
+        catalog,
+        model_digest,
+        health_path,
+        Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
+        allow_unprobed_idle_health,
+    )
+}
+
+fn health_filtered_gpu_route_plan_with_pending(
+    catalog: VerifiedGpuRouteCatalog,
+    model_digest: &str,
+    health_path: Option<&Arc<PathBuf>>,
+    pending_gpu_health: Arc<Mutex<PendingGpuHealthFailures>>,
     allow_unprobed_idle_health: bool,
 ) -> InferenceWorkerRoutePlan {
     if catalog.routes.is_empty() {
@@ -10887,12 +11073,15 @@ fn health_filtered_gpu_route_plan(
             app_build: DESKTOP_BUILD_ID.to_owned(),
             device_set_digest: catalog.device_set_digest,
         },
+        pending_failures: pending_gpu_health,
     };
     let mut diagnostic = catalog.diagnostic;
     let mut recovery_routes = Vec::with_capacity(catalog.routes.len());
     let mut routes = Vec::with_capacity(catalog.routes.len());
     let mut quarantined = 0_usize;
     let mut awaiting_probe = 0_usize;
+    let mut retained_failures = 0_usize;
+    let mut session_denials = 0_usize;
     let mut skipped_targets = catalog.skipped_targets;
     for base in catalog.routes.iter() {
         let Some(key) = route_health_key(base, model_digest) else {
@@ -10910,13 +11099,13 @@ fn health_filtered_gpu_route_plan(
         };
         let mut route = base.clone();
         route.health_key = Some(key.clone());
-        match health.cache().decision(&key) {
-            HealthDecision::Available => routes.push(route),
-            HealthDecision::RetryBypass => {
+        match health.decision(&key) {
+            EffectiveGpuHealthDecision::Disk(HealthDecision::Available) => routes.push(route),
+            EffectiveGpuHealthDecision::Disk(HealthDecision::RetryBypass) => {
                 route.consume_retry_bypass = true;
                 routes.push(route);
             }
-            HealthDecision::Quarantined { .. } => {
+            EffectiveGpuHealthDecision::Disk(HealthDecision::Quarantined { .. }) => {
                 quarantined = quarantined.saturating_add(1);
                 if let Some(target) = route.target.clone() {
                     skipped_targets.push(SkippedBackend {
@@ -10925,11 +11114,31 @@ fn health_filtered_gpu_route_plan(
                     });
                 }
             }
-            HealthDecision::InvalidOrUnprobed => {
+            EffectiveGpuHealthDecision::Disk(HealthDecision::InvalidOrUnprobed) => {
                 awaiting_probe = awaiting_probe.saturating_add(1);
                 if allow_unprobed_idle_health {
                     recovery_routes.push(route);
                 } else if let Some(target) = route.target.clone() {
+                    skipped_targets.push(SkippedBackend {
+                        target,
+                        reason: BackendSkipReason::Unhealthy,
+                    });
+                }
+            }
+            EffectiveGpuHealthDecision::PendingFailure => {
+                retained_failures = retained_failures.saturating_add(1);
+                if allow_unprobed_idle_health {
+                    recovery_routes.push(route);
+                } else if let Some(target) = route.target.clone() {
+                    skipped_targets.push(SkippedBackend {
+                        target,
+                        reason: BackendSkipReason::Unhealthy,
+                    });
+                }
+            }
+            EffectiveGpuHealthDecision::SessionDenied => {
+                session_denials = session_denials.saturating_add(1);
+                if let Some(target) = route.target.clone() {
                     skipped_targets.push(SkippedBackend {
                         target,
                         reason: BackendSkipReason::Unhealthy,
@@ -10954,6 +11163,20 @@ fn health_filtered_gpu_route_plan(
             &format!(
                 "{awaiting_probe} verified GPU route(s) require successful explicit idle probes"
             ),
+        );
+    }
+    if retained_failures != 0 {
+        append_route_plan_diagnostic(
+            &mut diagnostic,
+            &format!(
+                "{retained_failures} verified GPU route(s) have retained in-session health failures"
+            ),
+        );
+    }
+    if session_denials != 0 {
+        append_route_plan_diagnostic(
+            &mut diagnostic,
+            "retained GPU health state denied GPU routes for this app session",
         );
     }
     InferenceWorkerRoutePlan {
@@ -11017,6 +11240,7 @@ impl InferenceWorkerRegistry {
                         .join("gpu-worker-health-v3.json"),
                 )
             }),
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             #[cfg(test)]
@@ -11047,6 +11271,7 @@ impl InferenceWorkerRegistry {
                         .join("gpu-worker-health-v3.json"),
                 )
             }),
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             #[cfg(test)]
@@ -11068,6 +11293,7 @@ impl InferenceWorkerRegistry {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
@@ -11338,6 +11564,35 @@ impl InferenceWorkerRegistry {
         Ok(())
     }
 
+    fn auto_gpu_route_plan(
+        &self,
+        catalog: VerifiedGpuRouteCatalog,
+        policy: &AutoQualificationPolicy,
+        model_digest: &str,
+        allow_unprobed_idle_health: bool,
+        selection_power_source: PowerSource,
+    ) -> (InferenceWorkerRoutePlan, Option<AutoAdmissionWitness>) {
+        let qualified = auto_qualified_gpu_route_catalog_with_admission(
+            catalog,
+            policy,
+            model_digest,
+            selection_power_source,
+        );
+        let catalog = qualified.catalog;
+        let auto_live_admission = (!catalog.routes.is_empty()).then(|| catalog.clone());
+        let mut plan = health_filtered_gpu_route_plan_with_pending(
+            catalog,
+            model_digest,
+            self.gpu_health_path.as_ref(),
+            Arc::clone(&self.pending_gpu_health),
+            allow_unprobed_idle_health,
+        );
+        plan.selection_power_source = Some(selection_power_source);
+        plan.auto_live_admission = auto_live_admission;
+        reserve_auto_cpu_fallback(&mut plan, &self.routes);
+        (plan, qualified.volatile_admission_witness)
+    }
+
     fn routes_for_preference(
         &self,
         preference: AccelerationPreference,
@@ -11378,14 +11633,25 @@ impl InferenceWorkerRegistry {
             };
             #[cfg(test)]
             if let Some(catalog) = self.gpu_routes_for_testing.as_ref() {
-                let mut plan = InferenceWorkerRoutePlan {
-                    routes: Arc::clone(&catalog.routes),
-                    diagnostic: catalog.diagnostic.clone(),
-                    health: None,
-                    selection_power_source: Some(PowerSource::Ac),
-                    skipped_targets: catalog.skipped_targets.clone(),
-                    auto_live_admission: None,
+                let mut plan = if self.gpu_health_path.is_some() {
+                    health_filtered_gpu_route_plan_with_pending(
+                        catalog.clone(),
+                        &model.expected_sha256,
+                        self.gpu_health_path.as_ref(),
+                        Arc::clone(&self.pending_gpu_health),
+                        allow_unprobed_idle_health,
+                    )
+                } else {
+                    InferenceWorkerRoutePlan {
+                        routes: Arc::clone(&catalog.routes),
+                        diagnostic: catalog.diagnostic.clone(),
+                        health: None,
+                        selection_power_source: None,
+                        skipped_targets: catalog.skipped_targets.clone(),
+                        auto_live_admission: None,
+                    }
                 };
+                plan.selection_power_source = Some(PowerSource::Ac);
                 reserve_auto_cpu_fallback(&mut plan, &self.routes);
                 return Ok(plan);
             }
@@ -11476,12 +11742,10 @@ impl InferenceWorkerRegistry {
                     discovered
                 }
             };
-            let (plan, volatile_admission_witness) = auto_gpu_route_plan(
-                Arc::clone(&self.routes),
+            let (plan, volatile_admission_witness) = self.auto_gpu_route_plan(
                 catalog,
                 policy,
                 &model.expected_sha256,
-                self.gpu_health_path.as_ref(),
                 allow_unprobed_idle_health,
                 selection_power_source,
             );
@@ -11518,10 +11782,11 @@ impl InferenceWorkerRegistry {
         #[cfg(test)]
         if let Some(catalog) = self.gpu_routes_for_testing.as_ref() {
             if self.gpu_health_path.is_some() {
-                return Ok(health_filtered_gpu_route_plan(
+                return Ok(health_filtered_gpu_route_plan_with_pending(
                     catalog.clone(),
                     &model.expected_sha256,
                     self.gpu_health_path.as_ref(),
+                    Arc::clone(&self.pending_gpu_health),
                     allow_unprobed_idle_health,
                 ));
             }
@@ -11577,10 +11842,11 @@ impl InferenceWorkerRegistry {
             }
         };
 
-        Ok(health_filtered_gpu_route_plan(
+        Ok(health_filtered_gpu_route_plan_with_pending(
             catalog,
             &model.expected_sha256,
             self.gpu_health_path.as_ref(),
+            Arc::clone(&self.pending_gpu_health),
             allow_unprobed_idle_health,
         ))
     }
@@ -11612,6 +11878,7 @@ impl InferenceWorkerRegistry {
                 app_build: DESKTOP_BUILD_ID.to_owned(),
                 device_set_digest: catalog.device_set_digest.clone(),
             },
+            pending_failures: Arc::clone(&self.pending_gpu_health),
         };
         let key = catalog.routes.iter().find_map(|route| {
             let candidate = route.target.as_ref()?;
@@ -11727,20 +11994,39 @@ impl InferenceWorkerRegistry {
             ));
         };
         check_cancelled()?;
-        let needs_recovery = plan.health.as_ref().is_some_and(|health| {
-            route
-                .health_key
-                .as_ref()
-                .is_some_and(|key| health.cache().decision(key) != HealthDecision::Available)
+        let recovery_decision = plan
+            .health
+            .as_ref()
+            .and_then(|health| route.health_key.as_ref().map(|key| health.decision(key)));
+        let needs_recovery = recovery_decision.is_some_and(|decision| {
+            decision != EffectiveGpuHealthDecision::Disk(HealthDecision::Available)
         });
+        let retained_failure_recovery =
+            recovery_decision == Some(EffectiveGpuHealthDecision::PendingFailure);
         if plan
             .health
             .as_ref()
-            .is_some_and(|health| !health.consume_retry(route))
+            .is_some_and(|health| !health.consume_retry(route, true))
         {
             return Err(RuntimeError::WorkerUnavailable(
                 "the requested GPU retry target is not authorized for retry".to_owned(),
             ));
+        }
+        if retained_failure_recovery {
+            let health = plan
+                .health
+                .as_ref()
+                .expect("retained failure recovery requires private health state");
+            let key = route.health_key.as_ref().ok_or_else(|| {
+                RuntimeError::WorkerUnavailable(
+                    "GPU retry lacks an exact health identity".to_owned(),
+                )
+            })?;
+            if let Err(error) = health.persist_pending_failure_for_recovery(key) {
+                self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                self.retire_failed_route(route)?;
+                return Err(error);
+            }
         }
         let preparation_error = |error| match error {
             RoutePreparationError::Fatal(error) => error,
@@ -11789,6 +12075,7 @@ impl InferenceWorkerRegistry {
                         "GPU retry lacks an exact health identity".to_owned(),
                     )
                 })?;
+                let mut persisted_recovery = false;
                 for _ in 0..2 {
                     check_cancelled()?;
                     self.revalidate_route_activation(route)
@@ -11805,24 +12092,43 @@ impl InferenceWorkerRegistry {
                         .map_err(worker_unavailable)
                         .map_err(&mut observe_worker_failure)?;
                     check_cancelled()?;
-                    health.cache().record_idle_probe_success(key).map_err(|_| {
-                        RuntimeError::WorkerUnavailable(
-                            "GPU retry could not persist idle probe health".to_owned(),
-                        )
-                    })?;
+                    persisted_recovery |=
+                        health.cache().record_idle_probe_success(key).map_err(|_| {
+                            RuntimeError::WorkerUnavailable(
+                                "GPU retry could not persist idle probe health".to_owned(),
+                            )
+                        })?;
                 }
                 check_cancelled()?;
-                if health.cache().decision(key) != HealthDecision::Available {
+                if !persisted_recovery || health.cache().decision(key) != HealthDecision::Available
+                {
                     return Err(RuntimeError::WorkerUnavailable(
                         "GPU retry health is not available after idle probes".to_owned(),
                     ));
                 }
+                transport
+                    .generation_context_exact(generation)
+                    .map_err(worker_unavailable)
+                    .map_err(&mut observe_worker_failure)?;
+                check_cancelled()?;
             }
             transport
                 .generation_context_exact(generation)
                 .map_err(worker_unavailable)
                 .map_err(&mut observe_worker_failure)?;
             check_cancelled()?;
+            if retained_failure_recovery {
+                let health = plan
+                    .health
+                    .as_ref()
+                    .expect("retained failure recovery requires private health state");
+                let key = route.health_key.as_ref().ok_or_else(|| {
+                    RuntimeError::WorkerUnavailable(
+                        "GPU retry lacks an exact health identity".to_owned(),
+                    )
+                })?;
+                health.clear_pending_failure(key)?;
+            }
             Ok(execution)
         })();
         match result {
@@ -11848,6 +12154,12 @@ impl InferenceWorkerRegistry {
             }
             Err(error) => {
                 let error = check_cancelled().err().unwrap_or(error);
+                if retained_failure_recovery
+                    && let (Some(health), Some(key)) =
+                        (plan.health.as_ref(), route.health_key.as_ref())
+                {
+                    health.retain_pending_after_interrupted_recovery(key);
+                }
                 if !matches!(error, RuntimeError::Cancelled(_))
                     && let (Some(health), Some(observation)) = (&plan.health, failure_observation)
                 {
@@ -12004,7 +12316,7 @@ impl InferenceWorkerRegistry {
             if plan
                 .health
                 .as_ref()
-                .is_some_and(|health| !health.consume_retry(route))
+                .is_some_and(|health| !health.consume_retry(route, false))
             {
                 continue;
             }
@@ -12188,7 +12500,7 @@ impl InferenceWorkerRegistry {
             if plan
                 .health
                 .as_ref()
-                .is_some_and(|health| !health.consume_retry(route))
+                .is_some_and(|health| !health.consume_retry(route, false))
             {
                 continue;
             }
@@ -12397,11 +12709,15 @@ impl InferenceWorkerRegistry {
             self.retire_active_worker()?;
         }
         for route in plan.routes.iter().take(MAX_INFERENCE_ROUTE_ATTEMPTS) {
-            if plan
-                .health
-                .as_ref()
-                .is_some_and(|health| !health.consume_retry(route))
-            {
+            let retained_recovery = plan.health.as_ref().and_then(|health| {
+                route.health_key.as_ref().and_then(|key| {
+                    (health.decision(key) == EffectiveGpuHealthDecision::PendingFailure)
+                        .then_some((health, key))
+                })
+            });
+            if plan.health.as_ref().is_some_and(|health| {
+                !health.consume_retry(route, preference == AccelerationPreference::Gpu)
+            }) {
                 continue;
             }
             // Re-read the operating-system power fact immediately before a
@@ -12416,6 +12732,13 @@ impl InferenceWorkerRegistry {
                 )
             {
                 continue;
+            }
+            if let Some((health, key)) = retained_recovery
+                && let Err(error) = health.persist_pending_failure_for_recovery(key)
+            {
+                self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                self.retire_failed_route(route)?;
+                return Err(error);
             }
             attempted = true;
             match self.prepare_route(route) {
@@ -12432,6 +12755,87 @@ impl InferenceWorkerRegistry {
                     continue;
                 }
                 Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
+            if let Some((health, key)) = retained_recovery {
+                let mut failure_observation = None;
+                let recovery = (|| {
+                    let mut observe_worker_failure = |error: RuntimeError| {
+                        failure_observation =
+                            Some(health_observation_for_runtime_error(&error, false, false));
+                        error
+                    };
+                    let transport = &route.supervisor.transport;
+                    let generation = transport
+                        .generation_context()
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?
+                        .generation;
+                    self.revalidate_route_activation(route)
+                        .map_err(|error| match error {
+                            RoutePreparationError::DeviceRollbackAuthority(error)
+                            | RoutePreparationError::Fatal(error) => error,
+                        })?;
+                    route
+                        .supervisor
+                        .load_on_generation(
+                            artifact.clone(),
+                            Self::worker_preference_for_route(route, preference),
+                            Some(generation),
+                        )
+                        .map_err(&mut observe_worker_failure)?;
+                    transport
+                        .generation_context_exact(generation)
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    let correlation = route.supervisor.next_id();
+                    transport
+                        .health_on_generation(generation, correlation, correlation)
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    transport
+                        .generation_context_exact(generation)
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    let recovered =
+                        health.cache().record_idle_probe_success(key).map_err(|_| {
+                            RuntimeError::WorkerUnavailable(
+                                "GPU health probe could not persist recovery state".to_owned(),
+                            )
+                        })?;
+                    transport
+                        .generation_context_exact(generation)
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    let available = health.cache().decision(key) == HealthDecision::Available;
+                    transport
+                        .generation_context_exact(generation)
+                        .map_err(worker_unavailable)
+                        .map_err(&mut observe_worker_failure)?;
+                    Ok((recovered, available))
+                })();
+                match recovery {
+                    Ok((recovered, available)) => {
+                        if recovered && available {
+                            if let Err(error) = health.clear_pending_failure(key) {
+                                self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                                self.retire_failed_route(route)?;
+                                return Err(error);
+                            }
+                        } else {
+                            health.retain_pending_after_interrupted_recovery(key);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        if let Some(observation) = failure_observation {
+                            health.record_failure(route, observation);
+                        }
+                        health.retain_pending_after_interrupted_recovery(key);
+                        self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                        self.retire_failed_route(route)?;
+                        return Err(error);
+                    }
+                }
             }
             match route.supervisor.health(
                 artifact.clone(),
@@ -15017,6 +15421,10 @@ mod tests {
             pcm_kind: bool,
         },
         RuntimeFailureOnLoad(RuntimeError),
+        RuntimeFailureOnLoadAfter {
+            error: RuntimeError,
+            before_failure: Box<dyn FnOnce() + Send>,
+        },
         RuntimeFailureOnTranscribe(RuntimeError),
         RuntimeLoad,
         RuntimeDiagnostics(Box<WireRuntimeDiagnostics>),
@@ -15702,6 +16110,22 @@ mod tests {
             TestMode::RuntimeFailureOnLoad(error) => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::LoadRuntime { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeFailed {
+                        error: WireRuntimeError::from_runtime(&error),
+                    },
+                );
+            }
+            TestMode::RuntimeFailureOnLoadAfter {
+                error,
+                before_failure,
+            } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::LoadRuntime { .. }));
+                before_failure();
                 respond(
                     &mut output,
                     session_id,
@@ -19444,6 +19868,634 @@ mod tests {
     }
 
     #[test]
+    fn gpu_health_persistence_failure_retains_session_denial() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-failure");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, _) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        let catalog = registry
+            .gpu_routes_for_testing
+            .clone()
+            .expect("fixture GPU catalog");
+        let RuntimeArtifact::Gguf(model) = &fixture.artifact else {
+            unreachable!("fixture is GGUF")
+        };
+        let key = route_health_key(&catalog.routes[0], &model.expected_sha256)
+            .expect("verified GPU route health key");
+        let witnesses = HealthWitnesses {
+            app_build: DESKTOP_BUILD_ID.to_owned(),
+            device_set_digest: catalog.device_set_digest.clone(),
+        };
+        let mut persisted = HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK);
+        persisted
+            .record_provider_failure(
+                key.clone(),
+                crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+            )
+            .unwrap();
+        assert!(!persisted.record_idle_probe_success(&key).unwrap());
+        assert!(persisted.record_idle_probe_success(&key).unwrap());
+        assert_eq!(persisted.decision(&key), HealthDecision::Available);
+        let healthy_bytes = std::fs::read(&*path).unwrap();
+        registry.gpu_health_path = Some(Arc::clone(&path));
+
+        let selected = registry
+            .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+            .unwrap();
+        assert_eq!(selected.routes.len(), 1);
+        assert_eq!(selected.routes[0].health_key.as_ref(), Some(&key));
+        let health = selected.health.as_ref().expect("private GPU health");
+        persisted
+            .with_exclusive_lock_for_test(|| {
+                health.record_failure(&selected.routes[0], FailureObservation::WorkerCrash);
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(&*path).unwrap(), healthy_bytes);
+        assert_eq!(
+            HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK).decision(&key),
+            HealthDecision::Available,
+            "the old readable cache demonstrates that disk alone forgot the failed write"
+        );
+
+        let next_request = registry.clone();
+        let strict = next_request
+            .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+            .unwrap();
+        assert!(
+            strict.routes.is_empty(),
+            "strict GPU must retain the in-session denial without falling back to CPU"
+        );
+        let auto = next_request
+            .routes_for_preference(AccelerationPreference::Auto, &fixture.artifact)
+            .unwrap();
+        assert_eq!(auto.routes.len(), 1);
+        assert_eq!(auto.routes[0].provider, WorkerProvider::Cpu);
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_continued_io_failure_stops_before_gpu_launch() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-continued-io");
+        let path = Arc::new(fixture.root.join("health.json"));
+        std::fs::create_dir(&*path).unwrap();
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        registry
+            .pending_gpu_health
+            .lock()
+            .unwrap()
+            .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+        let error = registry
+            .retry_gpu(fixture.artifact.clone(), &target, 0, &AtomicU64::new(0))
+            .expect_err("continued persistence failure must stop before GPU dispatch");
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerUnavailable(message)
+                if message == "GPU retry could not persist the retained health failure"
+        ));
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        let pending = registry.pending_gpu_health.lock().unwrap();
+        assert!(pending.matching(&witnesses, &key).is_some());
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_recovery_retains_cancellation_and_probe_write_failure() {
+        for failure in ["cancel-after-probe-one", "second-probe-persist"] {
+            let fixture =
+                gguf_artifact_fixture(&format!("gpu-health-persistence-recovery-{failure}"));
+            let path = Arc::new(fixture.root.join("health.json"));
+            let cancellation = Arc::new(AtomicU64::new(0));
+            let cancellation_for_probe = Arc::clone(&cancellation);
+            let path_for_probe = Arc::clone(&path);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let target = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            )
+            .target
+            .unwrap();
+            let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeRetryHealth {
+                diagnostics: Box::new(diagnostics_with_child_gpu_context(target.clone())),
+                requests: Arc::clone(&requests),
+                before_health: Box::new(move |probe| {
+                    if probe == 2 && failure == "cancel-after-probe-one" {
+                        cancellation_for_probe.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if probe == 2 && failure == "second-probe-persist" {
+                        std::fs::remove_file(&*path_for_probe).unwrap();
+                        std::fs::create_dir(&*path_for_probe).unwrap();
+                    }
+                    true
+                }),
+                exit_after_health: None,
+            }]));
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let (mut registry, retained) =
+                explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+            registry.gpu_health_path = Some(Arc::clone(&path));
+            let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+            registry
+                .pending_gpu_health
+                .lock()
+                .unwrap()
+                .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+            let error = registry
+                .retry_gpu(fixture.artifact.clone(), &retained, 0, &cancellation)
+                .expect_err("interrupted recovery must retain the in-session denial");
+            if failure == "cancel-after-probe-one" {
+                assert!(matches!(error, RuntimeError::Cancelled(_)));
+            } else {
+                assert!(matches!(
+                    error,
+                    RuntimeError::WorkerUnavailable(message)
+                        if message == "GPU retry could not persist idle probe health"
+                ));
+            }
+            assert_eq!(*requests.lock().unwrap(), ["load", "health", "health"]);
+            assert!(
+                registry
+                    .pending_gpu_health
+                    .lock()
+                    .unwrap()
+                    .matching(&witnesses, &key)
+                    .is_some(),
+                "{failure}"
+            );
+            assert!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+                    .unwrap()
+                    .routes
+                    .is_empty(),
+                "{failure}"
+            );
+            assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+            assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_two_probe_recovery_clears_session_denial() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-recovery-success");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )
+        .target
+        .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeRetryHealth {
+            diagnostics: Box::new(diagnostics_with_child_gpu_context(target)),
+            requests: Arc::clone(&requests),
+            before_health: Box::new(|_| true),
+            exit_after_health: None,
+        }]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, retained) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        registry
+            .pending_gpu_health
+            .lock()
+            .unwrap()
+            .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+        registry
+            .retry_gpu(fixture.artifact.clone(), &retained, 0, &AtomicU64::new(0))
+            .expect("two persisted exact-generation probes recover the retained failure");
+        assert_eq!(*requests.lock().unwrap(), ["load", "health", "health"]);
+        assert_eq!(
+            HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+            HealthDecision::Available
+        );
+        assert!(
+            registry
+                .pending_gpu_health
+                .lock()
+                .unwrap()
+                .matching(&witnesses, &key)
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+                .unwrap()
+                .routes
+                .len(),
+            1
+        );
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        registry.unload().unwrap();
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_is_exact_to_key_and_witnesses() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-isolation");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, _) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        let mut unrelated = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            "windows-display:32.0.16.1088",
+            'b',
+        );
+        let unrelated_launcher = Arc::new(TestLauncher::new([]));
+        unrelated.supervisor = inference_supervisor_with_launcher(Arc::clone(&unrelated_launcher));
+        let exact = registry.gpu_routes_for_testing.as_ref().unwrap().routes[0].clone();
+        registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![exact, unrelated]));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        registry
+            .pending_gpu_health
+            .lock()
+            .unwrap()
+            .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+        let strict = registry
+            .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+            .unwrap();
+        assert_eq!(strict.routes.len(), 1);
+        assert_eq!(
+            strict.routes[0].target.as_ref().unwrap().device_id.as_str(),
+            "native:pci:0000:02:00.0"
+        );
+        let other_witness = HealthWitnesses {
+            app_build: witnesses.app_build.clone(),
+            device_set_digest: "f".repeat(64),
+        };
+        let other_health = GpuRouteHealth {
+            path,
+            witnesses: other_witness,
+            pending_failures: Arc::clone(&registry.pending_gpu_health),
+        };
+        assert_eq!(
+            other_health.decision(&key),
+            EffectiveGpuHealthDecision::Disk(HealthDecision::Available)
+        );
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(
+            unrelated_launcher.launch_attempts.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_capacity_and_poison_keep_cpu_safe() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-capacity");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, _) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (mut key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        {
+            let mut pending = registry.pending_gpu_health.lock().unwrap();
+            for index in 0..MAX_PENDING_GPU_HEALTH_FAILURES {
+                key.stable_device_identity = format!("native:test:{index}");
+                pending.retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+            }
+            key.stable_device_identity = "native:test:overflow".to_owned();
+            pending.retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+            assert_eq!(pending.entries.len(), MAX_PENDING_GPU_HEALTH_FAILURES);
+            assert!(pending.deny_all_gpu);
+        }
+        let assert_cpu_safe = |registry: &InferenceWorkerRegistry| {
+            assert!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &fixture.artifact)
+                    .unwrap()
+                    .routes
+                    .is_empty()
+            );
+            let auto = registry
+                .routes_for_preference(AccelerationPreference::Auto, &fixture.artifact)
+                .unwrap();
+            assert_eq!(auto.routes.len(), 1);
+            assert_eq!(auto.routes[0].provider, WorkerProvider::Cpu);
+            let cpu = registry
+                .routes_for_preference(AccelerationPreference::Cpu, &fixture.artifact)
+                .unwrap();
+            assert_eq!(cpu.routes.len(), 1);
+            assert_eq!(cpu.routes[0].provider, WorkerProvider::Cpu);
+        };
+        assert_cpu_safe(&registry);
+
+        let (mut poisoned_registry, _) = explicit_retry_registry(
+            Arc::new(TestLauncher::new([])),
+            Arc::new(TestLauncher::new([])),
+        );
+        poisoned_registry.gpu_health_path = Some(path);
+        let pending = Arc::clone(&poisoned_registry.pending_gpu_health);
+        let poison = std::panic::catch_unwind(move || {
+            let _guard = pending.lock().unwrap();
+            panic!("fixture retained GPU health lock poison");
+        });
+        assert!(poison.is_err());
+        assert_cpu_safe(&poisoned_registry);
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_capacity_crossing_blocks_later_gpu_in_same_request() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-capacity-crossing");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let path_for_failure = Arc::clone(&path);
+        let first_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoadAfter {
+            error: RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
+            before_failure: Box::new(move || {
+                std::fs::remove_file(&*path_for_failure).unwrap();
+                std::fs::create_dir(&*path_for_failure).unwrap();
+            }),
+        }]));
+        let second_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let mut first = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        first.supervisor = inference_supervisor_with_launcher(Arc::clone(&first_launcher));
+        let mut second = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            "windows-display:32.0.16.1088",
+            'b',
+        );
+        second.supervisor = inference_supervisor_with_launcher(Arc::clone(&second_launcher));
+        let catalog = verified_gpu_catalog(vec![first, second]);
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
+        );
+        registry.gpu_routes_for_testing = Some(catalog.clone());
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let RuntimeArtifact::Gguf(model) = &fixture.artifact else {
+            unreachable!("fixture is GGUF")
+        };
+        let first_key = route_health_key(&catalog.routes[0], &model.expected_sha256).unwrap();
+        let witnesses = HealthWitnesses {
+            app_build: DESKTOP_BUILD_ID.to_owned(),
+            device_set_digest: catalog.device_set_digest.clone(),
+        };
+        let mut healthy = HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK);
+        healthy
+            .record_provider_failure(
+                first_key.clone(),
+                crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+            )
+            .unwrap();
+        assert!(!healthy.record_idle_probe_success(&first_key).unwrap());
+        assert!(healthy.record_idle_probe_success(&first_key).unwrap());
+        {
+            let mut pending = registry.pending_gpu_health.lock().unwrap();
+            let mut unrelated = first_key;
+            for index in 0..MAX_PENDING_GPU_HEALTH_FAILURES {
+                unrelated.stable_device_identity = format!("native:pending:{index}");
+                pending.retain_failed_write(
+                    &witnesses,
+                    &unrelated,
+                    FailureObservation::WorkerCrash,
+                );
+            }
+            assert!(!pending.deny_all_gpu);
+        }
+
+        let execution = registry
+            .load(fixture.artifact.clone(), AccelerationPreference::Auto)
+            .expect("capacity crossing must deny the next GPU but preserve Auto CPU fallback");
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .expect("CPU fallback selection");
+        assert_eq!(selection.target.backend, BackendKind::Cpu);
+        assert_eq!(selection.reason, BackendSelectionReason::AutoCpuFallback);
+        assert_eq!(selection.fallback_history.len(), 1);
+        assert!(registry.pending_gpu_health.lock().unwrap().deny_all_gpu);
+        assert_eq!(first_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(second_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        registry.unload().unwrap();
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_ordinary_health_two_step_recovery() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-ordinary-recovery");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )
+        .target
+        .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeRetryHealth {
+            diagnostics: Box::new(diagnostics_with_child_gpu_context(target)),
+            requests: Arc::clone(&requests),
+            before_health: Box::new(|_| true),
+            exit_after_health: None,
+        }]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, _) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        registry
+            .pending_gpu_health
+            .lock()
+            .unwrap()
+            .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+        registry
+            .health(fixture.artifact.clone(), AccelerationPreference::Gpu)
+            .expect("first exact-generation idle probe succeeds");
+        assert!(matches!(
+            HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+            HealthDecision::Quarantined { .. }
+        ));
+        assert!(
+            registry
+                .pending_gpu_health
+                .lock()
+                .unwrap()
+                .matching(&witnesses, &key)
+                .is_some()
+        );
+
+        registry
+            .health(fixture.artifact.clone(), AccelerationPreference::Gpu)
+            .expect("second exact-generation persisted idle probe recovers health");
+        assert_eq!(
+            HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+            HealthDecision::Available
+        );
+        assert!(
+            registry
+                .pending_gpu_health
+                .lock()
+                .unwrap()
+                .matching(&witnesses, &key)
+                .is_none()
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            ["load", "health", "load", "health"]
+        );
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        registry.unload().unwrap();
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_ordinary_health_probe_write_failure_retains_denial() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-ordinary-probe-write");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let path_for_probe = Arc::clone(&path);
+        let target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )
+        .target
+        .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeRetryHealth {
+            diagnostics: Box::new(diagnostics_with_child_gpu_context(target)),
+            requests: Arc::clone(&requests),
+            before_health: Box::new(move |_| {
+                std::fs::remove_file(&*path_for_probe).unwrap();
+                std::fs::create_dir(&*path_for_probe).unwrap();
+                true
+            }),
+            exit_after_health: None,
+        }]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, retained_target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        registry
+            .pending_gpu_health
+            .lock()
+            .unwrap()
+            .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+        let error = registry
+            .health(fixture.artifact.clone(), AccelerationPreference::Gpu)
+            .expect_err("probe persistence failure must be propagated");
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerUnavailable(message)
+                if message == "GPU health probe could not persist recovery state"
+        ));
+        assert_eq!(*requests.lock().unwrap(), ["load", "health"]);
+        assert!(
+            registry
+                .pending_gpu_health
+                .lock()
+                .unwrap()
+                .matching(&witnesses, &key)
+                .is_some()
+        );
+        assert_eq!(
+            registry
+                .active_route
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|active| active.identity.clone()),
+            None
+        );
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+
+        let repeated = registry
+            .health(fixture.artifact.clone(), AccelerationPreference::Gpu)
+            .expect_err("continued invalid persistence state must fail before another launch");
+        assert!(matches!(
+            repeated,
+            RuntimeError::WorkerUnavailable(message)
+                if message == "GPU retry could not persist the retained health failure"
+        ));
+        let retry = registry
+            .retry_gpu(
+                fixture.artifact.clone(),
+                &retained_target,
+                0,
+                &AtomicU64::new(0),
+            )
+            .expect_err("UI retry must also reseed before another launch");
+        assert!(matches!(
+            retry,
+            RuntimeError::WorkerUnavailable(message)
+                if message == "GPU retry could not persist the retained health failure"
+        ));
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn gpu_health_persistence_failure_ordinary_health_replacement_after_load_is_not_recovery() {
+        let fixture = gguf_artifact_fixture("gpu-health-persistence-ordinary-replacement");
+        let path = Arc::new(fixture.root.join("health.json"));
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, _) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&path));
+        let (key, witnesses) = pending_health_identity(&registry, &fixture.artifact);
+        registry
+            .pending_gpu_health
+            .lock()
+            .unwrap()
+            .retain_failed_write(&witnesses, &key, FailureObservation::WorkerCrash);
+
+        registry
+            .health(fixture.artifact.clone(), AccelerationPreference::Gpu)
+            .expect_err("a dead loaded generation must not be replaced for recovery health");
+        assert!(
+            registry
+                .pending_gpu_health
+                .lock()
+                .unwrap()
+                .matching(&witnesses, &key)
+                .is_some()
+        );
+        assert!(matches!(
+            HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK).decision(&key),
+            HealthDecision::Quarantined { .. }
+        ));
+        assert_eq!(gpu_launcher.launch_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launch_attempts.load(Ordering::Acquire), 0);
+        assert!(registry.active_route.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn quarantined_verified_route_needs_two_explicit_successful_idle_probes() {
         let root = test_root("gpu-health-idle-probes");
         let path = Arc::new(root.join("health.json"));
@@ -19461,6 +20513,7 @@ mod tests {
                 app_build: DESKTOP_BUILD_ID.to_owned(),
                 device_set_digest: catalog.device_set_digest.clone(),
             },
+            pending_failures: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
         };
         let mut observed_route = route;
         observed_route.health_key = Some(key.clone());
@@ -19494,7 +20547,7 @@ mod tests {
                     .health
                     .as_ref()
                     .unwrap()
-                    .consume_retry(&probe.routes[0])
+                    .consume_retry(&probe.routes[0], true)
             );
             probe
                 .health
@@ -19573,6 +20626,7 @@ mod tests {
                 gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 gpu_health_path: Some(Arc::clone(&path)),
+                pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
                 active_route: Arc::new(Mutex::new(None)),
                 route_execution: Arc::new(Mutex::new(())),
                 gpu_routes_for_testing: Some(catalog),
@@ -19679,6 +20733,7 @@ mod tests {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: Some(Arc::clone(&path)),
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(catalog),
@@ -19764,6 +20819,7 @@ mod tests {
                 app_build: DESKTOP_BUILD_ID.to_owned(),
                 device_set_digest: catalog.device_set_digest.clone(),
             },
+            pending_failures: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
         };
         let mut observed_route = route;
         observed_route.health_key = Some(key.clone());
@@ -19826,6 +20882,7 @@ mod tests {
             })),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: Some(Arc::clone(&path)),
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
@@ -19845,8 +20902,19 @@ mod tests {
         let plan = health_filtered_gpu_route_plan(catalog, &"b".repeat(64), Some(&path), false);
         assert_eq!(plan.routes.len(), 1);
         assert!(plan.routes[0].consume_retry_bypass);
-        assert!(plan.health.as_ref().unwrap().consume_retry(&plan.routes[0]));
-        assert!(!plan.health.as_ref().unwrap().consume_retry(&plan.routes[0]));
+        assert!(
+            plan.health
+                .as_ref()
+                .unwrap()
+                .consume_retry(&plan.routes[0], true)
+        );
+        assert!(
+            !plan
+                .health
+                .as_ref()
+                .unwrap()
+                .consume_retry(&plan.routes[0], true)
+        );
 
         let persisted = std::fs::read_to_string(&*path).unwrap();
         assert!(!persisted.contains("private-model-path"));
@@ -20316,6 +21384,26 @@ mod tests {
         );
         registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![route]));
         (registry, target)
+    }
+
+    fn pending_health_identity(
+        registry: &InferenceWorkerRegistry,
+        artifact: &RuntimeArtifact,
+    ) -> (HealthKey, HealthWitnesses) {
+        let catalog = registry
+            .gpu_routes_for_testing
+            .as_ref()
+            .expect("fixture GPU catalog");
+        let RuntimeArtifact::Gguf(model) = artifact else {
+            unreachable!("fixture is GGUF")
+        };
+        let key = route_health_key(&catalog.routes[0], &model.expected_sha256)
+            .expect("verified GPU route health key");
+        let witnesses = HealthWitnesses {
+            app_build: DESKTOP_BUILD_ID.to_owned(),
+            device_set_digest: catalog.device_set_digest.clone(),
+        };
+        (key, witnesses)
     }
 
     #[test]
@@ -21671,6 +22759,7 @@ mod tests {
                 gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 gpu_health_path: None,
+                pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
                 active_route: Arc::new(Mutex::new(None)),
                 route_execution: Arc::new(Mutex::new(())),
                 gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
@@ -21815,6 +22904,7 @@ mod tests {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
@@ -23979,6 +25069,7 @@ mod tests {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
@@ -24159,6 +25250,7 @@ mod tests {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
+            pending_gpu_health: Arc::new(Mutex::new(PendingGpuHealthFailures::default())),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {

@@ -377,6 +377,24 @@ unreadable, noncanonical, app-build-mismatched, or device-set-mismatched state i
 explicitly invalid/unprobed for GPU while CPU remains eligible. Two successful
 idle probes atomically replace that state and restore availability.
 
+If an eligible failure cannot be saved, the registry retains an in-memory denial
+for its exact key and witnesses. New requests and registry clones consult that
+denial before the persisted cache, so an older readable healthy record cannot
+admit the failed GPU again. Auto can still select CPU, and explicit GPU keeps its
+GPU-only behavior. The temporary denial contains categorized failure metadata
+only. Exceeding its 128-entry bound or encountering poisoned state denies GPU
+for the remainder of the app session. CPU remains eligible. This
+protection is limited to the owning app session; other processes depend on
+successfully persisted health state.
+
+Explicit idle recovery first saves the pending failure before model dispatch.
+Clearing the temporary denial requires two successful, persisted probes. Each
+probe must use the authenticated generation that loaded its model, with final
+cancellation/generation checks and an available persisted decision. A readable
+healthy file or heartbeats without a
+completed persisted recovery cannot clear it. Failed persistence or incomplete
+recovery retains the denial and requires a fresh recovery attempt.
+
 The diagnostics **Retry GPU** action admits only idle application state and
 retains the exact model/backend/provider/device/driver/pack identity. It reprobes
 the verified catalog, consumes the existing one-shot quarantine grant when
