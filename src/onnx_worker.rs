@@ -11158,10 +11158,19 @@ impl InferenceWorkerRegistry {
             .map_err(|_| {
                 RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
             })?
-            .take();
+            .clone();
         self.clear_auto_live_admission();
         if let Some(active) = active {
             active.supervisor.retire()?;
+            let mut current = self.active_route.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?;
+            if current.as_ref().is_some_and(|current| {
+                current.identity == active.identity
+                    && Self::same_supervisor(&current.supervisor, &active.supervisor)
+            }) {
+                *current = None;
+            }
         }
         Ok(())
     }
@@ -11171,28 +11180,50 @@ impl InferenceWorkerRegistry {
         route: &InferenceWorkerRoute,
     ) -> Result<(), RuntimeError> {
         let active_gpu = {
-            let mut active = self.active_route.lock().map_err(|_| {
+            let active = self.active_route.lock().map_err(|_| {
                 RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
             })?;
             active
                 .as_ref()
-                .is_some_and(|current| current.identity.backend != BackendKind::Cpu)
-                .then(|| active.take())
-                .flatten()
+                .filter(|current| current.identity.backend != BackendKind::Cpu)
+                .cloned()
         };
         let route_retirement = route.supervisor.retire();
         self.clear_auto_live_admission();
-        let active_retirement = if active_gpu
-            .as_ref()
-            .is_some_and(|active| !Self::same_supervisor(&active.supervisor, &route.supervisor))
-        {
-            active_gpu
-                .as_ref()
-                .expect("checked active GPU route")
-                .supervisor
-                .retire()
-        } else {
-            Ok(())
+        let active_retirement = match active_gpu {
+            Some(active) if Self::same_supervisor(&active.supervisor, &route.supervisor) => {
+                if route_retirement.is_err() {
+                    Ok(())
+                } else {
+                    let mut current = self.active_route.lock().map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "active inference route lock poisoned".to_owned(),
+                        )
+                    })?;
+                    if current.as_ref().is_some_and(|current| {
+                        current.identity == active.identity
+                            && Self::same_supervisor(&current.supervisor, &active.supervisor)
+                    }) {
+                        *current = None;
+                    }
+                    Ok(())
+                }
+            }
+            Some(active) => active.supervisor.retire().and_then(|()| {
+                let mut current = self.active_route.lock().map_err(|_| {
+                    RuntimeError::WorkerUnavailable(
+                        "active inference route lock poisoned".to_owned(),
+                    )
+                })?;
+                if current.as_ref().is_some_and(|current| {
+                    current.identity == active.identity
+                        && Self::same_supervisor(&current.supervisor, &active.supervisor)
+                }) {
+                    *current = None;
+                }
+                Ok(())
+            }),
+            None => Ok(()),
         };
         route_retirement.and(active_retirement)
     }
@@ -11234,7 +11265,7 @@ impl InferenceWorkerRegistry {
     fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RoutePreparationError> {
         let identity = Self::route_identity(route);
         let prior = {
-            let mut active = self.active_route.lock().map_err(|_| {
+            let active = self.active_route.lock().map_err(|_| {
                 RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
                     "active inference route lock poisoned".to_owned(),
                 ))
@@ -11249,24 +11280,43 @@ impl InferenceWorkerRegistry {
                 self.revalidate_route_activation(route)?;
                 return Ok(());
             }
-            active.take()
+            active.clone()
         };
+        self.clear_auto_live_admission();
         if let Some(prior) = prior {
             prior
                 .supervisor
                 .retire()
                 .map_err(RoutePreparationError::Fatal)?;
+            let mut active = self.active_route.lock().map_err(|_| {
+                RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
+                    "active inference route lock poisoned".to_owned(),
+                ))
+            })?;
+            if active.as_ref().is_some_and(|current| {
+                current.identity == prior.identity
+                    && Self::same_supervisor(&current.supervisor, &prior.supervisor)
+            }) {
+                *active = None;
+            }
         }
-        self.clear_auto_live_admission();
         // Discovery, cache lookup, and retiring a prior route can take time.
         // Recheck directly before publication. An epoch advanced after this
         // boundary belongs to the next request; active work is never migrated.
         self.revalidate_route_activation(route)?;
-        *self.active_route.lock().map_err(|_| {
+        let mut active = self.active_route.lock().map_err(|_| {
             RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
                 "active inference route lock poisoned".to_owned(),
             ))
-        })? = Some(ActiveInferenceRoute {
+        })?;
+        if active.is_some() {
+            return Err(RoutePreparationError::Fatal(
+                RuntimeError::WorkerUnavailable(
+                    "active inference route changed during preparation".to_owned(),
+                ),
+            ));
+        }
+        *active = Some(ActiveInferenceRoute {
             identity,
             supervisor: route.supervisor.clone(),
         });
@@ -23347,6 +23397,482 @@ mod tests {
             2,
             "the timed-out active probe and skipped remaining probe are both diagnosed"
         );
+    }
+
+    struct RetirementFailureProcess {
+        failures_remaining: AtomicUsize,
+        termination_attempts: AtomicUsize,
+        running: AtomicBool,
+    }
+
+    impl WorkerProcess for RetirementFailureProcess {
+        fn is_running(&self) -> Result<bool> {
+            Ok(self.running.load(Ordering::Acquire))
+        }
+
+        fn terminate(&self) -> Result<()> {
+            self.termination_attempts.fetch_add(1, Ordering::AcqRel);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                bail!("injected registry retirement failure")
+            }
+            self.running.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn wait(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for RetirementFailureProcess {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Release);
+        }
+    }
+
+    struct RetirementFailureFixture {
+        supervisor: InferenceWorkerSupervisor,
+        process: Arc<RetirementFailureProcess>,
+        launcher: Arc<TestLauncher>,
+    }
+
+    impl RetirementFailureFixture {
+        fn new(failures: usize) -> Self {
+            let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+            let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            );
+            let process = Arc::new(RetirementFailureProcess {
+                failures_remaining: AtomicUsize::new(failures),
+                termination_attempts: AtomicUsize::new(0),
+                running: AtomicBool::new(true),
+            });
+            {
+                let mut state = transport.inner.state.lock().unwrap();
+                state.next_generation = 1;
+                state.current = Some(CurrentGeneration {
+                    generation: 1,
+                    process: process.clone(),
+                    expectation: expected_worker(WorkerRole::Inference),
+                    frozen_worker_approval: None,
+                    pack_launch: None,
+                    pack_bindings: Vec::new(),
+                    #[cfg(feature = "windows-gpu-capture-observation")]
+                    validated_handshake: None,
+                });
+            }
+            Self {
+                supervisor: InferenceWorkerSupervisor {
+                    transport,
+                    next_correlation: Arc::new(AtomicU64::new(0)),
+                },
+                process,
+                launcher,
+            }
+        }
+    }
+
+    impl Drop for RetirementFailureFixture {
+        fn drop(&mut self) {
+            self.process.failures_remaining.store(0, Ordering::Release);
+            let _ = self.supervisor.retire();
+            self.process.running.store(false, Ordering::Release);
+        }
+    }
+
+    fn retirement_failure_route(
+        provider: WorkerProvider,
+        backend: BackendKind,
+        stable_identity: &str,
+        supervisor: InferenceWorkerSupervisor,
+    ) -> InferenceWorkerRoute {
+        InferenceWorkerRoute {
+            provider,
+            supervisor,
+            target: Some(if backend == BackendKind::Cpu {
+                BackendTarget::cpu()
+            } else {
+                backend_target(backend, stable_identity, Some(0))
+            }),
+            health_key: None,
+            consume_retry_bypass: false,
+            auto_evidence_id: None,
+        }
+    }
+
+    fn retirement_failure_replacement_route(
+        label: &str,
+    ) -> (InferenceWorkerRoute, Arc<TestLauncher>) {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let supervisor = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
+        (
+            retirement_failure_route(WorkerProvider::Cpu, BackendKind::Cpu, label, supervisor),
+            launcher,
+        )
+    }
+
+    fn retirement_failure_registry_with_owner(
+        route: &InferenceWorkerRoute,
+    ) -> InferenceWorkerRegistry {
+        let registry = InferenceWorkerRegistry::with_cpu_supervisor(route.supervisor.clone());
+        *registry.active_route.lock().unwrap() = Some(ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(route),
+            supervisor: route.supervisor.clone(),
+        });
+        registry
+    }
+
+    fn assert_retirement_failure_owner(
+        registry: &InferenceWorkerRegistry,
+        route: &InferenceWorkerRoute,
+        fixture: &RetirementFailureFixture,
+        expected_attempts: usize,
+    ) {
+        let active = registry
+            .active_route
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("failed retirement must retain the authoritative owner");
+        assert_eq!(
+            active.identity,
+            InferenceWorkerRegistry::route_identity(route)
+        );
+        assert!(InferenceWorkerRegistry::same_supervisor(
+            &active.supervisor,
+            &route.supervisor
+        ));
+        assert_eq!(
+            fixture.process.termination_attempts.load(Ordering::Acquire),
+            expected_attempts
+        );
+        assert!(fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            fixture.supervisor.transport.current_generation().unwrap(),
+            Some(1)
+        );
+        assert_eq!(fixture.supervisor.transport.ensure_generation().unwrap(), 1);
+        assert_eq!(fixture.launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn retirement_failure_route_switch_retains_owner() {
+        let fixture = RetirementFailureFixture::new(2);
+        let active = retirement_failure_route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:30:00.0",
+            fixture.supervisor.clone(),
+        );
+        let registry = retirement_failure_registry_with_owner(&active);
+        let catalog = verified_gpu_catalog(vec![active.clone()]);
+        let active_owner = registry.active_route.lock().unwrap().clone().unwrap();
+        registry
+            .auto_gpu_routes
+            .lock()
+            .unwrap()
+            .retain_auto_live_admission(&catalog, &active_owner);
+        assert!(
+            registry
+                .auto_gpu_routes
+                .lock()
+                .unwrap()
+                .successful()
+                .is_some()
+        );
+        crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+        registry.prepare_route(&active).unwrap();
+        assert!(
+            registry
+                .auto_gpu_routes
+                .lock()
+                .unwrap()
+                .successful()
+                .is_some(),
+            "same-owner warm preparation must preserve live Auto admission"
+        );
+        let (replacement, replacement_launcher) =
+            retirement_failure_replacement_route("retirement-switch-replacement");
+
+        for expected_attempts in 1..=2 {
+            assert!(matches!(
+                registry.prepare_route(&replacement),
+                Err(RoutePreparationError::Fatal(
+                    RuntimeError::RetryableWorkerFailure(_)
+                ))
+            ));
+            assert_retirement_failure_owner(&registry, &active, &fixture, expected_attempts);
+            assert_eq!(replacement_launcher.launches.load(Ordering::Acquire), 0);
+            assert!(
+                registry
+                    .auto_gpu_routes
+                    .lock()
+                    .unwrap()
+                    .successful()
+                    .is_none(),
+                "a failed route switch must invalidate stale Auto live admission"
+            );
+        }
+
+        registry.prepare_route(&replacement).unwrap();
+        assert!(!fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            fixture.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        assert_eq!(replacement_launcher.launches.load(Ordering::Acquire), 0);
+        replacement
+            .supervisor
+            .transport
+            .ensure_generation()
+            .unwrap();
+        assert_eq!(replacement_launcher.launches.load(Ordering::Acquire), 1);
+        registry.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retirement_failure_retire_active_retains_owner() {
+        let fixture = RetirementFailureFixture::new(2);
+        let active = retirement_failure_route(
+            WorkerProvider::Cpu,
+            BackendKind::Cpu,
+            "retirement-active",
+            fixture.supervisor.clone(),
+        );
+        let registry = retirement_failure_registry_with_owner(&active);
+
+        for expected_attempts in 1..=2 {
+            assert!(registry.retire_active_worker().is_err());
+            assert_retirement_failure_owner(&registry, &active, &fixture, expected_attempts);
+        }
+
+        registry.retire_active_worker().unwrap();
+        assert!(registry.active_route.lock().unwrap().is_none());
+        assert!(!fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            fixture.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        let (replacement, replacement_launcher) =
+            retirement_failure_replacement_route("retirement-active-replacement");
+        registry.prepare_route(&replacement).unwrap();
+        replacement
+            .supervisor
+            .transport
+            .ensure_generation()
+            .unwrap();
+        assert_eq!(replacement_launcher.launches.load(Ordering::Acquire), 1);
+        registry.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retirement_failure_authority_rejection_retains_owner() {
+        for same_supervisor in [true, false] {
+            let fixture = RetirementFailureFixture::new(2);
+            let active = retirement_failure_route(
+                WorkerProvider::Vulkan,
+                BackendKind::Vulkan,
+                if same_supervisor {
+                    "native:pci:0000:31:00.0"
+                } else {
+                    "native:pci:0000:32:00.0"
+                },
+                fixture.supervisor.clone(),
+            );
+            let registry = retirement_failure_registry_with_owner(&active);
+            let rejected_launcher = Arc::new(TestLauncher::new([]));
+            let rejected = if same_supervisor {
+                active.clone()
+            } else {
+                retirement_failure_route(
+                    WorkerProvider::Vulkan,
+                    BackendKind::Vulkan,
+                    "native:pci:0000:33:00.0",
+                    InferenceWorkerSupervisor {
+                        transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                            rejected_launcher.clone(),
+                            short_deadlines(),
+                        ),
+                        next_correlation: Arc::new(AtomicU64::new(0)),
+                    },
+                )
+            };
+
+            for expected_attempts in 1..=2 {
+                assert!(
+                    registry
+                        .retire_gpu_workers_after_authority_rejection(&rejected)
+                        .is_err()
+                );
+                assert_retirement_failure_owner(&registry, &active, &fixture, expected_attempts);
+                assert_eq!(rejected_launcher.launches.load(Ordering::Acquire), 0);
+            }
+
+            registry
+                .retire_gpu_workers_after_authority_rejection(&rejected)
+                .unwrap();
+            assert!(registry.active_route.lock().unwrap().is_none());
+            assert!(!fixture.process.running.load(Ordering::Acquire));
+            assert_eq!(
+                fixture.supervisor.transport.current_generation().unwrap(),
+                None
+            );
+            let (replacement, replacement_launcher) =
+                retirement_failure_replacement_route("retirement-authority-replacement");
+            registry.prepare_route(&replacement).unwrap();
+            replacement
+                .supervisor
+                .transport
+                .ensure_generation()
+                .unwrap();
+            assert_eq!(replacement_launcher.launches.load(Ordering::Acquire), 1);
+            registry.shutdown().unwrap();
+        }
+
+        let selected_fixture = RetirementFailureFixture::new(1);
+        let active_fixture = RetirementFailureFixture::new(0);
+        let active = retirement_failure_route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:34:00.0",
+            active_fixture.supervisor.clone(),
+        );
+        let selected = retirement_failure_route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:35:00.0",
+            selected_fixture.supervisor.clone(),
+        );
+        let registry = retirement_failure_registry_with_owner(&active);
+
+        assert!(
+            registry
+                .retire_gpu_workers_after_authority_rejection(&selected)
+                .is_err()
+        );
+        assert_eq!(
+            selected_fixture
+                .process
+                .termination_attempts
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(selected_fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            selected_fixture
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            active_fixture
+                .process
+                .termination_attempts
+                .load(Ordering::Acquire),
+            1,
+            "the active GPU cleanup must still run after selected-route retirement fails"
+        );
+        assert!(!active_fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            active_fixture
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            None
+        );
+        assert!(
+            registry.active_route.lock().unwrap().is_none(),
+            "the active owner clears after its own retirement succeeds"
+        );
+        assert_eq!(
+            selected_fixture.launcher.launches.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(active_fixture.launcher.launches.load(Ordering::Acquire), 0);
+
+        registry
+            .retire_gpu_workers_after_authority_rejection(&selected)
+            .unwrap();
+        assert!(!selected_fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            selected_fixture
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            None
+        );
+        registry.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retirement_failure_warm_authority_rejection_retains_owner() {
+        struct ResetDeviceEpochRejection;
+        impl Drop for ResetDeviceEpochRejection {
+            fn drop(&mut self) {
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            }
+        }
+
+        let fixture = RetirementFailureFixture::new(2);
+        let active = retirement_failure_route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:36:00.0",
+            fixture.supervisor.clone(),
+        );
+        let registry = retirement_failure_registry_with_owner(&active);
+        crate::gpu_worker_pack::set_test_device_epoch_rejected(true);
+        let _reset = ResetDeviceEpochRejection;
+
+        for expected_attempts in 1..=2 {
+            assert!(matches!(
+                registry.prepare_route(&active),
+                Err(RoutePreparationError::Fatal(
+                    RuntimeError::WorkerUnavailable(_)
+                ))
+            ));
+            assert_retirement_failure_owner(&registry, &active, &fixture, expected_attempts);
+        }
+
+        assert!(matches!(
+            registry.prepare_route(&active),
+            Err(RoutePreparationError::DeviceRollbackAuthority(_))
+        ));
+        assert!(registry.active_route.lock().unwrap().is_none());
+        assert!(!fixture.process.running.load(Ordering::Acquire));
+        assert_eq!(
+            fixture.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        assert_eq!(fixture.launcher.launches.load(Ordering::Acquire), 0);
+
+        let (replacement, replacement_launcher) =
+            retirement_failure_replacement_route("retirement-warm-authority-replacement");
+        registry.prepare_route(&replacement).unwrap();
+        replacement
+            .supervisor
+            .transport
+            .ensure_generation()
+            .unwrap();
+        assert_eq!(replacement_launcher.launches.load(Ordering::Acquire), 1);
+        registry.shutdown().unwrap();
     }
 
     #[test]
