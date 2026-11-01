@@ -10091,6 +10091,7 @@ pub(crate) enum GpuPackProbeIssue {
     DeviceRollbackAuthorityRejected,
     ReleaseAuthorityRejected,
     NotAutoQualified,
+    AutoPowerPolicyExcluded,
     ProviderProbeRejected,
     DriverVersionUnavailable,
     PackLimitExceeded,
@@ -10178,6 +10179,7 @@ fn probe_issue(issue: crate::gpu_worker_pack::PackDiscoveryIssue) -> GpuPackProb
         }
         PackDiscoveryIssue::ReleaseAuthorityRejected => GpuPackProbeIssue::ReleaseAuthorityRejected,
         PackDiscoveryIssue::NotAutoQualified => GpuPackProbeIssue::NotAutoQualified,
+        PackDiscoveryIssue::AutoPowerPolicyExcluded => GpuPackProbeIssue::AutoPowerPolicyExcluded,
         PackDiscoveryIssue::ProviderProbeRejected => GpuPackProbeIssue::ProviderProbeRejected,
         PackDiscoveryIssue::DriverVersionUnavailable => GpuPackProbeIssue::DriverVersionUnavailable,
     }
@@ -10465,6 +10467,7 @@ fn auto_qualified_pack_discovery(
     discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
     policy: &AutoQualificationPolicy,
     model_digest: &str,
+    selection_power_source: PowerSource,
 ) -> crate::gpu_worker_pack::PackLeaseDiscovery {
     use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
 
@@ -10485,14 +10488,26 @@ fn auto_qualified_pack_discovery(
             runtime_abi: pack.runtime_abi_version,
         };
         let provider = crate::backend_policy::ProviderIdentity::new(pack.provider.clone());
-        if policy
+        if !policy
             .qualify_pack(backend, &provider, &identity, model_digest)
             .is_approved()
         {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::NotAutoQualified,
+                &pack.pack_id,
+                pack.backend,
+            ));
+        } else if policy.pack_is_power_eligible_for_auto(
+            backend,
+            &provider,
+            &identity,
+            model_digest,
+            selection_power_source,
+        ) {
             leases.push(lease);
         } else {
             diagnostics.push(PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::NotAutoQualified,
+                PackDiscoveryIssue::AutoPowerPolicyExcluded,
                 &pack.pack_id,
                 pack.backend,
             ));
@@ -11670,6 +11685,10 @@ impl InferenceWorkerRegistry {
                     });
                 }
             };
+            // This selection-time fact is also the volatile admission witness.
+            // Execution obtains a fresh fact again immediately before a GPU
+            // starts work, so this short cache can never authorize a route.
+            let selection_power_source = PowerSource::current();
             // Filter verified pack descriptors before creating any provider
             // probe. The checked-in production policy has zero entries, so
             // ordinary releases take this CPU path without loading a GPU DLL.
@@ -11677,6 +11696,7 @@ impl InferenceWorkerRegistry {
                 crate::gpu_worker_pack::discover_production_pack_leases(),
                 policy,
                 &model.expected_sha256,
+                selection_power_source,
             );
             if discovery.leases.is_empty() {
                 let mut diagnostic = discovery.diagnostic_summary();
@@ -11695,10 +11715,6 @@ impl InferenceWorkerRegistry {
             }
             let discovery_fingerprint =
                 auto_gpu_discovery_fingerprint(&discovery, policy, &model.expected_sha256);
-            // This selection-time fact is also the volatile admission witness.
-            // Execution obtains a fresh fact again immediately before a GPU
-            // starts work, so this short cache can never authorize a route.
-            let selection_power_source = PowerSource::current();
             let lookup_at = Instant::now();
             let active_warm_route = self.active_warm_auto_route(artifact);
             let cached_catalog = {
@@ -18134,6 +18150,30 @@ mod tests {
 
     #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
     #[test]
+    fn gpu_pack_probe_projects_auto_power_prefilter_diagnostic() {
+        use crate::gpu_worker_pack::manifest::{PackBackend, StoreComponent};
+        use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+        assert_eq!(
+            probe_issue(PackDiscoveryIssue::AutoPowerPolicyExcluded),
+            GpuPackProbeIssue::AutoPowerPolicyExcluded
+        );
+        let pack_id = StoreComponent::new("scribe-vulkan-windows-x64").unwrap();
+        let diagnostic = probe_pack_diagnostic(PackDiscoveryDiagnostic::pack(
+            PackDiscoveryIssue::AutoPowerPolicyExcluded,
+            &pack_id,
+            PackBackend::Vulkan,
+        ));
+        assert_eq!(diagnostic.stage, GpuPackProbeStage::PackCatalog);
+        let serialized = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(
+            serialized["issue"],
+            serde_json::Value::String("auto_power_policy_excluded".to_owned())
+        );
+    }
+
+    #[cfg(all(windows, feature = "windows-gpu-capture-observation"))]
+    #[test]
     fn gpu_pack_probe_omits_unvalidated_rejected_catalog_pack_ids() {
         use crate::gpu_worker_pack::manifest::{PackBackend, StoreComponent};
         use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
@@ -24215,7 +24255,8 @@ mod tests {
             catalog_generation: Some("fixture-generation".to_owned()),
         };
         let policy = AutoQualificationPolicy::embedded_windows_x64().unwrap();
-        let filtered = auto_qualified_pack_discovery(discovery, policy, &"b".repeat(64));
+        let filtered =
+            auto_qualified_pack_discovery(discovery, policy, &"b".repeat(64), PowerSource::Ac);
         assert!(filtered.leases.is_empty());
         assert_eq!(
             filtered.diagnostics,
@@ -24227,6 +24268,137 @@ mod tests {
         );
         drop(filtered);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_power_prefilter_excludes_discrete_only_verified_leases_before_probe() {
+        struct OwnedFixtureRoot(std::path::PathBuf);
+
+        impl Drop for OwnedFixtureRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = OwnedFixtureRoot(crate::gpu_worker_pack::manifest::test_support::temp_root(
+            "auto-power-preprobe",
+        ));
+        let (_verifier, lease) =
+            crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root.0);
+        let lease = Arc::new(lease);
+        {
+            let pack = lease.verified_pack();
+            let backend = match pack.backend {
+                PackBackend::Cuda => BackendKind::Cuda,
+                PackBackend::Vulkan => BackendKind::Vulkan,
+                PackBackend::Metal => BackendKind::Metal,
+            };
+            let identity = crate::backend_policy::BackendPackIdentity {
+                pack_id: pack.pack_id.as_str().to_owned(),
+                pack_version: pack.pack_version.as_str().to_owned(),
+                pack_digest: pack.pack_digest.clone(),
+                security_epoch: pack.security_epoch,
+                runtime_abi: pack.runtime_abi_version,
+            };
+            let provider = ProviderIdentity::new(pack.provider.clone());
+            let model_digest = "b".repeat(64);
+            let discovery = || crate::gpu_worker_pack::PackLeaseDiscovery {
+                leases: vec![Arc::clone(&lease)],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("fixture-generation".to_owned()),
+            };
+            let discrete_only = AutoQualificationPolicy::exact_pack_fixture_for_power_filter(
+                backend,
+                &provider,
+                &identity,
+                &model_digest,
+                &[DeviceClass::DiscreteGpu],
+            );
+
+            let ac = auto_qualified_pack_discovery(
+                discovery(),
+                &discrete_only,
+                &model_digest,
+                PowerSource::Ac,
+            );
+            assert_eq!(ac.leases.len(), 1);
+            assert!(ac.diagnostics.is_empty());
+
+            for power_source in [PowerSource::Battery, PowerSource::Unknown] {
+                let filtered = auto_qualified_pack_discovery(
+                    discovery(),
+                    &discrete_only,
+                    &model_digest,
+                    power_source,
+                );
+                assert!(
+                    filtered.leases.is_empty(),
+                    "{power_source:?} must not construct a provider probe for a discrete-only pack"
+                );
+                assert_eq!(
+                    filtered.diagnostics,
+                    vec![crate::gpu_worker_pack::PackDiscoveryDiagnostic::pack(
+                        crate::gpu_worker_pack::PackDiscoveryIssue::AutoPowerPolicyExcluded,
+                        &pack.pack_id,
+                        pack.backend,
+                    )]
+                );
+            }
+
+            let integrated = AutoQualificationPolicy::exact_pack_fixture_for_power_filter(
+                backend,
+                &provider,
+                &identity,
+                &model_digest,
+                &[DeviceClass::IntegratedGpu],
+            );
+            let mixed = AutoQualificationPolicy::exact_pack_fixture_for_power_filter(
+                backend,
+                &provider,
+                &identity,
+                &model_digest,
+                &[DeviceClass::DiscreteGpu, DeviceClass::UnifiedGpu],
+            );
+            let unified = AutoQualificationPolicy::exact_pack_fixture_for_power_filter(
+                backend,
+                &provider,
+                &identity,
+                &model_digest,
+                &[DeviceClass::UnifiedGpu],
+            );
+            for policy in [&integrated, &mixed, &unified] {
+                for power_source in [PowerSource::Battery, PowerSource::Unknown] {
+                    assert_eq!(
+                        auto_qualified_pack_discovery(
+                            discovery(),
+                            policy,
+                            &model_digest,
+                            power_source
+                        )
+                        .leases
+                        .len(),
+                        1,
+                        "an integrated or unified qualification entry remains probe-eligible on {power_source:?}"
+                    );
+                }
+            }
+
+            let mismatched_model = auto_qualified_pack_discovery(
+                discovery(),
+                &integrated,
+                &"d".repeat(64),
+                PowerSource::Battery,
+            );
+            assert!(mismatched_model.leases.is_empty());
+            assert_eq!(
+                mismatched_model.diagnostics,
+                vec![crate::gpu_worker_pack::PackDiscoveryDiagnostic::pack(
+                    crate::gpu_worker_pack::PackDiscoveryIssue::NotAutoQualified,
+                    &pack.pack_id,
+                    pack.backend,
+                )]
+            );
+        }
     }
 
     #[test]
