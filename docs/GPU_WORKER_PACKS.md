@@ -135,8 +135,17 @@ GPU is suitable for Auto.
 
 Before a provider is loaded, Auto compares a verified pack's backend, provider,
 ID/version/digest, security epoch, runtime ABI, and the requested GGUF digest
-with an entry. Only matching packs may be probed. After the challenge-bound
-Hello, it performs a second exact comparison of vendor, device class, and
+with an entry. On battery or when power is unknown, at least one entry matching
+that exact pack and model must qualify an integrated or unified GPU before the
+pack may be probed. Discrete-only packs are skipped before provider-helper
+construction or retirement of a warm CPU worker. AC retains the ordinary pack
+qualification rule; explicit GPU mode overrides the Auto power policy.
+
+This early filter skips packs that cannot yield a power-eligible qualified
+route. An eligible mixed-device provider can still enumerate discrete adapters
+while collecting capability metadata; it does not promise to avoid all driver
+initialization on those adapters. After the challenge-bound Hello, Auto performs
+a second exact comparison of vendor, device class, and
 driver identity while enforcing the entry's minimum total-memory and minimum
 available-memory thresholds. `minimum_available_memory_bytes` is a
 cold/provider-start admission threshold checked against a fresh bounded Hello:
@@ -149,8 +158,11 @@ device-loss, and private-protocol failures invalidate and retire the route.
 A short in-memory CPU-only denial backoff throttles repeated low/unknown-memory
 or power-policy denials, and a changed power fact bypasses it. It is deliberately
 excluded from stable device identity and warm-state fingerprints. The worker
-applies the AC/battery policy after qualification; unknown power is conservative and admits
-only integrated or unified GPUs. CPU is appended as Auto's final fallback.
+applies the AC/battery policy to the actual devices after qualification; unknown
+power is conservative and admits only integrated or unified GPUs. The next
+request reads power again before pack filtering, and execution rechecks power
+before starting GPU work. Active transcription is not migrated. CPU is appended
+as Auto's final fallback.
 Explicit `GPU` deliberately bypasses the Auto evidence and available-memory
 thresholds: it may attempt a verified GPU with low or unknown available memory,
 but it never falls back to CPU and returns a GPU-only error if no GPU route can

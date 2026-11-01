@@ -299,6 +299,27 @@ impl AutoQualificationPolicy {
         )
     }
 
+    /// Checks whether exact, immutable pack evidence can yield an Auto target
+    /// under the selection-time power policy. This uses only the embedded
+    /// qualification document and pack metadata, before a provider process is
+    /// constructed or its device inventory is queried.
+    pub(crate) fn pack_is_power_eligible_for_auto(
+        &self,
+        backend: BackendKind,
+        provider_id: &ProviderIdentity,
+        pack: &BackendPackIdentity,
+        model_digest: &str,
+        power_source: crate::backend_policy::PowerSource,
+    ) -> bool {
+        std::env::consts::OS == self.document.target_os
+            && std::env::consts::ARCH == self.document.target_arch
+            && self.document.entries.iter().any(|entry| {
+                entry_matches_pack(entry, backend, provider_id, pack, model_digest)
+                    && (power_source == crate::backend_policy::PowerSource::Ac
+                        || entry.device_class.is_battery_eligible_gpu())
+            })
+    }
+
     fn qualify_pack_on_platform(
         &self,
         operating_system: &str,
@@ -445,6 +466,63 @@ impl AutoQualificationPolicy {
     #[cfg(test)]
     pub(crate) fn from_fixture_json(input: &str) -> Result<Self, AutoQualificationError> {
         Self::from_canonical_json(input)
+    }
+
+    #[cfg(test)]
+    /// Builds an unvalidated fixture policy for testing the metadata-only
+    /// pre-probe filter against an actual verified pack lease. Production
+    /// policies remain parsed and validated from the embedded manifest.
+    pub(crate) fn exact_pack_fixture_for_power_filter(
+        backend: BackendKind,
+        provider_id: &ProviderIdentity,
+        pack: &BackendPackIdentity,
+        model_digest: &str,
+        device_classes: &[DeviceClass],
+    ) -> Self {
+        let entries = device_classes
+            .iter()
+            .enumerate()
+            .map(|(index, device_class)| QualificationEntry {
+                pack: PackBinding {
+                    pack_id: pack.pack_id.clone(),
+                    pack_version: pack.pack_version.clone(),
+                    pack_digest: pack.pack_digest.clone(),
+                    security_epoch: pack.security_epoch,
+                    runtime_abi: pack.runtime_abi,
+                },
+                model_digest: model_digest.to_owned(),
+                backend,
+                provider_id: provider_id.as_str().to_owned(),
+                vendor: GpuVendor::Unknown,
+                device_class: *device_class,
+                minimum_total_memory_bytes: 1,
+                minimum_available_memory_bytes: 1,
+                driver: DriverConstraint::Exact {
+                    value: "fixture-driver".to_owned(),
+                },
+                evidence: QualificationEvidence {
+                    id: format!("power-filter-fixture-{index}"),
+                    cold_runs: 5,
+                    warm_runs: 20,
+                    gpu_p95_ms: 1,
+                    cpu_p95_ms: 1,
+                    correctness_verified: true,
+                    reliability_verified: true,
+                    cold_evidence_sha256: "c".repeat(64),
+                    warm_evidence_sha256: "d".repeat(64),
+                    transcript_parity_evidence_sha256: "e".repeat(64),
+                },
+            })
+            .collect();
+        Self {
+            document: QualificationDocument {
+                schema_version: QUALIFICATION_SCHEMA_VERSION,
+                mode: QualificationMode::DefaultDeny,
+                target_os: std::env::consts::OS.to_owned(),
+                target_arch: std::env::consts::ARCH.to_owned(),
+                entries,
+            },
+        }
     }
 }
 
@@ -976,6 +1054,112 @@ mod tests {
             ),
             QualificationDecision::Denied(QualificationDenial::InsufficientMemory)
         );
+    }
+
+    #[test]
+    fn pack_power_gate_requires_an_exact_battery_eligible_entry() {
+        let target = fixture_target();
+        let pack = target.pack.as_ref().unwrap();
+        let provider = &target.provider_id;
+        let mut document = fixture_document();
+        document.target_os = std::env::consts::OS.to_owned();
+        document.target_arch = std::env::consts::ARCH.to_owned();
+        let policy = AutoQualificationPolicy { document };
+        let qualifies = |policy: &AutoQualificationPolicy, power_source| {
+            policy.pack_is_power_eligible_for_auto(
+                target.backend,
+                provider,
+                pack,
+                MODEL_DIGEST,
+                power_source,
+            )
+        };
+
+        assert!(qualifies(&policy, crate::backend_policy::PowerSource::Ac));
+        assert!(!qualifies(
+            &policy,
+            crate::backend_policy::PowerSource::Battery
+        ));
+        assert!(!qualifies(
+            &policy,
+            crate::backend_policy::PowerSource::Unknown
+        ));
+
+        let mut integrated = fixture_entry();
+        integrated.device_class = DeviceClass::IntegratedGpu;
+        let mixed_policy = AutoQualificationPolicy {
+            document: QualificationDocument {
+                entries: vec![fixture_entry(), integrated],
+                target_os: std::env::consts::OS.to_owned(),
+                target_arch: std::env::consts::ARCH.to_owned(),
+                ..fixture_document()
+            },
+        };
+        assert!(qualifies(
+            &mixed_policy,
+            crate::backend_policy::PowerSource::Battery
+        ));
+        assert!(qualifies(
+            &mixed_policy,
+            crate::backend_policy::PowerSource::Unknown
+        ));
+
+        assert!(!mixed_policy.pack_is_power_eligible_for_auto(
+            target.backend,
+            provider,
+            pack,
+            &"d".repeat(64),
+            crate::backend_policy::PowerSource::Battery,
+        ));
+        assert!(!mixed_policy.pack_is_power_eligible_for_auto(
+            BackendKind::Vulkan,
+            provider,
+            pack,
+            MODEL_DIGEST,
+            crate::backend_policy::PowerSource::Battery,
+        ));
+        assert!(!mixed_policy.pack_is_power_eligible_for_auto(
+            target.backend,
+            &ProviderIdentity::new("transcribe-cpp-ggml-vulkan"),
+            pack,
+            MODEL_DIGEST,
+            crate::backend_policy::PowerSource::Battery,
+        ));
+        for mutation in [
+            |value: &mut BackendPackIdentity| value.pack_id = "other-pack".to_owned(),
+            |value: &mut BackendPackIdentity| value.pack_version = "2.0.0".to_owned(),
+            |value: &mut BackendPackIdentity| value.pack_digest = "d".repeat(64),
+            |value: &mut BackendPackIdentity| value.security_epoch += 1,
+            |value: &mut BackendPackIdentity| value.runtime_abi += 1,
+        ] {
+            let mut mismatched_pack = pack.clone();
+            mutation(&mut mismatched_pack);
+            assert!(!mixed_policy.pack_is_power_eligible_for_auto(
+                target.backend,
+                provider,
+                &mismatched_pack,
+                MODEL_DIGEST,
+                crate::backend_policy::PowerSource::Battery,
+            ));
+        }
+        let mut foreign_platform = mixed_policy.clone();
+        foreign_platform.document.target_os = "foreign".to_owned();
+        assert!(!foreign_platform.pack_is_power_eligible_for_auto(
+            target.backend,
+            provider,
+            pack,
+            MODEL_DIGEST,
+            crate::backend_policy::PowerSource::Battery,
+        ));
+        let mut foreign_architecture = mixed_policy;
+        foreign_architecture.document.target_arch = "foreign".to_owned();
+        assert!(!foreign_architecture.pack_is_power_eligible_for_auto(
+            target.backend,
+            provider,
+            pack,
+            MODEL_DIGEST,
+            crate::backend_policy::PowerSource::Battery,
+        ));
     }
 
     #[test]
