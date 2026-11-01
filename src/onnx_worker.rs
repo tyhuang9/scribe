@@ -64,6 +64,10 @@ use sha2::{Digest, Sha256};
 #[path = "onnx_worker/windows_capture_launch.rs"]
 mod windows_capture_launch;
 
+#[cfg(all(test, windows))]
+#[path = "onnx_worker/windows_supervision_fault_tests.rs"]
+mod windows_supervision_fault_tests;
+
 pub(crate) use crate::worker_identity::{
     DESKTOP_BUILD_ID, INFERENCE_WORKER_BUILD_ID, PROTOCOL_VERSION, WORKER_ABI_VERSION,
 };
